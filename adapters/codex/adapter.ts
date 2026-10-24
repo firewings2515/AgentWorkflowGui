@@ -18,7 +18,7 @@ import {
   NativeTaskId,
   type ObservedModel,
   PermissionDecision,
-  type PermissionRequest,
+  PermissionRequest,
   PermissionRequestId,
   type SessionId,
   type SessionItem,
@@ -100,8 +100,11 @@ export interface PermissionHandle {
 }
 
 export interface CodexAdapterOptions {
-  /** Called once per approval request; must eventually answer it (or let it be withdrawn). */
-  onPermissionRequest(handle: PermissionHandle): void;
+  /**
+   * Called once per approval request; must eventually answer it (or let it be withdrawn). If it throws
+   * or its promise rejects before answering, the request is declined (fail closed).
+   */
+  onPermissionRequest(handle: PermissionHandle): unknown;
   /** Replaces the default spawn (tests plug in a fake app-server here). */
   spawn?: () => AppServerProcess;
   spawnOptions?: SpawnOptions;
@@ -233,11 +236,30 @@ interface PermissionEntry {
   threadId: string;
   nativeTurnId: string | null;
   kind: PermissionKind;
-  params: unknown;
+  /** For `permissions` requests: exactly the scope shown in `request`, granted on approval. */
+  grant?: JsonValue;
   request: PermissionRequest;
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v !== '';
+const isThenable = (v: unknown): v is PromiseLike<unknown> => (typeof v === 'object' || typeof v === 'function') && v !== null && typeof (v as { then?: unknown }).then === 'function';
+
+/**
+ * Enough structure to trust an item for reconciliation: every item has a type and an id, and a user
+ * message has its content array and a clientId that is a string or null.
+ */
+const isWireItem = (v: unknown): v is WireItem =>
+  isObject(v) &&
+  isNonEmptyString(v.type) &&
+  isNonEmptyString(v.id) &&
+  (v.type !== 'userMessage' || (Array.isArray(v.content) && (v.clientId === null || typeof v.clientId === 'string')));
+
+/** The stored history could not be read completely; reconciliation must stay unknown. */
+class IncompleteHistoryError extends Error {
+  override name = 'IncompleteHistoryError';
+}
+
 const rpcKey = (id: RpcId) => `${typeof id}:${id}`;
 const WEEK_MINUTES = 7 * 24 * 60;
 const MAX_HISTORY_PAGES = 10_000;
@@ -620,14 +642,20 @@ export class CodexAdapter {
       ...opt('limit', o.limit),
       ...opt('sortDirection', o.sortDirection),
     });
-    if (!isObject(page) || !Array.isArray(page.data)) throw new Error('thread/items/list: malformed response');
-    const data = page.data.filter((e): e is WireThreadItemEntry => isObject(e) && typeof e.turnId === 'string' && isObject(e.item) && typeof e.item.type === 'string');
-    return { data, nextCursor: typeof page.nextCursor === 'string' ? page.nextCursor : null };
+    // Strict on purpose: a page we cannot fully read means the history is incomplete (CR-2 §2), so a
+    // malformed entry or a missing / non-string cursor fails the read instead of being skipped.
+    if (!isObject(page) || !Array.isArray(page.data)) throw new IncompleteHistoryError('thread/items/list: response has no data array');
+    const bad = page.data.findIndex((e) => !isObject(e) || !isNonEmptyString(e.turnId) || !isWireItem(e.item));
+    if (bad >= 0) throw new IncompleteHistoryError(`thread/items/list: entry ${bad} is malformed`);
+    const { nextCursor } = page;
+    if (nextCursor !== null && !isNonEmptyString(nextCursor)) throw new IncompleteHistoryError('thread/items/list: nextCursor is missing or not a string');
+    return { data: page.data as WireThreadItemEntry[], nextCursor };
   }
 
   /**
    * Every stored item of the thread. Pages `thread/items/list` to the end; if that API fails, falls back
-   * to `thread/read` with full turns (the path SP CR-2 proved). Both are read-only.
+   * to `thread/read` with full turns (the path SP CR-2 proved). Both are read-only. Throws when the
+   * history cannot be shown to be complete.
    */
   private async readWholeHistory(threadId: string): Promise<{ turnId: string; item: WireItem }[]> {
     try {
@@ -639,15 +667,26 @@ export class CodexAdapter {
         if (res.nextCursor === null) return all;
         cursor = res.nextCursor;
       }
-      throw new Error('thread/items/list: history did not end');
+      throw new IncompleteHistoryError('thread/items/list: history did not end');
     } catch (error) {
       if (!(error instanceof RpcError)) throw error;
       this.log('warn', 'thread/items/list failed; reading full turns instead', error.message);
     }
     const res = await this.request('thread/read', { threadId, includeTurns: true });
-    const thread = isObject(res) ? (res.thread as WireThread | undefined) : undefined;
-    if (!thread || !Array.isArray(thread.turns)) throw new Error('thread/read: malformed response');
-    return thread.turns.flatMap((t) => (Array.isArray(t.items) ? t.items.map((item) => ({ turnId: t.id, item })) : []));
+    const thread = isObject(res) && isObject(res.thread) ? res.thread : undefined;
+    if (!thread || !Array.isArray(thread.turns)) throw new IncompleteHistoryError('thread/read: response has no turns');
+    const all: { turnId: string; item: WireItem }[] = [];
+    for (const [i, turn] of thread.turns.entries()) {
+      // Only `full` turns carry every item; `summary` / `notLoaded` would hide messages.
+      if (!isObject(turn) || !isNonEmptyString(turn.id) || turn.itemsView !== 'full' || !Array.isArray(turn.items)) {
+        throw new IncompleteHistoryError(`thread/read: turn ${i} is not fully loaded`);
+      }
+      for (const item of turn.items) {
+        if (!isWireItem(item)) throw new IncompleteHistoryError(`thread/read: turn ${turn.id} has a malformed item`);
+        all.push({ turnId: turn.id, item });
+      }
+    }
+    return all;
   }
 
   // ---- internals: events --------------------------------------------------------------------------
@@ -702,8 +741,10 @@ export class CodexAdapter {
       }
       this.turnModels.delete(turn.id);
     }
-    // A sub-agent's turns are not turns of the GUI session (Turn has no native task); its items still are.
+    // A sub-agent's turns are not turns of the GUI session (Turn has no native task); they drive its
+    // NativeTask state instead. Its items still belong to the session.
     if (binding.nativeTaskId === undefined) this.emit({ type: 'turn.updated', turn: mapped });
+    else this.onChildTurn(threadId!, turn, method === 'turn/completed', mapped.endedAt ?? now);
   }
 
   private onItem(method: string, params: Record<string, unknown>): void {
@@ -845,22 +886,44 @@ export class CodexAdapter {
     if (!this.threads.has(child)) this.threads.set(child, { sessionId: parent.sessionId, nativeTaskId: id });
     const previous = this.nativeTasks.get(child);
     const state = item.kind === 'completed' ? 'completed' : item.kind === 'interrupted' ? 'stopped' : 'running';
-    if (previous && previous.state === state && previous.lastActivity === item.kind) return;
-    const task: NativeTask = {
-      id,
-      sessionId: parent.sessionId,
-      runtime: 'codex',
-      parentRef: parentThreadId,
-      nativeRef: child,
-      ...opt('parentTaskId', parent.nativeTaskId),
-      label: typeof item.agentPath === 'string' && item.agentPath !== '' ? item.agentPath : child,
+    this.updateNativeTask(
+      previous ?? {
+        id,
+        sessionId: parent.sessionId,
+        runtime: 'codex',
+        parentRef: parentThreadId,
+        nativeRef: child,
+        ...opt('parentTaskId', parent.nativeTaskId),
+        label: typeof item.agentPath === 'string' && item.agentPath !== '' ? item.agentPath : child,
+        state,
+        background: false,
+        startedAt: at,
+      },
       state,
-      background: false,
-      lastActivity: item.kind,
-      startedAt: previous?.startedAt ?? at,
-      ...(state !== 'running' && { endedAt: at }),
-    };
-    this.nativeTasks.set(child, task);
+      item.kind,
+      at,
+      previous === undefined,
+    );
+  }
+
+  /**
+   * The sub-agent's own turns are what actually ran (SP-03): a child turn that ends interrupted, failed
+   * or completed ends the task even when no `subAgentActivity` follows, and a new child turn resumes it.
+   */
+  private onChildTurn(child: string, turn: WireTurn, ended: boolean, at: Timestamp): void {
+    const task = this.nativeTasks.get(child);
+    if (!task) return;
+    const state = !ended ? 'running' : turn.status === 'interrupted' ? 'stopped' : turn.status === 'completed' ? 'completed' : 'failed';
+    this.updateNativeTask(task, state, `turn ${turn.status}`, at, false);
+  }
+
+  private updateNativeTask(base: NativeTask, state: NativeTask['state'], lastActivity: string, at: Timestamp, isNew: boolean): void {
+    // Only state changes are reported; activity alone (turn started, interacted) would be noise.
+    if (!isNew && base.state === state) return;
+    const task: NativeTask = { ...base, state, lastActivity };
+    if (state === 'running') delete task.endedAt;
+    else task.endedAt = at;
+    this.nativeTasks.set(task.nativeRef, task);
     this.emit({ type: 'nativeTask.updated', task });
   }
 
@@ -874,15 +937,39 @@ export class CodexAdapter {
       this.conn?.respondError(id, -32601, `${method} is not supported by AgentWorkflowGui`);
       return;
     }
+    let entry: PermissionEntry;
+    try {
+      const built = this.registerPermission(id, kind, params);
+      if (typeof built === 'string') {
+        this.log('warn', `${method} refused: ${built}`);
+        this.conn?.respond(id, refusalToWire(kind));
+        return;
+      }
+      entry = built;
+    } catch (error) {
+      // Nothing reached the upper layer; still answer so the turn does not hang (fail closed).
+      this.log('warn', `${method} could not be handled; declining`, error);
+      if (!this.permissions.has(rpcKey(id))) this.conn?.respond(id, refusalToWire(kind));
+      else this.failClosed(this.permissions.get(rpcKey(id))!, error);
+      return;
+    }
+    const handle = this.handleFor(entry);
+    try {
+      const pending = this.options.onPermissionRequest(handle);
+      if (isThenable(pending)) void Promise.resolve(pending).catch((error: unknown) => this.failClosed(entry, error));
+    } catch (error) {
+      this.failClosed(entry, error);
+    }
+  }
+
+  /** Builds and registers an open request, or returns why it has to be refused. */
+  private registerPermission(id: RpcId, kind: PermissionKind, params: unknown): PermissionEntry | string {
     const p = isObject(params) ? params : {};
     const threadId = typeof p.threadId === 'string' ? p.threadId : '';
     const binding = this.threads.get(threadId);
-    const nativeTurnId = typeof p.turnId === 'string' ? p.turnId : null;
-    if (!binding) {
-      this.log('warn', `${method} for unknown thread ${threadId}; declining`);
-      this.conn?.respond(id, refusalToWire(kind));
-      return;
-    }
+    if (!binding) return `thread ${threadId} is not bound to a session`;
+    if (p.turnId !== undefined && p.turnId !== null && !isNonEmptyString(p.turnId)) return 'turnId is not a non-empty string';
+    const nativeTurnId = isNonEmptyString(p.turnId) ? p.turnId : null;
     const knownPaths = kind === 'fileChange' && typeof p.itemId === 'string' ? this.fileChangePaths(p.itemId) : undefined;
     const built = buildPermissionRequest(kind, params, {
       id: PermissionRequestId.parse(this.options.newId?.() ?? randomUUID()),
@@ -890,21 +977,24 @@ export class CodexAdapter {
       createdAt: this.now(),
       knownPaths,
     });
-    if (typeof built === 'string') {
-      this.log('warn', `${method} cannot be represented (${built}); declining`);
-      this.conn?.respond(id, refusalToWire(kind));
-      return;
-    }
-    const entry: PermissionEntry = { rpcId: id, threadId, nativeTurnId, kind, params, request: built };
+    if (typeof built === 'string') return `cannot be represented (${built})`;
+    const entry: PermissionEntry = { rpcId: id, threadId, nativeTurnId, kind, ...opt('grant', built.grant), request: built.request };
     this.permissions.set(rpcKey(id), entry);
-    this.emit({ type: 'permission.updated', request: built });
-    const handle = this.handleFor(entry);
+    this.emit({ type: 'permission.updated', request: built.request });
+    return entry;
+  }
+
+  /** A broken handler must not leave the turn hanging: decline whatever is still open. */
+  private failClosed(entry: PermissionEntry, error: unknown): void {
+    if (this.permissions.get(rpcKey(entry.rpcId)) !== entry) return;
+    this.log('warn', 'permission handler failed; declining', error);
+    const decision: Decision = { outcome: 'decline', decidedBy: 'policy', reason: 'permission handler failed', at: this.now() };
     try {
-      this.options.onPermissionRequest(handle);
-    } catch (error) {
-      // A broken handler must not leave the turn hanging; fail closed.
-      this.log('warn', 'permission handler threw; declining', error);
-      handle.answer({ outcome: 'decline', decidedBy: 'policy', reason: 'permission handler failed', at: this.now() });
+      this.handleFor(entry).answer(decision);
+    } catch {
+      // The answer itself could not be built; still release the runtime.
+      if (this.conn?.respond(entry.rpcId, refusalToWire(entry.kind))) this.permissions.delete(rpcKey(entry.rpcId));
+      this.withdraw(entry);
     }
   }
 
@@ -917,28 +1007,28 @@ export class CodexAdapter {
   private handleFor(entry: PermissionEntry): PermissionHandle {
     const key = rpcKey(entry.rpcId);
     const isOpen = () => this.permissions.get(key) === entry;
-    const update = (patch: Partial<PermissionRequest>) => {
-      entry.request = { ...entry.request, ...patch };
-      this.emit({ type: 'permission.updated', request: entry.request });
-    };
     return {
       get request() {
         return entry.request;
       },
+      // Both validate the whole resulting request before anything is emitted or sent, so an invalid
+      // answer (e.g. approve-for-session on an elicitation) throws and changes nothing.
       hold: (hold, extra) => {
         if (!isOpen()) return false;
-        update({ state: 'held', hold, ...opt('matchedRule', extra?.matchedRule) });
+        entry.request = PermissionRequest.parse({ ...entry.request, state: 'held', hold, ...opt('matchedRule', extra?.matchedRule) });
+        this.emit({ type: 'permission.updated', request: entry.request });
         return true;
       },
       answer: (decision, extra) => {
         if (!isOpen()) return false;
         const parsed = PermissionDecision.parse(decision);
-        if (!this.conn?.respond(entry.rpcId, decisionToWire(entry.kind, parsed, entry.params))) {
+        const answered = PermissionRequest.parse({ ...withoutHold(entry.request), state: 'answered', decision: parsed, ...opt('matchedRule', extra?.matchedRule) });
+        if (!this.conn?.respond(entry.rpcId, decisionToWire(entry.kind, parsed, entry.grant))) {
           this.withdraw(entry);
           return false;
         }
         this.permissions.delete(key);
-        entry.request = { ...withoutHold(entry.request), state: 'answered', decision: parsed, ...opt('matchedRule', extra?.matchedRule) };
+        entry.request = answered;
         this.emit({ type: 'permission.updated', request: entry.request });
         return true;
       },

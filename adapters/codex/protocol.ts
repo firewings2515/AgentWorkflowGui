@@ -122,12 +122,6 @@ export interface WireModel {
   isDefault: boolean;
 }
 
-/** `item/permissions/requestApproval` asks for these; the answer grants a subset (we grant all or nothing). */
-export interface WirePermissionProfile {
-  network: { enabled: boolean | null } | null;
-  fileSystem: { read: string[] | null; write: string[] | null; [key: string]: unknown } | null;
-}
-
 /** Server requests that reach the permission callback. */
 export const PERMISSION_METHODS = {
   command: 'item/commandExecution/requestApproval',

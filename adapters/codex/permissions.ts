@@ -3,7 +3,7 @@
 import { ItemId, McpElicitation, PermissionRequest, type PermissionRequestId, type Timestamp, TurnId } from '../../contracts';
 import type { PermissionDecision } from './contract-types';
 import { opt, type Placement } from './mapping';
-import { type JsonValue, PERMISSION_METHODS, type WirePermissionProfile } from './protocol';
+import { type JsonValue, PERMISSION_METHODS } from './protocol';
 
 export type PermissionKind = PermissionRequest['kind'];
 
@@ -12,7 +12,6 @@ export const permissionKindOf = (method: string): PermissionKind | undefined =>
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined);
-const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x !== '') : []);
 
 export interface BuildContext {
   id: PermissionRequestId;
@@ -22,8 +21,84 @@ export interface BuildContext {
   knownPaths?: string[] | undefined;
 }
 
-/** Builds the pending request, or returns an error message when the params cannot be represented. */
-export const buildPermissionRequest = (kind: PermissionKind, params: unknown, ctx: BuildContext): PermissionRequest | string => {
+/** What a `permissions` request asks for, in terms the upper layer sees, plus the exact grant to send back. */
+interface ParsedProfile {
+  network: boolean;
+  read: string[];
+  write: string[];
+  deny: string[];
+  grant: { [key: string]: JsonValue };
+}
+
+const onlyKeys = (o: Record<string, unknown>, allowed: string[]) => Object.keys(o).every((k) => allowed.includes(k));
+const pathList = (v: unknown): string[] | undefined =>
+  v === null || v === undefined ? [] : Array.isArray(v) && v.every((x) => typeof x === 'string' && x !== '') ? (v as string[]) : undefined;
+
+/**
+ * Accepts only what `PermissionRequest.paths` can show: network on/off and plain file paths (legacy
+ * `read` / `write` lists and `entries` of type `path`). Globs, special scopes (root, tmpdir, project
+ * roots, ...) and unknown fields cannot be shown to the user, so the request is refused (fail closed).
+ * The grant is rebuilt from the parsed values, never echoed from the raw params.
+ */
+export const parsePermissionProfile = (v: unknown): ParsedProfile | string => {
+  if (!isObject(v) || !onlyKeys(v, ['network', 'fileSystem'])) return 'permissions has unknown fields';
+  const out: ParsedProfile = { network: false, read: [], write: [], deny: [], grant: {} };
+  if (v.network !== null && v.network !== undefined) {
+    if (!isObject(v.network) || !onlyKeys(v.network, ['enabled'])) return 'network permission has unknown fields';
+    if (v.network.enabled === true) {
+      out.network = true;
+      out.grant.network = { enabled: true };
+    } else if (v.network.enabled !== false && v.network.enabled !== null) return 'network.enabled is not a boolean';
+  }
+  const fs = v.fileSystem;
+  if (fs === null || fs === undefined) return out;
+  if (!isObject(fs) || !onlyKeys(fs, ['read', 'write', 'entries', 'globScanMaxDepth'])) return 'fileSystem permission has unknown fields';
+  const read = pathList(fs.read);
+  const write = pathList(fs.write);
+  if (!read || !write) return 'fileSystem.read / write are not path lists';
+  out.read.push(...read);
+  out.write.push(...write);
+  const entries: JsonValue[] = [];
+  if (fs.entries !== null && fs.entries !== undefined) {
+    if (!Array.isArray(fs.entries)) return 'fileSystem.entries is not a list';
+    for (const e of fs.entries) {
+      if (!isObject(e) || !onlyKeys(e, ['path', 'access']) || !isObject(e.path)) return 'fileSystem entry is malformed';
+      if (e.path.type !== 'path' || !onlyKeys(e.path, ['type', 'path']) || !str(e.path.path)) {
+        return `fileSystem entry of type ${String(e.path.type)} cannot be represented`;
+      }
+      const path = e.path.path as string;
+      if (e.access === 'read') out.read.push(path);
+      else if (e.access === 'write') out.write.push(path);
+      else if (e.access === 'deny') out.deny.push(path);
+      else return 'fileSystem entry has an unknown access mode';
+      entries.push({ path: { type: 'path', path }, access: e.access });
+    }
+  }
+  const fileSystem: { [key: string]: JsonValue } = { read: read.length > 0 ? read : null, write: write.length > 0 ? write : null };
+  if (entries.length > 0) fileSystem.entries = entries;
+  if (out.read.length + out.write.length + out.deny.length > 0) out.grant.fileSystem = fileSystem;
+  return out;
+};
+
+export interface BuiltRequest {
+  request: PermissionRequest;
+  /** For `permissions` requests: exactly what an approval grants. */
+  grant?: JsonValue;
+}
+
+/**
+ * Builds the pending request, or returns an error message when the params cannot be represented.
+ * Never throws: anything unexpected becomes an error message, so the caller can refuse the request.
+ */
+export const buildPermissionRequest = (kind: PermissionKind, params: unknown, ctx: BuildContext): BuiltRequest | string => {
+  try {
+    return build(kind, params, ctx);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+};
+
+const build = (kind: PermissionKind, params: unknown, ctx: BuildContext): BuiltRequest | string => {
   if (!isObject(params)) return 'params are not an object';
   const itemId = kind === 'mcpElicitation' ? undefined : str(params.itemId);
   const base = {
@@ -37,6 +112,7 @@ export const buildPermissionRequest = (kind: PermissionKind, params: unknown, ct
     createdAt: ctx.createdAt,
   };
   const reason = str(params.reason);
+  let grant: JsonValue | undefined;
   let fields: Pick<PermissionRequest, 'summary' | 'paths'> & Partial<Pick<PermissionRequest, 'command' | 'cwd' | 'elicitation'>>;
   switch (kind) {
     case 'command': {
@@ -63,14 +139,20 @@ export const buildPermissionRequest = (kind: PermissionKind, params: unknown, ct
       break;
     }
     case 'permissions': {
-      const perms = isObject(params.permissions) ? params.permissions : {};
-      const fs = isObject(perms.fileSystem) ? perms.fileSystem : {};
-      const network = isObject(perms.network) && perms.network.enabled === true;
-      const read = strings(fs.read);
-      const write = strings(fs.write);
-      const parts = [network && 'network access', read.length > 0 && `read ${read.join(', ')}`, write.length > 0 && `write ${write.join(', ')}`].filter(Boolean);
+      const profile = parsePermissionProfile(params.permissions);
+      if (typeof profile === 'string') return profile;
+      grant = profile.grant;
+      const { network, read, write, deny } = profile;
+      const parts = [
+        network && 'network access',
+        write.length > 0 && `write ${write.join(', ')}`,
+        read.length > 0 && `read ${read.join(', ')}`,
+        deny.length > 0 && `deny ${deny.join(', ')}`,
+      ].filter(Boolean);
+      // The summary always states the full scope; the agent's reason is only added to it.
+      const scope = `Grant ${parts.length > 0 ? parts.join('; ') : 'no additional permissions'}`;
       fields = {
-        summary: reason ?? `Grant ${parts.length > 0 ? parts.join('; ') : 'additional permissions'}`,
+        summary: reason ? `${scope} (${reason})` : scope,
         ...opt('cwd', str(params.cwd)),
         paths: [...new Set([...write, ...read])],
       };
@@ -89,27 +171,24 @@ export const buildPermissionRequest = (kind: PermissionKind, params: unknown, ct
     }
   }
   const result = PermissionRequest.safeParse({ ...base, ...fields });
-  return result.success ? result.data : result.error.message;
+  if (!result.success) return result.error.message;
+  return grant === undefined ? { request: result.data } : { request: result.data, grant };
 };
 
 /**
  * The wire result for an answer. Elicitations carry the form content; permission grants are all or
- * nothing (`approve` for this turn, `approve-for-session` for the session).
+ * nothing (`approve` for this turn, `approve-for-session` for the session) and grant only `grant`, the
+ * scope the upper layer was shown.
  */
-export const decisionToWire = (kind: PermissionKind, decision: PermissionDecision, params: unknown): JsonValue => {
+export const decisionToWire = (kind: PermissionKind, decision: PermissionDecision, grant?: JsonValue): JsonValue => {
   const { outcome } = decision;
   switch (kind) {
     case 'command':
     case 'fileChange':
       return { decision: outcome === 'approve' ? 'accept' : outcome === 'approve-for-session' ? 'acceptForSession' : outcome };
-    case 'permissions': {
-      if (outcome === 'decline' || outcome === 'cancel') return { permissions: {}, scope: 'turn' };
-      const requested = (isObject(params) && isObject(params.permissions) ? params.permissions : {}) as Partial<WirePermissionProfile>;
-      const granted: Record<string, JsonValue> = {};
-      if (requested.network) granted.network = requested.network;
-      if (requested.fileSystem) granted.fileSystem = requested.fileSystem as JsonValue;
-      return { permissions: granted, scope: outcome === 'approve-for-session' ? 'session' : 'turn' };
-    }
+    case 'permissions':
+      if (outcome === 'decline' || outcome === 'cancel' || grant === undefined) return { permissions: {}, scope: 'turn' };
+      return { permissions: grant, scope: outcome === 'approve-for-session' ? 'session' : 'turn' };
     case 'mcpElicitation': {
       const accepted = outcome === 'approve' || outcome === 'approve-for-session';
       return { action: accepted ? 'accept' : outcome, content: accepted ? ((decision.content ?? null)) : null, _meta: null };

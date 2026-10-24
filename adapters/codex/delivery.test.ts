@@ -203,6 +203,7 @@ describe('reconcile', () => {
             {
               id: '01a16874-cc7f-7a90-952a-b9f32f705d54',
               items: [userItem('01a16874-d206-7011-a24f-0ec6ef158c89', 'de7e0897-b8ac-4891-a4c3-d9566db60d73', proofText), agentItem],
+              itemsView: 'full',
               status: 'completed',
               error: null,
               startedAt: 1792753847,
@@ -216,6 +217,31 @@ describe('reconcile', () => {
     const result = await h.adapter.reconcile({ threadId: '01a16874-c8e2-71d0-964c-4ef1fe708cdc', clientMessageId: 'de7e0897-b8ac-4891-a4c3-d9566db60d73', text: proofText });
     expect(result).toMatchObject({ state: 'sent', nativeRef: { turnRef: '01a16874-cc7f-7a90-952a-b9f32f705d54', itemRef: '01a16874-d206-7011-a24f-0ec6ef158c89' } });
     expect(sentParams(h.fake, 'thread/read')).toEqual({ threadId: '01a16874-c8e2-71d0-964c-4ef1fe708cdc', includeTurns: true });
+  });
+
+  // Review r1 P1-1: anything that keeps the history from being provably complete stays unknown.
+  it.each([
+    ['nextCursor is missing', { data: [entry('turn-1', userItem('u-1', CLIENT_ID, 'Handoff payload'))] }],
+    ['nextCursor is not a string', { data: [entry('turn-1', userItem('u-1', CLIENT_ID, 'Handoff payload'))], nextCursor: 42 }],
+    ['an entry is malformed', { data: [entry('turn-1', userItem('u-1', CLIENT_ID, 'Handoff payload')), { turnId: 'turn-2' }], nextCursor: null }],
+    [
+      'a user message lacks its clientId',
+      { data: [entry('turn-1', userItem('u-1', CLIENT_ID, 'Handoff payload')), entry('turn-2', { type: 'userMessage', id: 'u-2', content: [] })], nextCursor: null },
+    ],
+  ])('does not report sent when %s', async (_label, page) => {
+    const { result } = await reconcileWith([out('thread/items/list', 2), reply(2, page)]);
+    expect(result).toMatchObject({ state: 'unknown', reason: 'read-failed' });
+  });
+
+  it('does not trust a thread/read fallback whose turns are not fully loaded', async () => {
+    const turn = (id: string, itemsView: string) => ({ id, items: [userItem('u-1', CLIENT_ID, 'Handoff payload')], itemsView, status: 'completed', error: null, startedAt: 1, completedAt: 2 });
+    const { result } = await reconcileWith([
+      out('thread/items/list', 2),
+      replyError(2, -32600, 'thread not loaded'),
+      out('thread/read', 3, { threadId: THREAD_ID, includeTurns: true }),
+      reply(3, { thread: { id: THREAD_ID, turns: [turn('turn-1', 'full'), turn('turn-2', 'summary')] } }),
+    ]);
+    expect(result).toMatchObject({ state: 'unknown', reason: 'read-failed', detail: expect.stringContaining('not fully loaded') as unknown });
   });
 
   it('keeps unknown when the history cannot be read', async () => {

@@ -65,7 +65,7 @@ describe('permission requests', () => {
   it('grants the requested permission profile for the session on approve-for-session', async () => {
     const h = await started([turnStarted, serverRequest(7, 'item/permissions/requestApproval', permissionsParams), outResponse(7)]);
     await until(() => h.permissions.length === 1, 'request');
-    expect(h.permissions[0]!.request).toMatchObject({ kind: 'permissions', paths: ['E:\\work\\cache'], summary: 'needs network to fetch dependencies', turnId: TURN_ID });
+    expect(h.permissions[0]!.request).toMatchObject({ kind: 'permissions', paths: ['E:\\work\\cache'], summary: 'Grant network access; write E:\\work\\cache (needs network to fetch dependencies)', turnId: TURN_ID });
     h.permissions[0]!.answer({ outcome: 'approve-for-session', decidedBy: 'user', escalationId: EscalationId.parse('esc-1'), at: AT });
     expect(h.fake.received.at(-1)).toEqual({
       id: 7,
@@ -73,6 +73,112 @@ describe('permission requests', () => {
     });
     expect(h.fake.mismatches).toEqual([]);
     expectValidEvents(h.events);
+  });
+
+  // Review r1 P1-2: the grant must be exactly the scope the upper layer was shown.
+  it('shows entries of type path and grants only the parsed scope, never the raw params', async () => {
+    const params = {
+      ...permissionsParams,
+      permissions: {
+        network: null,
+        fileSystem: {
+          read: null,
+          write: null,
+          entries: [
+            { path: { type: 'path', path: 'E:\\outside\\out.txt' }, access: 'write' },
+            { path: { type: 'path', path: 'E:\\work\\.env' }, access: 'deny' },
+          ],
+        },
+      },
+    };
+    const h = await started([turnStarted, serverRequest(20, 'item/permissions/requestApproval', params), outResponse(20)]);
+    await until(() => h.permissions.length === 1, 'request');
+    expect(h.permissions[0]!.request.paths).toEqual(['E:\\outside\\out.txt']);
+    expect(h.permissions[0]!.request.summary).toContain('write E:\\outside\\out.txt');
+    expect(h.permissions[0]!.request.summary).toContain('deny E:\\work\\.env');
+    h.permissions[0]!.answer({ outcome: 'approve', decidedBy: 'user', escalationId: EscalationId.parse('esc-3'), at: AT });
+    expect(h.fake.received.at(-1)).toEqual({
+      id: 20,
+      result: {
+        permissions: {
+          fileSystem: {
+            read: null,
+            write: null,
+            entries: [
+              { path: { type: 'path', path: 'E:\\outside\\out.txt' }, access: 'write' },
+              { path: { type: 'path', path: 'E:\\work\\.env' }, access: 'deny' },
+            ],
+          },
+        },
+        scope: 'turn',
+      },
+    });
+  });
+
+  it.each([
+    ['a glob pattern', { fileSystem: { read: null, write: null, entries: [{ path: { type: 'glob_pattern', pattern: '**/*' }, access: 'write' }] } }],
+    ['a special scope', { fileSystem: { read: null, write: null, entries: [{ path: { type: 'special', value: { kind: 'root' } }, access: 'write' }] } }],
+    ['an unknown field', { fileSystem: { read: null, write: ['E:\\w'], futureScope: true } }],
+    ['an unknown top-level permission', { network: null, fileSystem: null, processes: { spawn: true } }],
+  ])('refuses a permissions request with %s without asking (fail closed)', async (_label, permissions) => {
+    const h = await started([
+      turnStarted,
+      serverRequest(21, 'item/permissions/requestApproval', { ...permissionsParams, permissions }),
+      outResponse(21, { permissions: {}, scope: 'turn' }),
+    ]);
+    await until(() => h.fake.finished, 'script');
+    await h.fake.idle();
+    expect(h.permissions).toHaveLength(0);
+    expect(h.of('permission.updated')).toHaveLength(0);
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
+  // Review r1 P1-5: an answer the contract rejects must not reach the runtime.
+  it('validates the whole answered request before replying, so an invalid answer changes nothing', async () => {
+    const elicit = serverRequest(22, 'mcpServer/elicitation/request', {
+      threadId: THREAD_ID,
+      turnId: TURN_ID,
+      serverName: 'gui',
+      mode: 'form',
+      _meta: null,
+      message: 'Allow the gui MCP server to run tool send_message?',
+      requestedSchema: { type: 'object', properties: {} },
+    });
+    const h = await started([turnStarted, elicit, outResponse(22, { action: 'accept', content: null, _meta: null })]);
+    await until(() => h.permissions.length === 1, 'elicitation');
+    const handle = h.permissions[0]!;
+    expect(() => handle.answer({ outcome: 'approve-for-session', decidedBy: 'policy', at: AT })).toThrow();
+    // A lock hold needs a deadline and a path.
+    expect(() => handle.hold({ reason: 'file-lock', until: AT })).toThrow();
+    expect(h.fake.received.some((m) => m.id === 22)).toBe(false);
+    expect(h.of('permission.updated').map((e) => e.request.state)).toEqual(['pending']);
+    expect(h.adapter.openPermissions()).toHaveLength(1);
+    expect(handle.answer({ outcome: 'approve', decidedBy: 'policy', at: AT })).toBe(true);
+    await until(() => h.fake.finished, 'script');
+    expect(h.fake.mismatches).toEqual([]);
+    expectValidEvents(h.events);
+  });
+
+  // Review r1 P1-3: every failure path still answers the runtime.
+  it('declines when an async handler rejects', async () => {
+    const approval = { threadId: THREAD_ID, turnId: TURN_ID, itemId: 'exec-23', startedAtMs: 1, command: 'ls', cwd: 'E:\\w' };
+    const h = await started([turnStarted, serverRequest(23, 'item/commandExecution/requestApproval', approval), outResponse(23, { decision: 'decline' })], {
+      onPermissionRequest: async () => {
+        await Promise.resolve();
+        throw new Error('policy store unavailable');
+      },
+    });
+    await until(() => h.fake.finished, 'script');
+    expect(h.of('permission.updated').at(-1)!.request).toMatchObject({ state: 'answered', decision: { outcome: 'decline', decidedBy: 'policy' } });
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
+  it('refuses a request whose params cannot be built (empty turnId) instead of leaving it unanswered', async () => {
+    const approval = { threadId: THREAD_ID, turnId: '', itemId: 'exec-24', startedAtMs: 1, command: 'ls', cwd: 'E:\\w' };
+    const h = await started([serverRequest(24, 'item/commandExecution/requestApproval', approval), outResponse(24, { decision: 'decline' })]);
+    await until(() => h.fake.finished, 'script');
+    expect(h.permissions).toHaveLength(0);
+    expect(h.fake.mismatches).toEqual([]);
   });
 
   it('withdraws a held request when the runtime resolves it, and drops a late answer', async () => {

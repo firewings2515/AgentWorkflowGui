@@ -5,6 +5,7 @@
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { PassThrough, Writable } from 'node:stream';
+import { isDeepStrictEqual } from 'node:util';
 import type { AppServerProcess } from '../rpc';
 
 export interface ReplayRecord {
@@ -27,9 +28,20 @@ export const recordedResult = (records: ReplayRecord[], method: string, n = 0): 
   return records.find((r) => r.kind === 'in' && r.data.method === undefined && r.data.id === id)?.data.result;
 };
 
+/** The text the recording sent with the n-th client request of `method` (turn/start, turn/steer). */
+export const recordedText = (records: ReplayRecord[], method: string, n = 0): string => {
+  const params = records.filter((r) => r.kind === 'out' && r.data.method === method)[n]?.data.params;
+  const input = isObject(params) && Array.isArray(params.input) ? (params.input as unknown[])[0] : undefined;
+  if (!isObject(input) || typeof input.text !== 'string') throw new Error(`no recorded ${method} #${n}`);
+  return input.text;
+};
+
 // Builders for hand-made scripts (scenarios no spike recorded, e.g. crashes and reroutes).
-export const out = (method: string, id?: number): ReplayRecord => ({ kind: 'out', data: id === undefined ? { method } : { id, method } });
-export const outResponse = (id: number): ReplayRecord => ({ kind: 'out', data: { id } });
+export const out = (method: string, id?: number, params?: Record<string, unknown>): ReplayRecord => ({
+  kind: 'out',
+  data: { ...(id !== undefined && { id }), method, ...(params !== undefined && { params }) },
+});
+export const outResponse = (id: number, result?: unknown): ReplayRecord => ({ kind: 'out', data: result === undefined ? { id } : { id, result } });
 export const reply = (id: number, result: unknown): ReplayRecord => ({ kind: 'in', data: { id, result } });
 export const replyError = (id: number, code: number, message: string): ReplayRecord => ({ kind: 'in', data: { id, error: { code, message } } });
 export const notify = (method: string, params: unknown): ReplayRecord => ({ kind: 'in', data: { method, params } });
@@ -124,6 +136,9 @@ export class FakeAppServer extends EventEmitter implements AppServerProcess {
       this.mismatches.push(`expected ${describe(expected)}, got ${describe(msg)}`);
       return;
     }
+    // Where the recording has them, the parameters that select what happens and the approval answers
+    // must be the same; settings that differ by design (policy, config, clientInfo) are not compared.
+    for (const problem of differences(expected, msg)) this.mismatches.push(`${describe(expected)}: ${problem}`);
     if (isRequest && expected.id !== undefined) this.idMap.set(expected.id, msg.id);
     this.cursor++;
     setImmediate(() => this.pump());
@@ -142,6 +157,22 @@ export class FakeAppServer extends EventEmitter implements AppServerProcess {
     for (const w of waiters) setImmediate(w);
   }
 }
+
+const CHECKED_PARAMS = ['threadId', 'turnId', 'expectedTurnId', 'cursor', 'input', 'clientUserMessageId', 'model', 'includeTurns', 'sortDirection'];
+
+const differences = (expected: Record<string, unknown>, actual: Record<string, unknown>): string[] => {
+  if (typeof expected.method !== 'string') {
+    return 'result' in expected && !isDeepStrictEqual(expected.result, actual.result)
+      ? [`answer ${JSON.stringify(actual.result ?? actual.error)} differs from recorded ${JSON.stringify(expected.result)}`]
+      : [];
+  }
+  const want = expected.params;
+  if (!isObject(want)) return [];
+  const got = isObject(actual.params) ? actual.params : {};
+  return CHECKED_PARAMS.filter((k) => k in want && !isDeepStrictEqual(want[k], got[k])).map(
+    (k) => `${k} ${JSON.stringify(got[k])} differs from recorded ${JSON.stringify(want[k])}`,
+  );
+};
 
 const describe = (m: Record<string, unknown>) => {
   const id = JSON.stringify(m.id ?? null);
