@@ -265,6 +265,64 @@ describe('permission requests', () => {
   });
 });
 
+// Review r2 P1: the parent's spawn activity lags behind the child's own turns (order seen in SP-03).
+describe('native sub-agent state', () => {
+  const CHILD = '01a167fd-0e9e-70a3-baba-cfdbcc1e464a';
+  const spawn = { type: 'subAgentActivity', id: 'call_spawn_1', kind: 'started', agentThreadId: CHILD, agentPath: '/root/slow_command' };
+  const childTurn = (id: string, status: string, completedAt: number | null) => ({
+    threadId: CHILD,
+    turn: { id, items: [], status, error: status === 'failed' ? { message: 'boom' } : null, startedAt: 1792739194, completedAt },
+  });
+  const spawnAndEnd = (status: string): ReplayRecord[] => [
+    turnStarted,
+    notify('item/started', { threadId: THREAD_ID, turnId: TURN_ID, startedAtMs: 1792739194000, item: spawn }),
+    notify('turn/started', childTurn('child-turn-1', 'inProgress', null)),
+    notify('turn/completed', childTurn('child-turn-1', status, 1792739195)),
+    // The spawn call itself finishes later, still reporting `started` for the same item.
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, completedAtMs: 1792739196000, item: spawn }),
+  ];
+  const states = (h: Awaited<ReturnType<typeof started>>) => h.of('nativeTask.updated').map((e) => e.task.state);
+
+  it.each([
+    ['interrupted', 'stopped'],
+    ['completed', 'completed'],
+    ['failed', 'failed'],
+  ])('keeps a task ended by its %s child turn ended when the spawn activity completes late', async (status, ended) => {
+    const h = await started(spawnAndEnd(status));
+    await until(() => h.fake.finished, 'script');
+    await h.fake.idle();
+    expect(states(h)).toEqual(['running', ended]);
+    expect(h.of('nativeTask.updated').at(-1)!.task).toMatchObject({ state: ended, endedAt: new Date(1792739195000).toISOString() });
+    expectValidEvents(h.events);
+  });
+
+  it('does not let a late parent end report override what the child turn showed', async () => {
+    const h = await started([
+      ...spawnAndEnd('failed'),
+      notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, completedAtMs: 1792739197000, item: { ...spawn, id: 'subagent-completed-1', kind: 'completed' } }),
+    ]);
+    await until(() => h.fake.finished, 'script');
+    await h.fake.idle();
+    expect(states(h)).toEqual(['running', 'failed']);
+  });
+
+  it('runs again when the child really starts a new turn after ending', async () => {
+    const h = await started([
+      ...spawnAndEnd('completed'),
+      notify('turn/started', childTurn('child-turn-2', 'inProgress', null)),
+      notify('item/started', { threadId: THREAD_ID, turnId: TURN_ID, startedAtMs: 1792739198000, item: { ...spawn, id: 'call_interact', kind: 'interacted' } }),
+      notify('turn/completed', childTurn('child-turn-2', 'interrupted', 1792739199)),
+    ]);
+    await until(() => h.fake.finished, 'script');
+    await h.fake.idle();
+    expect(states(h)).toEqual(['running', 'completed', 'running', 'stopped']);
+    const resumed = h.of('nativeTask.updated')[2]!.task;
+    expect(resumed.endedAt).toBeUndefined();
+    expect(h.of('nativeTask.updated').at(-1)!.task.endedAt).toBe(new Date(1792739199000).toISOString());
+    expectValidEvents(h.events);
+  });
+});
+
 describe('command output', () => {
   it('keeps only the tail of long output and marks it truncated', async () => {
     const command = { type: 'commandExecution', id: 'exec-long', command: 'build', cwd: 'E:\\w', processId: null, status: 'inProgress', aggregatedOutput: null, exitCode: null };

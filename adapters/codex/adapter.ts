@@ -272,6 +272,8 @@ export class CodexAdapter {
   private readonly turnModels = new Map<string, ModelSelection>();
   private readonly items = new Map<string, TrackedItem>();
   private readonly nativeTasks = new Map<string, NativeTask>();
+  /** State implied by each child thread's latest turn (running while a turn is open). */
+  private readonly childTurnStates = new Map<string, NativeTask['state']>();
   private readonly permissions = new Map<string, PermissionEntry>();
   private readonly dispatched = new Set<string>();
   private stderrTail = '';
@@ -885,7 +887,16 @@ export class CodexAdapter {
     const id = NativeTaskId.parse(child);
     if (!this.threads.has(child)) this.threads.set(child, { sessionId: parent.sessionId, nativeTaskId: id });
     const previous = this.nativeTasks.get(child);
-    const state = item.kind === 'completed' ? 'completed' : item.kind === 'interrupted' ? 'stopped' : 'running';
+    const reported = item.kind === 'completed' ? 'completed' : item.kind === 'interrupted' ? 'stopped' : 'running';
+    const childTurn = this.childTurnStates.get(child);
+    // The parent's activity items lag behind the child's own turns: a spawn call may finish (`started`
+    // again on item/completed) after the child turn already ended. So the child's turns decide: only a
+    // child turn/started makes a known task running again, and the parent's end report is used only
+    // when no child turn was ever seen.
+    let state: NativeTask['state'];
+    if (!previous) state = childTurn ?? reported;
+    else if (reported === 'running' || childTurn !== undefined) return;
+    else state = reported;
     this.updateNativeTask(
       previous ?? {
         id,
@@ -911,10 +922,11 @@ export class CodexAdapter {
    * or completed ends the task even when no `subAgentActivity` follows, and a new child turn resumes it.
    */
   private onChildTurn(child: string, turn: WireTurn, ended: boolean, at: Timestamp): void {
-    const task = this.nativeTasks.get(child);
-    if (!task) return;
     const state = !ended ? 'running' : turn.status === 'interrupted' ? 'stopped' : turn.status === 'completed' ? 'completed' : 'failed';
-    this.updateNativeTask(task, state, `turn ${turn.status}`, at, false);
+    // Remembered so a late spawn activity on the parent cannot contradict it.
+    this.childTurnStates.set(child, state);
+    const task = this.nativeTasks.get(child);
+    if (task) this.updateNativeTask(task, state, `turn ${turn.status}`, at, false);
   }
 
   private updateNativeTask(base: NativeTask, state: NativeTask['state'], lastActivity: string, at: Timestamp, isNew: boolean): void {
