@@ -24,6 +24,9 @@ const nodeGlobals = ['process', 'Buffer', 'require', 'module', '__dirname', '__f
 // (repo-relative, extension-less; a path allows itself and everything below it).
 const isBare = (specifier) => !specifier.startsWith('.') && !isAbsolute(specifier);
 
+// `pkg/../core/x` looks like a package but resolvers normalise it into a path elsewhere.
+const hasDotSegment = (specifier) => specifier.split(/[\\/]/).some((segment) => segment === '.' || segment === '..');
+
 const isAllowedPath = (specifier, filename, allowedPaths) => {
   const target = relative(root, resolve(dirname(filename), specifier)).split('\\').join('/').replace(sourceExtensionPattern, '');
   return allowedPaths.some((allowed) => target === allowed || target.startsWith(`${allowed}/`));
@@ -64,7 +67,7 @@ const noRestrictedLoads = {
         return;
       }
       const forbidden = isBare(specifier)
-        ? packagePatterns.some((re) => re.test(specifier))
+        ? hasDotSegment(specifier) || packagePatterns.some((re) => re.test(specifier.replaceAll('\\', '/')))
         : !isAllowedPath(specifier, context.filename, allowedPaths);
       if (forbidden) context.report({ node, message: `'${specifier}' is not allowed here. ${message}` });
     };
