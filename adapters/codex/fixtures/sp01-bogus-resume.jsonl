@@ -1,0 +1,5 @@
+{"kind":"out","data":{"id":1,"method":"initialize","params":{"clientInfo":{"name":"sp01","title":"AgentWorkflowGui SP-01","version":"0.0.1"},"capabilities":null}}}
+{"kind":"in","data":{"id":1,"result":{"userAgent":"sp01/0.160.0 (Windows 10.0.19045; x86_64) xterm-256color (sp01; 0.0.1)","codexHome":"<HOME>\\.codex","platformFamily":"windows","platformOs":"windows"}}}
+{"kind":"out","data":{"method":"initialized"}}
+{"kind":"out","data":{"id":2,"method":"thread/resume","params":{"threadId":"1f5dd9ca-61b9-40a3-887c-47c6f52728c5"}}}
+{"kind":"in","data":{"error":{"code":-32600,"message":"no rollout found for thread id 1f5dd9ca-61b9-40a3-887c-47c6f52728c5"},"id":2}}
