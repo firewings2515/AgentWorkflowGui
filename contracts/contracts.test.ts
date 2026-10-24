@@ -4,6 +4,7 @@ import {
   AppEvent,
   CONTRACTS_VERSION,
   Command,
+  CommandItem,
   CommandResult,
   DeliveryRecord,
   Escalation,
@@ -417,5 +418,40 @@ describe('review round 3 cases', () => {
     const respond = { type: 'escalation.respond', requestId: 'r1', escalationId: 'esc-1', decision: 'approve', content: { branch: 'main' } };
     expect(ok(Command, respond)).toBe(true);
     expect(ok(Command, { ...respond, decision: 'decline' })).toBe(false);
+  });
+});
+
+describe('contracts v0.3 additions', () => {
+  it('model observations and runtime exits are events (R-12)', () => {
+    const observed = { type: 'model.observed', sessionId: 's1', observed: { source: 'rerouted', from: 'a', to: 'b', reason: 'capacity', observedAt: at }, at };
+    expect(ok(AppEvent, observed)).toBe(true);
+    const exited = { type: 'runtime.exited', runtime: 'codex', sessionIds: ['s1'], expected: false, code: null, signal: null, error: 'crashed', at };
+    expect(ok(AppEvent, exited)).toBe(true);
+    expect(ok(AppEvent, { ...exited, runtime: 'other' })).toBe(false);
+  });
+
+  it('sub-agent turns and usage carry their native task (R-13)', () => {
+    expect(ok(Turn, { id: 't', sessionId: 's', nativeTaskId: 'nt', state: 'running', startedAt: at })).toBe(true);
+    expect(ok(TokenUsage, { sessionId: 's', nativeTaskId: 'nt', latest: { input: 1, output: 1, total: 2 }, at })).toBe(true);
+  });
+
+  it('commands keep the runtime process handle (CR-7)', () => {
+    const item = { id: 'i', sessionId: 's', kind: 'command', command: 'npm test', cwd: 'E:/w', state: 'running', nativeProcessRef: 'proc-1', startedAt: at };
+    expect(ok(CommandItem, item)).toBe(true);
+    expect(ok(CommandItem, { ...item, nativeProcessRef: '' })).toBe(false);
+  });
+
+  it('sessions state their writable folder scope (R-08)', () => {
+    const base = pick(fixtureSnapshotInput.sessions, 0);
+    expect(ok(LogicalSession, base)).toBe(true);
+    expect(ok(LogicalSession, { ...base, folderScope: undefined })).toBe(false);
+    const scope = { source: 'session-cwd', workspaceRoot: 'E:/w', writableRoots: [] };
+    expect(ok(LogicalSession, { ...base, folderScope: scope })).toBe(true); // read-only nodes write nowhere
+    expect(ok(LogicalSession, { ...base, folderScope: { ...scope, writableRoots: ['E:/other'] } })).toBe(false);
+    expect(ok(LogicalSession, { ...base, folderScope: { ...scope, workspaceRoot: undefined } })).toBe(false);
+    const wf = fixtureSnapshot.sessions.find((s) => s.kind === 'workflow' && s.workflow.taskId !== undefined);
+    expect(wf?.folderScope.source).toBe('task-worktree');
+    const reviewer = fixtureSnapshot.sessions.find((s) => s.id === 's-wf-review-a');
+    expect(reviewer?.folderScope.writableRoots).toEqual([]);
   });
 });

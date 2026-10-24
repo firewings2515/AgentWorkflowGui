@@ -219,3 +219,13 @@ export const Escalation = z
     if (e.kind === 'delivery-unknown' && !['handoff', 'peerMessage', 'transfer'].includes(e.ref?.kind ?? '')) fail('a delivery escalation points at its operation');
   });
 export type Escalation = z.infer<typeof Escalation>;
+
+// Inferred types for schemas that are not typed next to their definition.
+export type InputRule = z.infer<typeof InputRule>;
+export type OutputRule = z.infer<typeof OutputRule>;
+export type NodeKind = z.infer<typeof NodeKind>;
+export type WritePolicy = z.infer<typeof WritePolicy>;
+export type WorkflowEdge = z.infer<typeof WorkflowEdge>;
+export type TaskStatus = z.infer<typeof TaskStatus>;
+export type EscalationKind = z.infer<typeof EscalationKind>;
+export type EscalationRef = z.infer<typeof EscalationRef>;

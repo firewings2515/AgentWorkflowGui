@@ -62,6 +62,8 @@ export const TokenUsage = z
   .strictObject({
     sessionId: SessionId,
     turnId: TurnId.optional(),
+    /** Set when the usage belongs to a native sub-agent, so it never overwrites the session's own (R-13). */
+    nativeTaskId: NativeTaskId.optional(),
     latest: TokenCounts.optional(),
     cumulative: TokenCounts.optional(),
     contextWindow: z.number().int().positive().optional(),
@@ -69,6 +71,23 @@ export const TokenUsage = z
   })
   .refine((u) => u.latest !== undefined || u.cumulative !== undefined, { message: 'usage needs latest or cumulative counts' });
 export type TokenUsage = z.infer<typeof TokenUsage>;
+
+/**
+ * The session's effective folder scope (R-08): its workspace is the task worktree for task sessions (R-06),
+ * otherwise its own folder. `writableRoots` is where it may write without escalating; it is empty for
+ * read-only and exec-only nodes. Attachments only add readable roots, never writable ones (COM-04).
+ */
+export const FolderScope = z
+  .strictObject({
+    source: z.enum(['task-worktree', 'session-cwd']),
+    workspaceRoot: z.string().min(1),
+    writableRoots: z.array(z.string().min(1)),
+    readableRoots: z.array(z.string().min(1)).default([]),
+  })
+  .refine((s) => s.writableRoots.length === 0 || s.writableRoots.includes(s.workspaceRoot), {
+    message: 'a writable session can write its own workspace',
+  });
+export type FolderScope = z.infer<typeof FolderScope>;
 
 const sessionShape = {
   id: SessionId,
@@ -81,6 +100,7 @@ const sessionShape = {
   activity: SessionActivity,
   /** Working folder: the task worktree for workflow sessions, the user's folder otherwise. */
   cwd: z.string().min(1),
+  folderScope: FolderScope,
   /** Ordinary sessions: organising parent in the tree (WB-01). Workflow sessions: creating source. */
   parentId: SessionId.optional(),
   /** Set when this session was created by a cross-tool transfer from another session (R-02). */
@@ -107,6 +127,8 @@ export const Turn = z
   .strictObject({
     id: TurnId,
     sessionId: SessionId,
+    /** Set for a native sub-agent's own turn; such turns are not the session's turns (R-13). */
+    nativeTaskId: NativeTaskId.optional(),
     state: TurnState,
     requestedModel: ModelSelection.optional(),
     failure: z.strictObject({ message: z.string() }).optional(),
@@ -236,3 +258,10 @@ export const PeerMessage = z
     }
   });
 export type PeerMessage = z.infer<typeof PeerMessage>;
+
+// Inferred types for schemas that are not typed next to their definition.
+export type WorkflowBinding = z.infer<typeof WorkflowBinding>;
+export type TokenCounts = z.infer<typeof TokenCounts>;
+export type TurnState = z.infer<typeof TurnState>;
+export type MessageOrigin = z.infer<typeof MessageOrigin>;
+export type Attachment = z.infer<typeof Attachment>;

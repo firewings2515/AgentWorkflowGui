@@ -25,6 +25,11 @@ export const CommandItem = z
     cwd: z.string().min(1),
     state: z.enum(['running', 'completed', 'failed', 'declined', 'interrupted']),
     exitCode: z.number().int().optional(),
+    /**
+     * Runtime's own handle for the command's process (Codex `processId`), used to stop exactly this
+     * command without touching other sessions on the same host (CR-7). Not an OS PID.
+     */
+    nativeProcessRef: z.string().min(1).optional(),
     /** Aggregated output; may be cut to the tail, see `outputTruncated`. */
     output: z.string().default(''),
     outputTruncated: z.boolean().default(false),
@@ -129,3 +134,12 @@ export const PermissionRequest = z
   .refine((p) => p.decision?.content === undefined || p.kind === 'mcpElicitation', { message: 'only elicitation answers carry content' })
   .refine((p) => p.decision?.outcome !== 'approve-for-session' || p.kind !== 'mcpElicitation', { message: 'an elicitation is answered once' });
 export type PermissionRequest = z.infer<typeof PermissionRequest>;
+
+// Inferred types for schemas that are not typed next to their definition.
+export type CommandItem = z.infer<typeof CommandItem>;
+export type FileChangeItem = z.infer<typeof FileChangeItem>;
+export type ToolCallItem = z.infer<typeof ToolCallItem>;
+export type PermissionKind = z.infer<typeof PermissionKind>;
+export type PermissionHold = z.infer<typeof PermissionHold>;
+export type PermissionDecision = z.infer<typeof PermissionDecision>;
+export type McpElicitation = z.infer<typeof McpElicitation>;

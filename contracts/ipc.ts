@@ -3,7 +3,7 @@
 // never used to decide where a command goes (HC-05). Commands that create something carry the new
 // entity's ID, chosen by the renderer, so the caller can tell its own result apart from others'.
 import { z } from 'zod';
-import { AgentDefinition, ModelOption, ModelSelection } from './agent';
+import { AgentDefinition, ModelOption, ModelSelection, ObservedModel } from './agent';
 import {
   AgentId,
   EscalationId,
@@ -144,6 +144,22 @@ export const AppEvent = z.discriminatedUnion('type', [
     at: Timestamp,
   }),
   z.strictObject({ type: z.literal('modelOptions.updated'), runtime: Runtime, options: z.array(ModelOption), at: Timestamp }),
+  /** A new model observation for a session, including reroutes (R-12); Codex reports only "configured". */
+  z.strictObject({ type: z.literal('model.observed'), sessionId: SessionId, observed: ObservedModel, at: Timestamp }),
+  /**
+   * A runtime host process ended. `expected` is false for crashes; sessions it hosted lose their turns and
+   * open requests, and their pending deliveries stay as recorded (CR-2).
+   */
+  z.strictObject({
+    type: z.literal('runtime.exited'),
+    runtime: Runtime,
+    sessionIds: z.array(SessionId),
+    expected: z.boolean(),
+    code: z.number().int().nullable(),
+    signal: z.string().nullable(),
+    error: z.string().optional(),
+    at: Timestamp,
+  }),
 ]);
 export type AppEvent = z.infer<typeof AppEvent>;
 
@@ -174,3 +190,8 @@ export const Snapshot = z.strictObject({
   preferences: UiPreferences,
 });
 export type Snapshot = z.infer<typeof Snapshot>;
+
+// Inferred types for schemas that are not typed next to their definition.
+export type ErrorCode = z.infer<typeof ErrorCode>;
+export type CreatedRef = z.infer<typeof CreatedRef>;
+export type LimitWindow = z.infer<typeof LimitWindow>;
