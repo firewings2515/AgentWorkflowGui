@@ -32,6 +32,11 @@ export interface PayloadContext {
   /** The target session's original cwd: resume and Claude reconciliation need it (R-06, CR2 §4). */
   cwd: string;
   entry: DispatchEntry;
+  /**
+   * The target session's settings at acceptance, so a restarted GUI can resume it before dispatching
+   * (`ResumeSessionOptions`) without any other store.
+   */
+  session: SessionSettings;
 }
 
 /** Everything needed to create the target session again after a restart. */
