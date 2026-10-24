@@ -7,10 +7,10 @@
   "include": [
     "app/main/**/*",
     "app/preload/**/*",
-    "core/**/*",
-    "contracts/**/*",
     "adapters/**/*",
+    "tests/**/*",
     "electron.vite.config.ts",
+    "eslint.layers.d.mts",
     "vitest.config.mts"
   ]
 }

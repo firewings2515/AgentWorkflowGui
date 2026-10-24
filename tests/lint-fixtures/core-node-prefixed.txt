@@ -1,0 +1,4 @@
+// virtual-path: core/probe.ts
+// expect: error
+import { readFileSync } from 'node:fs';
+export const y = readFileSync;

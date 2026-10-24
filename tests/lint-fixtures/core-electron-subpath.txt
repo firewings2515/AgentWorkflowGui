@@ -1,0 +1,3 @@
+// virtual-path: core/probe.ts
+// expect: error
+export const load = () => import('electron/main');

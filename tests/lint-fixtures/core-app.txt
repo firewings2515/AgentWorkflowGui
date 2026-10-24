@@ -1,0 +1,4 @@
+// virtual-path: core/probe.ts
+// expect: error
+import { x } from '../app/main/index';
+export const y = x;

@@ -1,0 +1,4 @@
+// virtual-path: core/probe.ts
+// expect: error
+import { join } from 'path/posix';
+export const y = join;

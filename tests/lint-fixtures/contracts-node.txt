@@ -1,0 +1,4 @@
+// virtual-path: contracts/probe.ts
+// expect: error
+import { join } from 'node:path';
+export const y = join;

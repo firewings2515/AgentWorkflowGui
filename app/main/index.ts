@@ -1,8 +1,21 @@
 import { join } from 'node:path';
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow } from 'electron';
+import { handleTrusted } from './ipc';
+import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
 import { createWebPreferences } from './window-options';
 
 const APP_NAME = 'AgentWorkflowGui';
+
+const devUrl = process.env['ELECTRON_RENDERER_URL'];
+const rendererFile = join(__dirname, '../renderer/index.html');
+const isTrustedUrl = createTrustedUrlMatcher({ devUrl, rendererFile });
+
+let mainWindow: BrowserWindow | null = null;
+
+function getTrustedSender(): TrustedSender | null {
+  if (mainWindow === null || mainWindow.isDestroyed()) return null;
+  return { webContentsId: mainWindow.webContents.id, isTrustedUrl };
+}
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -11,6 +24,10 @@ function createWindow(): void {
     title: APP_NAME,
     webPreferences: createWebPreferences(join(__dirname, '../preload/index.js')),
   });
+  mainWindow = win;
+  win.on('closed', () => {
+    if (mainWindow === win) mainWindow = null;
+  });
 
   // The renderer is a single local page: block navigation and new windows.
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -18,18 +35,17 @@ function createWindow(): void {
     if (url !== win.webContents.getURL()) event.preventDefault();
   });
 
-  const devUrl = process.env['ELECTRON_RENDERER_URL'];
   if (devUrl) {
     void win.loadURL(devUrl);
   } else {
-    void win.loadFile(join(__dirname, '../renderer/index.html'));
+    void win.loadFile(rendererFile);
   }
 }
 
 app.setName(APP_NAME);
 
 void app.whenReady().then(() => {
-  ipcMain.handle('app:get-info', () => ({ name: APP_NAME, version: app.getVersion() }));
+  handleTrusted('app:get-info', getTrustedSender, () => ({ name: APP_NAME, version: app.getVersion() }));
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

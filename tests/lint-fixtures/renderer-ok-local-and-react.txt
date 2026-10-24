@@ -1,0 +1,6 @@
+// virtual-path: app/renderer/src/probe.ts
+// expect: ok
+import { createRoot } from 'react-dom/client';
+import { App } from './App';
+import('./main');
+export const y = [createRoot, App];

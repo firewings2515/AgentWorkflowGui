@@ -1,0 +1,3 @@
+// virtual-path: app/renderer/src/probe.ts
+// expect: error
+export const load = () => import('fs/promises');
