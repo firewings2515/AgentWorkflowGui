@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef } from 'react';
-import type { AgentId, LogicalSession, ModelOption, ModelSelection, SessionId, Snapshot } from '../../../contracts';
+import type { AgentDefinition, AgentId, LogicalSession, ModelOption, ModelSelection, SessionId, Snapshot } from '../../../contracts';
 import type { SessionViewContext, WorkspaceView } from './workbench-state';
 import { contextFor } from './workbench-state';
 import { DetailPanel } from './DetailPanel';
@@ -8,6 +8,7 @@ import { Empty, formatTime, Menu, observedModelText, Status } from './ui';
 export interface Selection { agentId: AgentId; model: ModelSelection }
 export interface WorkspaceProps {
   snapshot: Snapshot;
+  agentOptions: readonly AgentDefinition[];
   view: WorkspaceView;
   active: boolean;
   visible: boolean;
@@ -65,13 +66,13 @@ export function SessionWorkspace(props: WorkspaceProps) {
     {session.kind === 'workflow' && <div className="workflow-owner"><span>所屬 Workflow · {instance?.title ?? session.workflow.instanceId}</span><Menu label="所屬 Workflow 選單" className="owner-menu" actions={[{ label: '查看流程進度', onSelect: () => onProgress(session.workflow.instanceId) }]}>⋯</Menu></div>}
     <div className={`workspace-body ${context.detailsVisible ? '' : 'details-hidden'}`}>
       <div className="chat-panel">
-        <Transcript snapshot={snapshot} session={session} view={view} visible={props.visible} onContext={onContext} />
+        <div className="transcript-frame"><Transcript snapshot={snapshot} session={session} view={view} visible={props.visible} onContext={onContext} /></div>
         <form className="composer" onSubmit={event => { event.preventDefault(); onNotice(`「${session.title}」尚未連接 runtime，草稿已保留，未送出訊息。`); }}>
           <div className="selectors">
             <label>{session.kind === 'workflow' ? 'Agent · 已鎖定' : 'Agent'}<select aria-label="Agent" aria-describedby={session.kind === 'workflow' ? `${view.id}-agent-lock` : undefined} value={chosen.agentId} disabled={session.kind === 'workflow'} onChange={event => {
-              const agent = snapshot.agents.find(candidate => candidate.id === event.target.value);
+              const agent = props.agentOptions.find(candidate => candidate.id === event.target.value);
               if (agent) onAgent(agent.id);
-            }}>{snapshot.agents.map(agent => <option key={`${agent.id}:${agent.revision}`} value={agent.id}>{agent.name}</option>)}</select></label>
+            }}>{(session.kind === 'workflow' ? snapshot.agents : props.agentOptions).map(agent => <option key={`${agent.id}:${agent.revision}`} value={agent.id}>{agent.name}</option>)}</select></label>
             <label>Model<select aria-label="Model" value={`${chosen.model.runtime}:${chosen.model.model}`} onChange={event => {
               const model = snapshot.modelOptions.find(candidate => `${candidate.runtime}:${candidate.model}` === event.target.value);
               if (model) onModel(model);
