@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Local desktop GUI for managing reusable agent workflows across Claude and Codex sessions.",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "GPL-3.0-or-later",
   "main": "./out/main/index.js",
   "engines": {
     "node": ">=22.12.0"
