@@ -19,7 +19,7 @@ import {
   TransferId,
   WorkflowId,
 } from './common';
-import { DeliveryRecord, ProvisionRecord, deliveryNeedsBoundTarget } from './delivery';
+import { DeliveryRecord, DeliveryTarget, deliveryTargetIssues } from './delivery';
 
 /** Input rule: natural-language condition for the AI, plus the only fields the GUI enforces (R-04). */
 export const InputRule = z.strictObject({
@@ -51,26 +51,22 @@ export const OutputRule = z.strictObject({
 export const NodeKind = z.enum(['agent', 'merge']);
 export const WritePolicy = z.enum(['write', 'read-only', 'exec-only']);
 
-export const WorkflowNode = z
-  .strictObject({
-    id: NodeId,
-    kind: NodeKind,
-    label: z.string().min(1),
-    /** Agent nodes only; merge nodes are run by the GUI (R-06). */
-    agentId: AgentId.optional(),
-    model: ModelSelection.optional(),
-    writePolicy: WritePolicy,
-    concurrency: z.number().int().positive().default(1),
-    isRoot: z.boolean().default(false),
-    inputRules: z.array(InputRule),
-    outputRules: z.array(OutputRule),
-    /** Canvas position for the drag-to-build editor (R-09); not used for execution. */
-    position: z.strictObject({ x: z.number(), y: z.number() }),
-  })
-  .refine((n) => (n.kind === 'agent' ? n.agentId !== undefined && n.model !== undefined : n.agentId === undefined && n.model === undefined), {
-    message: 'agent nodes have an agent and a model; merge nodes have neither',
-  })
-  .refine((n) => !(n.isRoot && n.kind === 'merge'), { message: 'the root is an agent node' });
+const nodeShape = {
+  id: NodeId,
+  label: z.string().min(1),
+  writePolicy: WritePolicy,
+  concurrency: z.number().int().positive().default(1),
+  inputRules: z.array(InputRule),
+  outputRules: z.array(OutputRule),
+  /** Canvas position for the drag-to-build editor (R-09); not used for execution. */
+  position: z.strictObject({ x: z.number(), y: z.number() }),
+};
+
+/** Agent nodes run an Agent on a Model; merge nodes are run by the GUI (R-06) and are never the root. */
+export const WorkflowNode = z.discriminatedUnion('kind', [
+  z.strictObject({ ...nodeShape, kind: z.literal('agent'), agentId: AgentId, model: ModelSelection, isRoot: z.boolean().default(false) }),
+  z.strictObject({ ...nodeShape, kind: z.literal('merge') }),
+]);
 export type WorkflowNode = z.infer<typeof WorkflowNode>;
 
 /** Edges carry no conditions: they only mean "handoff allowed" (R-04). */
@@ -93,7 +89,7 @@ export const WorkflowTemplate = z
     const fail = (message: string) => ctx.addIssue({ code: 'custom', message });
     const ids = new Set<string>(w.nodes.map((n) => n.id));
     if (ids.size !== w.nodes.length) fail('node IDs must be unique');
-    if (w.nodes.filter((n) => n.isRoot).length !== 1) fail('exactly one node is the root');
+    if (w.nodes.filter((n) => n.kind === 'agent' && n.isRoot).length !== 1) fail('exactly one node is the root');
     const edges = new Set(w.edges.map((e) => `${e.source}->${e.target}`));
     for (const e of w.edges) if (!ids.has(e.source) || !ids.has(e.target)) fail(`edge ${e.source}->${e.target} references a missing node`);
     // An output rule's destination draws its edge (R-04, R-09), so every node target needs one.
@@ -167,8 +163,8 @@ export const Handoff = z
     /** Fan-out round and the upstream set expected in it (CR-4). */
     round: z.number().int().nonnegative(),
     expectedUpstream: z.array(NodeId).optional(),
-    /** Target GUI session once bound; `provision` when the target had to be created (CR2 §3). */
-    target: z.strictObject({ sessionId: SessionId.optional(), provision: ProvisionRecord.optional() }),
+    /** Target GUI session and its native binding once bound; `provision` when it had to be created (CR2 §3). */
+    target: DeliveryTarget,
     delivery: DeliveryRecord,
     /** When the acceptance transaction counted it (once per operationId). */
     acceptedAt: Timestamp,
@@ -180,8 +176,7 @@ export const Handoff = z
       if (new Set(h.expectedUpstream).size !== h.expectedUpstream.length) fail('expectedUpstream must be unique');
       if (!h.expectedUpstream.includes(h.fromNodeId)) fail('expectedUpstream must include the sender');
     }
-    if (h.delivery.state !== 'pending' && h.target.sessionId === undefined) fail('a dispatched handoff has a bound target session');
-    if (!deliveryNeedsBoundTarget(h.delivery, h.target.provision)) fail('payload cannot be dispatched before the target is created');
+    for (const issue of deliveryTargetIssues(h.delivery, h.target)) fail(issue);
   });
 export type Handoff = z.infer<typeof Handoff>;
 

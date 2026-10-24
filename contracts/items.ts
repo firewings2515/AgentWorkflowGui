@@ -82,9 +82,21 @@ export const PermissionDecision = z
     decidedBy: z.enum(['policy', 'user']),
     escalationId: EscalationId.optional(),
     reason: z.string().optional(),
+    /** Form answers for an accepted MCP elicitation, matching its `requestedSchema`. */
+    content: z.json().optional(),
     at: Timestamp,
   })
-  .refine((d) => (d.decidedBy === 'user') === (d.escalationId !== undefined), { message: 'user decisions come from an escalation' });
+  .refine((d) => (d.decidedBy === 'user') === (d.escalationId !== undefined), { message: 'user decisions come from an escalation' })
+  .refine((d) => d.content === undefined || d.outcome === 'approve', { message: 'only an accepted elicitation carries content' });
+
+/**
+ * What an MCP server asks the user for (MCP elicitation). `form`: fields described by a JSON schema
+ * (passed through as data); `url`: open a page and confirm. The answer goes in `PermissionDecision.content`.
+ */
+export const McpElicitation = z.discriminatedUnion('mode', [
+  z.strictObject({ mode: z.literal('form'), serverName: z.string().min(1), message: z.string(), requestedSchema: z.json() }),
+  z.strictObject({ mode: z.literal('url'), serverName: z.string().min(1), message: z.string(), url: z.url(), elicitationId: z.string().min(1) }),
+]);
 
 /**
  * A runtime approval request handed to the GUI (Codex server requests, Claude PreToolUse hook). The
@@ -105,11 +117,15 @@ export const PermissionRequest = z
     paths: z.array(z.string().min(1)).default([]),
     /** Escalation-list rule that matched (R-08); absent when the policy allowed it. */
     matchedRule: z.string().min(1).optional(),
+    elicitation: McpElicitation.optional(),
     state: z.enum(['pending', 'held', 'answered', 'withdrawn']),
     hold: PermissionHold.optional(),
     decision: PermissionDecision.optional(),
     createdAt: Timestamp,
   })
   .refine((p) => (p.state === 'held') === (p.hold !== undefined), { message: 'hold is set exactly when held' })
-  .refine((p) => (p.state === 'answered') === (p.decision !== undefined), { message: 'decision is set exactly when answered' });
+  .refine((p) => (p.state === 'answered') === (p.decision !== undefined), { message: 'decision is set exactly when answered' })
+  .refine((p) => (p.kind === 'mcpElicitation') === (p.elicitation !== undefined), { message: 'elicitation is set exactly for MCP elicitations' })
+  .refine((p) => p.decision?.content === undefined || p.kind === 'mcpElicitation', { message: 'only elicitation answers carry content' })
+  .refine((p) => p.decision?.outcome !== 'approve-for-session' || p.kind !== 'mcpElicitation', { message: 'an elicitation is answered once' });
 export type PermissionRequest = z.infer<typeof PermissionRequest>;

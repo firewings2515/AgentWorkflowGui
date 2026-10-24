@@ -19,7 +19,7 @@ import {
   Timestamp,
   TurnId,
 } from './common';
-import { DeliveryRecord } from './delivery';
+import { DeliveryRecord, deliveryTargetIssues } from './delivery';
 
 /** Ordinary sessions can change Agent; workflow sessions keep the Agent fixed and may change Model (WB-02). */
 export const SessionKind = z.enum(['ordinary', 'workflow']);
@@ -212,8 +212,12 @@ export const PeerMessage = z
   .strictObject({
     id: PeerMessageId,
     operationId: OperationId,
+    /** Native identity of the `send_message` MCP tool call, to recognise a resend of the same call (CR2 §4). */
+    sourceCallRef: z.string().min(1),
     fromSessionId: SessionId,
     toSessionId: SessionId,
+    /** Native session/thread the target was bound to when dispatched (R-04 step 4). */
+    toNativeSessionRef: z.string().min(1).optional(),
     /** Set when both sides are in one workflow instance (start-time consent covers it, R-11). */
     instanceId: InstanceId.optional(),
     text: z.string().min(1),
@@ -221,9 +225,14 @@ export const PeerMessage = z
     /** How it entered the target: a new turn when idle, or inserted into the running turn (SP-05). */
     entry: z.enum(['new-turn', 'insert']).optional(),
     delivery: DeliveryRecord,
+    /** Cancelling stops follow-up work; a delivery reconciled as sent afterwards is still recorded (CR2 §2). */
     outcome: z.strictObject({ kind: z.enum(['cancelled', 'rejected', 'failed']), detail: z.string(), at: Timestamp }).optional(),
     createdAt: Timestamp,
   })
-  .refine((m) => m.fromSessionId !== m.toSessionId, { message: 'a session does not message itself' })
-  .refine((m) => m.outcome?.kind !== 'cancelled' || m.delivery.state !== 'sent', { message: 'a sent message cannot be cancelled' });
+  .superRefine((m, ctx) => {
+    if (m.fromSessionId === m.toSessionId) ctx.addIssue({ code: 'custom', message: 'a session does not message itself' });
+    for (const message of deliveryTargetIssues(m.delivery, { sessionId: m.toSessionId, nativeSessionRef: m.toNativeSessionRef })) {
+      ctx.addIssue({ code: 'custom', message });
+    }
+  });
 export type PeerMessage = z.infer<typeof PeerMessage>;

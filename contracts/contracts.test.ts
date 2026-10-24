@@ -266,7 +266,7 @@ describe('delivery records (CR-2)', () => {
     const m = pick(fixtureSnapshotInput.peerMessages, 1);
     expect(ok(PeerMessage, { ...m, outcome: { kind: 'cancelled', detail: '使用者取消', at } })).toBe(true);
     const sent = pick(fixtureSnapshotInput.peerMessages, 0);
-    expect(ok(PeerMessage, { ...sent, outcome: { kind: 'cancelled', detail: 'x', at } })).toBe(false);
+    expect(ok(PeerMessage, { ...sent, outcome: { kind: 'cancelled', detail: 'x', at } })).toBe(true); // cancel stops follow-ups; the delivery fact stays (CR2 §2)
     expect(ok(PeerMessage, { ...sent, toSessionId: sent.fromSessionId })).toBe(false);
   });
 });
@@ -299,7 +299,7 @@ describe('transfer confirmation gate (R-02, CR-5)', () => {
 
   it('cancel and failure are consistent', () => {
     expect(ok(TransferProposal, { ...awaiting, state: 'cancelled', cancelledAt: at })).toBe(true);
-    expect(ok(TransferProposal, { ...approved, state: 'cancelled', cancelledAt: at })).toBe(false);
+    expect(ok(TransferProposal, { ...approved, state: 'cancelled', cancelledAt: at })).toBe(true);
     const created = { ...approved, delivery: undefined };
     expect(ok(TransferProposal, { ...created, state: 'failed' })).toBe(false);
     expect(ok(TransferProposal, { ...created, provision: undefined, createdSessionId: undefined, state: 'failed', failure: { message: 'thread/start failed' } })).toBe(true);
@@ -319,7 +319,7 @@ describe('workflow rules', () => {
   it('output targets need an edge and the graph has one root', () => {
     expect(ok(WorkflowTemplate, wf)).toBe(true);
     expect(ok(WorkflowTemplate, { ...wf, edges: wf.edges.filter((e) => e.target !== 'n-review') })).toBe(false);
-    expect(ok(WorkflowTemplate, { ...wf, nodes: wf.nodes.map((n) => ({ ...n, isRoot: false })) })).toBe(false);
+    expect(ok(WorkflowTemplate, { ...wf, nodes: wf.nodes.map((n) => (n.kind === 'agent' ? { ...n, isRoot: false } : n)) })).toBe(false);
     expect(ok(WorkflowTemplate, { ...wf, edges: [...wf.edges, { source: 'n-plan', target: 'n-ghost' }] })).toBe(false);
   });
 
@@ -335,5 +335,64 @@ describe('workflow rules', () => {
     expect(ok(Escalation, { ...esc, state: 'open' })).toBe(false);
     const perm = pick(fixtureSnapshotInput.escalations, 0);
     expect(ok(Escalation, { ...perm, ref: undefined })).toBe(false);
+  });
+});
+
+describe('review round 2 cases', () => {
+  const sentAttempt = { attemptId: 'att-1', clientMessageId: uuid(1), state: 'sent', dispatchStartedAt: at, nativeRef: { sessionRef: 'thread-1' }, evidence: { kind: 'reconciled', at, detail: 'same clientId' } };
+
+  it('MCP elicitations carry their form and the answer content', () => {
+    const req = pick(fixtureSnapshotInput.permissionRequests, 2);
+    expect(ok(PermissionRequest, req)).toBe(true);
+    expect(ok(PermissionRequest, { ...req, elicitation: undefined })).toBe(false);
+    expect(ok(PermissionRequest, { ...req, kind: 'command' })).toBe(false);
+    const escalationId = 'esc-x';
+    const answered = { ...req, state: 'answered', decision: { outcome: 'approve', decidedBy: 'user', escalationId, content: { branch: 'main' }, at } };
+    expect(ok(PermissionRequest, answered)).toBe(true);
+    expect(ok(PermissionRequest, { ...answered, decision: { ...answered.decision, outcome: 'decline' } })).toBe(false);
+    const url = { mode: 'url', serverName: 's', message: '登入', url: 'https://example.test/auth', elicitationId: 'el-1' };
+    expect(ok(PermissionRequest, { ...req, elicitation: url })).toBe(true);
+    const command = pick(fixtureSnapshotInput.permissionRequests, 1);
+    expect(ok(PermissionRequest, { ...command, decision: { outcome: 'approve', decidedBy: 'policy', content: { x: 1 }, at } })).toBe(false);
+  });
+
+  it('a user decision survives reconciliation as sent, but retry only abandons unknown', () => {
+    expect(ok(DeliveryRecord, { state: 'sent', attempts: [{ ...sentAttempt, resolution: { decision: 'wait', decidedBy: 'user', at } }] })).toBe(true);
+    expect(ok(DeliveryRecord, { state: 'sent', attempts: [{ ...sentAttempt, resolution: { decision: 'cancel', decidedBy: 'user', at } }] })).toBe(true);
+    expect(ok(DeliveryRecord, { state: 'sent', attempts: [{ ...sentAttempt, resolution: { decision: 'retry', decidedBy: 'user', at } }] })).toBe(false);
+  });
+
+  it('runtime references must point at the bound target', () => {
+    const h = pick(fixtureSnapshotInput.handoffs, 0);
+    const wrong = { state: 'sent', attempts: [{ ...sentAttempt, nativeRef: { sessionRef: 'WRONG-TARGET' } }] };
+    expect(ok(Handoff, { ...h, delivery: wrong })).toBe(false);
+    expect(ok(Handoff, { ...h, target: { ...h.target, nativeSessionRef: 'other-thread' } })).toBe(false);
+    expect(ok(Handoff, { ...h, target: { ...h.target, nativeSessionRef: undefined } })).toBe(false);
+    const tr = pick(fixtureSnapshotInput.transfers, 0);
+    expect(ok(TransferProposal, { ...tr, delivery: wrong })).toBe(false);
+    const pm = pick(fixtureSnapshotInput.peerMessages, 0);
+    expect(ok(PeerMessage, { ...pm, toNativeSessionRef: 'other-session' })).toBe(false);
+    expect(ok(PeerMessage, { ...pm, toNativeSessionRef: undefined })).toBe(false);
+  });
+
+  it('peer messages keep the native tool-call identity (CR2 §4)', () => {
+    const pm = pick(fixtureSnapshotInput.peerMessages, 0);
+    expect(ok(PeerMessage, { ...pm, sourceCallRef: undefined })).toBe(false);
+  });
+
+  it('a failed transfer may keep its undispatched pending delivery', () => {
+    const tr = pick(fixtureSnapshotInput.transfers, 0);
+    const failed = { ...tr, provision: undefined, createdSessionId: undefined, state: 'failed', failure: { message: 'thread/start failed' } };
+    expect(ok(TransferProposal, { ...failed, delivery: { state: 'pending', attempts: [] } })).toBe(true);
+    expect(ok(TransferProposal, { ...failed, delivery: { state: 'unknown', attempts: [{ attemptId: 'a', clientMessageId: uuid(9), state: 'unknown', dispatchStartedAt: at }] } })).toBe(false);
+  });
+
+  it('refined guarantees narrow the inferred types', () => {
+    const wf = WorkflowTemplate.parse(pick(fixtureSnapshotInput.workflows, 0));
+    const runtimes = wf.nodes.flatMap((n) => (n.kind === 'agent' ? [n.model.runtime] : []));
+    expect(runtimes.length).toBe(wf.nodes.length - 1);
+    const d = DeliveryRecord.parse({ state: 'sent', attempts: [sentAttempt] });
+    const refs = d.attempts.flatMap((a) => (a.state === 'sent' ? [a.nativeRef.sessionRef] : []));
+    expect(refs).toEqual(['thread-1']);
   });
 });

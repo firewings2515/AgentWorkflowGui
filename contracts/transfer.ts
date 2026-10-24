@@ -2,7 +2,7 @@
 import { z } from 'zod';
 import { ModelSelection } from './agent';
 import { OperationId, PayloadHash, Revision, SessionId, Timestamp, TransferId } from './common';
-import { DeliveryRecord, ProvisionRecord, deliveryNeedsBoundTarget } from './delivery';
+import { DeliveryRecord, ProvisionRecord, deliveryTargetIssues } from './delivery';
 
 export const TransferState = z.enum(['draft', 'awaiting-confirmation', 'stale', 'approved', 'failed', 'cancelled']);
 
@@ -50,11 +50,12 @@ export const TransferProposal = z
     if ((p.state === 'approved' || p.state === 'failed') && !approved) fail(`${p.state} needs an approval`);
     if ((p.state === 'failed') !== (p.failure !== undefined)) fail('failure is set exactly when failed');
     if ((p.state === 'cancelled') !== (p.cancelledAt !== undefined)) fail('cancelledAt is set exactly when cancelled');
-    if (p.state === 'failed' && p.delivery) fail('a failed transfer delivered nothing');
-    if (p.state === 'cancelled' && p.delivery?.state === 'sent') fail('a delivered transfer cannot be cancelled');
+    // Target creation failed, so the payload never crossed the dispatch boundary.
+    if (p.state === 'failed' && p.delivery && (p.delivery.state !== 'pending' || p.delivery.attempts.length > 0)) fail('a failed transfer dispatched nothing');
+    // Cancelling stops follow-up work; a delivery reconciled as sent afterwards is still recorded (CR2 §2).
     if ((p.createdSessionId !== undefined) !== (p.provision?.state === 'sent')) fail('createdSessionId is set exactly when the target was created');
-    if (p.delivery && p.delivery.state !== 'pending' && !p.createdSessionId) fail('the payload waits for the created target');
-    if (!deliveryNeedsBoundTarget(p.delivery, p.provision)) fail('the payload waits for the created target');
+    const target = { sessionId: p.createdSessionId, nativeSessionRef: p.provision?.nativeSessionRef, provision: p.provision };
+    for (const issue of deliveryTargetIssues(p.delivery, target)) fail(issue);
   });
 export type TransferProposal = z.infer<typeof TransferProposal>;
 
