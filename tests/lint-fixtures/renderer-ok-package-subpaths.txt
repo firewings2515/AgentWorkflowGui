@@ -1,0 +1,6 @@
+// virtual-path: app/renderer/src/probe.ts
+// expect: ok
+import { createRoot } from 'react-dom/client';
+import { jsx } from 'react/jsx-runtime';
+import type { Thing } from '@scope/pkg/sub/path';
+export const y = [createRoot, jsx] as unknown as Thing;

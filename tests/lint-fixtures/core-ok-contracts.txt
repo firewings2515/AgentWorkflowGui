@@ -1,0 +1,5 @@
+// virtual-path: core/probe.ts
+// expect: ok
+import { x } from '../contracts/probe';
+import { z } from './local';
+export const y = [x, z];

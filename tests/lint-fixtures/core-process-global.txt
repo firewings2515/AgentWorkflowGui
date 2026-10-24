@@ -1,0 +1,3 @@
+// virtual-path: core/probe.ts
+// expect: error
+export const cwd = process.cwd();

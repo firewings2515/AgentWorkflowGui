@@ -1,0 +1,3 @@
+// virtual-path: adapters/probe.ts
+// expect: error
+export { x } from 'zod/../../app/main/index';

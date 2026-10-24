@@ -1,0 +1,6 @@
+// virtual-path: adapters/probe.ts
+// expect: ok
+import { join } from 'node:path';
+import { x } from '../core/probe';
+import { c } from '../contracts/probe';
+export const y = [join, x, c];

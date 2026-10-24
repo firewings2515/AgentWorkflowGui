@@ -1,0 +1,4 @@
+// virtual-path: adapters/probe.ts
+// expect: error
+import { useState } from 'react';
+export const y = useState;

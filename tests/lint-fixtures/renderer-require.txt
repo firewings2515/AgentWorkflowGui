@@ -1,0 +1,4 @@
+// virtual-path: app/renderer/src/probe.ts
+// expect: error
+declare const require: (name: string) => unknown;
+export const fs = require('fs');

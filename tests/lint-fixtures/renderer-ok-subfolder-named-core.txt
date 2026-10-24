@@ -1,0 +1,5 @@
+// virtual-path: app/renderer/src/probe.ts
+// expect: ok
+import { x } from './components/core/probe';
+import { y } from './adapters/thing';
+export const z = [x, y];

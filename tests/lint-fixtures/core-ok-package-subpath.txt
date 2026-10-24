@@ -1,0 +1,3 @@
+// virtual-path: core/probe.ts
+// expect: ok
+export type { Thing } from '@scope/pkg/sub/path';

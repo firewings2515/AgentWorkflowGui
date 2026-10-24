@@ -1,0 +1,3 @@
+// virtual-path: core/probe.mts
+// expect: error
+export const load = () => import('electron');

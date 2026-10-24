@@ -1,0 +1,4 @@
+// virtual-path: app/renderer/src/probe.js
+// expect: error
+import { x } from '../../../core/probe.js';
+export const y = x;

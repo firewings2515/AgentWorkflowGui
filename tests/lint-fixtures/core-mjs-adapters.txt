@@ -1,0 +1,3 @@
+// virtual-path: core/probe.mjs
+// expect: error
+export { x } from '../adapters/probe.mjs';

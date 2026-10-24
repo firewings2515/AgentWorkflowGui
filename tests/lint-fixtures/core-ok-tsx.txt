@@ -1,0 +1,3 @@
+// virtual-path: core/probe.tsx
+// expect: ok
+export { x } from '../contracts/probe';

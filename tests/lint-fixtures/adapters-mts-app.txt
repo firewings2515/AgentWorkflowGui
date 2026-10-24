@@ -1,0 +1,3 @@
+// virtual-path: adapters/probe.mts
+// expect: error
+export const load = () => import('../app/main/index');

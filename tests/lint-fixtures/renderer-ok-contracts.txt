@@ -1,0 +1,4 @@
+// virtual-path: app/renderer/src/probe.ts
+// expect: ok
+import { x } from '../../../contracts/probe';
+export const y = x;

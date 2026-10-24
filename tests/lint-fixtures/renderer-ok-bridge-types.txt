@@ -1,0 +1,4 @@
+// virtual-path: app/renderer/src/probe.ts
+// expect: ok
+import type { AwgBridge } from '../../preload/bridge-types';
+export type Y = AwgBridge;

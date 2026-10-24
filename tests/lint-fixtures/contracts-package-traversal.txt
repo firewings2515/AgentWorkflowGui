@@ -1,0 +1,3 @@
+// virtual-path: contracts/probe.ts
+// expect: error
+export { x } from 'zod/../../core/probe';

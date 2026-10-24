@@ -1,0 +1,3 @@
+// virtual-path: app/renderer/src/probe.mjs
+// expect: error
+export const load = () => import('../../../adapters/probe.mjs');
