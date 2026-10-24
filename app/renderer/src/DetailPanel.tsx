@@ -85,7 +85,14 @@ function SessionInfo({ snapshot, session }: Pick<DetailProps, 'snapshot' | 'sess
     <dt>模型觀察</dt><dd>{observedModelText(session)}</dd>
     <dt>Runtime</dt><dd>{session.requestedModel.runtime}</dd>
     <dt>工作資料夾</dt><dd className="mono">{session.cwd}</dd>
-    <dt>有效資料夾範圍</dt><dd>資料未提供；工作資料夾不代表讀寫權限。</dd>
+    <dt>有效資料夾範圍</dt><dd>
+      <dl className="folder-scope">
+        <dt>範圍來源</dt><dd>{session.folderScope.source === 'task-worktree' ? 'Task worktree' : 'Session 工作資料夾'}</dd>
+        <dt>工作區根目錄</dt><dd className="mono">{session.folderScope.workspaceRoot}</dd>
+        <dt>可寫入目錄</dt><dd>{session.folderScope.writableRoots.length ? <ul>{session.folderScope.writableRoots.map(path => <li className="mono" key={path}>{path}</li>)}</ul> : '無可寫入目錄'}</dd>
+        <dt>額外可讀取目錄</dt><dd>{session.folderScope.readableRoots.length ? <ul>{session.folderScope.readableRoots.map(path => <li className="mono" key={path}>{path}</li>)}</ul> : '無額外可讀取目錄'}</dd>
+      </dl><p className="muted">附件不會擴大寫入或執行權限。</p>
+    </dd>
     <dt>活動狀態</dt><dd><Status value={session.activity} /></dd>
     <dt>狀態來源</dt><dd>示意快照 · seq {snapshot.seq}<br />Session 更新於 <time dateTime={session.updatedAt}>{formatTime(session.updatedAt)}</time></dd>
     {session.derivedFromSessionId && <><dt>轉交來源</dt><dd>{snapshot.sessions.find(source => source.id === session.derivedFromSessionId)?.title ?? session.derivedFromSessionId}</dd></>}

@@ -68,10 +68,18 @@ describe('layout stylesheet declarations', () => {
     ['.workspace', 'min-height', '0'],
     ['.workspace-body', 'min-height', '0'],
     ['.chat-panel', 'min-height', '0'],
+    ['.chat-panel', 'overflow', 'auto'],
+    ['.transcript-frame', 'min-height', '160px'],
+    ['.transcript-frame', 'flex', '1 0 160px'],
     ['.transcript', 'min-height', '0'],
     ['.transcript', 'overflow', 'auto'],
     ['.composer', 'flex-shrink', '0'],
     ['.app-shell', 'position', 'relative'],
+    ['.agent-form-actions', 'position', 'sticky'],
+    ['.agent-form-actions', 'bottom', '0px'],
+    ['.agent-form-actions', 'background', 'var(--panel)'],
+    ['.agent-editor', 'overflow', 'auto'],
+    ['.agent-editor', 'scroll-padding-bottom', '100px'],
   ])('%s retains %s: %s in base rules', (selector, property, expected) => {
     expect(baseValue(rules, selector, property)).toBe(expected);
   });
