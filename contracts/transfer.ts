@@ -63,3 +63,7 @@ export type TransferProposal = z.infer<typeof TransferProposal>;
 export const Theme = z.enum(['dark', 'light']);
 export const UiPreferences = z.strictObject({ theme: Theme.default('dark') });
 export type UiPreferences = z.infer<typeof UiPreferences>;
+
+// Inferred types for schemas that are not typed next to their definition.
+export type TransferState = z.infer<typeof TransferState>;
+export type Theme = z.infer<typeof Theme>;

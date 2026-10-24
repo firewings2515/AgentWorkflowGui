@@ -125,3 +125,6 @@ export const deliveryTargetIssues = (delivery: DeliveryRecord | undefined, targe
   }
   return issues;
 };
+
+// Inferred types for schemas that are not typed next to their definition.
+export type DeliveryEvidence = z.infer<typeof DeliveryEvidence>;

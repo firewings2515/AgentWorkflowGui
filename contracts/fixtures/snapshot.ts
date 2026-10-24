@@ -16,6 +16,8 @@ const claudeSonnet = { runtime: 'claude', model: 'claude-sonnet-5-5', effort: 'h
 const claudeOpus = { runtime: 'claude', model: 'claude-opus-5-5', effort: 'high' } as const;
 const codexAstra = { runtime: 'codex', model: 'gpt-6-astra', effort: 'high' } as const;
 const node = (nodeId: string) => ({ kind: 'node', nodeId }) as const;
+const own = (folder: string) => ({ source: 'session-cwd' as const, writableRoots: [folder] });
+const task = (worktree: string) => ({ source: 'task-worktree' as const, writableRoots: [worktree] });
 const root = { kind: 'root' } as const;
 const claudeEfforts = ['low', 'medium', 'high', 'xhigh', 'max'];
 const codexEfforts = ['low', 'medium', 'high'];
@@ -84,24 +86,24 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
   ],
   sessions: [
     { id: 's-plan-notes', revision: 4, kind: 'ordinary', title: '規劃想法', agent: { id: 'agent-planner', revision: 1 }, requestedModel: claudeOpus,
-      observedModel: { source: 'per-message', model: 'claude-opus-5-5', observedAt: t('10:02') }, activity: 'idle', cwd: 'E:/work/demo', createdAt: t('10:00'), updatedAt: t('10:30') },
+      observedModel: { source: 'per-message', model: 'claude-opus-5-5', observedAt: t('10:02') }, activity: 'idle', cwd: 'E:/work/demo', folderScope: own('E:/work/demo'), createdAt: t('10:00'), updatedAt: t('10:30') },
     { id: 's-research', revision: 2, kind: 'ordinary', title: '參考資料整理', agent: { id: 'agent-planner', revision: 1 }, requestedModel: claudeSonnet,
-      observedModel: { source: 'per-message', model: 'claude-sonnet-5-5', observedAt: t('10:20') }, activity: 'running', cwd: 'E:/work/demo', parentId: 's-plan-notes',
+      observedModel: { source: 'per-message', model: 'claude-sonnet-5-5', observedAt: t('10:20') }, activity: 'running', cwd: 'E:/work/demo', folderScope: own('E:/work/demo'), parentId: 's-plan-notes',
       tokenUsage: { sessionId: 's-research', turnId: 'turn-r1', latest: { input: 1800, cachedInput: 1200, output: 420, total: 2220 }, cumulative: { input: 9600, cachedInput: 6400, output: 2100, total: 11700 }, contextWindow: 200000, at: t('10:20') },
       createdAt: t('10:10'), updatedAt: t('10:20') },
     { id: 's-handoff-codex', revision: 1, kind: 'ordinary', title: '規劃想法（轉交 Codex）', agent: { id: 'agent-builder', revision: 2 }, requestedModel: codexAstra,
-      observedModel: { source: 'configured', model: 'gpt-6-astra', observedAt: t('10:40') }, activity: 'waiting-user', cwd: 'E:/work/demo', derivedFromSessionId: 's-plan-notes', createdAt: t('10:40'), updatedAt: t('10:41') },
+      observedModel: { source: 'configured', model: 'gpt-6-astra', observedAt: t('10:40') }, activity: 'waiting-user', cwd: 'E:/work/demo', folderScope: own('E:/work/demo'), derivedFromSessionId: 's-plan-notes', createdAt: t('10:40'), updatedAt: t('10:41') },
     { id: 's-wf-root', revision: 6, kind: 'workflow', title: '登入功能（root）', agent: { id: 'agent-planner', revision: 1 }, requestedModel: claudeOpus,
-      observedModel: { source: 'per-message', model: 'claude-opus-5-5', observedAt: t('11:05') }, activity: 'waiting-user', cwd: 'E:/work/demo',
+      observedModel: { source: 'per-message', model: 'claude-opus-5-5', observedAt: t('11:05') }, activity: 'waiting-user', cwd: 'E:/work/demo', folderScope: own('E:/work/demo'),
       workflow: { instanceId: 'inst-login', nodeId: 'n-plan' }, createdAt: t('11:00'), updatedAt: t('11:31') },
     { id: 's-wf-build-a', revision: 3, kind: 'workflow', title: '實作：表單驗證', agent: { id: 'agent-builder', revision: 2 }, requestedModel: codexAstra,
-      observedModel: { source: 'configured', model: 'gpt-6-astra', observedAt: t('11:20') }, activity: 'idle', cwd: 'E:/work/.awg/wt/t1', parentId: 's-wf-root',
+      observedModel: { source: 'configured', model: 'gpt-6-astra', observedAt: t('11:20') }, activity: 'idle', cwd: 'E:/work/.awg/wt/t1', folderScope: task('E:/work/.awg/wt/t1'), parentId: 's-wf-root',
       workflow: { instanceId: 'inst-login', nodeId: 'n-build', taskId: 'task-a' }, createdAt: t('11:10'), updatedAt: t('11:20') },
     { id: 's-wf-review-a', revision: 2, kind: 'workflow', title: 'Review：表單驗證', agent: { id: 'agent-reviewer', revision: 1 }, requestedModel: claudeSonnet,
-      observedModel: { source: 'per-message', model: 'claude-sonnet-5-5', observedAt: t('11:28') }, activity: 'running', cwd: 'E:/work/.awg/wt/t1', parentId: 's-wf-build-a',
+      observedModel: { source: 'per-message', model: 'claude-sonnet-5-5', observedAt: t('11:28') }, activity: 'running', cwd: 'E:/work/.awg/wt/t1', folderScope: task('E:/work/.awg/wt/t1'), parentId: 's-wf-build-a',
       workflow: { instanceId: 'inst-login', nodeId: 'n-review', taskId: 'task-a' }, createdAt: t('11:22'), updatedAt: t('11:28') },
     { id: 's-wf-build-b', revision: 2, kind: 'workflow', title: '實作：Session 儲存', agent: { id: 'agent-builder', revision: 2 }, requestedModel: codexAstra,
-      observedModel: { source: 'rerouted', from: 'gpt-6-astra', to: 'gpt-6-luna', reason: '暫時容量不足', observedAt: t('11:25') }, activity: 'running', cwd: 'E:/work/.awg/wt/t2', parentId: 's-wf-root',
+      observedModel: { source: 'rerouted', from: 'gpt-6-astra', to: 'gpt-6-luna', reason: '暫時容量不足', observedAt: t('11:25') }, activity: 'running', cwd: 'E:/work/.awg/wt/t2', folderScope: task('E:/work/.awg/wt/t2'), parentId: 's-wf-root',
       workflow: { instanceId: 'inst-login', nodeId: 'n-build', taskId: 'task-b' }, createdAt: t('11:12'), updatedAt: t('11:30') },
   ],
   messages: [
@@ -126,7 +128,7 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
   items: [
     { id: 'it-1', sessionId: 's-wf-build-a', turnId: 'turn-a1', kind: 'command', command: 'npm test', cwd: 'E:/work/.awg/wt/t1', state: 'completed', exitCode: 0, output: 'Tests  12 passed (12)', startedAt: t('11:18'), endedAt: t('11:19') },
     { id: 'it-2', sessionId: 's-wf-build-a', turnId: 'turn-a1', kind: 'fileChange', changes: [{ path: 'src/form/validate.ts', change: 'update' }, { path: 'src/form/validate.test.ts', change: 'add' }], state: 'applied', startedAt: t('11:15'), endedAt: t('11:15') },
-    { id: 'it-3', sessionId: 's-wf-build-b', turnId: 'turn-b1', nativeTaskId: 'nt-3', kind: 'command', command: 'npm run migrate:gen', cwd: 'E:/work/.awg/wt/t2', state: 'running', output: 'generating…', startedAt: t('11:24') },
+    { id: 'it-3', sessionId: 's-wf-build-b', turnId: 'turn-b1', nativeTaskId: 'nt-3', kind: 'command', command: 'npm run migrate:gen', nativeProcessRef: 'proc-demo-1', cwd: 'E:/work/.awg/wt/t2', state: 'running', output: 'generating…', startedAt: t('11:24') },
     { id: 'it-4', sessionId: 's-research', turnId: 'turn-r1', nativeTaskId: 'nt-2', kind: 'toolCall', tool: 'Read', summary: 'refs/b.md', state: 'running', startedAt: t('10:20') },
   ],
   permissionRequests: [

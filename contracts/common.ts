@@ -3,7 +3,7 @@
 import { z } from 'zod';
 
 /** Bump on any breaking change; contract changes go through the main session. */
-export const CONTRACTS_VERSION = '0.2.0';
+export const CONTRACTS_VERSION = '0.3.0';
 
 /**
  * Carried by every serialized boundary (Snapshot, event envelope, saved definitions) so stored data
@@ -74,3 +74,8 @@ export const Revision = z.number().int().nonnegative();
 
 /** Content hash of a fixed payload snapshot (R-04 step 3, CR-2). */
 export const PayloadHash = z.string().regex(/^sha256:[0-9a-f]{64}$/);
+
+// Inferred types for schemas that are not typed next to their definition.
+export type SchemaVersion = z.infer<typeof SchemaVersion>;
+export type Revision = z.infer<typeof Revision>;
+export type PayloadHash = z.infer<typeof PayloadHash>;
