@@ -6,15 +6,20 @@ import type {
   ClientMessageId,
   DeliveryEvidence,
   DispatchAttempt,
+  Message,
   ModelOption,
   ModelSelection,
   NativeRef,
+  NativeTask,
+  NativeTaskId,
   ObservedModel,
   PermissionDecision,
   PermissionHold,
   PermissionRequest,
   Runtime,
   SessionId,
+  SessionItem,
+  Turn,
 } from '../../contracts';
 
 /** Events an adapter emits; all are AppEvent members, so the layer above can forward them as they are. */
@@ -140,6 +145,31 @@ export type ReconcileResult =
       detail: string;
     };
 
+/** One stored history entry, already mapped to contract types. */
+export type HistoryEntry = { kind: 'turn'; turn: Turn } | { kind: 'message'; message: Message } | { kind: 'item'; item: SessionItem };
+
+export interface HistoryRequest {
+  sessionId: SessionId;
+  nativeSessionRef: string;
+  /** Claude reads stored sessions by cwd and session ID; Codex ignores it. */
+  cwd: string;
+  /**
+   * A native sub-agent's own conversation instead of the session's (R-13, CR-6: Claude
+   * `getSubagentMessages`, Codex child thread). Entries carry this `nativeTaskId`.
+   */
+  nativeTask?: { nativeTaskId: NativeTaskId; nativeRef: string };
+}
+
+/**
+ * Read-only, oldest first; never resumes a session or starts a turn. `complete: false` means some of the
+ * history could not be read (paging failed, summarised turns), so callers must not treat gaps as absence.
+ */
+export interface HistoryResult {
+  entries: HistoryEntry[];
+  nativeTasks: NativeTask[];
+  complete: boolean;
+}
+
 /** When a model change takes effect (R-12): Claude from the next model call, Codex from the next turn. */
 export type ModelChangeTiming = 'next-model-call' | 'next-turn';
 
@@ -153,6 +183,8 @@ export interface RuntimeAdapter {
   /** Every payload enters a session through here exactly once (CR2_DELIVERY_FIX §1 step 4). */
   dispatchOnce(request: DispatchRequest): Promise<DispatchResult>;
   reconcile(request: ReconcileRequest): Promise<ReconcileResult>;
+  /** Stored history of a session or one of its native sub-agents, for restart and read-only views. */
+  readHistory(request: HistoryRequest): Promise<HistoryResult>;
   interrupt(nativeSessionRef: string): Promise<void>;
   setModel(nativeSessionRef: string, model: ModelSelection): Promise<ModelChangeTiming>;
   /** Stops one native sub-agent only (R-13). */

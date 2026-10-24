@@ -445,8 +445,13 @@ describe('contracts v0.3 additions', () => {
     const base = pick(fixtureSnapshotInput.sessions, 0);
     expect(ok(LogicalSession, base)).toBe(true);
     expect(ok(LogicalSession, { ...base, folderScope: undefined })).toBe(false);
-    expect(ok(LogicalSession, { ...base, folderScope: { source: 'session-cwd', writableRoots: [] } })).toBe(false);
+    const scope = { source: 'session-cwd', workspaceRoot: 'E:/w', writableRoots: [] };
+    expect(ok(LogicalSession, { ...base, folderScope: scope })).toBe(true); // read-only nodes write nowhere
+    expect(ok(LogicalSession, { ...base, folderScope: { ...scope, writableRoots: ['E:/other'] } })).toBe(false);
+    expect(ok(LogicalSession, { ...base, folderScope: { ...scope, workspaceRoot: undefined } })).toBe(false);
     const wf = fixtureSnapshot.sessions.find((s) => s.kind === 'workflow' && s.workflow.taskId !== undefined);
     expect(wf?.folderScope.source).toBe('task-worktree');
+    const reviewer = fixtureSnapshot.sessions.find((s) => s.id === 's-wf-review-a');
+    expect(reviewer?.folderScope.writableRoots).toEqual([]);
   });
 });

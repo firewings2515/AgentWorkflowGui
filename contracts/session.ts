@@ -73,14 +73,20 @@ export const TokenUsage = z
 export type TokenUsage = z.infer<typeof TokenUsage>;
 
 /**
- * Folders the session may write without escalating (R-08): the task worktree for task sessions (R-06),
- * otherwise the session's own folder. Attachments only add readable roots, never writable ones (COM-04).
+ * The session's effective folder scope (R-08): its workspace is the task worktree for task sessions (R-06),
+ * otherwise its own folder. `writableRoots` is where it may write without escalating; it is empty for
+ * read-only and exec-only nodes. Attachments only add readable roots, never writable ones (COM-04).
  */
-export const FolderScope = z.strictObject({
-  source: z.enum(['task-worktree', 'session-cwd']),
-  writableRoots: z.array(z.string().min(1)).min(1),
-  readableRoots: z.array(z.string().min(1)).default([]),
-});
+export const FolderScope = z
+  .strictObject({
+    source: z.enum(['task-worktree', 'session-cwd']),
+    workspaceRoot: z.string().min(1),
+    writableRoots: z.array(z.string().min(1)),
+    readableRoots: z.array(z.string().min(1)).default([]),
+  })
+  .refine((s) => s.writableRoots.length === 0 || s.writableRoots.includes(s.workspaceRoot), {
+    message: 'a writable session can write its own workspace',
+  });
 export type FolderScope = z.infer<typeof FolderScope>;
 
 const sessionShape = {

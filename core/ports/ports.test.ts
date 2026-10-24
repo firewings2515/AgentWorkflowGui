@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { CommitUncertainError, type DispatchResult, type RuntimeAdapter, type RuntimeEvent } from './index';
+import type { OperationId, SessionId } from '../../contracts';
+import { type AcceptInput, CommitUncertainError, type DispatchResult, type RuntimeAdapter, type RuntimeEvent } from './index';
 
 describe('core ports', () => {
   it('a runtime adapter can be implemented against the port alone', async () => {
@@ -13,6 +14,7 @@ describe('core ports', () => {
       resumeSession: (o) => Promise.resolve({ sessionId: o.sessionId, nativeSessionRef: o.nativeSessionRef, cwd: o.cwd, model: { source: 'unknown' } }),
       dispatchOnce: () => Promise.resolve(unknown),
       reconcile: () => Promise.resolve({ state: 'unknown', reason: 'not-running', matches: [], detail: 'stub' }),
+      readHistory: () => Promise.resolve({ entries: [], nativeTasks: [], complete: false }),
       interrupt: () => Promise.resolve(),
       setModel: () => Promise.resolve('next-turn'),
       stopNativeTask: () => Promise.resolve(),
@@ -32,5 +34,18 @@ describe('core ports', () => {
   it('CommitUncertainError is recognisable', () => {
     const error: unknown = new CommitUncertainError('commit result unknown');
     expect(error instanceof CommitUncertainError && error.name).toBe('CommitUncertainError');
+  });
+});
+
+describe('delivery port records', () => {
+  it('payloads carry their dispatch context and provisions their create spec', () => {
+    const base = { operationId: 'op-1' as OperationId, payloadHash: `sha256:${'a'.repeat(64)}`, proposalRevision: 0, target: {}, at: '2026-10-25T03:00:00+08:00' };
+    const payload: AcceptInput = { ...base, kind: 'handoff', payload: 'do it', context: { runtime: 'codex', cwd: 'E:/w', entry: { kind: 'new-turn' } } };
+    const provision: AcceptInput = {
+      ...base,
+      kind: 'provision',
+      spec: { runtime: 'claude', sessionId: 's-new' as SessionId, cwd: 'E:/w', model: { runtime: 'claude', model: 'claude-sonnet-5-5' }, readOnly: true },
+    };
+    expect([payload.kind, provision.kind]).toEqual(['handoff', 'provision']);
   });
 });
