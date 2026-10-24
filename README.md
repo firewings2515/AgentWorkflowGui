@@ -32,7 +32,7 @@ adapters/       runtime, storage and desktop adapters implementing core ports
 tests/          cross-cutting tests (dependency-direction regression test and its fixtures)
 ```
 
-Dependency direction (enforced by `npm run lint`, rules in `eslint.layers.mjs`; static imports, `export … from`, `import()`, `require()` and `typeof import()` are all checked):
+Dependency direction (enforced by `npm run lint`, rules in `eslint.layers.mjs`; static imports, `export … from`, `import()`, `require()` and `typeof import()` are all checked, in every source extension: ts, tsx, mts, cts, js, jsx, mjs, cjs; relative imports are resolved to their target path, so only the target layer matters, not folder names). Plain JS files are not part of any TypeScript project, so lint rejects them in these layers:
 
 - `app/renderer` may import only `contracts` (and the preload bridge types) — never `core`, `adapters`, Electron or Node modules.
 - `core` may not import Electron, React (including subpaths such as `react-dom/server`), Node modules, `adapters` or `app`, and has no Node types (`tsconfig.core.json`), so `process` and friends do not typecheck.

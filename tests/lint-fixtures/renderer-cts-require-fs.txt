@@ -1,0 +1,3 @@
+// virtual-path: app/renderer/src/probe.cts
+// expect: error
+export const fs = require('fs');

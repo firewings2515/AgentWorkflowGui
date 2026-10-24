@@ -1,0 +1,4 @@
+// virtual-path: app/renderer/src/probe.cjs
+// expect: error
+const path = require('node:path');
+module.exports = path;

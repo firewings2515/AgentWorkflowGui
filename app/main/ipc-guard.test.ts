@@ -55,6 +55,12 @@ describe('createTrustedUrlMatcher', () => {
     expect(matches('not a url')).toBe(false);
   });
 
+  it('rejects blob: and other schemes that report the dev origin', () => {
+    const matches = createTrustedUrlMatcher({ devUrl: 'http://localhost:5173/', rendererFile });
+    expect(matches('blob:http://localhost:5173/6f1d2c3e-0000-4000-8000-000000000000')).toBe(false);
+    expect(matches('filesystem:http://localhost:5173/temporary/x')).toBe(false);
+  });
+
   it('matches only the packaged renderer page otherwise', () => {
     const matches = createTrustedUrlMatcher({ devUrl: undefined, rendererFile });
     const appUrl = pathToFileURL(rendererFile).href;

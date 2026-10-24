@@ -1,0 +1,3 @@
+// virtual-path: app/renderer/src/boundary-probe.mts
+// expect: error
+export const load = () => import('../../../core/probe');

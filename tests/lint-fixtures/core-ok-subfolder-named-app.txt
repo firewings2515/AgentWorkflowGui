@@ -1,0 +1,4 @@
+// virtual-path: core/probe.ts
+// expect: ok
+import { x } from './app/thing';
+export const y = x;

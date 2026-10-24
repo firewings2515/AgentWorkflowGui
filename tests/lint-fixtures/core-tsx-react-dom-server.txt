@@ -1,0 +1,3 @@
+// virtual-path: core/probe.tsx
+// expect: error
+export { renderToString } from 'react-dom/server';

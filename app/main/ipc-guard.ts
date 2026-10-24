@@ -37,8 +37,13 @@ export function createTrustedUrlMatcher(options: {
 }): (url: string) => boolean {
   const { devUrl, rendererFile } = options;
   if (devUrl) {
-    const devOrigin = new URL(devUrl).origin;
-    return (url) => URL.canParse(url) && new URL(url).origin === devOrigin;
+    const dev = new URL(devUrl);
+    // Compare the protocol too: `blob:http://localhost:5173/…` reports the dev origin as its origin.
+    return (url) => {
+      if (!URL.canParse(url)) return false;
+      const candidate = new URL(url);
+      return candidate.protocol === dev.protocol && candidate.origin === dev.origin;
+    };
   }
   const appUrl = pathToFileURL(rendererFile).href;
   return (url) => {

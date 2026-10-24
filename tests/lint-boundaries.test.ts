@@ -14,7 +14,7 @@ const fixtureDir = join(__dirname, 'lint-fixtures');
 const eslint = new ESLint({
   cwd: root,
   overrideConfigFile: true,
-  overrideConfig: [{ files: ['**/*.{ts,tsx}'], languageOptions: { parser: tseslint.parser } }, ...layerConfigs],
+  overrideConfig: [{ files: ['**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs}'], languageOptions: { parser: tseslint.parser } }, ...layerConfigs],
 });
 
 const fixtures = readdirSync(fixtureDir)

@@ -1,0 +1,3 @@
+// virtual-path: adapters/probe.cjs
+// expect: error
+module.exports = require('../app/main/index');

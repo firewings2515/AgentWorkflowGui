@@ -1,0 +1,3 @@
+// virtual-path: contracts/probe.tsx
+// expect: error
+export { useState } from 'react';

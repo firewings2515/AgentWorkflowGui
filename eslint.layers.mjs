@@ -3,37 +3,52 @@
 //   renderer -> contracts (+ preload bridge types); core -> contracts; adapters -> core + contracts;
 //   contracts -> nothing. app/main and app/preload may use everything but the renderer.
 import { builtinModules } from 'node:module';
+import { dirname, isAbsolute, relative, resolve } from 'node:path';
+
+const root = import.meta.dirname;
+
+// Every source extension TypeScript or Node may load, so no extension escapes the rules.
+const sourceExtensions = '{ts,tsx,mts,cts,js,jsx,mjs,cjs}';
+const sourceExtensionPattern = /\.(d\.)?[cm]?[jt]sx?$/;
 
 const nodeBuiltins = [...new Set(builtinModules.filter((m) => !m.startsWith('_')).map((m) => m.replace(/^node:/, '')))];
 
-// Regex sources matched against the module specifier of every import/export-from/import()/require().
+// Bare specifiers (packages, Node builtins) are matched against these regex sources.
 const pkg = (...names) => `^(${names.join('|')})(/.*)?$`;
-const dir = (name) => `(^|/)${name}(/|$)`;
 const nodeModules = `^(node:.*|(${nodeBuiltins.join('|')})(/.*)?)$`;
 const uiPackages = pkg('electron', 'react', 'react-dom');
-// app/main, referenced by path or by a relative climb out of app/renderer.
-const appMain = String.raw`(^|/)app/main(/|$)|^(\.\./)+main(/|$)`;
-// Everything under a preload directory except the import-free bridge types.
-const preloadExceptBridgeTypes = '(^|/)preload(/(?!bridge-types$).*)?$';
 
 const nodeGlobals = ['process', 'Buffer', 'require', 'module', '__dirname', '__filename', 'global'];
 
-/** Reports every way of loading a module whose specifier matches `forbidden`. */
+// Relative specifiers are resolved against the importing file and must land inside `allowedPaths`
+// (repo-relative, extension-less; a path allows itself and everything below it).
+const isBare = (specifier) => !specifier.startsWith('.') && !isAbsolute(specifier);
+
+const isAllowedPath = (specifier, filename, allowedPaths) => {
+  const target = relative(root, resolve(dirname(filename), specifier)).split('\\').join('/').replace(sourceExtensionPattern, '');
+  return allowedPaths.some((allowed) => target === allowed || target.startsWith(`${allowed}/`));
+};
+
+/** Reports every way of loading a module that the layer may not depend on. */
 const noRestrictedLoads = {
   meta: {
     type: 'problem',
     schema: [
       {
         type: 'object',
-        properties: { forbidden: { type: 'array', items: { type: 'string' } }, message: { type: 'string' } },
-        required: ['forbidden', 'message'],
+        properties: {
+          forbiddenPackages: { type: 'array', items: { type: 'string' } },
+          allowedPaths: { type: 'array', items: { type: 'string' } },
+          message: { type: 'string' },
+        },
+        required: ['forbiddenPackages', 'allowedPaths', 'message'],
         additionalProperties: false,
       },
     ],
   },
   create(context) {
-    const { forbidden, message } = context.options[0];
-    const patterns = forbidden.map((source) => new RegExp(source));
+    const { forbiddenPackages, allowedPaths, message } = context.options[0];
+    const packagePatterns = forbiddenPackages.map((source) => new RegExp(source));
 
     const specifierOf = (node) => {
       if (!node) return undefined;
@@ -48,9 +63,10 @@ const noRestrictedLoads = {
         if (dynamic) context.report({ node, message: `Non-literal module specifier. ${message}` });
         return;
       }
-      if (patterns.some((re) => re.test(specifier))) {
-        context.report({ node, message: `'${specifier}' is not allowed here. ${message}` });
-      }
+      const forbidden = isBare(specifier)
+        ? packagePatterns.some((re) => re.test(specifier))
+        : !isAllowedPath(specifier, context.filename, allowedPaths);
+      if (forbidden) context.report({ node, message: `'${specifier}' is not allowed here. ${message}` });
     };
 
     return {
@@ -74,11 +90,11 @@ const noRestrictedLoads = {
 
 export const layerPlugin = { rules: { 'no-restricted-loads': noRestrictedLoads } };
 
-const layer = (files, message, forbidden, { globals = [] } = {}) => ({
-  files,
+const layer = (dir, message, { forbiddenPackages, allowedPaths, globals = [] }) => ({
+  files: [`${dir}/**/*.${sourceExtensions}`],
   plugins: { layer: layerPlugin },
   rules: {
-    'layer/no-restricted-loads': ['error', { forbidden, message }],
+    'layer/no-restricted-loads': ['error', { forbiddenPackages, allowedPaths, message }],
     ...(globals.length > 0 && {
       'no-restricted-globals': ['error', ...globals.map((name) => ({ name, message }))],
     }),
@@ -87,22 +103,26 @@ const layer = (files, message, forbidden, { globals = [] } = {}) => ({
 
 export const layerConfigs = [
   layer(
-    ['app/renderer/**/*.{ts,tsx}'],
+    'app/renderer',
     'app/renderer may depend only on contracts (and the preload bridge types), never on core, adapters, Electron or Node.',
-    [nodeModules, pkg('electron'), dir('core'), dir('adapters'), appMain, preloadExceptBridgeTypes],
-    { globals: nodeGlobals },
+    {
+      forbiddenPackages: [nodeModules, pkg('electron')],
+      allowedPaths: ['app/renderer', 'contracts', 'app/preload/bridge-types'],
+      globals: nodeGlobals,
+    },
   ),
-  layer(
-    ['core/**/*.ts'],
-    'core must not depend on Electron, React, Node, adapters or app code.',
-    [nodeModules, uiPackages, dir('adapters'), dir('app')],
-    { globals: nodeGlobals },
-  ),
-  layer(
-    ['contracts/**/*.ts'],
-    'contracts must not depend on any other layer, Node or UI libraries.',
-    [nodeModules, uiPackages, dir('core'), dir('adapters'), dir('app')],
-    { globals: nodeGlobals },
-  ),
-  layer(['adapters/**/*.ts'], 'adapters must not depend on app code or UI libraries.', [uiPackages, dir('app')]),
+  layer('core', 'core must not depend on Electron, React, Node, adapters or app code.', {
+    forbiddenPackages: [nodeModules, uiPackages],
+    allowedPaths: ['core', 'contracts'],
+    globals: nodeGlobals,
+  }),
+  layer('contracts', 'contracts must not depend on any other layer, Node or UI libraries.', {
+    forbiddenPackages: [nodeModules, uiPackages],
+    allowedPaths: ['contracts'],
+    globals: nodeGlobals,
+  }),
+  layer('adapters', 'adapters may depend only on core and contracts, not on app code or UI libraries.', {
+    forbiddenPackages: [uiPackages],
+    allowedPaths: ['adapters', 'core', 'contracts'],
+  }),
 ];

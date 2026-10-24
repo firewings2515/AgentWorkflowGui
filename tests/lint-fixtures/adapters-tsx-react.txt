@@ -1,0 +1,3 @@
+// virtual-path: adapters/probe.tsx
+// expect: error
+export { useState } from 'react';
