@@ -396,3 +396,26 @@ describe('review round 2 cases', () => {
     expect(refs).toEqual(['thread-1']);
   });
 });
+
+describe('review round 3 cases', () => {
+  const abandoned = { attemptId: 'att-old', clientMessageId: uuid(50), state: 'unknown', dispatchStartedAt: at, resolution: { decision: 'retry', decidedBy: 'user', at } };
+  const retried = { state: 'pending', attempts: [abandoned] };
+
+  it('a pending record that kept dispatched attempts still needs its target', () => {
+    const h = pick(fixtureSnapshotInput.handoffs, 0);
+    expect(ok(Handoff, { ...h, delivery: retried })).toBe(true);
+    expect(ok(Handoff, { ...h, delivery: retried, target: {} })).toBe(false);
+    expect(ok(Handoff, { ...h, delivery: retried, target: { provision: { operationId: 'op-t', bindingKey: 'k', state: 'unknown', preallocated: false } } })).toBe(false);
+    const pm = pick(fixtureSnapshotInput.peerMessages, 0);
+    expect(ok(PeerMessage, { ...pm, delivery: retried, toNativeSessionRef: undefined })).toBe(false);
+    const tr = pick(fixtureSnapshotInput.transfers, 0);
+    expect(ok(TransferProposal, { ...tr, delivery: retried, provision: undefined, createdSessionId: undefined })).toBe(false);
+    expect(ok(TransferProposal, { ...tr, delivery: { state: 'pending', attempts: [] }, provision: undefined, createdSessionId: undefined })).toBe(true);
+  });
+
+  it('escalation.respond carries elicitation answers only on approve', () => {
+    const respond = { type: 'escalation.respond', requestId: 'r1', escalationId: 'esc-1', decision: 'approve', content: { branch: 'main' } };
+    expect(ok(Command, respond)).toBe(true);
+    expect(ok(Command, { ...respond, decision: 'decline' })).toBe(false);
+  });
+});

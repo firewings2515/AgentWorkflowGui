@@ -115,7 +115,9 @@ export const deliveryTargetIssues = (delivery: DeliveryRecord | undefined, targe
   if (provision?.nativeSessionRef !== undefined && nativeSessionRef !== undefined && provision.nativeSessionRef !== nativeSessionRef) {
     issues.push('the target binding differs from the provisioned session');
   }
-  if (delivery === undefined || delivery.state === 'pending') return issues;
+  // A pending record that keeps user-abandoned attempts has crossed the boundary before, so it still needs
+  // its original target for reconciliation; only a never-dispatched record may lack one.
+  if (delivery === undefined || delivery.attempts.length === 0) return issues;
   if (target.sessionId === undefined || nativeSessionRef === undefined) issues.push('a dispatched payload has a bound target');
   if (provision !== undefined && provision.state !== 'sent') issues.push('payload cannot be dispatched before the target is created');
   for (const a of delivery.attempts) {

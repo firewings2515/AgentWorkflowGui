@@ -51,7 +51,11 @@ export const Command = z.discriminatedUnion('type', [
     firstMessage: z.string().min(1),
     crossToolConsent: z.boolean(),
   }),
-  cmd('escalation.respond', { escalationId: EscalationId, decision: z.enum(['approve', 'decline']), note: z.string().optional() }),
+  /** `content`: the user's form answers when approving an MCP elicitation (becomes `PermissionDecision.content`). */
+  cmd('escalation.respond', { escalationId: EscalationId, decision: z.enum(['approve', 'decline']), note: z.string().optional(), content: z.json().optional() }).refine(
+    (c) => c.content === undefined || c.decision === 'approve',
+    { message: 'only an approval carries form content' },
+  ),
   /**
    * The user's decision on a delivery whose outcome stayed unknown (CR2_DELIVERY_FIX §2). A retry may
    * deliver twice, so the user must acknowledge that explicitly.
