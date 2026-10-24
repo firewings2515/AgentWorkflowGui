@@ -1,12 +1,13 @@
 // Agent definitions and model selection.
 import { z } from 'zod';
-import { AgentId, Revision, Runtime, Timestamp } from './common';
+import { AgentId, Revision, Runtime, SchemaVersion, Timestamp } from './common';
 
 /**
  * Reusable role definition (AG-01, AG-02, COM-01). Deliberately has no model / defaultModel field:
  * the schema is strict, so a stray `model` key is rejected (HC-01).
  */
 export const AgentDefinition = z.strictObject({
+  schemaVersion: SchemaVersion,
   id: AgentId,
   revision: Revision,
   name: z.string().min(1),
@@ -43,5 +44,9 @@ export const ModelOption = z.strictObject({
   displayName: z.string().min(1),
   efforts: z.array(z.string().min(1)),
   defaultEffort: z.string().min(1).optional(),
+  /** The runtime's own default for new sessions. */
+  isDefault: z.boolean().default(false),
+  /** Codex `hidden`: listed by the API but not offered in the picker by default. */
+  hidden: z.boolean().default(false),
 });
 export type ModelOption = z.infer<typeof ModelOption>;
