@@ -2,7 +2,7 @@
 // (two short turns on the cheapest model). Optional: AWG_CODEX_MODEL (default gpt-6-luna),
 // AWG_CODEX_COMMAND (default `codex` on PATH).
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -41,13 +41,16 @@ describe.skipIf(!live)('Codex app-server (live)', () => {
     expect(events.some((e) => e.type === 'message.completed' && e.message.role === 'assistant')).toBe(true);
     expect(await writer.close()).toMatchObject({ forced: false });
 
-    const reader = new CodexAdapter({ spawnOptions, onPermissionRequest: (h) => h.answer({ outcome: 'decline', decidedBy: 'policy', at: new Date().toISOString() }) });
+    const warnings: string[] = [];
+    const reader = new CodexAdapter({ spawnOptions, log: (level, message) => level === 'warn' && warnings.push(message), onPermissionRequest: (h) => h.answer({ outcome: 'decline', decidedBy: 'policy', at: new Date().toISOString() }) });
     await reader.start();
     const reconciled = await reader.reconcile({ nativeSessionRef: thread.threadId, cwd, clientMessageId: ClientMessageId.parse(clientMessageId), text });
     // Same fresh app-server, thread not loaded: thread/items/list and thread/turns/list on a stored thread (T006).
     const history = await reader.readHistory({ sessionId: SessionId.parse('live-session'), nativeSessionRef: thread.threadId, cwd });
     await reader.close();
     expect(reconciled).toMatchObject({ state: 'sent', evidence: { kind: 'reconciled' } });
+    // Which path read the unloaded thread: items/list directly, or the thread/read fallback (logged as a warning).
+    if (process.env.AWG_CODEX_LIVE_NOTE) writeFileSync(process.env.AWG_CODEX_LIVE_NOTE, JSON.stringify({ warnings, entries: history.entries.length, tasks: history.nativeTasks.length }));
     expect(history.complete).toBe(true);
     expect(history.entries.some((e) => e.kind === 'turn')).toBe(true);
     expect(history.entries.some((e) => e.kind === 'message' && e.message.role === 'user' && e.message.text === text)).toBe(true);
