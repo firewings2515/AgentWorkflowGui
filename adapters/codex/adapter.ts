@@ -159,6 +159,8 @@ interface ThreadBinding {
   nextTurnModel?: ModelSelection;
   /** Chosen with setModel or at session start but not sent yet: the next turn/start carries it (R-12). */
   pendingModel?: ModelSelection;
+  /** Bumped whenever pendingModel is set or cleared, so a reply only clears what its own request used. */
+  pendingVersion?: number;
   /** The turn this thread is running, from turn/started until turn/completed. */
   activeTurnId?: string;
 }
@@ -328,7 +330,7 @@ export class CodexAdapter implements RuntimeAdapter {
   /** Codex has no call to change a thread's model; it is sent with the next turn/start (R-12). */
   setModel(nativeSessionRef: string, model: ModelSelection): Promise<ModelChangeTiming> {
     try {
-      this.binding(nativeSessionRef).pendingModel = this.codexSelection(model);
+      this.setPending(this.binding(nativeSessionRef), this.codexSelection(model));
       return Promise.resolve('next-turn');
     } catch (error) {
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
@@ -343,7 +345,12 @@ export class CodexAdapter implements RuntimeAdapter {
   /** `nativeTaskRef` is the child thread ID (`NativeTask.nativeRef`); only children of this session's thread qualify (R-13). */
   async stopNativeTask(nativeSessionRef: string, nativeTaskRef: string): Promise<void> {
     const parent = this.binding(nativeSessionRef);
-    const child = this.threads.get(nativeTaskRef);
+    let child = this.threads.get(nativeTaskRef);
+    if (!child) {
+      // After a restart the child is only known from the parent's stored activity (R-13: seen means stoppable).
+      this.adoptChildren(parent.sessionId, nativeSessionRef, (await this.readWholeHistory(nativeSessionRef, { requireFull: false })).items);
+      child = this.threads.get(nativeTaskRef);
+    }
     if (!child || child.nativeTaskId === undefined || child.sessionId !== parent.sessionId) {
       throw new Error(`thread ${nativeTaskRef} is not a native task of the session bound to ${nativeSessionRef}`);
     }
@@ -590,6 +597,7 @@ export class CodexAdapter implements RuntimeAdapter {
     if (turns !== undefined && itemsByTurn.size > 0) complete = false;
     for (const turnId of [...itemsByTurn.keys()]) emitTurnItems(turnId);
 
+    this.adoptChildren(req.sessionId, threadId, stored.items);
     const found = await this.nativeTasksIn(req.sessionId, threadId, nativeTaskId, stored.items);
     return { entries, nativeTasks: found.tasks, complete: complete && found.exact };
   }
@@ -613,9 +621,9 @@ export class CodexAdapter implements RuntimeAdapter {
   }
 
   /**
-   * Native tasks the thread's stored activity mentions (R-13). A task whose end is not recorded is
-   * resolved from what this adapter saw live, else from its own last turn; `exact` is false when that
-   * had to be guessed.
+   * Native tasks the thread's stored activity mentions (R-13). As live (T003 review r2), the child's own
+   * turns decide a task's state: the parent's `completed` / `interrupted` activity is used only when no
+   * finished child turn is known. `exact` is false when the state had to be guessed.
    */
   private async nativeTasksIn(sessionId: SessionId, parentThreadId: string, parentTaskId: NativeTaskId | undefined, items: StoredItem[]): Promise<{ tasks: NativeTask[]; exact: boolean }> {
     const seen = new Map<string, { label: string; kind: string; startedAt: Timestamp; last: Timestamp }>();
@@ -634,24 +642,8 @@ export class CodexAdapter implements RuntimeAdapter {
     const tasks: NativeTask[] = [];
     let exact = true;
     for (const [child, activity] of seen) {
-      let state: NativeTask['state'];
-      let lastActivity: string = activity.kind;
-      if (activity.kind === 'completed') state = 'completed';
-      else if (activity.kind === 'interrupted') state = 'stopped';
-      else {
-        const live = this.nativeTasks.get(child);
-        const resolved: { state: NativeTask['state']; lastActivity?: string | undefined; guessed?: boolean } | undefined = live
-          ? { state: live.state, lastActivity: live.lastActivity }
-          : await this.lastTurnState(child);
-        if (resolved) {
-          state = resolved.state;
-          lastActivity = resolved.lastActivity ?? lastActivity;
-          if (resolved.guessed) exact = false;
-        } else {
-          state = 'running';
-          exact = false;
-        }
-      }
+      const resolved = await this.childState(child, activity.kind, activity.last);
+      if (!resolved.exact) exact = false;
       tasks.push({
         id: NativeTaskId.parse(child),
         sessionId,
@@ -660,32 +652,64 @@ export class CodexAdapter implements RuntimeAdapter {
         nativeRef: child,
         ...opt('parentTaskId', parentTaskId),
         label: activity.label,
-        state,
+        state: resolved.state,
         background: false,
-        lastActivity,
+        lastActivity: resolved.lastActivity ?? activity.kind,
         startedAt: activity.startedAt,
-        ...(state !== 'running' && { endedAt: activity.last }),
+        ...(resolved.state !== 'running' && { endedAt: resolved.endedAt ?? activity.last }),
       });
     }
     return { tasks, exact };
   }
 
-  /** The state a stored child thread's newest turn implies; undefined when it cannot be read. */
-  private async lastTurnState(child: string): Promise<{ state: NativeTask['state']; lastActivity: string; guessed?: boolean } | undefined> {
-    let last: WireTurn | undefined;
+  /** What a child's own turns say, else the parent's end report, else a guess. */
+  private async childState(
+    child: string,
+    parentKind: string,
+    parentAt: Timestamp,
+  ): Promise<{ state: NativeTask['state']; lastActivity?: string | undefined; endedAt?: Timestamp | undefined; exact: boolean }> {
+    // A child turn this adapter saw live is the freshest word there is.
+    const live = this.childTurnStates.get(child);
+    if (live !== undefined) {
+      const task = this.nativeTasks.get(child);
+      return { state: live, lastActivity: task?.lastActivity, endedAt: task?.endedAt, exact: true };
+    }
+    const last = await this.lastTurn(child);
+    if (last && (last.status === 'completed' || last.status === 'interrupted' || last.status === 'failed')) {
+      const state = last.status === 'completed' ? 'completed' : last.status === 'interrupted' ? 'stopped' : 'failed';
+      return { state, lastActivity: `turn ${last.status}`, endedAt: typeof last.completedAt === 'number' ? isoFromSeconds(last.completedAt) : parentAt, exact: true };
+    }
+    if (parentKind === 'completed' || parentKind === 'interrupted') {
+      return { state: parentKind === 'completed' ? 'completed' : 'stopped', exact: true, endedAt: parentAt };
+    }
+    // Nothing of ours is running it, so a turn stored as in progress was cut off.
+    if (last) return { state: 'failed', lastActivity: 'turn left in progress', endedAt: parentAt, exact: false };
+    return { state: 'running', exact: false };
+  }
+
+  /** A stored child thread's newest turn; undefined when it cannot be read. */
+  private async lastTurn(child: string): Promise<WireTurn | undefined> {
     try {
       const page = (await this.request('thread/turns/list', { threadId: child, limit: 1, sortDirection: 'desc' })) as WirePage<WireTurn> | undefined;
-      last = page?.data?.[0];
+      const turn = page?.data?.[0];
+      return isObject(turn) && typeof turn.status === 'string' ? turn : undefined;
     } catch (error) {
       if (!(error instanceof RpcError)) throw error;
       return undefined;
     }
-    if (!last || typeof last.status !== 'string') return undefined;
-    if (last.status === 'completed') return { state: 'completed', lastActivity: 'turn completed' };
-    if (last.status === 'interrupted') return { state: 'stopped', lastActivity: 'turn interrupted' };
-    if (last.status === 'failed') return { state: 'failed', lastActivity: 'turn failed' };
-    // Nothing of ours is running it, so a turn stored as in progress was cut off.
-    return { state: 'failed', lastActivity: 'turn left in progress', guessed: true };
+  }
+
+  /**
+   * Binds the child threads that `items` (stored activity of `threadId`) name to the same session, so a
+   * task found in history can be stopped like one seen live (R-13). Only for a thread already bound to
+   * `sessionId`; a thread bound elsewhere is left alone.
+   */
+  private adoptChildren(sessionId: SessionId, threadId: string, items: StoredItem[]): void {
+    if (this.threads.get(threadId)?.sessionId !== sessionId) return;
+    for (const { item } of items) {
+      if (item.type !== 'subAgentActivity' || !isNonEmptyString(item.agentThreadId) || this.threads.has(item.agentThreadId)) continue;
+      this.threads.set(item.agentThreadId, { sessionId, nativeTaskId: NativeTaskId.parse(item.agentThreadId) });
+    }
   }
 
   // ---- permission requests ------------------------------------------------------------------------
@@ -745,6 +769,7 @@ export class CodexAdapter implements RuntimeAdapter {
         ? binding.pendingModel
         : undefined;
     const effort = input.effort ?? requested?.effort;
+    const pendingVersion = binding.pendingVersion;
     // turn/started can arrive before the response (seen in SP-06), so remember the model for it.
     if (requested) binding.nextTurnModel = requested;
     const response = await this.request(
@@ -762,9 +787,16 @@ export class CodexAdapter implements RuntimeAdapter {
     });
     if (requested && isObject(response) && isObject(response.turn) && typeof response.turn.id === 'string') {
       this.turnModels.set(response.turn.id, requested);
-      delete binding.pendingModel;
+      // Only what this request knew about is spent; a setModel made while it was in flight stays for the next turn.
+      if (binding.pendingVersion === pendingVersion) this.setPending(binding, undefined);
     }
     return response;
+  }
+
+  private setPending(binding: ThreadBinding, model: ModelSelection | undefined): void {
+    if (model) binding.pendingModel = model;
+    else delete binding.pendingModel;
+    binding.pendingVersion = (binding.pendingVersion ?? 0) + 1;
   }
 
   private codexSelection(model: ModelSelection): ModelSelection {
@@ -783,8 +815,7 @@ export class CodexAdapter implements RuntimeAdapter {
   /** The thread is created or resumed with the model; its effort can only go with a turn, so it waits for the next one. */
   private keepEffort(threadId: string, model: ModelSelection): void {
     const binding = this.binding(threadId);
-    if (model.effort !== undefined) binding.pendingModel = model;
-    else delete binding.pendingModel;
+    this.setPending(binding, model.effort !== undefined ? model : undefined);
   }
 
   private async interruptRunning(threadId: string): Promise<void> {

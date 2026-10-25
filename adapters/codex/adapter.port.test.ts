@@ -191,7 +191,7 @@ describe('interrupt and stopNativeTask', () => {
   });
 
   it('stops only native tasks of the session, never other threads', async () => {
-    const h = await resumed([]);
+    const h = await resumed([out('thread/items/list', 3, { threadId: THREAD_ID, limit: 200, sortDirection: 'asc' }), reply(3, { data: [], nextCursor: null, backwardsCursor: null })]);
     await expect(h.adapter.stopNativeTask(THREAD_ID, 'unknown-thread')).rejects.toThrow(/not a native task/);
     // The session's own thread is not a native task either.
     await expect(h.adapter.stopNativeTask(THREAD_ID, THREAD_ID)).rejects.toThrow(/not a native task/);
@@ -275,6 +275,9 @@ describe('readHistory', () => {
       // CHILD_A never reported an end; its own newest turn did.
       out('thread/turns/list', 4, { threadId: CHILD_A, limit: 1, sortDirection: 'desc' }),
       reply(4, page([wireTurn('child-turn', 'completed')])),
+      // CHILD_B: the parent reported it completed, but its own newest turn failed, and the child decides (T003 r2).
+      out('thread/turns/list', 5, { threadId: CHILD_B, limit: 1, sortDirection: 'desc' }),
+      reply(5, page([wireTurn('child-turn-b', 'failed', 1792739194, 1792739196)])),
     ]);
     await h.adapter.start();
     const result = await h.adapter.readHistory(historyRequest());
@@ -293,10 +296,10 @@ describe('readHistory', () => {
     expect(command).toMatchObject({ item: { kind: 'command', state: 'interrupted', nativeProcessRef: '55', output: 'partial', turnId: 'turn-1', endedAt: new Date(1792739197000).toISOString() } });
     expect(result.nativeTasks).toEqual([
       expect.objectContaining({ nativeRef: CHILD_A, id: CHILD_A, label: '/root/a', state: 'completed', parentRef: THREAD_ID, lastActivity: 'turn completed' }),
-      expect.objectContaining({ nativeRef: CHILD_B, label: '/root/b', state: 'completed', endedAt: new Date(1792739196500).toISOString() }),
+      expect.objectContaining({ nativeRef: CHILD_B, label: '/root/b', state: 'failed', endedAt: new Date(1792739196000).toISOString() }),
     ]);
     // Read only: no resume, no turn.
-    expect(h.fake.received.map((m) => m.method)).toEqual(['initialize', 'initialized', 'thread/items/list', 'thread/turns/list', 'thread/turns/list']);
+    expect(h.fake.received.map((m) => m.method)).toEqual(['initialize', 'initialized', 'thread/items/list', 'thread/turns/list', 'thread/turns/list', 'thread/turns/list']);
     expect(h.fake.mismatches).toEqual([]);
   });
 
@@ -368,5 +371,113 @@ describe('readHistory', () => {
     const result = await h.adapter.readHistory(historyRequest());
     expect(result.nativeTasks).toEqual([expect.objectContaining({ nativeRef: CHILD_A, state: 'failed', lastActivity: 'turn left in progress' })]);
     expect(result.complete).toBe(false);
+  });
+});
+
+// ---- review round 1 regressions ---------------------------------------------------------------------
+
+describe('native task state: the child decides, live and in history', () => {
+  const spawn = { type: 'subAgentActivity', id: 'call_spawn', kind: 'started', agentThreadId: CHILD_A, agentPath: '/root/a' };
+  const childTurn = (id: string, status: string, completedAt: number | null) => ({ threadId: CHILD_A, turn: wireTurn(id, status, 1792739194, completedAt) });
+
+  it('keeps a task its own turn failed as failed when the parent stored a completed activity', async () => {
+    const h = await resumed([
+      turnStarted,
+      notify('item/started', { threadId: THREAD_ID, turnId: TURN_ID, startedAtMs: 1792739194000, item: spawn }),
+      notify('turn/started', childTurn('child-turn', 'inProgress', null)),
+      notify('turn/completed', childTurn('child-turn', 'failed', 1792739195)),
+      out('thread/items/list', 3, { threadId: THREAD_ID, ...ITEMS }),
+      reply(3, page([entry(TURN_ID, spawn, 1792739194000, null), entry(TURN_ID, { ...spawn, id: 'sa-done', kind: 'completed' }, null, 1792739197000)])),
+      out('thread/turns/list', 4, { threadId: THREAD_ID, ...ITEMS }),
+      reply(4, page([wireTurn(TURN_ID, 'completed')])),
+    ]);
+    await until(() => h.of('nativeTask.updated').some((e) => e.task.state === 'failed'), 'live failed');
+    const result = await h.adapter.readHistory(historyRequest());
+    expect(result.nativeTasks).toEqual([expect.objectContaining({ nativeRef: CHILD_A, state: 'failed', endedAt: new Date(1792739195000).toISOString() })]);
+    expect(result.complete).toBe(true);
+    // The child's turn was known live, so no extra read was needed.
+    expect(h.fake.received.filter((m) => m.method === 'thread/turns/list')).toHaveLength(1);
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
+  it('uses the parent end report only when the child has no finished turn to show', async () => {
+    const h = setup([
+      ...init(),
+      out('thread/items/list', 2, { threadId: THREAD_ID, ...ITEMS }),
+      reply(2, page([entry('turn-1', activity('sa-1', 'started', CHILD_A, '/root/a')), entry('turn-1', activity('sa-2', 'interrupted', CHILD_A, '/root/a'), null, 1792739197000)])),
+      out('thread/turns/list', 3, { threadId: THREAD_ID, ...ITEMS }),
+      reply(3, page([wireTurn('turn-1', 'completed')])),
+      out('thread/turns/list', 4, { threadId: CHILD_A, limit: 1, sortDirection: 'desc' }),
+      replyError(4, -32600, 'child not stored'),
+    ]);
+    await h.adapter.start();
+    const result = await h.adapter.readHistory(historyRequest());
+    expect(result.nativeTasks).toEqual([expect.objectContaining({ nativeRef: CHILD_A, state: 'stopped', endedAt: new Date(1792739197000).toISOString() })]);
+    expect(result.complete).toBe(true);
+  });
+});
+
+describe('stopping a native task found in history (R-13)', () => {
+  const childTurnId = 'child-turn';
+  const spawn = { ...activity('sa-1', 'started', CHILD_A, '/root/a') };
+  const stopScript = (firstId: number): ReplayRecord[] => [
+    out('thread/turns/list', firstId, { threadId: CHILD_A, limit: 1, sortDirection: 'desc' }),
+    reply(firstId, page([wireTurn(childTurnId, 'inProgress')])),
+    out('turn/interrupt', firstId + 1, { threadId: CHILD_A, turnId: childTurnId }),
+    reply(firstId + 1, {}),
+  ];
+
+  it('stops the child read by readHistory after the parent was resumed', async () => {
+    const h = await resumed([
+      out('thread/items/list', 3, { threadId: THREAD_ID, ...ITEMS }),
+      reply(3, page([entry('turn-1', spawn)])),
+      out('thread/turns/list', 4, { threadId: THREAD_ID, ...ITEMS }),
+      reply(4, page([wireTurn('turn-1', 'completed')])),
+      // the child's newest turn, read to find the task's state
+      out('thread/turns/list', 5, { threadId: CHILD_A, limit: 1, sortDirection: 'desc' }),
+      reply(5, page([wireTurn(childTurnId, 'inProgress')])),
+      ...stopScript(6),
+    ]);
+    const result = await h.adapter.readHistory(historyRequest());
+    expect(result.nativeTasks).toHaveLength(1);
+    await h.adapter.stopNativeTask(THREAD_ID, result.nativeTasks[0]!.nativeRef);
+    expect(h.fake.received.filter((m) => m.method === 'turn/interrupt')).toHaveLength(1);
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
+  it('finds the child in the parent stored activity when only the task ref is known (after a restart)', async () => {
+    const h = await resumed([out('thread/items/list', 3, { threadId: THREAD_ID, ...ITEMS }), reply(3, page([entry('turn-1', spawn)])), ...stopScript(4)]);
+    await h.adapter.stopNativeTask(THREAD_ID, CHILD_A);
+    expect(h.fake.received.filter((m) => m.method === 'turn/interrupt')).toHaveLength(1);
+    expect(h.fake.mismatches).toEqual([]);
+  });
+});
+
+describe('pending model while a turn/start is in flight', () => {
+  const luna = { runtime: 'codex', model: 'gpt-6-luna', effort: 'low' } as const;
+  const sol = { runtime: 'codex', model: 'gpt-6.1-sol', effort: 'high' } as const;
+  const start = (n: number, t: string, model?: { model: string; effort: string }) =>
+    out('turn/start', n + 2, { threadId: THREAD_ID, input: text(t), clientUserMessageId: attempt(n).clientMessageId, ...(model && { model: model.model, effort: model.effort }) });
+  const ack = (id: number) => reply(id, recordedResult(sp01, 'turn/start'));
+
+  it('keeps a model set while an explicit-model turn/start was waiting', async () => {
+    const h = await resumed([start(1, 'one', luna), ack(3), start(2, 'two', sol), ack(4)]);
+    const first = h.adapter.dispatchOnce(dispatch(1, { kind: 'new-turn', model: luna }, 'one'));
+    await h.adapter.setModel(THREAD_ID, sol);
+    expect(await first).toMatchObject({ state: 'sent' });
+    expect(await h.adapter.dispatchOnce(dispatch(2, { kind: 'new-turn' }, 'two'))).toMatchObject({ state: 'sent' });
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
+  it('keeps a newer model when the turn/start that used the older pending one is answered', async () => {
+    const h = await resumed([start(1, 'one', luna), ack(3), start(2, 'two', sol), ack(4), out('turn/start', 5, { threadId: THREAD_ID, input: text('three'), clientUserMessageId: attempt(3).clientMessageId }), ack(5)]);
+    await h.adapter.setModel(THREAD_ID, luna);
+    const first = h.adapter.dispatchOnce(dispatch(1, { kind: 'new-turn' }, 'one'));
+    await h.adapter.setModel(THREAD_ID, sol);
+    expect(await first).toMatchObject({ state: 'sent' });
+    expect(await h.adapter.dispatchOnce(dispatch(2, { kind: 'new-turn' }, 'two'))).toMatchObject({ state: 'sent' });
+    // Now it is spent: a third turn names nothing.
+    expect(await h.adapter.dispatchOnce(dispatch(3, { kind: 'new-turn' }, 'three'))).toMatchObject({ state: 'sent' });
+    expect(h.fake.mismatches).toEqual([]);
   });
 });
