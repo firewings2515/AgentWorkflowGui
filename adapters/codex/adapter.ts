@@ -348,7 +348,7 @@ export class CodexAdapter implements RuntimeAdapter {
     let child = this.threads.get(nativeTaskRef);
     if (!child) {
       // After a restart the child is only known from the parent's stored activity (R-13: seen means stoppable).
-      this.adoptChildren(parent.sessionId, nativeSessionRef, (await this.readWholeHistory(nativeSessionRef, { requireFull: false })).items);
+      await this.restoreChildren(parent.sessionId, nativeSessionRef, parent.nativeTaskId, (await this.readWholeHistory(nativeSessionRef, { requireFull: false })).items);
       child = this.threads.get(nativeTaskRef);
     }
     if (!child || child.nativeTaskId === undefined || child.sessionId !== parent.sessionId) {
@@ -597,8 +597,7 @@ export class CodexAdapter implements RuntimeAdapter {
     if (turns !== undefined && itemsByTurn.size > 0) complete = false;
     for (const turnId of [...itemsByTurn.keys()]) emitTurnItems(turnId);
 
-    this.adoptChildren(req.sessionId, threadId, stored.items);
-    const found = await this.nativeTasksIn(req.sessionId, threadId, nativeTaskId, stored.items);
+    const found = await this.restoreChildren(req.sessionId, threadId, nativeTaskId, stored.items);
     return { entries, nativeTasks: found.tasks, complete: complete && found.exact };
   }
 
@@ -622,10 +621,16 @@ export class CodexAdapter implements RuntimeAdapter {
 
   /**
    * Native tasks the thread's stored activity mentions (R-13). As live (T003 review r2), the child's own
-   * turns decide a task's state: the parent's `completed` / `interrupted` activity is used only when no
-   * finished child turn is known. `exact` is false when the state had to be guessed.
+   * turns decide a task's state; the parent's `completed` / `interrupted` activity counts only when the
+   * child was read and has no turn at all. `exact` is false when the state is not established, and
+   * `fromTurn` names the tasks whose state comes from a child turn.
    */
-  private async nativeTasksIn(sessionId: SessionId, parentThreadId: string, parentTaskId: NativeTaskId | undefined, items: StoredItem[]): Promise<{ tasks: NativeTask[]; exact: boolean }> {
+  private async nativeTasksIn(
+    sessionId: SessionId,
+    parentThreadId: string,
+    parentTaskId: NativeTaskId | undefined,
+    items: StoredItem[],
+  ): Promise<{ tasks: NativeTask[]; exact: boolean; fromTurn: Set<string> }> {
     const seen = new Map<string, { label: string; kind: string; startedAt: Timestamp; last: Timestamp }>();
     for (const e of items) {
       const wire = e.item;
@@ -640,10 +645,12 @@ export class CodexAdapter implements RuntimeAdapter {
       });
     }
     const tasks: NativeTask[] = [];
+    const fromTurn = new Set<string>();
     let exact = true;
     for (const [child, activity] of seen) {
       const resolved = await this.childState(child, activity.kind, activity.last);
       if (!resolved.exact) exact = false;
+      if (resolved.fromTurn) fromTurn.add(child);
       tasks.push({
         id: NativeTaskId.parse(child),
         sessionId,
@@ -659,51 +666,75 @@ export class CodexAdapter implements RuntimeAdapter {
         ...(resolved.state !== 'running' && { endedAt: resolved.endedAt ?? activity.last }),
       });
     }
-    return { tasks, exact };
+    return { tasks, exact, fromTurn };
   }
 
-  /** What a child's own turns say, else the parent's end report, else a guess. */
+  /**
+   * A child's state from the best evidence there is: a turn seen live, else its newest stored turn (a
+   * turn still in progress means running, whatever the parent said). The parent's end report is used
+   * only when the child was read and has no turn at all; a child that cannot be read stays running and
+   * unconfirmed rather than being given an end it was not shown to have.
+   */
   private async childState(
     child: string,
     parentKind: string,
     parentAt: Timestamp,
-  ): Promise<{ state: NativeTask['state']; lastActivity?: string | undefined; endedAt?: Timestamp | undefined; exact: boolean }> {
-    // A child turn this adapter saw live is the freshest word there is.
+  ): Promise<{ state: NativeTask['state']; lastActivity?: string | undefined; endedAt?: Timestamp | undefined; exact: boolean; fromTurn: boolean }> {
     const live = this.childTurnStates.get(child);
     if (live !== undefined) {
       const task = this.nativeTasks.get(child);
-      return { state: live, lastActivity: task?.lastActivity, endedAt: task?.endedAt, exact: true };
+      return { state: live, lastActivity: task?.lastActivity, endedAt: task?.endedAt, exact: true, fromTurn: true };
     }
+    const parentEnded = parentKind === 'completed' || parentKind === 'interrupted';
     const last = await this.lastTurn(child);
-    if (last && (last.status === 'completed' || last.status === 'interrupted' || last.status === 'failed')) {
-      const state = last.status === 'completed' ? 'completed' : last.status === 'interrupted' ? 'stopped' : 'failed';
-      return { state, lastActivity: `turn ${last.status}`, endedAt: typeof last.completedAt === 'number' ? isoFromSeconds(last.completedAt) : parentAt, exact: true };
+    if (last.kind === 'unreadable') return { state: 'running', exact: false, fromTurn: false };
+    if (last.kind === 'turn') {
+      const { status, completedAt } = last.turn;
+      if (status === 'inProgress') return { state: 'running', lastActivity: 'turn inProgress', exact: !parentEnded, fromTurn: true };
+      const state = status === 'completed' ? 'completed' : status === 'interrupted' ? 'stopped' : 'failed';
+      return { state, lastActivity: `turn ${status}`, endedAt: typeof completedAt === 'number' ? isoFromSeconds(completedAt) : parentAt, exact: true, fromTurn: true };
     }
-    if (parentKind === 'completed' || parentKind === 'interrupted') {
-      return { state: parentKind === 'completed' ? 'completed' : 'stopped', exact: true, endedAt: parentAt };
-    }
-    // Nothing of ours is running it, so a turn stored as in progress was cut off.
-    if (last) return { state: 'failed', lastActivity: 'turn left in progress', endedAt: parentAt, exact: false };
-    return { state: 'running', exact: false };
+    if (parentEnded) return { state: parentKind === 'completed' ? 'completed' : 'stopped', endedAt: parentAt, exact: true, fromTurn: false };
+    return { state: 'running', exact: false, fromTurn: false };
   }
 
-  /** A stored child thread's newest turn; undefined when it cannot be read. */
-  private async lastTurn(child: string): Promise<WireTurn | undefined> {
+  /** A stored child thread's newest turn: read and found, read and empty, or not readable at all. */
+  private async lastTurn(child: string): Promise<{ kind: 'turn'; turn: WireTurn } | { kind: 'none' } | { kind: 'unreadable' }> {
+    let page: unknown;
     try {
-      const page = (await this.request('thread/turns/list', { threadId: child, limit: 1, sortDirection: 'desc' })) as WirePage<WireTurn> | undefined;
-      const turn = page?.data?.[0];
-      return isObject(turn) && typeof turn.status === 'string' ? turn : undefined;
+      page = await this.request('thread/turns/list', { threadId: child, limit: 1, sortDirection: 'desc' });
     } catch (error) {
       if (!(error instanceof RpcError)) throw error;
-      return undefined;
+      return { kind: 'unreadable' };
     }
+    if (!isObject(page) || !Array.isArray(page.data)) return { kind: 'unreadable' };
+    if (page.data.length === 0) return { kind: 'none' };
+    const turn: unknown = page.data[0];
+    const known = ['completed', 'interrupted', 'failed', 'inProgress'];
+    return isObject(turn) && isNonEmptyString(turn.id) && typeof turn.status === 'string' && known.includes(turn.status) ? { kind: 'turn', turn: turn as unknown as WireTurn } : { kind: 'unreadable' };
   }
 
   /**
-   * Binds the child threads that `items` (stored activity of `threadId`) name to the same session, so a
-   * task found in history can be stopped like one seen live (R-13). Only for a thread already bound to
-   * `sessionId`; a thread bound elsewhere is left alone.
+   * Takes over the native tasks that `items` (stored activity of `threadId`) show, for a thread bound to
+   * `sessionId`: binds their threads to the session (so they can be stopped, R-13) and records their state
+   * the way live events would have, so later events follow the T003 rules (a child turn ends or resumes a
+   * task; a late spawn report cannot revive it). A thread or child bound elsewhere is left alone, and
+   * what the adapter already saw live is kept.
    */
+  private async restoreChildren(sessionId: SessionId, threadId: string, parentTaskId: NativeTaskId | undefined, items: StoredItem[]) {
+    this.adoptChildren(sessionId, threadId, items);
+    const found = await this.nativeTasksIn(sessionId, threadId, parentTaskId, items);
+    if (this.threads.get(threadId)?.sessionId === sessionId) {
+      for (const task of found.tasks) {
+        if (this.threads.get(task.nativeRef)?.sessionId !== sessionId) continue;
+        if (!this.nativeTasks.has(task.nativeRef)) this.nativeTasks.set(task.nativeRef, task);
+        if (found.fromTurn.has(task.nativeRef) && !this.childTurnStates.has(task.nativeRef)) this.childTurnStates.set(task.nativeRef, task.state);
+      }
+    }
+    return found;
+  }
+
+  /** Binds the child threads that `items` name to the session; only for a thread already bound to it. */
   private adoptChildren(sessionId: SessionId, threadId: string, items: StoredItem[]): void {
     if (this.threads.get(threadId)?.sessionId !== sessionId) return;
     for (const { item } of items) {
