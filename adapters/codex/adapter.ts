@@ -1,19 +1,16 @@
-// Codex runtime adapter (T003): owns one `codex app-server` stdio child (D-03) and turns its threads,
-// turns, items and approval requests into contracts types. Several GUI sessions may share one
-// app-server; every thread is bound to the GUI session it belongs to.
+// Codex runtime adapter (T003, aligned with the runtime port in T006): owns one `codex app-server` stdio
+// child (D-03) and turns its threads, turns, items and approval requests into contracts types. Several
+// GUI sessions may share one app-server; every thread is bound to the GUI session it belongs to.
 //
 // Not here on purpose: retries of any kind (CR-2), the R-08 escalation decision (policy module), the
 // supervisor's idle shutdown, and killing command processes after an interrupt (CR-7).
 import { randomUUID } from 'node:crypto';
 import {
-  type AppEvent,
-  type DispatchAttempt,
   ItemId,
   type Message,
   MessageId,
   type ModelOption,
   type ModelSelection,
-  type NativeRef,
   type NativeTask,
   NativeTaskId,
   type ObservedModel,
@@ -26,7 +23,24 @@ import {
   type Turn,
   TurnId,
 } from '../../contracts';
-import type { DeliveryEvidence, MessageOrigin, PermissionDecision as Decision, PermissionHold } from './contract-types';
+import type {
+  DispatchRequest,
+  DispatchResult,
+  HistoryEntry,
+  HistoryRequest,
+  HistoryResult,
+  ModelChangeTiming,
+  NativeSessionInfo,
+  PermissionHandle,
+  ReconcileMatch,
+  ReconcileRequest,
+  ReconcileResult,
+  ResumeSessionOptions,
+  RuntimeAdapter,
+  RuntimeAdapterHooks,
+  RuntimeEvent,
+  StartSessionOptions,
+} from '../../core/ports';
 import {
   closeOpenItem,
   isoFromMs,
@@ -63,48 +77,10 @@ import { type AppServerProcess, type ExitInfo, RpcClosedError, RpcConnection, Rp
 
 // ---- public types ---------------------------------------------------------------------------------
 
-type AdapterAppEvent = Extract<
-  AppEvent,
-  {
-    type:
-      | 'turn.updated'
-      | 'message.delta'
-      | 'message.completed'
-      | 'item.updated'
-      | 'item.outputDelta'
-      | 'permission.updated'
-      | 'nativeTask.updated'
-      | 'usage.tokens'
-      | 'usage.limits';
-  }
->;
+/** Events this adapter emits are the port's events; kept under its T003 name for existing imports. */
+export type CodexAdapterEvent = RuntimeEvent;
 
-/**
- * What the adapter reports. Most are AppEvent members as-is; `model.observed` (R-12 reroute) and
- * `runtime.exited` have no AppEvent of their own yet, so the layer above folds them into its state.
- */
-export type CodexAdapterEvent =
-  | AdapterAppEvent
-  | { type: 'model.observed'; sessionId: SessionId; observed: Extract<ObservedModel, { source: 'rerouted' }> }
-  | { type: 'runtime.exited'; expected: boolean; code: number | null; signal: string | null; error?: string; at: Timestamp };
-
-/**
- * One approval request handed to the layer above. Answering may wait as long as needed (R-07 lock
- * holds, R-05 escalations); call `hold` to show why. Both return false once the request is no longer
- * open (answered, or withdrawn because the turn ended or the runtime went away).
- */
-export interface PermissionHandle {
-  readonly request: PermissionRequest;
-  hold(hold: PermissionHold, extra?: { matchedRule?: string }): boolean;
-  answer(decision: Decision, extra?: { matchedRule?: string }): boolean;
-}
-
-export interface CodexAdapterOptions {
-  /**
-   * Called once per approval request; must eventually answer it (or let it be withdrawn). If it throws
-   * or its promise rejects before answering, the request is declined (fail closed).
-   */
-  onPermissionRequest(handle: PermissionHandle): unknown;
+export interface CodexAdapterOptions extends RuntimeAdapterHooks {
   /** Replaces the default spawn (tests plug in a fake app-server here). */
   spawn?: () => AppServerProcess;
   spawnOptions?: SpawnOptions;
@@ -113,7 +89,7 @@ export interface CodexAdapterOptions {
    * Origin of user messages seen in the thread. Peer and handoff messages arrive as plain user input in
    * Codex; the layer above knows them by the clientMessageId it dispatched. Defaults to `user`.
    */
-  userOrigin?: (info: { sessionId: SessionId; clientMessageId: string | null }) => MessageOrigin;
+  userOrigin?: (info: { sessionId: SessionId; clientMessageId: string | null }) => Message['origin'];
   now?: () => Date;
   newId?: () => string;
   /** Command output is kept to this many trailing characters (default 64 KiB). */
@@ -169,48 +145,11 @@ export interface TurnInput {
   clientUserMessageId?: string;
 }
 
-export type HistoryEntry = { turnId: string } & ({ kind: 'message'; message: Message } | { kind: 'item'; item: SessionItem });
-
-export type DispatchEntry = { kind: 'new-turn'; model?: string; effort?: string } | { kind: 'insert'; expectedTurnId: string };
-
-export interface DispatchRequest {
-  threadId: string;
-  /** The attempt already committed as unknown by the dispatcher (CR2_DELIVERY_FIX §1 step 3). */
-  attempt: Extract<DispatchAttempt, { state: 'unknown' }>;
-  text: string;
-  entry: DispatchEntry;
-  timeoutMs?: number;
+export interface ServerInfo {
+  userAgent: string;
+  codexHome: string | null;
+  platformOs: string | null;
 }
-
-/**
- * `sent`: the runtime accepted this exact request. `unknown`: anything else. `written: false` means the
- * payload never left this process; even then the attempt stays unknown, nothing is resent (CR-2).
- */
-export type DispatchResult =
-  | { state: 'sent'; nativeRef: NativeRef; evidence: DeliveryEvidence }
-  | {
-      state: 'unknown';
-      reason: 'timeout' | 'disconnected' | 'rejected' | 'not-running' | 'already-dispatched' | 'malformed-response';
-      written: boolean;
-      detail: string;
-    };
-
-export interface ReconcileRequest {
-  threadId: string;
-  clientMessageId: string;
-  /** The exact text that was dispatched; matched against the stored user message. */
-  text: string;
-}
-
-export interface ReconcileMatch {
-  turnId: string;
-  itemId: string;
-  contentMatches: boolean;
-}
-
-export type ReconcileResult =
-  | { state: 'sent'; nativeRef: NativeRef; evidence: DeliveryEvidence }
-  | { state: 'unknown'; reason: 'not-found' | 'content-mismatch' | 'duplicate' | 'read-failed' | 'not-running'; matches: ReconcileMatch[]; detail: string };
 
 /** Codex thread on our side: which GUI session it belongs to, and the native task when it is a sub-agent. */
 interface ThreadBinding {
@@ -218,6 +157,28 @@ interface ThreadBinding {
   nativeTaskId?: NativeTaskId;
   /** Model asked for by a turn/start whose turn has not been announced yet. */
   nextTurnModel?: ModelSelection;
+  /** Chosen with setModel or at session start but not sent yet: the next turn/start carries it (R-12). */
+  pendingModel?: ModelSelection;
+  /** Bumped whenever pendingModel is set or cleared, so a reply only clears what its own request used. */
+  pendingVersion?: number;
+  /** The turn this thread is running, from turn/started until turn/completed. */
+  activeTurnId?: string;
+}
+
+/** An item as stored in a thread's history, with the times the API gave (all optional). */
+interface StoredItem {
+  turnId: string;
+  item: WireItem;
+  startedAtMs: number | null;
+  completedAtMs: number | null;
+}
+
+/** Everything `thread/*` could tell about a thread's history; `turns` is absent when only items were read. */
+interface StoredHistory {
+  items: StoredItem[];
+  turns?: WireTurn[];
+  /** False when some turns were summarised or not loaded, so their items are missing. */
+  full: boolean;
 }
 
 interface TrackedItem {
@@ -264,16 +225,20 @@ const rpcKey = (id: RpcId) => `${typeof id}:${id}`;
 const WEEK_MINUTES = 7 * 24 * 60;
 const MAX_HISTORY_PAGES = 10_000;
 
-export class CodexAdapter {
+export class CodexAdapter implements RuntimeAdapter {
+  readonly runtime = 'codex' as const;
   private conn: RpcConnection | undefined;
   private closing = false;
-  private readonly listeners = new Set<(event: CodexAdapterEvent) => void>();
+  private info: ServerInfo | undefined;
+  private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   private readonly threads = new Map<string, ThreadBinding>();
   private readonly turnModels = new Map<string, ModelSelection>();
   private readonly items = new Map<string, TrackedItem>();
   private readonly nativeTasks = new Map<string, NativeTask>();
-  /** State implied by each child thread's latest turn (running while a turn is open). */
+  /** State implied by each child thread's latest turn (running while a turn is open), seen live or read from history. */
   private readonly childTurnStates = new Map<string, NativeTask['state']>();
+  /** Children whose turn state came from live events: only these are trusted without reading the child again. */
+  private readonly liveChildTurns = new Set<string>();
   private readonly permissions = new Map<string, PermissionEntry>();
   private readonly dispatched = new Set<string>();
   private stderrTail = '';
@@ -291,13 +256,18 @@ export class CodexAdapter {
     return this.stderrTail;
   }
 
-  subscribe(listener: (event: CodexAdapterEvent) => void): () => void {
+  /** What the app-server said about itself in `initialize`; empty until `start` returned. */
+  get serverInfo(): ServerInfo | undefined {
+    return this.info;
+  }
+
+  subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
 
   /** Spawns the app-server and runs the `initialize` handshake. */
-  async start(): Promise<{ userAgent: string; codexHome: string | null; platformOs: string | null }> {
+  async start(): Promise<void> {
     if (this.conn) throw new Error('CodexAdapter.start: already started');
     const proc = (this.options.spawn ?? (() => spawnAppServer(this.options.spawnOptions)))();
     this.conn = new RpcConnection(proc, {
@@ -313,7 +283,7 @@ export class CodexAdapter {
     });
     this.conn.notify('initialized');
     const r = isObject(result) ? result : {};
-    return {
+    this.info = {
       userAgent: typeof r.userAgent === 'string' ? r.userAgent : '',
       codexHome: typeof r.codexHome === 'string' ? r.codexHome : null,
       platformOs: typeof r.platformOs === 'string' ? r.platformOs : null,
@@ -338,6 +308,57 @@ export class CodexAdapter {
     return { ...killed, forced: true };
   }
 
+  // ---- sessions (runtime port) --------------------------------------------------------------------
+
+  /**
+   * Port entry for a new session: a Codex thread. `preallocatedRef` is ignored, Codex picks the thread ID
+   * itself (CR2_DELIVERY_FIX §3). The model's effort cannot be set on the thread, so it rides on the
+   * first turn/start.
+   */
+  async startSession(options: StartSessionOptions): Promise<NativeSessionInfo> {
+    const model = this.codexSelection(options.model);
+    const info = await this.startThread({ sessionId: options.sessionId, cwd: options.cwd, ...this.settingsOf(options, model) });
+    this.keepEffort(info.threadId, model);
+    return { sessionId: options.sessionId, nativeSessionRef: info.threadId, cwd: info.cwd, model: info.configuredModel };
+  }
+
+  async resumeSession(options: ResumeSessionOptions): Promise<NativeSessionInfo> {
+    const model = this.codexSelection(options.model);
+    const info = await this.resumeThread({ sessionId: options.sessionId, threadId: options.nativeSessionRef, cwd: options.cwd, ...this.settingsOf(options, model) });
+    this.keepEffort(info.threadId, model);
+    return { sessionId: options.sessionId, nativeSessionRef: info.threadId, cwd: info.cwd, model: info.configuredModel };
+  }
+
+  /** Codex has no call to change a thread's model; it is sent with the next turn/start (R-12). */
+  setModel(nativeSessionRef: string, model: ModelSelection): Promise<ModelChangeTiming> {
+    try {
+      this.setPending(this.binding(nativeSessionRef), this.codexSelection(model));
+      return Promise.resolve('next-turn');
+    } catch (error) {
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  /** Interrupts the thread's running turn; nothing to do when it has none. Command processes are CR-7. */
+  async interrupt(nativeSessionRef: string): Promise<void> {
+    await this.interruptRunning(nativeSessionRef);
+  }
+
+  /** `nativeTaskRef` is the child thread ID (`NativeTask.nativeRef`); only children of this session's thread qualify (R-13). */
+  async stopNativeTask(nativeSessionRef: string, nativeTaskRef: string): Promise<void> {
+    const parent = this.binding(nativeSessionRef);
+    let child = this.threads.get(nativeTaskRef);
+    if (!child) {
+      // After a restart the child is only known from the parent's stored activity (R-13: seen means stoppable).
+      await this.restoreChildren(parent.sessionId, nativeSessionRef, parent.nativeTaskId, (await this.readWholeHistory(nativeSessionRef, { requireFull: false })).items);
+      child = this.threads.get(nativeTaskRef);
+    }
+    if (!child || child.nativeTaskId === undefined || child.sessionId !== parent.sessionId) {
+      throw new Error(`thread ${nativeTaskRef} is not a native task of the session bound to ${nativeSessionRef}`);
+    }
+    await this.interruptRunning(nativeTaskRef);
+  }
+
   // ---- threads ------------------------------------------------------------------------------------
 
   /**
@@ -350,7 +371,7 @@ export class CodexAdapter {
     return this.bindFromResponse(options.sessionId, response, 'thread/start');
   }
 
-  /** `thread/resume` without loading the full history (page it with listTurns / listItems). */
+  /** `thread/resume` without loading the full history (read its history with readHistory). */
   async resumeThread(options: ResumeThreadOptions): Promise<CodexThreadInfo> {
     const existing = this.threads.get(options.threadId);
     if (existing && existing.sessionId !== options.sessionId) throw new Error(`thread/resume: thread ${options.threadId} is already bound to another session`);
@@ -378,44 +399,6 @@ export class CodexAdapter {
     const sessionId = options.sessionId ?? this.threads.get(threadId)?.sessionId;
     const turns = sessionId === undefined ? [] : (thread.turns ?? []).map((t) => toTurn(sessionId, t, { now: this.now(), requestedModel: this.turnModels.get(t.id) }));
     return { ...this.threadInfo(thread, thread.model, sessionId), turns };
-  }
-
-  /** One page of `thread/turns/list` (default: newest first). */
-  async listTurns(
-    threadId: string,
-    options: { sessionId?: SessionId; cursor?: string; limit?: number; sortDirection?: 'asc' | 'desc' } = {},
-  ): Promise<{ turns: Turn[]; nextCursor: string | null }> {
-    const sessionId = this.sessionFor(threadId, options.sessionId);
-    const page = (await this.request('thread/turns/list', {
-      threadId,
-      ...opt('cursor', options.cursor),
-      ...opt('limit', options.limit),
-      ...opt('sortDirection', options.sortDirection),
-    })) as WirePage<WireTurn>;
-    const turns = (page?.data ?? []).map((t) => toTurn(sessionId, t, { now: this.now(), requestedModel: this.turnModels.get(t.id) }));
-    return { turns, nextCursor: page?.nextCursor ?? null };
-  }
-
-  /** One page of `thread/items/list` mapped to messages and session items; other item kinds are skipped. */
-  async listItems(
-    threadId: string,
-    options: { sessionId?: SessionId; turnId?: string; cursor?: string; limit?: number; sortDirection?: 'asc' | 'desc' } = {},
-  ): Promise<{ entries: HistoryEntry[]; nextCursor: string | null }> {
-    const sessionId = this.sessionFor(threadId, options.sessionId);
-    const page = await this.itemsPage(threadId, options);
-    const binding = this.threads.get(threadId);
-    const entries: HistoryEntry[] = [];
-    for (const e of page.data) {
-      const placement = this.placementFor(binding ?? { sessionId }, e.turnId);
-      // Stored items are finished; history may lack timestamps, so fall back to the read time.
-      const startedAt = typeof e.startedAtMs === 'number' ? isoFromMs(e.startedAtMs) : this.now();
-      const times = { startedAt, endedAt: typeof e.completedAtMs === 'number' ? isoFromMs(e.completedAtMs) : startedAt };
-      const message = this.messageOf(placement, e.item, times.endedAt);
-      if (message) entries.push({ turnId: e.turnId, kind: 'message', message });
-      const item = this.sessionItemOf(placement, e.item, times, { output: e.item.type === 'commandExecution' ? (e.item.aggregatedOutput ?? '') : '', truncated: false });
-      if (item) entries.push({ turnId: e.turnId, kind: 'item', item });
-    }
-    return { entries, nextCursor: page.nextCursor };
   }
 
   /** Threads this app-server has loaded, including native sub-agent threads (SP-03). */
@@ -494,37 +477,45 @@ export class CodexAdapter {
       return { state: 'unknown', reason: 'already-dispatched', written: false, detail: 'this attempt was already handed to the runtime by this adapter' };
     }
     if (!this.running) return { state: 'unknown', reason: 'not-running', written: false, detail: 'app-server is not running' };
-    const binding = this.threads.get(req.threadId);
-    if (!binding) throw new Error(`dispatchOnce: thread ${req.threadId} is not bound to a session`);
+    const threadId = req.nativeSessionRef;
+    const binding = this.threads.get(threadId);
+    if (!binding) throw new Error(`dispatchOnce: thread ${threadId} is not bound to a session`);
+    // Everything that can still be refused locally is settled before the attempt counts as handed over.
+    const entry = req.entry;
+    const model = entry.kind === 'new-turn' && entry.model ? this.codexSelection(entry.model) : undefined;
+    const expectedTurnId = entry.kind === 'insert' ? (entry.expectedTurnRef ?? binding.activeTurnId) : undefined;
+    if (entry.kind === 'insert' && expectedTurnId === undefined) {
+      return { state: 'unknown', reason: 'rejected', written: false, detail: 'no running turn is known to insert into; nothing was sent' };
+    }
     for (const k of keys) this.dispatched.add(k);
 
     const timeoutMs = req.timeoutMs ?? this.options.dispatchTimeoutMs ?? 30_000;
-    const method = req.entry.kind === 'new-turn' ? 'turn/start' : 'turn/steer';
+    const method = entry.kind === 'new-turn' ? 'turn/start' : 'turn/steer';
     try {
       const response =
-        req.entry.kind === 'new-turn'
+        entry.kind === 'new-turn'
           ? await this.sendTurnStart(
               binding,
-              { threadId: req.threadId, text: req.text, clientUserMessageId: attempt.clientMessageId, ...opt('model', req.entry.model), ...opt('effort', req.entry.effort) },
+              { threadId, text: req.text, clientUserMessageId: attempt.clientMessageId, ...opt('model', model?.model), ...opt('effort', model?.effort) },
               timeoutMs,
             )
           : await this.request(
               'turn/steer',
               {
-                threadId: req.threadId,
-                expectedTurnId: req.entry.expectedTurnId,
+                threadId,
+                expectedTurnId,
                 input: [{ type: 'text', text: req.text, text_elements: [] }],
                 clientUserMessageId: attempt.clientMessageId,
               },
               timeoutMs,
             );
-      const turnId = req.entry.kind === 'new-turn' ? (isObject(response) && isObject(response.turn) ? response.turn.id : undefined) : isObject(response) ? response.turnId : undefined;
+      const turnId = entry.kind === 'new-turn' ? (isObject(response) && isObject(response.turn) ? response.turn.id : undefined) : isObject(response) ? response.turnId : undefined;
       if (typeof turnId !== 'string' || turnId === '') {
         return { state: 'unknown', reason: 'malformed-response', written: true, detail: `${method} answered without a turn id` };
       }
       return {
         state: 'sent',
-        nativeRef: { sessionRef: req.threadId, turnRef: turnId },
+        nativeRef: { sessionRef: threadId, turnRef: turnId },
         evidence: { kind: 'live-ack', at: this.now(), detail: `${method} accepted clientUserMessageId ${attempt.clientMessageId} as turn ${turnId}` },
       };
     } catch (error) {
@@ -544,26 +535,219 @@ export class CodexAdapter {
    */
   async reconcile(req: ReconcileRequest): Promise<ReconcileResult> {
     if (!this.running) return { state: 'unknown', reason: 'not-running', matches: [], detail: 'app-server is not running' };
-    let entries: { turnId: string; item: WireItem }[];
+    const threadId = req.nativeSessionRef;
+    let stored: StoredHistory;
     try {
-      entries = await this.readWholeHistory(req.threadId);
+      stored = await this.readWholeHistory(threadId, { requireFull: true });
     } catch (error) {
       return { state: 'unknown', reason: 'read-failed', matches: [], detail: error instanceof Error ? error.message : String(error) };
     }
-    const matches: ReconcileMatch[] = entries
-      .filter((e): e is { turnId: string; item: Extract<WireItem, { type: 'userMessage' }> } => e.item.type === 'userMessage' && e.item.clientId === req.clientMessageId)
-      .map((e) => ({ turnId: e.turnId, itemId: e.item.id, contentMatches: sameText(e.item.content, req.text) }));
+    const matches: ReconcileMatch[] = stored.items
+      .filter((e): e is StoredItem & { item: Extract<WireItem, { type: 'userMessage' }> } => e.item.type === 'userMessage' && e.item.clientId === req.clientMessageId)
+      .map((e) => ({ turnRef: e.turnId, itemRef: e.item.id, contentMatches: sameText(e.item.content, req.text) }));
     if (matches.length === 0) {
-      return { state: 'unknown', reason: 'not-found', matches, detail: `no user message with clientId ${req.clientMessageId} in ${entries.length} stored items` };
+      return { state: 'unknown', reason: 'not-found', matches, detail: `no user message with clientId ${req.clientMessageId} in ${stored.items.length} stored items` };
     }
     if (matches.length > 1) return { state: 'unknown', reason: 'duplicate', matches, detail: `${matches.length} user messages carry clientId ${req.clientMessageId}` };
     const [match] = matches as [ReconcileMatch];
     if (!match.contentMatches) return { state: 'unknown', reason: 'content-mismatch', matches, detail: 'the stored message with this clientId has different content' };
     return {
       state: 'sent',
-      nativeRef: { sessionRef: req.threadId, turnRef: match.turnId, itemRef: match.itemId },
-      evidence: { kind: 'reconciled', at: this.now(), detail: `stored userMessage ${match.itemId} in turn ${match.turnId} has clientId ${req.clientMessageId} and the same text` },
+      nativeRef: { sessionRef: threadId, turnRef: match.turnRef, itemRef: match.itemRef },
+      evidence: { kind: 'reconciled', at: this.now(), detail: `stored userMessage ${match.itemRef} in turn ${match.turnRef} has clientId ${req.clientMessageId} and the same text` },
     };
+  }
+
+  // ---- history (read-only) ------------------------------------------------------------------------
+
+  /**
+   * The stored history of a session thread, or of one native sub-agent's thread, mapped to contracts
+   * types and ordered oldest first: each turn, then its messages and items. Reads only (`thread/turns/list`,
+   * `thread/items/list`, falling back to `thread/read`); never resumes a thread or starts a turn.
+   * `complete` is false when part of the history could not be read or a native task's state is a guess.
+   */
+  async readHistory(req: HistoryRequest): Promise<HistoryResult> {
+    const threadId = req.nativeTask?.nativeRef ?? req.nativeSessionRef;
+    const nativeTaskId = req.nativeTask?.nativeTaskId;
+    const stored = await this.readWholeHistory(threadId, { requireFull: false });
+    let complete = stored.full;
+    let turns = stored.turns;
+    if (turns === undefined) {
+      try {
+        turns = await this.readAllTurns(threadId);
+      } catch (error) {
+        if (!(error instanceof RpcError) && !(error instanceof IncompleteHistoryError)) throw error;
+        this.log('warn', 'thread/turns/list failed; history has no turn entries', error.message);
+        complete = false;
+      }
+    }
+    const turnState = new Map<string, Turn>();
+    const entries: HistoryEntry[] = [];
+    const itemsByTurn = new Map<string, StoredItem[]>();
+    for (const e of stored.items) itemsByTurn.set(e.turnId, [...(itemsByTurn.get(e.turnId) ?? []), e]);
+    const emitTurnItems = (turnId: string) => {
+      for (const e of itemsByTurn.get(turnId) ?? []) entries.push(...this.storedEntries(req.sessionId, nativeTaskId, e, turnState.get(turnId)));
+      itemsByTurn.delete(turnId);
+    };
+    for (const wire of turns ?? []) {
+      const turn = toTurn(req.sessionId, wire, { now: this.now(), requestedModel: this.turnModels.get(wire.id), nativeTaskId });
+      turnState.set(wire.id, turn);
+      entries.push({ kind: 'turn', turn });
+      emitTurnItems(wire.id);
+    }
+    // Items of turns the turn list did not show (or all items when it could not be read), in stored order.
+    if (turns !== undefined && itemsByTurn.size > 0) complete = false;
+    for (const turnId of [...itemsByTurn.keys()]) emitTurnItems(turnId);
+
+    const found = await this.restoreChildren(req.sessionId, threadId, nativeTaskId, stored.items);
+    return { entries, nativeTasks: found.tasks, complete: complete && found.exact };
+  }
+
+  /** Messages and session items of one stored item; open items end with their turn (SP-08). */
+  private storedEntries(sessionId: SessionId, nativeTaskId: NativeTaskId | undefined, e: StoredItem, turn: Turn | undefined): HistoryEntry[] {
+    const placement: Placement = nativeTaskId === undefined ? { sessionId, turnId: e.turnId } : { sessionId, nativeTaskId };
+    // Stored items are finished; history may lack timestamps, so fall back to the turn or the read time.
+    const startedAt = typeof e.startedAtMs === 'number' ? isoFromMs(e.startedAtMs) : (turn?.startedAt ?? this.now());
+    const endedAt = typeof e.completedAtMs === 'number' ? isoFromMs(e.completedAtMs) : startedAt;
+    const out: HistoryEntry[] = [];
+    const message = this.messageOf(placement, e.item, endedAt);
+    if (message) out.push({ kind: 'message', message });
+    const output = e.item.type === 'commandExecution' ? clipOutput(e.item.aggregatedOutput ?? '', this.maxOutputChars()) : { output: '', truncated: false };
+    let item = this.sessionItemOf(placement, e.item, { startedAt, endedAt }, output);
+    const closeAs = item && turn && turn.state !== 'running' ? closeOpenItem(item, turn.state) : undefined;
+    // A wire item still in progress was mapped as open with an end time; close it with its turn instead.
+    if (closeAs) item = this.sessionItemOf(placement, e.item, { startedAt, endedAt: turn?.endedAt ?? endedAt }, output, closeAs);
+    if (item) out.push({ kind: 'item', item });
+    return out;
+  }
+
+  /**
+   * Native tasks the thread's stored activity mentions (R-13). As live (T003 review r2), the child's own
+   * turns decide a task's state; the parent's `completed` / `interrupted` activity counts only when the
+   * child was read and has no turn at all. `exact` is false when the state is not established, and
+   * `fromTurn` names the tasks whose state comes from a child turn.
+   */
+  private async nativeTasksIn(
+    sessionId: SessionId,
+    parentThreadId: string,
+    parentTaskId: NativeTaskId | undefined,
+    items: StoredItem[],
+  ): Promise<{ tasks: NativeTask[]; exact: boolean; fromTurn: Set<string> }> {
+    const seen = new Map<string, { label: string; kind: string; startedAt: Timestamp; last: Timestamp }>();
+    for (const e of items) {
+      const wire = e.item;
+      if (wire.type !== 'subAgentActivity' || !isNonEmptyString(wire.agentThreadId)) continue;
+      const at = typeof e.completedAtMs === 'number' ? isoFromMs(e.completedAtMs) : typeof e.startedAtMs === 'number' ? isoFromMs(e.startedAtMs) : this.now();
+      const previous = seen.get(wire.agentThreadId);
+      seen.set(wire.agentThreadId, {
+        label: previous?.label ?? (isNonEmptyString(wire.agentPath) ? wire.agentPath : wire.agentThreadId),
+        kind: wire.kind,
+        startedAt: previous?.startedAt ?? at,
+        last: at,
+      });
+    }
+    const tasks: NativeTask[] = [];
+    const fromTurn = new Set<string>();
+    let exact = true;
+    for (const [child, activity] of seen) {
+      const resolved = await this.childState(child, activity.kind, activity.last);
+      if (!resolved.exact) exact = false;
+      if (resolved.fromTurn) fromTurn.add(child);
+      tasks.push({
+        id: NativeTaskId.parse(child),
+        sessionId,
+        runtime: 'codex',
+        parentRef: parentThreadId,
+        nativeRef: child,
+        ...opt('parentTaskId', parentTaskId),
+        label: activity.label,
+        state: resolved.state,
+        background: false,
+        lastActivity: resolved.lastActivity ?? activity.kind,
+        startedAt: activity.startedAt,
+        ...(resolved.state !== 'running' && { endedAt: resolved.endedAt ?? activity.last }),
+      });
+    }
+    return { tasks, exact, fromTurn };
+  }
+
+  /**
+   * A child's state from the best evidence there is: a turn seen live, else its newest stored turn (a
+   * turn still in progress means running, whatever the parent said). The parent's end report is used
+   * only when the child was read and has no turn at all; a child that cannot be read stays running and
+   * unconfirmed rather than being given an end it was not shown to have.
+   */
+  private async childState(
+    child: string,
+    parentKind: string,
+    parentAt: Timestamp,
+  ): Promise<{ state: NativeTask['state']; lastActivity?: string | undefined; endedAt?: Timestamp | undefined; exact: boolean; fromTurn: boolean }> {
+    const live = this.liveChildTurns.has(child) ? this.childTurnStates.get(child) : undefined;
+    if (live !== undefined) {
+      const task = this.nativeTasks.get(child);
+      return { state: live, lastActivity: task?.lastActivity, endedAt: task?.endedAt, exact: true, fromTurn: true };
+    }
+    const parentEnded = parentKind === 'completed' || parentKind === 'interrupted';
+    const last = await this.lastTurn(child);
+    if (last.kind === 'unreadable') return { state: 'running', exact: false, fromTurn: false };
+    if (last.kind === 'turn') {
+      const { status, completedAt } = last.turn;
+      if (status === 'inProgress') return { state: 'running', lastActivity: 'turn inProgress', exact: !parentEnded, fromTurn: true };
+      const state = status === 'completed' ? 'completed' : status === 'interrupted' ? 'stopped' : 'failed';
+      return { state, lastActivity: `turn ${status}`, endedAt: typeof completedAt === 'number' ? isoFromSeconds(completedAt) : parentAt, exact: true, fromTurn: true };
+    }
+    if (parentEnded) return { state: parentKind === 'completed' ? 'completed' : 'stopped', endedAt: parentAt, exact: true, fromTurn: false };
+    return { state: 'running', exact: false, fromTurn: false };
+  }
+
+  /** A stored child thread's newest turn: read and found, read and empty, or not readable at all. */
+  private async lastTurn(child: string): Promise<{ kind: 'turn'; turn: WireTurn } | { kind: 'none' } | { kind: 'unreadable' }> {
+    let page: unknown;
+    try {
+      page = await this.request('thread/turns/list', { threadId: child, limit: 1, sortDirection: 'desc' });
+    } catch (error) {
+      if (!(error instanceof RpcError)) throw error;
+      return { kind: 'unreadable' };
+    }
+    if (!isObject(page) || !Array.isArray(page.data)) return { kind: 'unreadable' };
+    if (page.data.length === 0) return { kind: 'none' };
+    const turn: unknown = page.data[0];
+    const known = ['completed', 'interrupted', 'failed', 'inProgress'];
+    return isObject(turn) && isNonEmptyString(turn.id) && typeof turn.status === 'string' && known.includes(turn.status) ? { kind: 'turn', turn: turn as unknown as WireTurn } : { kind: 'unreadable' };
+  }
+
+  /**
+   * Takes over the native tasks that `items` (stored activity of `threadId`) show, for a thread bound to
+   * `sessionId`: binds their threads to the session (so they can be stopped, R-13) and records their state
+   * the way live events would have, so later events follow the T003 rules (a child turn ends or resumes a
+   * task; a late spawn report cannot revive it). A thread or child bound elsewhere is left alone, and
+   * what the adapter saw of a child's own turns live is kept. Otherwise a child turn read now replaces
+   * older knowledge in both maps together, so the task and its turn state never disagree.
+   */
+  private async restoreChildren(sessionId: SessionId, threadId: string, parentTaskId: NativeTaskId | undefined, items: StoredItem[]) {
+    this.adoptChildren(sessionId, threadId, items);
+    const found = await this.nativeTasksIn(sessionId, threadId, parentTaskId, items);
+    if (this.threads.get(threadId)?.sessionId === sessionId) {
+      for (const task of found.tasks) {
+        if (this.threads.get(task.nativeRef)?.sessionId !== sessionId || this.liveChildTurns.has(task.nativeRef)) continue;
+        if (found.fromTurn.has(task.nativeRef)) {
+          this.nativeTasks.set(task.nativeRef, task);
+          this.childTurnStates.set(task.nativeRef, task.state);
+        } else if (!this.nativeTasks.has(task.nativeRef)) {
+          this.nativeTasks.set(task.nativeRef, task);
+        }
+      }
+    }
+    return found;
+  }
+
+  /** Binds the child threads that `items` name to the session; only for a thread already bound to it. */
+  private adoptChildren(sessionId: SessionId, threadId: string, items: StoredItem[]): void {
+    if (this.threads.get(threadId)?.sessionId !== sessionId) return;
+    for (const { item } of items) {
+      if (item.type !== 'subAgentActivity' || !isNonEmptyString(item.agentThreadId) || this.threads.has(item.agentThreadId)) continue;
+      this.threads.set(item.agentThreadId, { sessionId, nativeTaskId: NativeTaskId.parse(item.agentThreadId) });
+    }
   }
 
   // ---- permission requests ------------------------------------------------------------------------
@@ -616,7 +800,14 @@ export class CodexAdapter {
   }
 
   private async sendTurnStart(binding: ThreadBinding, input: TurnInput, timeoutMs: number): Promise<unknown> {
-    const requested: ModelSelection | undefined = input.model ? { runtime: 'codex', model: input.model, ...opt('effort', input.effort) } : undefined;
+    // A model chosen earlier (setModel, session start) rides on the first turn that names none itself.
+    const requested: ModelSelection | undefined = input.model
+      ? { runtime: 'codex', model: input.model, ...opt('effort', input.effort) }
+      : input.effort === undefined
+        ? binding.pendingModel
+        : undefined;
+    const effort = input.effort ?? requested?.effort;
+    const pendingVersion = binding.pendingVersion;
     // turn/started can arrive before the response (seen in SP-06), so remember the model for it.
     if (requested) binding.nextTurnModel = requested;
     const response = await this.request(
@@ -625,15 +816,61 @@ export class CodexAdapter {
         threadId: input.threadId,
         input: [{ type: 'text', text: input.text, text_elements: [] }],
         ...opt('clientUserMessageId', input.clientUserMessageId),
-        ...opt('model', input.model),
-        ...opt('effort', input.effort),
+        ...opt('model', requested?.model),
+        ...opt('effort', effort),
       },
       timeoutMs,
     ).finally(() => {
       if (binding.nextTurnModel === requested) delete binding.nextTurnModel;
     });
-    if (requested && isObject(response) && isObject(response.turn) && typeof response.turn.id === 'string') this.turnModels.set(response.turn.id, requested);
+    if (requested && isObject(response) && isObject(response.turn) && typeof response.turn.id === 'string') {
+      this.turnModels.set(response.turn.id, requested);
+      // Only what this request knew about is spent; a setModel made while it was in flight stays for the next turn.
+      if (binding.pendingVersion === pendingVersion) this.setPending(binding, undefined);
+    }
     return response;
+  }
+
+  private setPending(binding: ThreadBinding, model: ModelSelection | undefined): void {
+    if (model) binding.pendingModel = model;
+    else delete binding.pendingModel;
+    binding.pendingVersion = (binding.pendingVersion ?? 0) + 1;
+  }
+
+  private codexSelection(model: ModelSelection): ModelSelection {
+    if (model.runtime !== 'codex') throw new Error(`the Codex adapter cannot use a ${model.runtime} model (${model.model})`);
+    return model;
+  }
+
+  private settingsOf(options: { readOnly: boolean; instructions?: string | undefined }, model: ModelSelection): ThreadSettings {
+    return {
+      sandbox: options.readOnly ? 'read-only' : 'workspace-write',
+      model: model.model,
+      ...opt('developerInstructions', options.instructions === '' ? undefined : options.instructions),
+    };
+  }
+
+  /** The thread is created or resumed with the model; its effort can only go with a turn, so it waits for the next one. */
+  private keepEffort(threadId: string, model: ModelSelection): void {
+    const binding = this.binding(threadId);
+    this.setPending(binding, model.effort !== undefined ? model : undefined);
+  }
+
+  private async interruptRunning(threadId: string): Promise<void> {
+    const binding = this.binding(threadId);
+    const turnId = binding.activeTurnId ?? (await this.findRunningTurn(threadId));
+    if (turnId !== undefined) await this.interruptTurn(threadId, turnId);
+  }
+
+  /** For a turn we did not see start (e.g. it began before this adapter resumed the thread). */
+  private async findRunningTurn(threadId: string): Promise<string | undefined> {
+    const page = (await this.request('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc' })) as WirePage<WireTurn> | undefined;
+    const newest = page?.data?.[0];
+    return newest?.status === 'inProgress' && isNonEmptyString(newest.id) ? newest.id : undefined;
+  }
+
+  private maxOutputChars(): number {
+    return this.options.maxOutputChars ?? 64 * 1024;
   }
 
   private async itemsPage(threadId: string, o: { turnId?: string; cursor?: string; limit?: number; sortDirection?: 'asc' | 'desc' }): Promise<WirePage<WireThreadItemEntry>> {
@@ -654,19 +891,45 @@ export class CodexAdapter {
     return { data: page.data as WireThreadItemEntry[], nextCursor };
   }
 
+  /** Every turn of the thread, oldest first, with the same strictness as the item pages. */
+  private async readAllTurns(threadId: string): Promise<WireTurn[]> {
+    const all: WireTurn[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < MAX_HISTORY_PAGES; page++) {
+      const res = await this.request('thread/turns/list', { threadId, ...opt('cursor', cursor), limit: 200, sortDirection: 'asc' });
+      if (!isObject(res) || !Array.isArray(res.data)) throw new IncompleteHistoryError('thread/turns/list: response has no data array');
+      const bad = res.data.findIndex((t) => !isObject(t) || !isNonEmptyString(t.id) || typeof t.status !== 'string');
+      if (bad >= 0) throw new IncompleteHistoryError(`thread/turns/list: entry ${bad} is malformed`);
+      all.push(...(res.data as WireTurn[]));
+      const { nextCursor } = res;
+      if (nextCursor === null) return all;
+      if (!isNonEmptyString(nextCursor)) throw new IncompleteHistoryError('thread/turns/list: nextCursor is missing or not a string');
+      cursor = nextCursor;
+    }
+    throw new IncompleteHistoryError('thread/turns/list: history did not end');
+  }
+
   /**
    * Every stored item of the thread. Pages `thread/items/list` to the end; if that API fails, falls back
-   * to `thread/read` with full turns (the path SP CR-2 proved). Both are read-only. Throws when the
-   * history cannot be shown to be complete.
+   * to `thread/read` with full turns (the path SP CR-2 proved). Both are read-only. With `requireFull`
+   * (reconciliation) it throws unless the history is shown to be complete; without it, turns that are
+   * only summarised are reported through `full: false` and their items are missing.
    */
-  private async readWholeHistory(threadId: string): Promise<{ turnId: string; item: WireItem }[]> {
+  private async readWholeHistory(threadId: string, o: { requireFull: boolean }): Promise<StoredHistory> {
     try {
-      const all: { turnId: string; item: WireItem }[] = [];
+      const items: StoredItem[] = [];
       let cursor: string | undefined;
       for (let page = 0; page < MAX_HISTORY_PAGES; page++) {
         const res = await this.itemsPage(threadId, { ...opt('cursor', cursor), limit: 200, sortDirection: 'asc' });
-        all.push(...res.data);
-        if (res.nextCursor === null) return all;
+        for (const e of res.data) {
+          items.push({
+            turnId: e.turnId,
+            item: e.item,
+            startedAtMs: typeof e.startedAtMs === 'number' ? e.startedAtMs : null,
+            completedAtMs: typeof e.completedAtMs === 'number' ? e.completedAtMs : null,
+          });
+        }
+        if (res.nextCursor === null) return { items, full: true };
         cursor = res.nextCursor;
       }
       throw new IncompleteHistoryError('thread/items/list: history did not end');
@@ -677,18 +940,24 @@ export class CodexAdapter {
     const res = await this.request('thread/read', { threadId, includeTurns: true });
     const thread = isObject(res) && isObject(res.thread) ? res.thread : undefined;
     if (!thread || !Array.isArray(thread.turns)) throw new IncompleteHistoryError('thread/read: response has no turns');
-    const all: { turnId: string; item: WireItem }[] = [];
+    const items: StoredItem[] = [];
+    const turns: WireTurn[] = [];
+    let full = true;
     for (const [i, turn] of thread.turns.entries()) {
+      if (!isObject(turn) || !isNonEmptyString(turn.id)) throw new IncompleteHistoryError(`thread/read: turn ${i} is malformed`);
+      turns.push(turn as unknown as WireTurn);
       // Only `full` turns carry every item; `summary` / `notLoaded` would hide messages.
-      if (!isObject(turn) || !isNonEmptyString(turn.id) || turn.itemsView !== 'full' || !Array.isArray(turn.items)) {
-        throw new IncompleteHistoryError(`thread/read: turn ${i} is not fully loaded`);
+      if (turn.itemsView !== 'full' || !Array.isArray(turn.items)) {
+        if (o.requireFull) throw new IncompleteHistoryError(`thread/read: turn ${i} is not fully loaded`);
+        full = false;
+        continue;
       }
       for (const item of turn.items) {
         if (!isWireItem(item)) throw new IncompleteHistoryError(`thread/read: turn ${turn.id} has a malformed item`);
-        all.push({ turnId: turn.id, item });
+        items.push({ turnId: turn.id, item, startedAtMs: null, completedAtMs: null });
       }
     }
-    return all;
+    return { items, turns, full };
   }
 
   // ---- internals: events --------------------------------------------------------------------------
@@ -729,8 +998,10 @@ export class CodexAdapter {
       delete binding.nextTurnModel;
     }
     const now = this.now();
-    const mapped = toTurn(binding.sessionId, turn, { now, requestedModel: this.turnModels.get(turn.id) });
+    const mapped = toTurn(binding.sessionId, turn, { now, requestedModel: this.turnModels.get(turn.id), nativeTaskId: binding.nativeTaskId });
+    if (method === 'turn/started') binding.activeTurnId = turn.id;
     if (method === 'turn/completed') {
+      if (binding.activeTurnId === turn.id) delete binding.activeTurnId;
       const endedAt = mapped.endedAt ?? now;
       for (const [id, tracked] of this.items) {
         if (tracked.threadId !== threadId || tracked.turnId !== turn.id) continue;
@@ -743,10 +1014,10 @@ export class CodexAdapter {
       }
       this.turnModels.delete(turn.id);
     }
-    // A sub-agent's turns are not turns of the GUI session (Turn has no native task); they drive its
-    // NativeTask state instead. Its items still belong to the session.
-    if (binding.nativeTaskId === undefined) this.emit({ type: 'turn.updated', turn: mapped });
-    else this.onChildTurn(threadId!, turn, method === 'turn/completed', mapped.endedAt ?? now);
+    // A sub-agent's turns carry its nativeTaskId, so they are not the session's own turns (R-13); they
+    // also decide its NativeTask state.
+    this.emit({ type: 'turn.updated', turn: mapped });
+    if (binding.nativeTaskId !== undefined) this.onChildTurn(threadId!, turn, method === 'turn/completed', mapped.endedAt ?? now);
   }
 
   private onItem(method: string, params: Record<string, unknown>): void {
@@ -833,22 +1104,18 @@ export class CodexAdapter {
   }
 
   private setOutput(tracked: TrackedItem, output: string): void {
-    const max = this.options.maxOutputChars ?? 64 * 1024;
-    if (output.length > max) {
-      tracked.output = output.slice(-max);
-      tracked.truncated = true;
-    } else {
-      tracked.output = output;
-    }
+    const clipped = clipOutput(output, this.maxOutputChars());
+    tracked.output = clipped.output;
+    if (clipped.truncated) tracked.truncated = true;
   }
 
-  /** Token usage of the session's own thread; a sub-agent's totals would overwrite the session's. */
+  /** Usage of a thread; a sub-agent's carries its nativeTaskId so it never replaces the session's own totals (R-13). */
   private onTokenUsage(threadId: string | undefined, params: Record<string, unknown>): void {
     const binding = threadId === undefined ? undefined : this.threads.get(threadId);
     const usage = params.tokenUsage as WireTokenUsage | undefined;
-    if (!binding || binding.nativeTaskId !== undefined || !isObject(usage) || !isObject(usage.last) || !isObject(usage.total)) return;
+    if (!binding || !isObject(usage) || !isObject(usage.last) || !isObject(usage.total)) return;
     const turnId = typeof params.turnId === 'string' ? params.turnId : undefined;
-    this.emit({ type: 'usage.tokens', usage: toTokenUsage({ sessionId: binding.sessionId, turnId }, usage, this.now()) });
+    this.emit({ type: 'usage.tokens', usage: toTokenUsage({ sessionId: binding.sessionId, turnId, nativeTaskId: binding.nativeTaskId }, usage, this.now()) });
   }
 
   /** Only the weekly window maps to a contracts field (`codexWeekly`). */
@@ -870,10 +1137,12 @@ export class CodexAdapter {
     if (!binding || binding.nativeTaskId !== undefined) return;
     const { fromModel, toModel, reason } = params;
     if (typeof fromModel !== 'string' || typeof toModel !== 'string' || fromModel === '' || toModel === '') return;
+    const at = this.now();
     this.emit({
       type: 'model.observed',
       sessionId: binding.sessionId,
-      observed: { source: 'rerouted', from: fromModel, to: toModel, reason: typeof reason === 'string' ? reason : 'unknown', observedAt: this.now() },
+      observed: { source: 'rerouted', from: fromModel, to: toModel, reason: typeof reason === 'string' ? reason : 'unknown', observedAt: at },
+      at,
     });
   }
 
@@ -925,6 +1194,7 @@ export class CodexAdapter {
     const state = !ended ? 'running' : turn.status === 'interrupted' ? 'stopped' : turn.status === 'completed' ? 'completed' : 'failed';
     // Remembered so a late spawn activity on the parent cannot contradict it.
     this.childTurnStates.set(child, state);
+    this.liveChildTurns.add(child);
     const task = this.nativeTasks.get(child);
     if (task) this.updateNativeTask(task, state, `turn ${turn.status}`, at, false);
   }
@@ -1000,7 +1270,7 @@ export class CodexAdapter {
   private failClosed(entry: PermissionEntry, error: unknown): void {
     if (this.permissions.get(rpcKey(entry.rpcId)) !== entry) return;
     this.log('warn', 'permission handler failed; declining', error);
-    const decision: Decision = { outcome: 'decline', decidedBy: 'policy', reason: 'permission handler failed', at: this.now() };
+    const decision: PermissionDecision = { outcome: 'decline', decidedBy: 'policy', reason: 'permission handler failed', at: this.now() };
     try {
       this.handleFor(entry).answer(decision);
     } catch {
@@ -1059,6 +1329,8 @@ export class CodexAdapter {
     for (const entry of [...this.permissions.values()]) this.withdraw(entry);
     this.emit({
       type: 'runtime.exited',
+      runtime: 'codex',
+      sessionIds: [...new Set([...this.threads.values()].map((b) => b.sessionId))],
       expected: this.closing,
       code: exit.code,
       signal: exit.signal,
@@ -1075,12 +1347,6 @@ export class CodexAdapter {
     return binding;
   }
 
-  private sessionFor(threadId: string, explicit: SessionId | undefined): SessionId {
-    const sessionId = explicit ?? this.threads.get(threadId)?.sessionId;
-    if (sessionId === undefined) throw new Error(`thread ${threadId} is not bound to a session; pass sessionId`);
-    return sessionId;
-  }
-
   /** Session items of a sub-agent carry its native task and no session turn (R-13). */
   private placementFor(binding: Pick<ThreadBinding, 'sessionId' | 'nativeTaskId'>, turnId: string | undefined): Placement {
     return binding.nativeTaskId === undefined ? { sessionId: binding.sessionId, turnId } : { sessionId: binding.sessionId, nativeTaskId: binding.nativeTaskId };
@@ -1090,7 +1356,7 @@ export class CodexAdapter {
     return (this.options.now?.() ?? new Date()).toISOString();
   }
 
-  private emit(event: CodexAdapterEvent): void {
+  private emit(event: RuntimeEvent): void {
     for (const listener of this.listeners) {
       try {
         listener(event);
@@ -1120,6 +1386,10 @@ const withoutHold = (request: PermissionRequest): PermissionRequest => {
   delete copy.hold;
   return copy;
 };
+
+/** Keeps the trailing `max` characters of command output. */
+const clipOutput = (output: string, max: number): { output: string; truncated: boolean } =>
+  output.length > max ? { output: output.slice(-max), truncated: true } : { output, truncated: false };
 
 /** The dispatched payload is one text input; the stored message must be exactly that text. */
 const sameText = (content: unknown, text: string): boolean =>

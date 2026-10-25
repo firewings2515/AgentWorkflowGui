@@ -1,7 +1,6 @@
 // Codex approval server requests <-> contracts PermissionRequest / PermissionDecision. Which answer to
 // give is not decided here (the policy module owns the R-08 escalation list); this only translates.
-import { ItemId, McpElicitation, PermissionRequest, type PermissionRequestId, type Timestamp, TurnId } from '../../contracts';
-import type { PermissionDecision } from './contract-types';
+import { ItemId, McpElicitation, type PermissionDecision, PermissionRequest, type PermissionRequestId, type Timestamp, TurnId } from '../../contracts';
 import { opt, type Placement } from './mapping';
 import { type JsonValue, PERMISSION_METHODS } from './protocol';
 

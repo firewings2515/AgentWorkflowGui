@@ -2,7 +2,7 @@
 // reconcile only by reading the stored history. Scripts reuse the SP-01 recording for the handshake.
 import { describe, expect, it } from 'vitest';
 import { AttemptId, ClientMessageId, DispatchAttempt } from '../../contracts';
-import type { DispatchRequest } from './adapter';
+import type { DispatchRequest, ReconcileRequest } from '../../core/ports';
 import { RpcClosedError } from './rpc';
 import { loadFixture, out, recordedResult, reply, replyError, type ReplayRecord, serverRequest } from './testing/fake-app-server';
 import { SESSION, sentParams, setup, until } from './testing/harness';
@@ -27,10 +27,10 @@ const attempt = (n = 1): DispatchRequest['attempt'] => ({
 });
 
 const dispatch = (n = 1, extra: Partial<DispatchRequest> = {}): DispatchRequest => ({
-  threadId: THREAD_ID,
+  nativeSessionRef: THREAD_ID,
   attempt: attempt(n),
   text: 'Handoff payload',
-  entry: { kind: 'new-turn', model: 'gpt-6-luna', effort: 'low' },
+  entry: { kind: 'new-turn', model: { runtime: 'codex', model: 'gpt-6-luna', effort: 'low' } },
   ...extra,
 });
 
@@ -79,7 +79,7 @@ describe('dispatchOnce', () => {
 
   it('reports unknown when the runtime rejects the request (an error is not proof of non-delivery)', async () => {
     const h = await started([...handshake(), out('turn/steer', 3), replyError(3, -32600, 'expectedTurnId does not match the active turn')]);
-    const result = await h.adapter.dispatchOnce(dispatch(1, { entry: { kind: 'insert', expectedTurnId: 'turn-gone' } }));
+    const result = await h.adapter.dispatchOnce(dispatch(1, { entry: { kind: 'insert', expectedTurnRef: 'turn-gone' } }));
     expect(result).toMatchObject({ state: 'unknown', reason: 'rejected', written: true, detail: expect.stringContaining('expectedTurnId') as unknown });
   });
 
@@ -94,7 +94,7 @@ describe('dispatchOnce', () => {
     });
     const h = await started([...handshake(), approval, out('turn/steer', 3), out('thread/read', 4)]);
     await until(() => h.permissions.length === 1, 'approval');
-    const pendingDispatch = h.adapter.dispatchOnce(dispatch(1, { entry: { kind: 'insert', expectedTurnId: RECORDED_TURN } }));
+    const pendingDispatch = h.adapter.dispatchOnce(dispatch(1, { entry: { kind: 'insert', expectedTurnRef: RECORDED_TURN } }));
     const pendingRead = h.adapter.readThread(THREAD_ID).catch((e: unknown) => e);
     await h.fake.idle();
     h.fake.crash(3);
@@ -129,12 +129,13 @@ const userItem = (id: string, clientId: string | null, text: string) => ({
 const entry = (turnId: string, item: unknown) => ({ turnId, item, startedAtMs: 1792739195018, completedAtMs: 1792739195018 });
 const agentItem = { type: 'agentMessage', id: 'msg_1', text: 'ACK', phase: 'final_answer' };
 
-const CLIENT_ID = '9a7c1e52-0d3b-4f6e-8a21-000000000001';
+const CLIENT_ID = ClientMessageId.parse('9a7c1e52-0d3b-4f6e-8a21-000000000001');
 const init = (): ReplayRecord[] => [out('initialize', 1), reply(1, recordedResult(sp01, 'initialize')), out('initialized')];
+const reconcileRequest = (clientMessageId: ClientMessageId, text: string, nativeSessionRef = THREAD_ID): ReconcileRequest => ({ nativeSessionRef, cwd: 'E:\\work\\task', clientMessageId, text });
 const reconcileWith = async (records: ReplayRecord[], text = 'Handoff payload') => {
   const h = setup([...init(), ...records]);
   await h.adapter.start();
-  const result = await h.adapter.reconcile({ threadId: THREAD_ID, clientMessageId: CLIENT_ID, text });
+  const result = await h.adapter.reconcile(reconcileRequest(CLIENT_ID, text));
   // Reconciliation is read-only: no resume, no turn.
   expect(h.fake.received.every((m) => ['initialize', 'initialized', 'thread/items/list', 'thread/read'].includes(m.method as string))).toBe(true);
   expect(h.fake.mismatches).toEqual([]);
@@ -176,7 +177,7 @@ describe('reconcile', () => {
         backwardsCursor: null,
       }),
     ]);
-    expect(result).toMatchObject({ state: 'unknown', reason: 'duplicate', matches: [{ itemId: 'u-1' }, { itemId: 'u-2' }] });
+    expect(result).toMatchObject({ state: 'unknown', reason: 'duplicate', matches: [{ itemRef: 'u-1' }, { itemRef: 'u-2' }] });
   });
 
   it('does not accept a clientId match whose content differs', async () => {
@@ -214,7 +215,7 @@ describe('reconcile', () => {
       }),
     ]);
     await h.adapter.start();
-    const result = await h.adapter.reconcile({ threadId: '01a16874-c8e2-71d0-964c-4ef1fe708cdc', clientMessageId: 'de7e0897-b8ac-4891-a4c3-d9566db60d73', text: proofText });
+    const result = await h.adapter.reconcile(reconcileRequest(ClientMessageId.parse('de7e0897-b8ac-4891-a4c3-d9566db60d73'), proofText, '01a16874-c8e2-71d0-964c-4ef1fe708cdc'));
     expect(result).toMatchObject({ state: 'sent', nativeRef: { turnRef: '01a16874-cc7f-7a90-952a-b9f32f705d54', itemRef: '01a16874-d206-7011-a24f-0ec6ef158c89' } });
     expect(sentParams(h.fake, 'thread/read')).toEqual({ threadId: '01a16874-c8e2-71d0-964c-4ef1fe708cdc', includeTurns: true });
   });

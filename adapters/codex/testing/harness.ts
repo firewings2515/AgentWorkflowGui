@@ -1,8 +1,9 @@
 // Test wiring: an adapter on a fake app-server, its events, and checks that every event satisfies the
 // contracts schemas (the refinements are the point: e.g. endedAt exactly when an item is finished).
 import { expect } from 'vitest';
-import { AppEvent, ObservedModel, SessionId } from '../../../contracts';
-import { CodexAdapter, type CodexAdapterEvent, type CodexAdapterOptions, type PermissionHandle } from '../adapter';
+import { AppEvent, SessionId } from '../../../contracts';
+import type { PermissionHandle } from '../../../core/ports';
+import { CodexAdapter, type CodexAdapterEvent, type CodexAdapterOptions } from '../adapter';
 import { FakeAppServer, type ReplayRecord } from './fake-app-server';
 
 export const SESSION = SessionId.parse('session-a');
@@ -50,11 +51,8 @@ export const until = async (predicate: () => boolean, what = 'condition', timeou
 /** Every event must parse with its contracts schema. */
 export const expectValidEvents = (events: CodexAdapterEvent[]): void => {
   for (const event of events) {
-    if (event.type === 'model.observed') ObservedModel.parse(event.observed);
-    else if (event.type !== 'runtime.exited') {
-      const result = AppEvent.safeParse(event);
-      expect(result.success, `${event.type}: ${result.error?.message ?? ''}`).toBe(true);
-    }
+    const result = AppEvent.safeParse(event);
+    expect(result.success, `${event.type}: ${result.error?.message ?? ''}`).toBe(true);
   }
 };
 

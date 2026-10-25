@@ -2,8 +2,9 @@
 // scripted with the protocol 0.160.0 shapes on top of the SP-01 handshake.
 import { describe, expect, it } from 'vitest';
 import { EscalationId } from '../../contracts';
+import type { PermissionHandle } from '../../core/ports';
 import { FakeAppServer, loadFixture, notify, out, outResponse, recordedResult, reply, type ReplayRecord, serverRequest } from './testing/fake-app-server';
-import { CodexAdapter, type PermissionHandle } from './adapter';
+import { CodexAdapter } from './adapter';
 import { expectValidEvents, SESSION, setup, until } from './testing/harness';
 
 const sp01 = loadFixture('sp01-create.jsonl');
@@ -43,7 +44,7 @@ describe('model reroute and limits', () => {
     ]);
     await until(() => h.fake.finished && h.of('usage.limits').length === 1, 'notifications');
     expect(h.of('model.observed')).toEqual([
-      { type: 'model.observed', sessionId: SESSION, observed: { source: 'rerouted', from: 'gpt-6-luna', to: 'gpt-6-safe', reason: 'highRiskCyberActivity', observedAt: AT } },
+      { type: 'model.observed', sessionId: SESSION, observed: { source: 'rerouted', from: 'gpt-6-luna', to: 'gpt-6-safe', reason: 'highRiskCyberActivity', observedAt: AT }, at: AT },
     ]);
     expect(h.of('usage.limits')[0]).toMatchObject({ codexWeekly: { percentUsed: 12.5, resetsAt: new Date(1793293777000).toISOString() } });
     expectValidEvents(h.events);

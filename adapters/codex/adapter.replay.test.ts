@@ -12,8 +12,8 @@ describe('lifecycle and streaming (SP-01)', () => {
   it('initializes, starts a policy-isolated thread, streams two turns and closes by ending stdin', async () => {
     const rec = loadFixture('sp01-create.jsonl');
     const h = setup(rec);
-    const init = await h.adapter.start();
-    expect(init.userAgent).toContain('0.160.0');
+    await h.adapter.start();
+    expect(h.adapter.serverInfo?.userAgent).toContain('0.160.0');
     expect(h.fake.received.slice(0, 2).map((m) => m.method)).toEqual(['initialize', 'initialized']);
 
     const info = await h.adapter.startThread({ sessionId: SESSION, cwd: 'E:\\work\\task' });
@@ -101,7 +101,7 @@ describe('approvals, steer and elicitation (SP-05)', () => {
     // A busy-session message goes into the running turn (SP-05), as a CR-2 dispatch.
     await h.fake.idle();
     const steer = await h.adapter.dispatchOnce({
-      threadId,
+      nativeSessionRef: threadId,
       attempt: {
         state: 'unknown',
         attemptId: AttemptId.parse('attempt-1'),
@@ -109,7 +109,7 @@ describe('approvals, steer and elicitation (SP-05)', () => {
         dispatchStartedAt: '2026-10-24T12:00:00.000Z',
       },
       text: recordedText(rec, 'turn/steer', 0),
-      entry: { kind: 'insert', expectedTurnId: turn.id },
+      entry: { kind: 'insert', expectedTurnRef: turn.id },
     });
     expect(steer).toMatchObject({ state: 'sent', nativeRef: { sessionRef: threadId, turnRef: turn.id }, evidence: { kind: 'live-ack' } });
     expect(sentParams(h.fake, 'turn/steer')).toMatchObject({ expectedTurnId: turn.id, clientUserMessageId: '0b6c3c2e-7f43-4a55-9d7e-4f0c0a7f2b11' });
@@ -133,7 +133,7 @@ describe('approvals, steer and elicitation (SP-05)', () => {
     h.permissions[2]!.answer(decide('approve'));
     await until(() => h.of('turn.updated').filter((e) => e.turn.state === 'completed').length === 2, 'second turn end');
     const queued = await h.adapter.dispatchOnce({
-      threadId,
+      nativeSessionRef: threadId,
       attempt: {
         state: 'unknown',
         attemptId: AttemptId.parse('attempt-2'),
@@ -184,14 +184,14 @@ describe('interrupt (SP-08)', () => {
     const h = setup(rec);
     await h.adapter.start();
     const { threadId } = await h.adapter.startThread({ sessionId: SESSION, cwd: 'E:\\work\\task' });
-    const turn = await h.adapter.startTurn({ threadId, text: recordedText(rec, 'turn/start', 0) });
+    await h.adapter.startTurn({ threadId, text: recordedText(rec, 'turn/start', 0) });
     await until(() => h.permissions.length === 1, 'approval');
     h.permissions[0]!.answer(decide('approve'));
     await h.fake.idle();
 
     const read = await h.adapter.readThread(threadId, { includeTurns: true });
     expect(read.turns.map((t) => t.state)).toEqual(['running']);
-    await h.adapter.interruptTurn(threadId, turn.id);
+    await h.adapter.interrupt(threadId);
     await until(() => h.of('turn.updated').some((e) => e.turn.state === 'interrupted'), 'interrupted turn');
 
     const command = h.of('item.updated').filter((e) => e.item.kind === 'command').at(-1)!.item;
@@ -202,7 +202,7 @@ describe('interrupt (SP-08)', () => {
 });
 
 describe('native sub-agents (SP-03)', () => {
-  it('binds child threads to the session as native tasks and keeps their turns and tokens out of the session', async () => {
+  it('binds child threads to the session as native tasks and tags their turns and tokens with the task', async () => {
     const rec = loadFixture('sp03-subagents.jsonl');
     const h = setup(rec);
     await h.adapter.start();
@@ -223,13 +223,28 @@ describe('native sub-agents (SP-03)', () => {
       ['/root/read_a', 'completed'],
       ['/root/read_b', 'completed'],
     ]);
-    expect(h.of('turn.updated').every((e) => e.turn.id === h.of('turn.updated')[0]!.turn.id)).toBe(true);
+    // R-13: a sub-agent's turns and token reports carry its nativeTaskId, so they are never taken for the session's own.
+    const sessionTurns = h.of('turn.updated').filter((e) => e.turn.nativeTaskId === undefined);
+    expect(sessionTurns.every((e) => e.turn.id === sessionTurns[0]!.turn.id)).toBe(true);
+    const taskIds = new Set(h.of('nativeTask.updated').map((e) => e.task.id));
+    const childTurns = h.of('turn.updated').filter((e) => e.turn.nativeTaskId !== undefined);
+    expect(childTurns.length).toBeGreaterThan(0);
+    expect(childTurns.every((e) => taskIds.has(e.turn.nativeTaskId!) && e.turn.id !== sessionTurns[0]!.turn.id)).toBe(true);
+    expect(childTurns.some((e) => e.turn.state === 'completed' && e.turn.endedAt !== undefined)).toBe(true);
     const childItems = h.of('item.updated').map((e) => e.item);
     expect(childItems.length).toBeGreaterThan(0);
     expect(childItems.every((i) => i.nativeTaskId !== undefined && i.turnId === undefined)).toBe(true);
     const childAnswer = h.of('message.completed').find((e) => e.message.text.includes('HERON') && e.message.nativeTaskId !== undefined);
     expect(childAnswer?.message.role).toBe('assistant');
-    expect(h.of('usage.tokens').every((e) => e.usage.turnId === undefined || e.usage.turnId === h.of('turn.updated')[0]!.turn.id)).toBe(true);
+    const sessionUsage = h.of('usage.tokens').filter((e) => e.usage.nativeTaskId === undefined);
+    const childUsage = h.of('usage.tokens').filter((e) => e.usage.nativeTaskId !== undefined);
+    expect(sessionUsage.length).toBeGreaterThan(0);
+    expect(sessionUsage.every((e) => e.usage.turnId === undefined || e.usage.turnId === sessionTurns[0]!.turn.id)).toBe(true);
+    expect(childUsage.length).toBeGreaterThan(0);
+    expect(childUsage.every((e) => taskIds.has(e.usage.nativeTaskId!) && childTurns.some((t) => t.turn.id === e.usage.turnId))).toBe(true);
+    // The command items of the children carry Codex's process handle (CR-7 uses it to stop exactly this command).
+    const processRefs = childItems.flatMap((i) => (i.kind === 'command' && i.nativeProcessRef ? [i.nativeProcessRef] : []));
+    expect(processRefs.length).toBeGreaterThan(0);
 
     expect(await h.adapter.listLoadedThreads()).toHaveLength(3);
 
@@ -241,9 +256,10 @@ describe('native sub-agents (SP-03)', () => {
     await h.fake.idle();
     const childTask = h.of('nativeTask.updated').at(-1)!.task;
     expect(childTask.nativeRef).toBe(child.nativeTaskId);
-    await h.adapter.interruptTurn(childTask.nativeRef, '01a167fd-0f09-7f10-b499-85674fe07a1c');
+    // The adapter knows the child's running turn from turn/started, so the port call needs no turn ID.
+    await h.adapter.stopNativeTask(threadId, childTask.nativeRef);
     await until(() => h.fake.finished, 'script end');
-    await until(() => h.of('turn.updated').filter((e) => e.turn.state === 'completed').length === 2, 'parent turn end');
+    await until(() => h.of('turn.updated').filter((e) => e.turn.nativeTaskId === undefined && e.turn.state === 'completed').length === 2, 'parent turn end');
     // Review r1 P1-4: the interrupted child turn ends the task; no subAgentActivity follows it.
     const slow = h.of('nativeTask.updated').filter((e) => e.task.nativeRef === childTask.nativeRef);
     expect(slow.map((e) => e.task.state)).toEqual(['running', 'stopped']);
