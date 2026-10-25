@@ -328,6 +328,51 @@ describe('provision and target binding', () => {
     expect(admissions()).toBe(1);
     expect((await store.claim(claimInput(OP))).status).toBe('claimed');
   });
+
+  // Review r2 P1: whether a payload is bound depends on its target, not on whether it changed since acceptance.
+  /** Claims provision `name` and records its pre-allocated session as created; returns its binding. */
+  const sendProvision = async (name: string) => {
+    const input = provisionInput({}, name);
+    const createClaim = claimInput(input.operationId, { expectedNativeSessionRef: undefined });
+    await store.claim(createClaim);
+    expect(await store.recordSent(input.operationId, createClaim.attemptId, { sessionRef: input.spec.preallocatedRef ?? '' }, ack)).toBe('recorded');
+    const record = valid(await store.get(input.operationId)).target.provision;
+    if (record === undefined) throw new Error('no provision');
+    return { sessionId: input.spec.sessionId, nativeSessionRef: input.spec.preallocatedRef ?? '', provision: record };
+  };
+
+  it('claims a payload accepted already bound to its sent provision; setting the same target again changes nothing', async () => {
+    const a = await provisionTarget('A', true);
+    await store.accept(payloadInput({ target: a.bound }));
+    expect(await store.updateTarget(OP, a.bound, a.bound)).toBe('recorded');
+    expect(valid(await store.get(OP))).toMatchObject({ target: a.bound, delivery: { state: 'pending', attempts: [] } });
+    expect((await store.claim(claimInput(OP, { expectedNativeSessionRef: a.created }))).status).toBe('claimed');
+    expect(admissions()).toBe(1);
+  });
+
+  it('still binds a payload accepted before its provision was sent, through updateTarget', async () => {
+    const a = await provisionTarget('A', false);
+    await store.accept(payloadInput({ target: a.waiting }));
+    expect(await store.claim(claimInput(OP, { expectedNativeSessionRef: a.created }))).toEqual({ status: 'target-not-ready' });
+    const bound = await sendProvision('A');
+    expect(await store.claim(claimInput(OP, { expectedNativeSessionRef: a.created }))).toEqual({ status: 'target-not-ready' });
+    expect(await store.updateTarget(OP, a.waiting, bound)).toBe('recorded');
+    expect((await store.claim(claimInput(OP, { expectedNativeSessionRef: a.created }))).status).toBe('claimed');
+  });
+
+  it('moves a payload accepted with the pre-allocated session to its provision’s sent record, and nowhere else', async () => {
+    const a = await provisionTarget('A', false);
+    const early = { ...a.waiting, nativeSessionRef: a.created };
+    await store.accept(payloadInput({ target: early }));
+    expect(await store.claim(claimInput(OP, { expectedNativeSessionRef: a.created }))).toEqual({ status: 'target-not-ready' });
+    const bound = await sendProvision('A');
+    // Created, but the payload's own snapshot has not caught up yet.
+    expect(await store.claim(claimInput(OP, { expectedNativeSessionRef: a.created }))).toEqual({ status: 'target-not-ready' });
+    expect(await store.updateTarget(OP, early, { ...bound, nativeSessionRef: 'elsewhere' })).toBe('stale');
+    expect(await store.updateTarget(OP, early, bound)).toBe('recorded');
+    expect((await store.claim(claimInput(OP, { expectedNativeSessionRef: a.created }))).status).toBe('claimed');
+    expect(admissions()).toBe(1);
+  });
 });
 
 describe('listByState', () => {

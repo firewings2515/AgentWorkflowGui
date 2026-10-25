@@ -150,9 +150,12 @@ export class SqliteDeliveryStore implements DeliveryStore {
       writeTransaction<WriteResult>(this.db, () => {
         const row = this.row(operationId);
         if (row === undefined || row.state !== 'pending' || row.target !== canonicalJson(expected)) return unchanged('stale');
-        // The destination is fixed at acceptance (R-04 step 3): the only change is binding a payload, once,
-        // to the session its own provision created. A provision's target follows its own state.
-        if (row.kind === 'provision' || row.target !== row.accepted_target) return unchanged('stale');
+        // Setting the target it already has is applied by definition: nothing changes, so nothing is written.
+        if (canonicalJson(next) === row.target) return unchanged('recorded');
+        // The destination is fixed at acceptance (R-04 step 3): the only change is moving a payload that waits
+        // for its own provision to exactly the binding that provision's records give (the created session,
+        // its sessionId and its sent ProvisionRecord). A provision's target follows its own state.
+        if (row.kind === 'provision') return unchanged('stale');
         const binding = this.binding(row);
         if (binding.status !== 'bound' || canonicalJson(next) !== canonicalJson(binding.target)) return unchanged('stale');
         const updated = this.db
@@ -351,8 +354,9 @@ export class SqliteDeliveryStore implements DeliveryStore {
       const binding = this.binding(row);
       if (binding.status === 'mismatch') return 'target-changed';
       if (binding.status === 'waiting') return 'target-not-ready';
-      // Not bound yet (updateTarget has not run), or bound to anything but the provision's session.
-      if (row.target === row.accepted_target) return 'target-not-ready';
+      // Bound means the target names a session and a created provision, whether it was accepted that way
+      // or moved there by updateTarget; it must then be exactly the provision's own binding.
+      if (target.nativeSessionRef === undefined || target.provision?.state !== 'sent') return 'target-not-ready';
       if (row.target !== canonicalJson(binding.target)) return 'target-changed';
     }
     return input.expectedNativeSessionRef === target.nativeSessionRef ? undefined : 'target-changed';
