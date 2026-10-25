@@ -261,6 +261,73 @@ describe('provision and target binding', () => {
     await store.recordResolution(PROVISION, createClaim.attemptId, { decision: 'retry', at: at(20) });
     expect(valid(await store.get(PROVISION)).target.provision?.state).toBe('pending');
   });
+
+  // Review r1 P1: the destination is fixed at acceptance; binding may only follow the payload's own provision.
+  /** Accepts provision `name`; with `send`, also claims it and records the pre-allocated session as created. */
+  const provisionTarget = async (name: string, send: boolean) => {
+    const input = provisionInput({}, name);
+    await store.accept(input);
+    const waiting = { sessionId: input.spec.sessionId, provision: valid(await store.get(input.operationId)).target.provision };
+    const created = input.spec.preallocatedRef ?? '';
+    if (send) {
+      const createClaim = claimInput(input.operationId, { expectedNativeSessionRef: undefined });
+      await store.claim(createClaim);
+      expect(await store.recordSent(input.operationId, createClaim.attemptId, { sessionRef: created }, ack)).toBe('recorded');
+    }
+    const record = valid(await store.get(input.operationId)).target.provision;
+    if (waiting.provision === undefined || record === undefined) throw new Error('no provision');
+    return { waiting: { ...waiting, provision: waiting.provision }, bound: { sessionId: input.spec.sessionId, nativeSessionRef: created, provision: record }, created };
+  };
+
+  it('cannot re-point a payload waiting for provision B at the finished provision A', async () => {
+    const a = await provisionTarget('A', true);
+    const b = await provisionTarget('B', false);
+    await store.accept(payloadInput({ target: b.waiting }));
+    expect(await store.updateTarget(OP, b.waiting, a.bound)).toBe('stale');
+    expect(await store.updateTarget(OP, b.waiting, { ...a.bound, sessionId: b.waiting.sessionId })).toBe('stale');
+    expect(await store.updateTarget(OP, b.waiting, { ...a.bound, provision: { ...a.bound.provision, operationId: b.waiting.provision.operationId } })).toBe('stale');
+    // B is not created yet, so binding it early is refused too.
+    expect(await store.updateTarget(OP, b.waiting, { ...b.waiting, nativeSessionRef: b.created })).toBe('stale');
+    expect(await store.claim(claimInput(OP, { expectedNativeSessionRef: a.created }))).toEqual({ status: 'target-not-ready' });
+    expect(valid(await store.get(OP)).target).toEqual(b.waiting);
+    expect((await store.get(op('provision-B')))?.delivery.state).toBe('pending');
+    expect(admissions()).toBe(1);
+  });
+
+  it('refuses targets that mix provision A with provision B’s binding key or session', async () => {
+    const a = await provisionTarget('A', true);
+    const b = await provisionTarget('B', false);
+    const mixed = [
+      // A's operationId, B's binding key.
+      { ...a.bound, provision: { ...a.bound.provision, bindingKey: b.waiting.provision.bindingKey } },
+      // A's operationId and binding key, B's session.
+      { ...a.bound, sessionId: b.waiting.sessionId },
+      // Still waiting: A's operationId with B's binding key.
+      { sessionId: b.waiting.sessionId, provision: { ...a.waiting.provision, bindingKey: b.waiting.provision.bindingKey } },
+    ];
+    for (const [i, target] of mixed.entries()) {
+      const operationId = op(`mixed-${i}`);
+      await store.accept(payloadInput({ operationId, target }));
+      expect(await store.claim(claimInput(operationId, { expectedNativeSessionRef: a.created }))).toEqual({ status: 'target-changed' });
+      expect(await store.updateTarget(operationId, target, a.bound)).toBe('stale');
+      expect(valid(await store.get(operationId)).delivery).toEqual({ state: 'pending', attempts: [] });
+    }
+    expect(admissions()).toBe(mixed.length);
+  });
+
+  it('cannot re-bind a payload that was accepted bound, or change a provision’s own target', async () => {
+    await store.accept(payloadInput());
+    const accepted = payloadInput().target;
+    expect(await store.updateTarget(OP, accepted, { ...accepted, nativeSessionRef: 'thread-B' })).toBe('stale');
+    expect(await store.updateTarget(OP, accepted, { sessionId: provisionInput().spec.sessionId, nativeSessionRef: THREAD })).toBe('stale');
+    expect(await store.claim(claimInput(OP, { expectedNativeSessionRef: 'thread-B' }))).toEqual({ status: 'target-changed' });
+    expect(valid(await store.get(OP)).target).toEqual(accepted);
+
+    const a = await provisionTarget('A', false);
+    expect(await store.updateTarget(op('provision-A'), a.waiting, { ...a.waiting, nativeSessionRef: 'elsewhere' })).toBe('stale');
+    expect(admissions()).toBe(1);
+    expect((await store.claim(claimInput(OP))).status).toBe('claimed');
+  });
 });
 
 describe('listByState', () => {

@@ -150,9 +150,11 @@ export class SqliteDeliveryStore implements DeliveryStore {
       writeTransaction<WriteResult>(this.db, () => {
         const row = this.row(operationId);
         if (row === undefined || row.state !== 'pending' || row.target !== canonicalJson(expected)) return unchanged('stale');
-        if (row.kind === 'provision' && (next.provision?.operationId !== operationId || next.provision.bindingKey !== expected.provision?.bindingKey)) {
-          throw new TypeError('a provision keeps its own operationId and binding key');
-        }
+        // The destination is fixed at acceptance (R-04 step 3): the only change is binding a payload, once,
+        // to the session its own provision created. A provision's target follows its own state.
+        if (row.kind === 'provision' || row.target !== row.accepted_target) return unchanged('stale');
+        const binding = this.binding(row);
+        if (binding.status !== 'bound' || canonicalJson(next) !== canonicalJson(binding.target)) return unchanged('stale');
         const updated = this.db
           .prepare("UPDATE delivery SET target = ? WHERE operation_id = ? AND state = 'pending' AND target = ?")
           .run(canonicalJson(next), operationId, row.target);
@@ -170,7 +172,7 @@ export class SqliteDeliveryStore implements DeliveryStore {
         // Re-checked inside the transaction (R-04 step 5).
         if (row.proposal_revision !== input.expectedProposalRevision) return unchanged({ status: 'revision-changed' });
         const target = parse<DeliveryTarget>(row.target);
-        const blocked = row.kind === 'provision' ? this.provisionBlocked(target, input) : this.payloadBlocked(target, input);
+        const blocked = row.kind === 'provision' ? this.provisionBlocked(target, input) : this.payloadBlocked(row, target, input);
         if (blocked !== undefined) return unchanged({ status: blocked });
 
         // The single conditional update that decides the one dispatcher (CR2_DELIVERY_FIX §1 step 3).
@@ -312,22 +314,46 @@ export class SqliteDeliveryStore implements DeliveryStore {
     return live?.attempt_id === attemptId && live.state === 'unknown';
   }
 
-  /** The session a sent provision created, read from its own record rather than from a snapshot. */
-  private createdSession(provisionOperationId: string): string | undefined {
-    const row = this.row(provisionOperationId);
-    if (row?.kind !== 'provision' || row.state !== 'sent') return undefined;
-    const live = this.liveAttempt(provisionOperationId);
-    return live?.native_ref == null ? undefined : parse<NativeRef>(live.native_ref).sessionRef;
+  /**
+   * The binding a payload that waits for a provision may take, read from the provision's own records
+   * rather than from the payload's snapshot: `waiting` until that provision is sent, `mismatch` when the
+   * accepted target does not describe that provision (operationId, binding key, session) consistently.
+   */
+  private binding(row: DeliveryRow): { status: 'waiting' } | { status: 'mismatch' } | { status: 'bound'; target: DeliveryTarget } {
+    const accepted = parse<DeliveryTarget>(row.accepted_target);
+    if (accepted.provision === undefined) return { status: 'mismatch' };
+    const provision = this.row(accepted.provision.operationId);
+    if (provision === undefined) return { status: 'waiting' };
+    if (provision.kind !== 'provision') return { status: 'mismatch' };
+    const bindingKey = (this.db.prepare('SELECT binding_key FROM provision WHERE operation_id = ?').get(provision.operation_id) as { binding_key: string } | undefined)?.binding_key;
+    const record = parse<DeliveryTarget>(provision.target).provision;
+    const sessionId = parse<{ spec: ProvisionSpec }>(provision.body).spec.sessionId;
+    if (record === undefined || bindingKey !== accepted.provision.bindingKey) return { status: 'mismatch' };
+    if (accepted.sessionId !== undefined && accepted.sessionId !== sessionId) return { status: 'mismatch' };
+    if (provision.state !== 'sent') return { status: 'waiting' };
+    const live = this.liveAttempt(provision.operation_id);
+    const created = live?.native_ref == null ? undefined : parse<NativeRef>(live.native_ref).sessionRef;
+    if (created === undefined || record.nativeSessionRef !== created) return { status: 'mismatch' };
+    if (accepted.nativeSessionRef !== undefined && accepted.nativeSessionRef !== created) return { status: 'mismatch' };
+    return { status: 'bound', target: { sessionId, nativeSessionRef: created, provision: record } };
   }
 
-  /** A payload leaves the GUI only to a bound target whose provision, if any, is sent (CR2 §2-3). */
-  private payloadBlocked(target: DeliveryTarget, input: ClaimInput): 'target-not-ready' | 'target-changed' | undefined {
-    if (target.sessionId === undefined || target.nativeSessionRef === undefined) return 'target-not-ready';
-    if (target.provision !== undefined) {
-      if (target.provision.state !== 'sent') return 'target-not-ready';
-      const created = this.createdSession(target.provision.operationId);
-      if (created === undefined) return 'target-not-ready';
-      if (created !== target.nativeSessionRef) return 'target-changed';
+  /**
+   * A payload leaves the GUI only to the target fixed at acceptance: as accepted, or bound to the session
+   * its own provision created (CR2 §2-3). The whole target is checked, not only the native ref.
+   */
+  private payloadBlocked(row: DeliveryRow, target: DeliveryTarget, input: ClaimInput): 'target-not-ready' | 'target-changed' | undefined {
+    const accepted = parse<DeliveryTarget>(row.accepted_target);
+    if (accepted.provision === undefined) {
+      if (row.target !== row.accepted_target) return 'target-changed';
+      if (target.sessionId === undefined || target.nativeSessionRef === undefined) return 'target-not-ready';
+    } else {
+      const binding = this.binding(row);
+      if (binding.status === 'mismatch') return 'target-changed';
+      if (binding.status === 'waiting') return 'target-not-ready';
+      // Not bound yet (updateTarget has not run), or bound to anything but the provision's session.
+      if (row.target === row.accepted_target) return 'target-not-ready';
+      if (row.target !== canonicalJson(binding.target)) return 'target-changed';
     }
     return input.expectedNativeSessionRef === target.nativeSessionRef ? undefined : 'target-changed';
   }

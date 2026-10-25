@@ -39,15 +39,16 @@ export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadIn
     ...overrides,
   });
 
-export const provisionInput = (overrides: Partial<ProvisionInput> = {}): ProvisionInput => {
-  const operationId = overrides.operationId ?? op('provision-1');
+/** A provision for target `name`: its own operationId, session, pre-allocated ref and binding key. */
+export const provisionInput = (overrides: Partial<ProvisionInput> = {}, name = '1'): ProvisionInput => {
+  const operationId = overrides.operationId ?? op(`provision-${name}`);
   const spec: ProvisionInput['spec'] = {
     runtime: 'claude',
-    sessionId: SessionId.parse('session-new'),
+    sessionId: SessionId.parse(`session-new-${name}`),
     cwd: 'E:/work',
     model: { runtime: 'claude', model: 'claude-sonnet-5-5' },
     readOnly: true,
-    preallocatedRef: '6f1c2a40-5b7e-4d89-9a3c-2e8f0b1d4c55',
+    preallocatedRef: `6f1c2a40-5b7e-4d89-9a3c-2e8f0b1d4c5${name}`,
   };
   return {
     kind: 'provision',
@@ -56,7 +57,7 @@ export const provisionInput = (overrides: Partial<ProvisionInput> = {}): Provisi
     proposalRevision: 1,
     target: {
       sessionId: spec.sessionId,
-      provision: { operationId, bindingKey: COUNT_KEY, state: 'pending', preallocated: true, nativeSessionRef: spec.preallocatedRef },
+      provision: { operationId, bindingKey: `binding/${name}`, state: 'pending', preallocated: true, nativeSessionRef: spec.preallocatedRef },
     },
     at: at(),
     spec,

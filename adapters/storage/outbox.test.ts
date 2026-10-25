@@ -1,7 +1,7 @@
 // The 10 CR-2 scenarios of spike/review-followup/cr2-outbox-test.mjs, on the real store and real SQLite
 // files. Races and crashes use separate GUI processes (testing/outbox-child.ts, bundled once with vite)
 // that are killed at each stage; the receiver ledger is its own SQLite file.
-import { fork } from 'node:child_process';
+import { type ChildProcess, fork } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -69,11 +69,13 @@ const withStore = async <T>(path: string, body: (store: SqliteDeliveryStore, db:
 type Mode = Stage | 'before-claim' | 'race' | 'none';
 const runsToEnd = (stage: Mode) => stage === 'none' || stage === 'race';
 
+type ChildMessage = { ready?: boolean; claimed?: boolean; stage?: string; result?: string };
+
 /**
- * Runs one GUI process; with a stage, kills it as soon as it reports reaching that stage. In `race` mode
- * the process waits for `start` and then holds its claim briefly before calling the receiver.
+ * Runs one GUI process; with a stage, kills it as soon as it reports reaching that stage. `onMessage`
+ * sees every message, for the `race` handshake.
  */
-const launch = (paths: { db: string; receiver: string }, stage: Mode, start?: () => Promise<void>) =>
+const launch = (paths: { db: string; receiver: string }, stage: Mode, onMessage?: (message: ChildMessage, proc: ChildProcess) => void) =>
   new Promise<{ result?: string }>((resolve, reject) => {
     const proc = fork(child, [paths.db, paths.receiver, OP, stage], {
       execArgv: ['--disable-warning=ExperimentalWarning'],
@@ -88,8 +90,8 @@ const launch = (paths: { db: string; receiver: string }, stage: Mode, start?: ()
       proc.kill();
       reject(new Error(`child timed out at ${stage}: ${stderr}`));
     }, 20_000);
-    proc.on('message', (message: { ready?: boolean; stage?: string; result?: string }) => {
-      if (message.ready === true) void start?.().then(() => proc.send('go'));
+    proc.on('message', (message: ChildMessage) => {
+      onMessage?.(message, proc);
       if (message.stage !== undefined) {
         reached = true;
         proc.kill('SIGKILL');
@@ -105,19 +107,39 @@ const launch = (paths: { db: string; receiver: string }, stage: Mode, start?: ()
     });
   });
 
-/** Starts `count` GUI processes that all begin dispatching once every one of them is ready. */
-const race = (paths: { db: string; receiver: string }, count: number) => {
-  let ready = 0;
-  let go = () => undefined as void;
-  const started = new Promise<void>((resolve) => (go = resolve));
-  return Promise.all(
+/**
+ * Starts `count` GUI processes that begin dispatching together once all are ready. A process that wins
+ * the claim stops before calling the receiver and is released only after every process has finished its
+ * claim attempt, so the losers' claims certainly overlap the winner's committed unknown. `log` records
+ * the order in which claim attempts settled and winners were released.
+ */
+const race = async (paths: { db: string; receiver: string }, count: number) => {
+  const ready: ChildProcess[] = [];
+  const winners: ChildProcess[] = [];
+  const log: string[] = [];
+  let settled = 0;
+  const settle = () => {
+    if (++settled < count) return;
+    log.push('released');
+    for (const winner of winners) winner.send('continue');
+  };
+  const results = await Promise.all(
     Array.from({ length: count }, () =>
-      launch(paths, 'race', () => {
-        if (++ready === count) go();
-        return started;
+      launch(paths, 'race', (message, proc) => {
+        if (message.ready === true && ready.push(proc) === count) for (const p of ready) p.send('go');
+        if (message.claimed === true) {
+          log.push('claimed');
+          winners.push(proc);
+          settle();
+        }
+        if (message.result !== undefined) {
+          log.push(message.result);
+          if (!winners.includes(proc)) settle();
+        }
       }),
     ),
   );
+  return { results, log };
 };
 
 /** A restarted GUI: dispatch every pending delivery again (twice), then reconcile every unknown one. */
@@ -145,9 +167,11 @@ describe('CR-2 outbox scenarios (spike cr2-outbox-test.mjs)', () => {
 
   it('2. two independent dispatch processes produce one delivery', async () => {
     const paths = await fresh();
-    // Both start together and the winner holds its claim for a while, so the loser's claim really overlaps.
-    const results = await race(paths, 2);
+    // Both start together; the winner may call the receiver only after the loser's claim attempt settled.
+    const { results, log } = await race(paths, 2);
     expect(results.map((r) => r.result).sort()).toEqual(['not-pending', 'sent']);
+    expect([...log.slice(0, 2)].sort()).toEqual(['claimed', 'not-pending']);
+    expect(log.slice(2)).toEqual(['released', 'sent']);
     expect(receivedRows(paths.receiver)).toHaveLength(1);
     await withStore(paths.db, async (store) => expect((await store.get(OP))?.delivery.state).toBe('sent'));
   }, 30_000);
