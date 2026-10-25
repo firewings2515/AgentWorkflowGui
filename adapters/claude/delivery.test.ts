@@ -2,8 +2,7 @@
 // the stored transcript and never resumes or starts a turn (CR2_DELIVERY_FIX §1, §2, §4).
 import { describe, expect, it } from 'vitest';
 import type { DispatchRequest } from '../../core/ports';
-import { attempt, CWD, echo, expectValidEvents, init, loadStored, REF, result, settle, started, until } from './testing/harness';
-import type { WireSessionMessage } from './wire';
+import { attempt, CWD, echo, expectValidEvents, init, loadStored, promptLine, REF, replyLine, result, settle, started, transcript, u, until } from './testing/harness';
 
 const request = (extra: Partial<DispatchRequest> = {}): DispatchRequest => ({
   nativeSessionRef: REF,
@@ -144,22 +143,15 @@ describe('dispatchOnce', () => {
 });
 
 describe('reconcile (CR2_DELIVERY_FIX §4)', () => {
-  const stored = (uuid: string, content: unknown, sessionId = REF): WireSessionMessage => ({
-    type: 'user',
-    uuid,
-    session_id: sessionId,
-    message: { role: 'user', content },
-    parent_tool_use_id: null,
-    timestamp: '2026-10-25T11:59:00.000Z',
-  });
-  const reply = (uuid: string): WireSessionMessage => ({ type: 'assistant', uuid, session_id: REF, message: { id: 'msg_1', role: 'assistant', model: 'claude-haiku-5-5', content: [{ type: 'text', text: 'ACK' }] }, parent_tool_use_id: null });
   const uuid = '6c8a00ac-6181-4e5f-8c01-0d915ed9844f';
   const text = `Receipt fixture ${uuid}. Reply only ACK. Do not call tools.`;
   const req = { nativeSessionRef: REF, cwd: CWD, clientMessageId: uuid as never, text };
+  const ack = (n: number) => replyLine(u(n), { type: 'text', text: 'ACK' });
+  const lines = (...l: Parameters<typeof transcript>[2]) => transcript(REF, CWD, l);
 
   it('finds the stored prompt by session, uuid and text, read-only', async () => {
     const h = await started();
-    h.sdk.store(CWD, REF, [stored('11111111-0000-4000-8000-000000000000', 'earlier'), reply('r1'), stored(uuid, text), reply('r2')]);
+    h.sdk.store(CWD, REF, lines(promptLine(u(1), 'earlier'), ack(2), promptLine(uuid, text), ack(3)));
     const queries = h.sdk.queries.length;
     const out = await h.adapter.reconcile(req);
     expect(out).toMatchObject({ state: 'sent', nativeRef: { sessionRef: REF, turnRef: uuid, itemRef: uuid }, evidence: { kind: 'reconciled', at: '2026-10-25T12:00:00.000Z' } });
@@ -172,33 +164,73 @@ describe('reconcile (CR2_DELIVERY_FIX §4)', () => {
   it('also works with no adapter session open, and with the text as one text block', async () => {
     const h = await started();
     await h.adapter.close();
-    h.sdk.store(CWD, REF, [stored(uuid, [{ type: 'text', text }])]);
+    h.sdk.store(CWD, REF, lines(promptLine(uuid, [{ type: 'text', text }]), ack(1)));
     expect(await h.adapter.reconcile(req)).toMatchObject({ state: 'sent' });
   });
 
-  it('stays unknown when not found, in another cwd, duplicated, different or unreadable', async () => {
+  it('finds a payload folded into a running turn, stored as a queued-command attachment (live, T009)', async () => {
+    const h = await started();
+    const queued = { type: 'attachment', uuid: u(9), attachment: { type: 'queued_command', prompt: text, source_uuid: uuid, commandMode: 'prompt' } };
+    h.sdk.store(CWD, REF, lines(promptLine(u(1), 'Run the tests.'), replyLine(u(2), { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'npm test' } }, { stop: 'tool_use' }), queued, ack(3)));
+    expect(await h.adapter.reconcile(req)).toMatchObject({ state: 'sent', nativeRef: { turnRef: u(1), itemRef: uuid } });
+  });
+
+  it('sees a duplicate the SDK chain view hides (review r1 P1-1)', async () => {
+    const h = await started();
+    h.sdk.store(CWD, REF, lines(promptLine(uuid, text), ack(1), promptLine(uuid, text, { parentUuid: u(1) }), ack(2)));
+    // getSessionMessages keeps one entry per uuid, so it alone cannot show the duplicate.
+    const chain = await h.sdk.getSessionMessages(REF, { dir: CWD });
+    expect(chain.filter((m) => m.uuid === uuid)).toHaveLength(1);
+    expect(await h.adapter.reconcile(req)).toMatchObject({ state: 'unknown', reason: 'duplicate', matches: [{ contentMatches: true }, { contentMatches: true }] });
+    // A prompt line and a queued-command record of the same uuid are two records too.
+    const queued = { type: 'attachment', uuid: u(9), attachment: { type: 'queued_command', prompt: text, source_uuid: uuid } };
+    h.sdk.store(CWD, REF, lines(promptLine(uuid, text), queued, ack(1)));
+    expect(await h.adapter.reconcile(req)).toMatchObject({ reason: 'duplicate' });
+  });
+
+  it('stays unknown when not found, different or unreadable', async () => {
     const h = await started();
     expect(await h.adapter.reconcile(req)).toMatchObject({ state: 'unknown', reason: 'not-found', matches: [] });
-    // Stored under the cwd it ran in: another cwd finds nothing (R-06).
-    h.sdk.store('E:\\work\\other', REF, [stored(uuid, text)]);
-    expect(await h.adapter.reconcile(req)).toMatchObject({ reason: 'not-found' });
-    h.sdk.store(CWD, REF, [stored(uuid, text), reply('r'), stored(uuid, text)]);
-    expect(await h.adapter.reconcile(req)).toMatchObject({ reason: 'duplicate', matches: [{ contentMatches: true }, { contentMatches: true }] });
-    h.sdk.store(CWD, REF, [stored(uuid, `${text} (edited)`)]);
+    h.sdk.store(CWD, REF, lines(promptLine(uuid, `${text} (edited)`)));
     expect(await h.adapter.reconcile(req)).toMatchObject({ reason: 'content-mismatch', matches: [{ contentMatches: false }] });
-    h.sdk.store(CWD, REF, [stored(uuid, [{ type: 'text', text }, { type: 'text', text: 'extra' }])]);
+    h.sdk.store(CWD, REF, lines(promptLine(uuid, [{ type: 'text', text }, { type: 'text', text: 'extra' }])));
     expect(await h.adapter.reconcile(req)).toMatchObject({ reason: 'content-mismatch' });
-    h.sdk.store(CWD, REF, [{ ...stored(uuid, [{ type: 'tool_result', tool_use_id: 't', content: text }]) }]);
-    expect(await h.adapter.reconcile(req)).toMatchObject({ reason: 'not-found' });
+    // A record of another session (copied transcript) does not count for this one.
+    h.sdk.store(CWD, REF, lines(promptLine(uuid, text, { sessionId: '22222222-2222-4222-8222-222222222222' })));
+    expect(await h.adapter.reconcile(req)).toMatchObject({ reason: 'content-mismatch' });
+    // Any line with this uuid is a record of it; one that is not the prompt does not match.
+    h.sdk.store(CWD, REF, lines(promptLine(u(1), 'x'), { ...promptLine(uuid, [{ type: 'tool_result', tool_use_id: 't', content: text }]) }));
+    expect(await h.adapter.reconcile(req)).toMatchObject({ reason: 'content-mismatch' });
     h.sdk.readError = new Error('EACCES');
     expect(await h.adapter.reconcile(req)).toMatchObject({ state: 'unknown', reason: 'read-failed', detail: 'EACCES' });
   });
 
+  it('reads past a compaction, whose summary hides earlier prompts from the chain view (review r1 P1-2)', async () => {
+    const h = await started();
+    const boundary = { type: 'system', subtype: 'compact_boundary', uuid: u(5), parentUuid: null, logicalParentUuid: u(4), content: 'Conversation compacted', compactMetadata: { trigger: 'auto', preTokens: 150000 } };
+    const summary = promptLine(u(6), 'This session is being continued from a previous conversation that ran out of context.', { isCompactSummary: true, isVisibleInTranscriptOnly: true });
+    h.sdk.store(CWD, REF, lines(promptLine(uuid, text), ack(4), boundary, summary, promptLine(u(7), 'next'), ack(8)));
+    expect((await h.sdk.getSessionMessages(REF, { dir: CWD })).some((m) => m.uuid === uuid)).toBe(false);
+    // The raw lines still hold the one record: positive evidence, and a duplicate would still show.
+    expect(await h.adapter.reconcile(req)).toMatchObject({ state: 'sent' });
+    // Not found after a compaction says so; it stays unknown.
+    const other = await h.adapter.reconcile({ ...req, clientMessageId: u(99) as never });
+    expect(other).toMatchObject({ state: 'unknown', reason: 'not-found' });
+    expect(other.state === 'unknown' && other.detail).toContain('compacted');
+  });
+
+  it('finds the session from another worktree of the same repository, as the SDK does (SP-07)', async () => {
+    const h = await started();
+    h.sdk.store(CWD, REF, lines(promptLine(uuid, text), ack(1)), { alsoFoundFrom: ['E:\\work\\task-1-copy'] });
+    expect(await h.adapter.reconcile({ ...req, cwd: 'E:\\work\\task-1-copy' })).toMatchObject({ state: 'sent' });
+    expect(await h.adapter.reconcile({ ...req, cwd: 'E:\\elsewhere' })).toMatchObject({ reason: 'not-found' });
+  });
+
   it('reconciles a prompt recorded by a real session (SP-03 transcript)', async () => {
     const h = await started();
-    const fx = loadStored('sp03-history.json');
-    h.sdk.store(fx.cwd, fx.sessionId, fx.messages);
-    const prompt = fx.messages.find((m) => m.type === 'user')!;
+    const fx = loadStored('sp03-transcript.json');
+    h.sdk.store(fx.cwd, fx.sessionId, fx.entries);
+    const prompt = fx.entries.find((e) => e.type === 'user')!;
     const content = (prompt.message as { content: string }).content;
     const out = await h.adapter.reconcile({ nativeSessionRef: fx.sessionId, cwd: fx.cwd, clientMessageId: prompt.uuid as never, text: content });
     expect(out).toMatchObject({ state: 'sent', nativeRef: { sessionRef: fx.sessionId, itemRef: prompt.uuid } });

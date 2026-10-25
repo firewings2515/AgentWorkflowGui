@@ -8,6 +8,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
 import {
   type ClientMessageId,
   type Message,
@@ -45,7 +46,7 @@ import type {
   SessionSettings,
   StartSessionOptions,
 } from '../../core/ports';
-import { INTERRUPT_MARKER, mapTranscript, rebuildNativeTasks, storedPrompts } from './history';
+import { INTERRUPT_MARKER, isCompacted, mapTranscript, payloadRecords, rebuildNativeTasks, recordedCwd } from './history';
 import { InputQueue } from './input-queue';
 import {
   closeOpenItem,
@@ -73,7 +74,7 @@ import {
   toTokenCounts,
 } from './mapping';
 import { buildPermissionRequest, decisionToHookOutput, denyOutput, parsePreToolUse } from './permissions';
-import { type ClaudeSdk, isWireUuid, type WireHookOutput, type WireMcpServer, type WireOrigin, type WireQuery, type WireQueryOptions, type WireSessionMessage, type WireUserMessage } from './wire';
+import { type ClaudeSdk, isWireUuid, type WireHookOutput, type WireMcpServer, type WireOrigin, type WireQuery, type WireQueryOptions, type WireTranscriptEntry, type WireUserMessage } from './wire';
 
 export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
   /** The SDK functions; `claudeAgentSdk` from ./sdk in production, a fake in tests. */
@@ -154,6 +155,8 @@ interface LiveSession {
   openMessages: Map<string, OpenMessage>;
   /** API message id announced by `message_start`, per context, for text deltas. */
   streamIds: Map<string, string>;
+  /** Usage of the API message in progress, per context; reported once when the message ends. */
+  usage: Map<string, { id: string; usage: unknown; placement: Placement }>;
   items: Map<string, TrackedItem>;
   /** Tool calls the GUI denied; their error result is a decline, not a failure. */
   declined: Set<string>;
@@ -167,6 +170,12 @@ interface LiveSession {
 
 const MAIN = 'main';
 const DEFAULT_MAX_OUTPUT = 64 * 1024;
+
+/** Same folder, compared the way Windows does (case-insensitive, either separator, no trailing one). */
+const sameFolder = (a: string, b: string): boolean => {
+  const norm = (p: string) => resolve(p).replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? norm(a).toLowerCase() === norm(b).toLowerCase() : norm(a) === norm(b);
+};
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -235,19 +244,25 @@ export class ClaudeAdapter implements RuntimeAdapter {
     return this.open(options, ref, { sessionId: ref }, { source: 'unknown' });
   }
 
-  /** Always in the original cwd (R-06); the transcript is looked up there first, read-only. */
+  /**
+   * Always in the original cwd (R-06). Core keeps the cwd from start (NativeSessionInfo) and passes it
+   * here; the adapter checks it against the cwd the transcript itself recorded, because the SDK also
+   * finds a session from another worktree of the same repository (SP-07). Read-only before the CLI starts.
+   */
   async resumeSession(options: ResumeSessionOptions): Promise<NativeSessionInfo> {
     this.checkCwd(options.cwd, 'resumeSession');
-    let stored: WireSessionMessage[];
+    let lines: WireTranscriptEntry[];
     try {
-      stored = await this.options.sdk.getSessionMessages(options.nativeSessionRef, { dir: options.cwd });
+      lines = await this.options.sdk.readTranscript(options.nativeSessionRef, { dir: options.cwd });
     } catch (error) {
       throw new Error(`resumeSession: could not read session ${options.nativeSessionRef} under ${options.cwd}: ${errorText(error)}`, { cause: error });
     }
-    if (stored.length === 0) {
-      throw new Error(`resumeSession: no stored Claude session ${options.nativeSessionRef} under ${options.cwd}; it must be resumed from the cwd it was created in`);
+    if (lines.length === 0) throw new Error(`resumeSession: no stored Claude session ${options.nativeSessionRef} under ${options.cwd}`);
+    const recorded = recordedCwd(lines);
+    if (recorded !== undefined && !sameFolder(recorded, options.cwd)) {
+      throw new Error(`resumeSession: Claude session ${options.nativeSessionRef} ran in ${recorded}, not ${options.cwd}; resume it from its own folder`);
     }
-    const lastModel = [...stored].reverse().find((m) => m.type === 'assistant' && isObject(m.message) && isNonEmptyString(m.message.model) && m.message.model !== '<synthetic>');
+    const lastModel = [...lines].reverse().find((e) => e.type === 'assistant' && e.isSidechain !== true && isObject(e.message) && isNonEmptyString(e.message.model) && e.message.model !== '<synthetic>');
     const observed: ObservedModel =
       lastModel && isObject(lastModel.message)
         ? { source: 'per-message', model: lastModel.message.model as string, observedAt: this.timeOf(lastModel.timestamp) }
@@ -330,20 +345,25 @@ export class ClaudeAdapter implements RuntimeAdapter {
   }
 
   /**
-   * Read-only (CR2_DELIVERY_FIX §2, §4): reads the stored transcript under the session's cwd and looks
-   * for a prompt with this uuid in this session and the same text. Never resumes or starts a turn.
+   * Read-only (CR2_DELIVERY_FIX §2, §4): reads the session's raw transcript lines and looks for records
+   * of this uuid in this session with the same text. Raw lines, because getSessionMessages keeps one
+   * entry per uuid and would hide a duplicate. Never resumes or starts a turn.
    */
   async reconcile(req: ReconcileRequest): Promise<ReconcileResult> {
-    let messages: WireSessionMessage[];
+    let lines: WireTranscriptEntry[];
     try {
-      messages = await this.options.sdk.getSessionMessages(req.nativeSessionRef, { dir: req.cwd });
+      lines = await this.options.sdk.readTranscript(req.nativeSessionRef, { dir: req.cwd });
     } catch (error) {
       return { state: 'unknown', reason: 'read-failed', matches: [], detail: errorText(error) };
     }
-    const hits = storedPrompts(messages).filter((m) => m.uuid === req.clientMessageId);
-    const matches: ReconcileMatch[] = hits.map((m) => ({ turnRef: m.turnId, itemRef: m.uuid, contentMatches: m.sessionId === req.nativeSessionRef && sameText(m.content, req.text) }));
+    const matches: ReconcileMatch[] = payloadRecords(lines, req.clientMessageId).map((r) => ({
+      turnRef: r.turnRef,
+      itemRef: r.itemRef,
+      contentMatches: r.sessionId === req.nativeSessionRef && sameText(r.content, req.text),
+    }));
     if (matches.length === 0) {
-      return { state: 'unknown', reason: 'not-found', matches, detail: `no stored prompt with uuid ${req.clientMessageId} among ${messages.length} messages of ${req.nativeSessionRef} under ${req.cwd}` };
+      const compacted = isCompacted(lines) ? ' (the session was compacted)' : '';
+      return { state: 'unknown', reason: 'not-found', matches, detail: `no stored record of uuid ${req.clientMessageId} among ${lines.length} transcript lines of ${req.nativeSessionRef}${compacted}` };
     }
     if (matches.length > 1) return { state: 'unknown', reason: 'duplicate', matches, detail: `${matches.length} stored prompts carry uuid ${req.clientMessageId}` };
     const [match] = matches as [ReconcileMatch];
@@ -374,6 +394,13 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const messages = await sdk.getSessionMessages(req.nativeSessionRef, { ...dir, includeSystemMessages: true });
     const mapped = mapTranscript(messages, ctx);
     let complete = mapped.complete;
+    // The chain view drops the compaction boundary's subtype, so the raw lines are checked too.
+    try {
+      if (isCompacted(await sdk.readTranscript(req.nativeSessionRef, dir))) complete = false;
+    } catch (error) {
+      this.log('warn', 'could not read the raw transcript of a stored session', error);
+      complete = false;
+    }
     const agents: { agentId: string; parentToolUseId?: string }[] = [];
     try {
       for (const agentId of await sdk.listSubagents(req.nativeSessionRef, dir)) {
@@ -460,6 +487,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
       acks: new Map(),
       openMessages: new Map(),
       streamIds: new Map(),
+      usage: new Map(),
       items: new Map(),
       declined: new Set(),
       tasks: new Map(),
@@ -571,6 +599,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
     for (const entry of [...s.permissions]) this.withdraw(entry, 'the Claude session ended');
     const at = this.now();
     for (const key of [...s.openMessages.keys()]) this.flushMessage(s, key);
+    for (const key of [...s.usage.keys()]) this.flushUsage(s, key);
     // Calls still open were killed with the process, whatever happens to the turn.
     for (const [id, tracked] of s.items) {
       const closed = closeOpenItem(tracked.item, 'interrupted', at);
@@ -655,11 +684,20 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const key = parent ?? MAIN;
     if (event.type === 'message_start' && isObject(event.message) && isNonEmptyString(event.message.id)) {
       s.streamIds.set(key, event.message.id);
+      const p = this.placement(s, m, parent);
+      if (p) this.trackUsage(s, key, event.message.id, event.message.usage, p);
+      return;
+    }
+    // message_delta carries the message's final counts.
+    if (event.type === 'message_delta' && isObject(event.usage)) {
+      const tracked = s.usage.get(key);
+      if (tracked) tracked.usage = event.usage;
       return;
     }
     if (event.type === 'message_stop') {
       s.streamIds.delete(key);
       this.flushMessage(s, key);
+      this.flushUsage(s, key);
       return;
     }
     if (event.type !== 'content_block_delta' || !isObject(event.delta) || event.delta.type !== 'text_delta') return;
@@ -691,6 +729,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
       this.emit({ type: 'model.observed', sessionId: s.sessionId, observed: s.observed, at });
     }
     const id = isNonEmptyString(message.id) ? message.id : str(m.uuid);
+    if (id) this.trackUsage(s, key, id, message.usage, p);
     const text = textOf(message.content);
     if (id && text !== '') {
       const open = s.openMessages.get(key);
@@ -738,19 +777,13 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const open = s.turn;
     if (!open) return;
     this.flushMessage(s, MAIN);
-    const latest = toTokenCounts(m.usage);
+    this.flushUsage(s, MAIN);
+    // `result.usage` covers the whole turn, so it is not `latest`; the session total comes from modelUsage.
     const total = sumModelUsage(m.modelUsage);
-    if (latest || total) {
+    if (total) {
       this.emit({
         type: 'usage.tokens',
-        usage: {
-          sessionId: s.sessionId,
-          turnId: open.turn.id,
-          ...opt('latest', latest),
-          ...opt('cumulative', total?.counts),
-          ...opt('contextWindow', total?.contextWindow),
-          at,
-        },
+        usage: { sessionId: s.sessionId, turnId: open.turn.id, cumulative: total.counts, ...opt('contextWindow', total.contextWindow), at },
       });
     }
     // A cancel answer (`continue: false`) stops the loop with a successful result and this reason.
@@ -828,6 +861,36 @@ export class ClaudeAdapter implements RuntimeAdapter {
     if (!s.ended) this.emit({ type: 'session.activity', sessionId: s.sessionId, activity: state === 'interrupted' ? 'interrupted' : 'idle', at });
   }
 
+  /** Keeps the newest usage of the API message in progress; a new message reports the previous one. */
+  private trackUsage(s: LiveSession, key: string, id: string, usage: unknown, placement: Placement): void {
+    const tracked = s.usage.get(key);
+    if (tracked && tracked.id !== id) this.flushUsage(s, key);
+    const current = s.usage.get(key);
+    if (current) {
+      if (isObject(usage)) current.usage = usage;
+    } else s.usage.set(key, { id, usage, placement });
+  }
+
+  /** `latest` is one model call's usage (contracts: Claude per-message usage), for the turn or the sub-agent. */
+  private flushUsage(s: LiveSession, key: string): void {
+    const tracked = s.usage.get(key);
+    if (!tracked) return;
+    s.usage.delete(key);
+    const latest = toTokenCounts(tracked.usage);
+    if (!latest) return;
+    const p = tracked.placement;
+    this.emit({
+      type: 'usage.tokens',
+      usage: {
+        sessionId: p.sessionId,
+        ...opt('turnId', p.turnId === undefined ? undefined : TurnId.parse(p.turnId)),
+        ...opt('nativeTaskId', p.nativeTaskId),
+        latest,
+        at: this.now(),
+      },
+    });
+  }
+
   private flushMessage(s: LiveSession, key: string): void {
     const open = s.openMessages.get(key);
     if (!open) return;
@@ -902,6 +965,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
   /** A finished sub-agent's open message and calls end with it. */
   private endTask(s: LiveSession, task: NativeTask, at: Timestamp): void {
     for (const [key, open] of s.openMessages) if (open.placement.nativeTaskId === task.id) this.flushMessage(s, key);
+    for (const [key, tracked] of s.usage) if (tracked.placement.nativeTaskId === task.id) this.flushUsage(s, key);
     for (const [id, tracked] of s.items) {
       if (tracked.nativeTaskId !== task.id) continue;
       const closed = closeOpenItem(tracked.item, 'interrupted', at);

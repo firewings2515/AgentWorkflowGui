@@ -1,14 +1,16 @@
-// Stored history (getSessionMessages / listSubagents / getSubagentMessages, CR-6), from the transcript
-// SP-03 left behind. Read-only: nothing is resumed and no query is started.
+// Stored history (getSessionMessages / listSubagents / getSubagentMessages, CR-6). The fake SDK keeps raw
+// transcript lines and reads them with the SDK's own readers, so chain rebuilding, deduplication and
+// compaction behave as in production. Read-only: nothing is resumed and no query is started.
 import { describe, expect, it } from 'vitest';
-import { NativeTaskId, SessionId } from '../../contracts';
+import { AppEvent, NativeTaskId, SessionId } from '../../contracts';
 import type { HistoryEntry } from '../../core/ports';
-import { AppEvent } from '../../contracts';
-import { loadStored, setup } from './testing/harness';
-import type { WireSessionMessage } from './wire';
+import { loadStored, promptLine, replyLine, setup, toolResultLine, transcript, u } from './testing/harness';
+import type { WireTranscriptEntry } from './wire';
 
-const fx = loadStored('sp03-history.json');
+const fx = loadStored('sp03-transcript.json');
 const SESSION = SessionId.parse('session-sp03');
+const REF = '22222222-2222-4222-8222-222222222222';
+const DIR = 'D:\\demo\\w';
 
 const kinds = (entries: HistoryEntry[]) => entries.map((e) => (e.kind === 'turn' ? `turn:${e.turn.state}` : e.kind === 'message' ? `${e.message.role}` : `${e.item.kind}:${e.item.state}`));
 
@@ -21,18 +23,25 @@ const expectValid = (entries: HistoryEntry[]) => {
   }
 };
 
+const read = async (lines: WireTranscriptEntry[], subagents: Record<string, WireTranscriptEntry[]> = {}) => {
+  const h = setup();
+  h.sdk.store(DIR, REF, lines, { subagents });
+  return h.adapter.readHistory({ sessionId: SESSION, nativeSessionRef: REF, cwd: DIR });
+};
+const bash = (n: number, command: string, id = `toolu_${n}`) => replyLine(u(n), { type: 'tool_use', id, name: 'Bash', input: { command } }, { stop: 'tool_use' });
+
 describe('readHistory', () => {
   it('rebuilds turns, messages, tool calls and native tasks of a stored session', async () => {
     const h = setup();
-    h.sdk.store(fx.cwd, fx.sessionId, fx.messages, fx.subagents);
+    h.sdk.store(fx.cwd, fx.sessionId, fx.entries, { subagents: fx.subagents });
     const history = await h.adapter.readHistory({ sessionId: SESSION, nativeSessionRef: fx.sessionId, cwd: fx.cwd });
     expect(h.sdk.queries).toEqual([]);
     expect(history.complete).toBe(true);
     expectValid(history.entries);
 
-    // Prompts start turns: three typed prompts and the background agent's notification (R-05).
+    // Prompts start turns: three typed prompts and the background agent's notification (R-05). Each ends
+    // with a final assistant message; turn 2 stopped one sub-agent but went on.
     const turns = history.entries.flatMap((e) => (e.kind === 'turn' ? [e.turn] : []));
-    // Turn 2 stopped one sub-agent but went on, so it completed.
     expect(turns.map((t) => [t.id, t.state])).toEqual([
       ['99be6393-b8c6-4aed-8211-7b02e0cda2de', 'completed'],
       ['009ad0a6-af87-40aa-8d27-b3204d9a9c0b', 'completed'],
@@ -79,7 +88,7 @@ describe('readHistory', () => {
 
   it("reads one sub-agent's own conversation, placed on its task (CR-6)", async () => {
     const h = setup();
-    h.sdk.store(fx.cwd, fx.sessionId, fx.messages, fx.subagents);
+    h.sdk.store(fx.cwd, fx.sessionId, fx.entries, { subagents: fx.subagents });
     const nativeTaskId = NativeTaskId.parse('ab136d00f928b2a8a');
     const history = await h.adapter.readHistory({ sessionId: SESSION, nativeSessionRef: fx.sessionId, cwd: fx.cwd, nativeTask: { nativeTaskId, nativeRef: 'ab136d00f928b2a8a' } });
     expectValid(history.entries);
@@ -92,53 +101,104 @@ describe('readHistory', () => {
     expect(history.nativeTasks).toEqual([]);
   });
 
-  it('needs the original cwd: another folder has no such session', async () => {
+  it('finds nothing from an unrelated folder', async () => {
     const h = setup();
-    h.sdk.store(fx.cwd, fx.sessionId, fx.messages, fx.subagents);
+    h.sdk.store(fx.cwd, fx.sessionId, fx.entries, { subagents: fx.subagents });
     const history = await h.adapter.readHistory({ sessionId: SESSION, nativeSessionRef: fx.sessionId, cwd: 'E:\\elsewhere' });
     expect(history).toEqual({ entries: [], nativeTasks: [], complete: true });
   });
 
-  it('marks the history incomplete after compaction or for a sub-agent it cannot place', async () => {
-    const h = setup();
-    const boundary: WireSessionMessage = { type: 'system', uuid: 'b1', session_id: fx.sessionId, message: { subtype: 'compact_boundary' }, parent_tool_use_id: null };
-    h.sdk.store(fx.cwd, fx.sessionId, [boundary, ...fx.messages.slice(-2)], { 'a-unknown': [] });
-    const history = await h.adapter.readHistory({ sessionId: SESSION, nativeSessionRef: fx.sessionId, cwd: fx.cwd });
+  it('keeps a turn without an end running and says the history is incomplete (review r1 P1-3)', async () => {
+    // The last turn is still running a command (or the process died there): no completion evidence.
+    const running = await read(transcript(REF, DIR, [promptLine(u(1), 'Run the tests.'), bash(2, 'npm test')]));
+    expect(kinds(running.entries)).toEqual(['turn:running', 'user', 'command:running']);
+    expect(running.entries[0]).toMatchObject({ kind: 'turn', turn: { state: 'running' } });
+    expect(running.entries[0]!.kind === 'turn' && running.entries[0]!.turn.endedAt).toBeUndefined();
+    expect(running.complete).toBe(false);
+    expectValid(running.entries);
+
+    // A cancelled turn (hook_stopped, live T009) has no end in the transcript either, even with a later turn.
+    const cancelled = await read(
+      transcript(REF, DIR, [
+        promptLine(u(1), 'Write marker.txt.'),
+        replyLine(u(2), { type: 'tool_use', id: 'toolu_w', name: 'Write', input: { file_path: 'D:\\demo\\w\\marker.txt', content: 'hi' } }, { stop: 'tool_use' }),
+        toolResultLine(u(3), 'toolu_w', 'PreToolUse:Write hook error: declined by AgentWorkflowGui', true),
+        promptLine(u(4), 'Say hi.'),
+        replyLine(u(5), { type: 'text', text: 'hi' }),
+      ]),
+    );
+    expect(kinds(cancelled.entries)).toEqual(['turn:running', 'user', 'fileChange:declined', 'turn:completed', 'user', 'assistant']);
+    expect(cancelled.complete).toBe(false);
+  });
+
+  it('puts a prompt taken in mid-turn into that turn, as live (live, T009)', async () => {
+    const queued = { type: 'attachment', uuid: u(4), attachment: { type: 'queued_command', prompt: 'Also say PEER-OK.', source_uuid: u(9), commandMode: 'prompt' } };
+    const history = await read(
+      transcript(REF, DIR, [promptLine(u(1), 'Sleep, then say SLEPT.'), bash(2, 'Start-Sleep -Seconds 15'), toolResultLine(u(3), 'toolu_2', '(PowerShell completed with no output)'), queued, replyLine(u(5), { type: 'text', text: 'SLEPT PEER-OK' })]),
+    );
+    expect(kinds(history.entries)).toEqual(['turn:completed', 'user', 'command:completed', 'user', 'assistant']);
+    const prompts = history.entries.flatMap((e) => (e.kind === 'message' && e.message.role === 'user' ? [e.message] : []));
+    expect(prompts.map((m) => [m.id, m.turnId])).toEqual([
+      [u(1), u(1)],
+      [u(9), u(1)],
+    ]);
+    expect(history.complete).toBe(true);
+  });
+
+  it('marks the history incomplete after a compaction (review r1 P1-2)', async () => {
+    // A compaction as the CLI writes it: a boundary line, then the summary prompt chained to it.
+    const boundary = { type: 'system', subtype: 'compact_boundary', uuid: u(5), parentUuid: null, logicalParentUuid: u(4), content: 'Conversation compacted', compactMetadata: { trigger: 'auto', preTokens: 150000 } };
+    const summary = promptLine(u(6), 'This session is being continued from a previous conversation that ran out of context.', { isCompactSummary: true, isVisibleInTranscriptOnly: true });
+    const lines = transcript(REF, DIR, [promptLine(u(1), 'first'), replyLine(u(2), { type: 'text', text: 'one' }), promptLine(u(3), 'second'), replyLine(u(4), { type: 'text', text: 'two' }), boundary, summary, promptLine(u(7), 'third'), replyLine(u(8), { type: 'text', text: 'three' })]);
+    const history = await read(lines);
+    expect(history.complete).toBe(false);
+    // The earlier prompts are gone from the SDK's chain; the summary is not shown as a prompt.
+    const prompts = history.entries.flatMap((e) => (e.kind === 'message' && e.message.role === 'user' ? [e.message.text] : []));
+    expect(prompts).toEqual(['third']);
+
+    // The raw boundary alone is enough, even when the summary line is missing.
+    const boundaryOnly = await read(transcript(REF, DIR, [promptLine(u(1), 'first'), replyLine(u(2), { type: 'text', text: 'one' }), boundary, promptLine(u(7), 'third', { parentUuid: u(5) }), replyLine(u(8), { type: 'text', text: 'three' })]));
+    expect(boundaryOnly.complete).toBe(false);
+  });
+
+  it('marks the history incomplete for a sub-agent it cannot place', async () => {
+    const history = await read(transcript(REF, DIR, [promptLine(u(1), 'hi'), replyLine(u(2), { type: 'text', text: 'hello' })]), { 'a-unknown': [] });
     expect(history.complete).toBe(false);
     expect(history.nativeTasks).toEqual([]);
   });
 
   it('shows calls the GUI refused or did not answer in time as declined (live, T009)', async () => {
-    const h = setup();
-    const at = '2026-10-25T11:00:00.000Z';
-    const write = (id: string): WireSessionMessage => ({ type: 'assistant', uuid: `a-${id}`, session_id: 's', message: { id: `msg_${id}`, model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use', id, name: 'Write', input: { file_path: 'E:\\w\\x.txt', content: 'hi' } }] }, parent_tool_use_id: null, timestamp: at });
-    const refused = (id: string, text: string): WireSessionMessage => ({ type: 'user', uuid: `r-${id}`, session_id: 's', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, is_error: true, content: text }] }, parent_tool_use_id: null, timestamp: at });
-    h.sdk.store('E:\\w', 's', [
-      { type: 'user', uuid: '11111111-0000-4000-8000-000000000001', session_id: 's', message: { role: 'user', content: 'write it' }, parent_tool_use_id: null, timestamp: at },
-      write('t1'),
-      refused('t1', 'PreToolUse:Write hook error: declined by AgentWorkflowGui'),
-      write('t2'),
-      refused('t2', 'PreToolUse hook did not respond before its timeout (host client may be unreachable). The tool call was not executed; other configured hooks may not have completed.'),
-      write('t3'),
-      refused('t3', 'EACCES: permission denied'),
-    ]);
-    const history = await h.adapter.readHistory({ sessionId: SESSION, nativeSessionRef: 's', cwd: 'E:\\w' });
-    expect(kinds(history.entries)).toEqual(['turn:completed', 'user', 'fileChange:declined', 'fileChange:declined', 'fileChange:failed']);
+    const write = (n: number) => replyLine(u(n), { type: 'tool_use', id: `t${n}`, name: 'Write', input: { file_path: 'D:\\demo\\w\\x.txt', content: 'hi' } }, { stop: 'tool_use' });
+    const history = await read(
+      transcript(REF, DIR, [
+        promptLine(u(1), 'write it'),
+        write(2),
+        toolResultLine(u(3), 't2', 'PreToolUse:Write hook error: declined by AgentWorkflowGui', true),
+        write(4),
+        toolResultLine(u(5), 't4', 'PreToolUse hook did not respond before its timeout (host client may be unreachable). The tool call was not executed; other configured hooks may not have completed.', true),
+        write(6),
+        toolResultLine(u(7), 't6', 'EACCES: permission denied', true),
+        replyLine(u(8), { type: 'text', text: 'FAILED' }),
+      ]),
+    );
+    expect(kinds(history.entries)).toEqual(['turn:completed', 'user', 'fileChange:declined', 'fileChange:declined', 'fileChange:failed', 'assistant']);
   });
 
-  it('skips CLI-local command output and keeps an interrupted turn interrupted', async () => {
-    const h = setup();
-    const at = '2026-10-25T11:00:00.000Z';
-    const user = (uuid: string, content: unknown): WireSessionMessage => ({ type: 'user', uuid, session_id: 's', message: { role: 'user', content }, parent_tool_use_id: null, timestamp: at });
-    h.sdk.store('E:\\w', 's', [
-      user('11111111-0000-4000-8000-000000000001', 'run the tests'),
-      { type: 'assistant', uuid: 'a1', session_id: 's', message: { id: 'msg_1', model: 'claude-sonnet-5-5', content: [{ type: 'tool_use', id: 'toolu_9', name: 'Bash', input: { command: 'npm test' } }] }, parent_tool_use_id: null, timestamp: at },
-      user('11111111-0000-4000-8000-000000000002', [{ type: 'tool_result', tool_use_id: 'toolu_9', is_error: true, content: '[Request interrupted by user for tool use]' }]),
-      user('11111111-0000-4000-8000-000000000003', [{ type: 'text', text: '[Request interrupted by user for tool use]' }]),
-      user('11111111-0000-4000-8000-000000000004', '<local-command-stdout>Set model to `haiku`</local-command-stdout>'),
-    ]);
-    const history = await h.adapter.readHistory({ sessionId: SESSION, nativeSessionRef: 's', cwd: 'E:\\w' });
-    expect(kinds(history.entries)).toEqual(['turn:interrupted', 'user', 'command:interrupted']);
-    expectValid(history.entries);
+  it('fails a turn the CLI answered with its own error message (R-12) and keeps interrupts', async () => {
+    const synthetic = await read(transcript(REF, DIR, [promptLine(u(1), 'hi'), replyLine(u(2), { type: 'text', text: 'There is an issue with the selected model.' }, { model: '<synthetic>', stop: 'stop_sequence' })]));
+    expect(synthetic.entries[0]).toMatchObject({ kind: 'turn', turn: { state: 'failed', failure: { message: 'There is an issue with the selected model.' } } });
+
+    const interrupted = await read(
+      transcript(REF, DIR, [
+        promptLine(u(1), 'run the tests'),
+        bash(2, 'npm test'),
+        toolResultLine(u(3), 'toolu_2', '[Request interrupted by user for tool use]', true),
+        promptLine(u(4), [{ type: 'text', text: '[Request interrupted by user for tool use]' }]),
+        promptLine(u(5), '<local-command-stdout>Set model to `haiku`</local-command-stdout>'),
+      ]),
+    );
+    expect(kinds(interrupted.entries)).toEqual(['turn:interrupted', 'user', 'command:interrupted']);
+    expect(interrupted.complete).toBe(true);
+    expectValid(interrupted.entries);
   });
 });

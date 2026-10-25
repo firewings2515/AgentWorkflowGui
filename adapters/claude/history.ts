@@ -36,7 +36,7 @@ import {
   toolResultText,
   toolUsesOf,
 } from './mapping';
-import type { WireSessionMessage } from './wire';
+import type { WireSessionMessage, WireTranscriptEntry } from './wire';
 
 /** Text the CLI stores when the user interrupts a turn or a tool call. */
 export const INTERRUPT_MARKER = '[Request interrupted by user';
@@ -78,11 +78,8 @@ interface AgentCall {
 
 const messageOf = (m: WireSessionMessage): Json | undefined => (isObject(m.message) ? m.message : undefined);
 
-/** Compaction replaces earlier turns with a summary, so the history is no longer whole. */
-const isCompactBoundary = (m: WireSessionMessage): boolean => {
-  const inner = messageOf(m);
-  return m.type === 'system' && (inner?.subtype === 'compact_boundary' || (m as unknown as Json).subtype === 'compact_boundary');
-};
+/** How a stored turn is known to have ended. Without one, the turn may still be running or was cut off. */
+type TurnEnd = { state: 'completed' } | { state: 'interrupted' } | { state: 'failed'; failure: string };
 
 export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: TranscriptContext): MappedTranscript => {
   const entries: HistoryEntry[] = [];
@@ -92,20 +89,29 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
   let complete = true;
   let lastTime = ctx.fallbackTime;
 
-  // Session turns (main transcript only).
-  let turn: { id: string; index: number; startedAt: Timestamp; interrupted: boolean; lastAt: Timestamp } | undefined;
+  // Session turns (main transcript only). A turn is finished only on evidence: a final assistant message
+  // (stop_reason other than tool_use) or the stored interrupt prompt. Otherwise it stays running and the
+  // history is marked incomplete, because the transcript cannot tell "still running" from "cut off".
+  let turn: { id: string; index: number; startedAt: Timestamp; lastAt: Timestamp; end?: TurnEnd | undefined } | undefined;
   const closeTurn = () => {
     if (!turn) return;
+    const { end } = turn;
+    if (!end) {
+      complete = false;
+      turn = undefined;
+      return;
+    }
     const entry: Turn = {
       id: TurnId.parse(turn.id),
       sessionId: ctx.sessionId,
-      state: turn.interrupted ? 'interrupted' : 'completed',
+      state: end.state,
+      ...(end.state === 'failed' && { failure: { message: end.failure } }),
       startedAt: turn.startedAt,
       endedAt: turn.lastAt,
     };
     entries[turn.index] = { kind: 'turn', turn: entry };
     for (const [id, open] of items) {
-      const closed = closeOpenItem(open.item, turn.interrupted ? 'interrupted' : 'failed', turn.lastAt);
+      const closed = closeOpenItem(open.item, end.state === 'interrupted' ? 'interrupted' : 'failed', turn.lastAt);
       if (closed) entries[open.index] = { kind: 'item', item: closed };
       items.delete(id);
     }
@@ -118,7 +124,9 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
   let open: { id: string; index: number; message: Message } | undefined;
 
   for (const m of messages) {
-    if (isCompactBoundary(m)) {
+    // Compaction replaced the earlier conversation with this summary: the history is no longer whole.
+    // (The boundary line itself reaches here without its `subtype`; the adapter also scans raw lines.)
+    if (m.isCompactSummary === true) {
       complete = false;
       continue;
     }
@@ -137,14 +145,16 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
       if (isPrompt(content)) {
         open = undefined;
         if (text.startsWith(INTERRUPT_MARKER)) {
-          if (turn) turn.interrupted = true;
+          if (turn) turn.end = { state: 'interrupted' };
           continue;
         }
         if (LOCAL_COMMAND.test(text)) continue;
         const notice = parseTaskNotification(text);
-        if (ctx.nativeTaskId === undefined) {
+        // A prompt taken in while the turn ran belongs to that turn (as live, where it is folded in).
+        const folded = m.isQueuedCommand === true && turn !== undefined && turn.end === undefined;
+        if (ctx.nativeTaskId === undefined && !folded) {
           closeTurn();
-          turn = { id: m.uuid, index: entries.length, startedAt: at, interrupted: false, lastAt: at };
+          turn = { id: m.uuid, index: entries.length, startedAt: at, lastAt: at };
           entries.push({ kind: 'turn', turn: { id: TurnId.parse(m.uuid), sessionId: ctx.sessionId, state: 'running', startedAt: at } });
         }
         if (notice) {
@@ -200,6 +210,12 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
       const messageId = isNonEmptyString(inner.id) ? inner.id : m.uuid;
       const text = textOf(content);
       const model = str(inner.model);
+      // Every stored block of an API message carries its final stop_reason.
+      const stop = str(inner.stop_reason);
+      if (turn && ctx.nativeTaskId === undefined && isNonEmptyString(stop)) {
+        // `<synthetic>` is the CLI's own message for an API error (R-12).
+        turn.end = stop === 'tool_use' ? undefined : model === '<synthetic>' ? { state: 'failed', failure: text || 'API error' } : { state: 'completed' };
+      }
       if (text !== '') {
         if (open?.id === messageId) {
           open.message = { ...open.message, text: open.message.text + text };
@@ -239,15 +255,7 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
       }
     }
   }
-  // The last turn may still be running in a live session; it is closed only when the transcript says so.
-  if (turn?.interrupted) closeTurn();
-  else if (turn) {
-    const last = turn;
-    entries[last.index] = {
-      kind: 'turn',
-      turn: { id: TurnId.parse(last.id), sessionId: ctx.sessionId, state: 'completed', startedAt: last.startedAt, endedAt: last.lastAt },
-    };
-  }
+  closeTurn();
   return { entries, agentCalls, notifications, complete };
 };
 
@@ -302,24 +310,45 @@ export const rebuildNativeTasks = (
   return { tasks, unlinked };
 };
 
-export interface StoredUserMessage {
-  uuid: string;
-  sessionId: string;
-  turnId: string;
+export interface PayloadRecord {
+  /** The turn it entered: its own uuid when it started one, else the latest prompt before it. */
+  turnRef: string;
+  itemRef: string;
+  sessionId: string | undefined;
   content: unknown;
 }
 
-/** Stored prompts with the turn each belongs to, for reconciliation (CR2_DELIVERY_FIX §4). */
-export const storedPrompts = (messages: readonly WireSessionMessage[]): StoredUserMessage[] => {
-  const out: StoredUserMessage[] = [];
-  for (const m of messages) {
-    const inner = messageOf(m);
-    if (m.type !== 'user' || !inner || !isNonEmptyString(m.uuid) || !isPrompt(inner.content)) continue;
-    const text = textOf(inner.content);
-    if (text.startsWith(INTERRUPT_MARKER) || LOCAL_COMMAND.test(text)) continue;
-    // Every prompt starts its own turn in the rebuilt history (see mapTranscript).
-    out.push({ uuid: m.uuid, sessionId: m.session_id, turnId: m.uuid, content: inner.content });
+/**
+ * Every stored record of a dispatched payload, from the raw transcript lines (CR2_DELIVERY_FIX §4): a
+ * prompt line with this uuid, or a queued-command attachment carrying it as `source_uuid` (a payload
+ * folded into a running turn; live-checked, T009). Raw lines are not deduplicated, so a payload stored
+ * twice is seen twice; compaction leaves earlier lines in the file, so it does not hide them.
+ */
+export const payloadRecords = (lines: readonly WireTranscriptEntry[], uuid: string): PayloadRecord[] => {
+  const out: PayloadRecord[] = [];
+  let turnRef: string | undefined;
+  for (const e of lines) {
+    if (e.isSidechain === true) continue;
+    if (e.type === 'user' && isNonEmptyString(e.uuid) && isObject(e.message)) {
+      const content = e.message.content;
+      const text = textOf(content);
+      const startsTurn =
+        isPrompt(content) && e.isMeta !== true && e.isCompactSummary !== true && !text.startsWith(INTERRUPT_MARKER) && !LOCAL_COMMAND.test(text);
+      if (startsTurn) turnRef = e.uuid;
+      if (e.uuid === uuid) out.push({ turnRef: startsTurn ? e.uuid : (turnRef ?? e.uuid), itemRef: e.uuid, sessionId: str(e.sessionId), content });
+    } else if (e.type === 'attachment' && isObject(e.attachment) && e.attachment.type === 'queued_command' && e.attachment.source_uuid === uuid) {
+      out.push({ turnRef: turnRef ?? uuid, itemRef: uuid, sessionId: str(e.sessionId), content: e.attachment.prompt });
+    }
   }
   return out;
+};
+
+/** A compaction boundary line: the conversation before it was replaced by a summary. */
+export const isCompacted = (lines: readonly WireTranscriptEntry[]): boolean => lines.some((e) => e.type === 'system' && e.subtype === 'compact_boundary');
+
+/** The folder the session ran in: the `cwd` its first conversation line recorded. */
+export const recordedCwd = (lines: readonly WireTranscriptEntry[]): string | undefined => {
+  const first = lines.find((e) => (e.type === 'user' || e.type === 'assistant') && e.isSidechain !== true && isNonEmptyString(e.cwd));
+  return first ? str(first.cwd) : undefined;
 };
 

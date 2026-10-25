@@ -38,10 +38,18 @@ describe('streaming turns (SP-01)', () => {
     // R-12: the model of each reply, reported once while it does not change.
     expect(h.of('model.observed').map((e) => e.observed)).toEqual([{ source: 'per-message', model: 'claude-haiku-5-5', observedAt: '2026-10-25T12:00:00.000Z' }]);
 
-    // `latest` is the turn's main-loop usage; `cumulative` sums result.modelUsage, which already runs across turns.
+    // `latest` is one model call (the API message, final counts from message_delta); `cumulative` sums
+    // result.modelUsage, which already runs across turns.
     const usage = h.of('usage.tokens').map((e) => e.usage);
-    expect(usage[0]).toMatchObject({ latest: { input: 2 + 1883 + 2643, cachedInput: 2643, output: 4, reasoningOutput: 0, total: 4532 }, contextWindow: 1_000_000 });
-    expect(usage[1]!.cumulative).toEqual({ input: 4 + 5548 + 3557, cachedInput: 5548, output: 7, reasoningOutput: 0, total: 9116 });
+    expect(usage.map((x) => [x.latest ? 'latest' : 'cumulative', x.turnId])).toEqual([
+      ['latest', h.of('turn.updated')[0]!.turn.id],
+      ['cumulative', h.of('turn.updated')[0]!.turn.id],
+      ['latest', h.of('turn.updated')[2]!.turn.id],
+      ['cumulative', h.of('turn.updated')[2]!.turn.id],
+    ]);
+    expect(usage[0]!.latest).toEqual({ input: 2 + 1883 + 2643, cachedInput: 2643, output: 4, reasoningOutput: 0, total: 4532 });
+    expect(usage[1]).toMatchObject({ contextWindow: 1_000_000 });
+    expect(usage[3]!.cumulative).toEqual({ input: 4 + 5548 + 3557, cachedInput: 5548, output: 7, reasoningOutput: 0, total: 9116 });
     expect(h.of('usage.limits')[0]).toMatchObject({ claude5h: { percentUsed: 16, resetsAt: '2026-10-23T10:20:00.000Z' }, claudeWeekly: { percentUsed: 2 } });
 
     expect(await h.adapter.close()).toEqual({ forced: false });
@@ -75,6 +83,13 @@ describe('models (SP-02, R-12)', () => {
     expect(command.map((i) => i.state)).toEqual(['running', 'completed']);
     expect(command[1]).toMatchObject({ command: 'Start-Sleep -Seconds 12', cwd: 'E:\\work\\task-1', output: '(PowerShell completed with no output)' });
     expect(h.of('nativeTask.updated')).toEqual([]);
+
+    // Review r1 P1-4: the third turn made two model calls; `latest` reports each, not the turn's sum
+    // (result.usage of that turn counts 64,265 input tokens; its last call read 32,306).
+    const third = h.of('turn.updated').filter((e) => e.turn.state === 'completed')[2]!.turn.id;
+    const calls = h.of('usage.tokens').filter((e) => e.usage.turnId === third && e.usage.latest).map((e) => e.usage.latest!.input);
+    expect(calls).toHaveLength(2);
+    expect(calls.at(-1)).toBe(32_306);
     expectValidEvents(h.events);
   });
 

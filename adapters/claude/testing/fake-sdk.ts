@@ -1,7 +1,9 @@
 // A scriptable stand-in for the Claude Agent SDK (tests only). Each query() is a FakeQuery: the test
 // feeds SDK messages into it (recorded or synthetic), sees what the adapter wrote to the streaming
 // input, calls the PreToolUse hook the adapter registered, and controls how control requests answer.
-import type { ClaudeSdk, WireHookOutput, WireModelInfo, WireQuery, WireQueryOptions, WireSessionMessage, WireUserMessage } from '../wire';
+// Stored transcripts are read with the SDK's own readers (sdk.ts transcriptReaders), not a copy of them.
+import { transcriptReaders } from '../sdk';
+import type { ClaudeSdk, WireHookOutput, WireModelInfo, WireQuery, WireQueryOptions, WireSessionMessage, WireTranscriptEntry, WireUserMessage } from '../wire';
 
 class Channel<T> {
   private readonly items: T[] = [];
@@ -141,20 +143,32 @@ export class FakeQuery implements WireQuery {
   }
 }
 
-/** Stored transcripts are found only under the cwd they were written in (SP-01), like the real SDK. */
-const key = (dir: string, sessionId: string) => `${dir.replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase()}|${sessionId}`;
+const folder = (dir: string) => dir.replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase();
 
+interface Stored {
+  folders: string[];
+  entries: WireTranscriptEntry[];
+  subagents: Record<string, WireTranscriptEntry[]>;
+}
+
+/**
+ * Stored sessions. Like the real SDK, a session is found under the folder it ran in and under other git
+ * worktrees of the same repository (SP-07; `alsoFoundFrom`), and nowhere else. The reads themselves go
+ * through the SDK's readers over these lines, so deduplication and compaction behave as in production.
+ */
 export class FakeSdk implements ClaudeSdk {
   readonly queries: FakeQuery[] = [];
   readonly reads: string[] = [];
   behaviour: FakeQueryBehaviour = {};
-  private readonly transcripts = new Map<string, WireSessionMessage[]>();
-  private readonly subagents = new Map<string, Map<string, WireSessionMessage[]>>();
   readError: Error | undefined;
+  private readonly stored = new Map<string, Stored>();
+  private readonly readers = transcriptReaders({
+    main: (sessionId) => this.stored.get(sessionId)?.entries,
+    subagents: (sessionId) => this.stored.get(sessionId)?.subagents ?? {},
+  });
 
-  store(dir: string, sessionId: string, messages: WireSessionMessage[], subagents: Record<string, WireSessionMessage[]> = {}): void {
-    this.transcripts.set(key(dir, sessionId), messages);
-    this.subagents.set(key(dir, sessionId), new Map(Object.entries(subagents)));
+  store(cwd: string, sessionId: string, entries: WireTranscriptEntry[], o: { subagents?: Record<string, WireTranscriptEntry[]>; alsoFoundFrom?: string[] } = {}): void {
+    this.stored.set(sessionId, { folders: [cwd, ...(o.alsoFoundFrom ?? [])].map(folder), entries, subagents: o.subagents ?? {} });
   }
 
   query(params: { prompt: AsyncIterable<WireUserMessage>; options: WireQueryOptions }): FakeQuery {
@@ -169,19 +183,31 @@ export class FakeSdk implements ClaudeSdk {
     return q;
   }
 
-  getSessionMessages(sessionId: string, options: { dir: string }): Promise<WireSessionMessage[]> {
+  getSessionMessages(sessionId: string, options: { dir: string; includeSystemMessages?: boolean }): Promise<WireSessionMessage[]> {
     this.reads.push(`messages:${sessionId}`);
     if (this.readError) return Promise.reject(this.readError);
-    return Promise.resolve([...(this.transcripts.get(key(options.dir, sessionId)) ?? [])]);
+    return this.found(sessionId, options.dir) ? this.readers.getSessionMessages(sessionId, options) : Promise.resolve([]);
   }
 
   listSubagents(sessionId: string, options: { dir: string }): Promise<string[]> {
     this.reads.push(`subagents:${sessionId}`);
-    return Promise.resolve([...(this.subagents.get(key(options.dir, sessionId))?.keys() ?? [])]);
+    return this.found(sessionId, options.dir) ? this.readers.listSubagents(sessionId, options) : Promise.resolve([]);
   }
 
   getSubagentMessages(sessionId: string, agentId: string, options: { dir: string }): Promise<WireSessionMessage[]> {
     this.reads.push(`subagent:${agentId}`);
-    return Promise.resolve([...(this.subagents.get(key(options.dir, sessionId))?.get(agentId) ?? [])]);
+    return this.found(sessionId, options.dir) ? this.readers.getSubagentMessages(sessionId, agentId, options) : Promise.resolve([]);
+  }
+
+  readTranscript(sessionId: string, options: { dir: string }): Promise<WireTranscriptEntry[]> {
+    this.reads.push(`transcript:${sessionId}`);
+    if (this.readError) return Promise.reject(this.readError);
+    const stored = this.found(sessionId, options.dir);
+    return Promise.resolve(stored ? stored.entries.map((e) => ({ ...e })) : []);
+  }
+
+  private found(sessionId: string, dir: string): Stored | undefined {
+    const stored = this.stored.get(sessionId);
+    return stored?.folders.includes(folder(dir)) ? stored : undefined;
   }
 }

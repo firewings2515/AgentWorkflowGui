@@ -87,7 +87,12 @@ export interface WireQuery extends AsyncIterable<unknown> {
   initializationResult(): Promise<unknown>;
 }
 
-/** `SessionMessage` from the stored transcript; `timestamp` and `origin` are present at runtime but not typed by the SDK. */
+/**
+ * `SessionMessage` from the stored transcript, after the SDK rebuilt the conversation chain. The SDK
+ * keeps one entry per uuid (later lines replace earlier ones) and drops line fields such as `subtype`,
+ * so duplicates and compaction boundaries cannot be seen here; see `WireTranscriptEntry`.
+ * `timestamp`, `origin` and the flags below are present at runtime but not typed by the SDK.
+ */
 export interface WireSessionMessage {
   type: 'user' | 'assistant' | 'system';
   uuid: string;
@@ -97,17 +102,39 @@ export interface WireSessionMessage {
   parent_agent_id?: string | null;
   timestamp?: string;
   origin?: unknown;
+  /** The summary prompt a compaction wrote in place of the earlier conversation. */
+  isCompactSummary?: boolean;
+  /** A prompt the CLI took in while a turn was running (stored as a queued-command attachment). */
+  isQueuedCommand?: boolean;
+  is_meta?: boolean;
 }
 
-/** Stored sessions are kept per cwd, so every read names the session's cwd (SP-01, CR2_DELIVERY_FIX §4). */
+/**
+ * One line of the stored transcript as written (JSONL), not deduplicated and with all its fields.
+ * Read through the SDK's `importSessionToStore`; used where the chain view hides facts (CR-2).
+ */
+export interface WireTranscriptEntry {
+  type: string;
+  uuid?: string;
+  timestamp?: string;
+  [field: string]: unknown;
+}
+
+/**
+ * Stored sessions are kept per project folder. The SDK finds a session under `dir` and also under
+ * other git worktrees of the same repository (SP-07), so a successful read does not prove `dir` is the
+ * folder the session ran in; the adapter checks the transcript's own `cwd` where that matters (R-06).
+ */
 export interface WireReadOptions {
   dir: string;
 }
 
 export interface ClaudeSdk {
   query(params: { prompt: AsyncIterable<WireUserMessage>; options: WireQueryOptions }): WireQuery;
-  /** Empty when the session is not found under `dir`. */
+  /** Empty when the session is not found. */
   getSessionMessages(sessionId: string, options: WireReadOptions & { includeSystemMessages?: boolean }): Promise<WireSessionMessage[]>;
   listSubagents(sessionId: string, options: WireReadOptions): Promise<string[]>;
   getSubagentMessages(sessionId: string, agentId: string, options: WireReadOptions): Promise<WireSessionMessage[]>;
+  /** The main transcript's lines in file order; empty when the session is not found. */
+  readTranscript(sessionId: string, options: WireReadOptions): Promise<WireTranscriptEntry[]>;
 }

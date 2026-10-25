@@ -5,7 +5,7 @@ import { expect } from 'vitest';
 import { AppEvent, AttemptId, ClientMessageId, type DispatchAttempt, SessionId } from '../../../contracts';
 import type { PermissionHandle, RuntimeEvent, StartSessionOptions } from '../../../core/ports';
 import { ClaudeAdapter, type ClaudeAdapterOptions } from '../adapter';
-import type { WireSessionMessage } from '../wire';
+import type { WireTranscriptEntry } from '../wire';
 import { FakeSdk } from './fake-sdk';
 
 export const SESSION = SessionId.parse('session-a');
@@ -108,12 +108,49 @@ export const loadMessages = (name: string): Record<string, unknown>[] =>
 export interface StoredFixture {
   sessionId: string;
   cwd: string;
-  messages: WireSessionMessage[];
-  subagents: Record<string, WireSessionMessage[]>;
+  entries: WireTranscriptEntry[];
+  subagents: Record<string, WireTranscriptEntry[]>;
 }
 
-/** A stored transcript as getSessionMessages / getSubagentMessages returned it. */
+/**
+ * A stored session as raw transcript lines (the CLI's JSONL shape, reduced to the fields the SDK reader
+ * uses; paths made up). sp03-transcript.json is SP-03's session.
+ */
 export const loadStored = (name: string): StoredFixture => JSON.parse(readFileSync(fixturePath(name), 'utf8')) as StoredFixture;
+
+type Line = Partial<WireTranscriptEntry> & { type: string; uuid: string };
+
+/**
+ * Raw transcript lines for one session, chained by parentUuid in the given order (a line may name its
+ * own parent), with the fields every CLI line carries.
+ */
+export const transcript = (sessionId: string, cwd: string, lines: Line[]): WireTranscriptEntry[] => {
+  let parent: string | null = null;
+  return lines.map((line, i) => {
+    const entry: WireTranscriptEntry = { parentUuid: parent, isSidechain: false, sessionId, cwd, timestamp: `2026-10-25T11:00:${String(i).padStart(2, '0')}.000Z`, ...line };
+    parent = line.uuid;
+    return entry;
+  });
+};
+
+/** A prompt line (typed or dispatched; `content` as the CLI stores it). */
+export const promptLine = (uuid: string, content: unknown, extra: Partial<WireTranscriptEntry> = {}): Line => ({ type: 'user', uuid, message: { role: 'user', content }, ...extra });
+
+/** An assistant line: one content block of API message `id`, carrying the message's final stop_reason. */
+export const replyLine = (uuid: string, block: Record<string, unknown>, o: { id?: string; stop?: string; model?: string } = {}): Line => ({
+  type: 'assistant',
+  uuid,
+  message: { id: o.id ?? `msg_${uuid.slice(-4)}`, type: 'message', role: 'assistant', model: o.model ?? 'claude-haiku-5-5', stop_reason: o.stop ?? 'end_turn', content: [block] },
+});
+
+export const toolResultLine = (uuid: string, toolUseId: string, content: string, isError = false): Line => ({
+  type: 'user',
+  uuid,
+  message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, is_error: isError, content }] },
+});
+
+/** A transcript uuid with a readable tail, e.g. u(7) → 11111111-0000-4000-8000-000000000007. */
+export const u = (n: number) => `11111111-0000-4000-8000-${String(n).padStart(12, '0')}`;
 
 /** The recorded messages up to and including the n-th result (0-based), split into turns. */
 export const turnsOf = (messages: Record<string, unknown>[]): Record<string, unknown>[][] => {

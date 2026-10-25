@@ -58,26 +58,35 @@ describe('startSession', () => {
 });
 
 describe('resumeSession', () => {
-  const fx = loadStored('sp03-history.json');
+  const fx = loadStored('sp03-transcript.json');
   const resume = { sessionId: SessionId.parse('session-sp03'), nativeSessionRef: fx.sessionId, cwd: fx.cwd, model: { runtime: 'claude' as const, model: 'sonnet' }, readOnly: false };
 
   it('resumes in the original cwd and reports the last model the transcript shows', async () => {
     const h = setup();
-    h.sdk.store(fx.cwd, fx.sessionId, fx.messages);
+    h.sdk.store(fx.cwd, fx.sessionId, fx.entries);
     await h.adapter.start();
-    const info = await h.adapter.resumeSession(resume);
-    expect(info).toEqual({ sessionId: 'session-sp03', nativeSessionRef: fx.sessionId, cwd: fx.cwd, model: { source: 'per-message', model: 'claude-haiku-5-5', observedAt: '2026-10-23T08:58:55.800Z' } });
-    expect(h.sdk.last.options).toMatchObject({ resume: fx.sessionId, cwd: fx.cwd, model: 'sonnet' });
+    // The folder may be spelled differently (case, separators, trailing one).
+    const info = await h.adapter.resumeSession({ ...resume, cwd: 'd:/DEMO/sp03/' });
+    expect(info).toEqual({ sessionId: 'session-sp03', nativeSessionRef: fx.sessionId, cwd: 'd:/DEMO/sp03/', model: { source: 'per-message', model: 'claude-haiku-5-5', observedAt: '2026-10-23T08:58:55.800Z' } });
+    expect(h.sdk.last.options).toMatchObject({ resume: fx.sessionId, cwd: 'd:/DEMO/sp03/', model: 'sonnet' });
     expect(h.sdk.last.options.sessionId).toBeUndefined();
   });
 
-  it('refuses a session not stored under that cwd, without starting the CLI', async () => {
+  it('refuses a session not found there, without starting the CLI', async () => {
     const h = setup();
-    h.sdk.store(fx.cwd, fx.sessionId, fx.messages);
+    h.sdk.store(fx.cwd, fx.sessionId, fx.entries);
     await h.adapter.start();
     await expect(h.adapter.resumeSession({ ...resume, cwd: 'E:\\other' })).rejects.toThrow(/no stored Claude session .* under E:\\other/);
     h.sdk.readError = new Error('EBUSY');
     await expect(h.adapter.resumeSession(resume)).rejects.toThrow(/could not read session/);
+    expect(h.sdk.queries).toEqual([]);
+  });
+
+  it('refuses another worktree, where the SDK still finds the session (R-06, SP-07)', async () => {
+    const h = setup();
+    h.sdk.store(fx.cwd, fx.sessionId, fx.entries, { alsoFoundFrom: ['D:\\demo\\sp03-wt2'] });
+    await h.adapter.start();
+    await expect(h.adapter.resumeSession({ ...resume, cwd: 'D:\\demo\\sp03-wt2' })).rejects.toThrow(/ran in D:\\demo\\sp03, not D:\\demo\\sp03-wt2/);
     expect(h.sdk.queries).toEqual([]);
   });
 });
