@@ -1,5 +1,10 @@
 import { join } from 'node:path';
 import { app, BrowserWindow } from 'electron';
+import { fixtureSnapshot } from '../../contracts/fixtures/snapshot';
+import { APP_INFO_CHANNEL } from '../preload/channels';
+import { registerAppIpc } from './app-ipc';
+import { EventBus } from './event-bus';
+import { createFakeFacade } from './facade';
 import { handleTrusted } from './ipc';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
 import { createWebPreferences } from './window-options';
@@ -45,7 +50,16 @@ function createWindow(): void {
 app.setName(APP_NAME);
 
 void app.whenReady().then(() => {
-  handleTrusted('app:get-info', getTrustedSender, () => ({ name: APP_NAME, version: app.getVersion() }));
+  handleTrusted(APP_INFO_CHANNEL, getTrustedSender, () => ({ name: APP_NAME, version: app.getVersion() }));
+  // Fake backend for now; the core replaces the facade later. The bus starts at the fixture's seq.
+  const bus = new EventBus({ seq: fixtureSnapshot.seq });
+  registerAppIpc({
+    facade: createFakeFacade({ bus }),
+    bus,
+    getTrustedSender,
+    getEventTarget: () => (mainWindow === null || mainWindow.isDestroyed() ? null : mainWindow.webContents),
+    isTrustedUrl,
+  });
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
