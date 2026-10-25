@@ -6,11 +6,22 @@
 /** `SDKMessageOrigin` subset the adapter may stamp on a dispatched user message (R-03, SP-05). */
 export type WireOrigin = { kind: 'human' } | { kind: 'peer'; from: string; fromMode?: 'bypass' | 'prompting'; name?: string };
 
+/** The SDK types message uuids as five dash-separated parts. */
+export type WireUuid = `${string}-${string}-${string}-${string}-${string}`;
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const isWireUuid = (s: string): s is WireUuid => UUID.test(s);
+
+/** MCP servers the GUI mounts per session (R-03): the local HTTP server, or a stdio command. */
+export type WireMcpServer =
+  | { type: 'http' | 'sse'; url: string; headers?: Record<string, string>; alwaysLoad?: boolean }
+  | { type?: 'stdio'; command: string; args?: string[]; env?: Record<string, string>; alwaysLoad?: boolean };
+
 /** `SDKUserMessage` as the adapter writes it into the streaming input. */
 export interface WireUserMessage {
   type: 'user';
   /** Client-chosen UUID; echoed as `user_message_uuid(s)` and stored as the transcript entry's uuid (CR2 §4). */
-  uuid: string;
+  uuid: WireUuid;
   session_id: string;
   parent_tool_use_id: null;
   message: { role: 'user'; content: string };
@@ -45,7 +56,7 @@ export interface WireQueryOptions {
   /** `disableClaudeAiConnectors`: account-level connectors are not covered by settingSources (SP-04). */
   settings: { disableClaudeAiConnectors: true };
   strictMcpConfig: true;
-  mcpServers?: Record<string, unknown>;
+  mcpServers?: Record<string, WireMcpServer>;
   /** R-08: every tool runs without the CLI asking; the PreToolUse hook hands each call to the GUI. */
   permissionMode: 'bypassPermissions';
   allowDangerouslySkipPermissions: true;

@@ -73,7 +73,7 @@ import {
   toTokenCounts,
 } from './mapping';
 import { buildPermissionRequest, decisionToHookOutput, denyOutput, parsePreToolUse } from './permissions';
-import type { ClaudeSdk, WireHookOutput, WireOrigin, WireQuery, WireQueryOptions, WireSessionMessage, WireUserMessage } from './wire';
+import { type ClaudeSdk, isWireUuid, type WireHookOutput, type WireMcpServer, type WireOrigin, type WireQuery, type WireQueryOptions, type WireSessionMessage, type WireUserMessage } from './wire';
 
 export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
   /** The SDK functions; `claudeAgentSdk` from ./sdk in production, a fake in tests. */
@@ -88,7 +88,7 @@ export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
   /** Origin of a user message shown in events and history (defaults to `user`). */
   userOrigin?: (info: { sessionId: SessionId; clientMessageId: string }) => MessageOrigin;
   /** Per-session MCP servers, e.g. the GUI MCP server with the session's own token (R-03). */
-  mcpServers?: (info: { sessionId: SessionId; cwd: string }) => Record<string, unknown>;
+  mcpServers?: (info: { sessionId: SessionId; cwd: string }) => Record<string, WireMcpServer>;
   now?: () => Date;
   newId?: () => string;
   /** Command output is kept to this many trailing characters (default 64 KiB). */
@@ -166,7 +166,6 @@ interface LiveSession {
 
 const MAIN = 'main';
 const DEFAULT_MAX_OUTPUT = 64 * 1024;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -231,7 +230,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
 
   async startSession(options: StartSessionOptions): Promise<NativeSessionInfo> {
     const ref = options.preallocatedRef ?? this.options.newId?.() ?? randomUUID();
-    if (!UUID.test(ref)) throw new Error(`startSession: Claude session IDs are UUIDs, got ${ref}`);
+    if (!isWireUuid(ref)) throw new Error(`startSession: Claude session IDs are UUIDs, got ${ref}`);
     return this.open(options, ref, { sessionId: ref }, { source: 'unknown' });
   }
 
@@ -295,6 +294,8 @@ export class ClaudeAdapter implements RuntimeAdapter {
       }
     }
     const uuid: ClientMessageId = attempt.clientMessageId;
+    // ClientMessageId is already a validated UUID; this only narrows the type for the SDK.
+    if (!isWireUuid(uuid)) throw new Error(`dispatchOnce: clientMessageId ${uuid} is not a UUID`);
     const acked = new Promise<string | undefined>((resolve) => s.acks.set(uuid, { text: req.text, resolve }));
     const message: WireUserMessage = {
       type: 'user',
