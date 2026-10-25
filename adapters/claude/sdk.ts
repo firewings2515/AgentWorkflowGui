@@ -2,6 +2,7 @@
 // Everything else in the adapter depends on the structural `ClaudeSdk` interface in wire.ts, so the SDK
 // can be isolated or replaced here alone.
 import {
+  getSessionInfo,
   getSessionMessages,
   getSubagentMessages,
   importSessionToStore,
@@ -12,27 +13,40 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import type { ClaudeSdk, WireTranscriptEntry } from './wire';
 
+/** Bytes the lines take in the file: the CLI writes each as compact JSON plus a newline. */
+const bytesOf = (lines: readonly WireTranscriptEntry[]): number => lines.reduce((n, line) => n + Buffer.byteLength(JSON.stringify(line)) + 1, 0);
+
 /**
  * `importSessionToStore` copies the session file line by line into a store without deduplicating, so a
  * store that only collects the main transcript gives the raw lines. It throws when there is no such
- * session, which is reported as an empty transcript.
+ * session (an empty transcript), but silently skips a line that does not parse (review r2). So the read
+ * counts as complete only when the lines it gave, written back, are exactly the file's size, and the
+ * size did not change meanwhile (re-serialisation matched byte for byte on 40 real transcripts, T009).
+ * A missing final newline is tolerated: that line parsed.
  */
 const readTranscript: ClaudeSdk['readTranscript'] = async (sessionId, { dir }) => {
-  const entries: WireTranscriptEntry[] = [];
+  const lines: WireTranscriptEntry[] = [];
   const collector: SessionStore = {
     append: (key, batch) => {
-      if (key.subpath === undefined) entries.push(...batch);
+      if (key.subpath === undefined) lines.push(...batch);
       return Promise.resolve();
     },
     load: () => Promise.resolve(null),
   };
+  const before = (await getSessionInfo(sessionId, { dir }))?.fileSize;
   try {
     await importSessionToStore(sessionId, collector, { dir, includeSubagents: false });
   } catch (error) {
-    if (error instanceof Error && /^Session \S+ not found$/.test(error.message)) return [];
+    if (error instanceof Error && /^Session \S+ not found$/.test(error.message)) return { lines: [], complete: true };
     throw error;
   }
-  return entries;
+  const after = (await getSessionInfo(sessionId, { dir }))?.fileSize;
+  const read = bytesOf(lines);
+  if (after === undefined || before !== after) {
+    return { lines, complete: false, detail: after === undefined ? 'the transcript size is not known' : 'the transcript changed while it was read' };
+  }
+  if (after !== read && after !== read - 1) return { lines, complete: false, detail: `read ${read} of ${after} transcript bytes; some lines did not parse` };
+  return { lines, complete: true };
 };
 
 export const claudeAgentSdk: ClaudeSdk = {

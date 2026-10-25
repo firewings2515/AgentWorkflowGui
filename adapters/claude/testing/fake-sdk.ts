@@ -3,7 +3,7 @@
 // input, calls the PreToolUse hook the adapter registered, and controls how control requests answer.
 // Stored transcripts are read with the SDK's own readers (sdk.ts transcriptReaders), not a copy of them.
 import { transcriptReaders } from '../sdk';
-import type { ClaudeSdk, WireHookOutput, WireModelInfo, WireQuery, WireQueryOptions, WireSessionMessage, WireTranscriptEntry, WireUserMessage } from '../wire';
+import type { ClaudeSdk, WireHookOutput, WireModelInfo, WireQuery, WireQueryOptions, WireSessionMessage, WireTranscript, WireTranscriptEntry, WireUserMessage } from '../wire';
 
 class Channel<T> {
   private readonly items: T[] = [];
@@ -199,11 +199,15 @@ export class FakeSdk implements ClaudeSdk {
     return this.found(sessionId, options.dir) ? this.readers.getSubagentMessages(sessionId, agentId, options) : Promise.resolve([]);
   }
 
-  readTranscript(sessionId: string, options: { dir: string }): Promise<WireTranscriptEntry[]> {
+  /** Set to report the next raw reads as incomplete (sdk.test.ts covers the real check). */
+  incompleteRead: string | undefined;
+
+  readTranscript(sessionId: string, options: { dir: string }): Promise<WireTranscript> {
     this.reads.push(`transcript:${sessionId}`);
     if (this.readError) return Promise.reject(this.readError);
     const stored = this.found(sessionId, options.dir);
-    return Promise.resolve(stored ? stored.entries.map((e) => ({ ...e })) : []);
+    const lines = stored ? stored.entries.map((e) => ({ ...e })) : [];
+    return Promise.resolve(this.incompleteRead !== undefined && stored ? { lines, complete: false, detail: this.incompleteRead } : { lines, complete: true });
   }
 
   private found(sessionId: string, dir: string): Stored | undefined {

@@ -2,7 +2,8 @@
 // the stored transcript and never resumes or starts a turn (CR2_DELIVERY_FIX §1, §2, §4).
 import { describe, expect, it } from 'vitest';
 import type { DispatchRequest } from '../../core/ports';
-import { attempt, CWD, echo, expectValidEvents, init, loadStored, promptLine, REF, replyLine, result, settle, started, transcript, u, until } from './testing/harness';
+import { payloadRecords } from './history';
+import { attempt, CWD, echo, expectValidEvents, init, loadStored, promptLine, REF, replyLine, result, SESSION, settle, started, transcript, u, until } from './testing/harness';
 
 const request = (extra: Partial<DispatchRequest> = {}): DispatchRequest => ({
   nativeSessionRef: REF,
@@ -173,6 +174,39 @@ describe('reconcile (CR2_DELIVERY_FIX §4)', () => {
     const queued = { type: 'attachment', uuid: u(9), attachment: { type: 'queued_command', prompt: text, source_uuid: uuid, commandMode: 'prompt' } };
     h.sdk.store(CWD, REF, lines(promptLine(u(1), 'Run the tests.'), replyLine(u(2), { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'npm test' } }, { stop: 'tool_use' }), queued, ack(3)));
     expect(await h.adapter.reconcile(req)).toMatchObject({ state: 'sent', nativeRef: { turnRef: u(1), itemRef: uuid } });
+  });
+
+  it('names the turn readHistory shows for a queued payload, also after the previous turn ended (review r2 P1-2)', async () => {
+    const h = await started();
+    const queued = { type: 'attachment', uuid: u(9), attachment: { type: 'queued_command', prompt: text, source_uuid: uuid, commandMode: 'prompt' } };
+    const raw = lines(
+      promptLine(u(1), 'Say hi.'),
+      replyLine(u(2), { type: 'text', text: 'hi' }),
+      queued,
+      replyLine(u(3), { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'npm test' } }, { stop: 'tool_use' }),
+    );
+    h.sdk.store(CWD, REF, raw);
+    const history = await h.adapter.readHistory({ sessionId: SESSION, nativeSessionRef: REF, cwd: CWD });
+    const turns = history.entries.flatMap((e) => (e.kind === 'turn' ? [[e.turn.id, e.turn.state]] : []));
+    // A ended before Q came in, so Q starts its own turn, still running.
+    expect(turns).toEqual([
+      [u(1), 'completed'],
+      [uuid, 'running'],
+    ]);
+    const shown = history.entries.find((e) => e.kind === 'message' && e.message.id === uuid);
+    expect(shown?.kind === 'message' && shown.message.turnId).toBe(uuid);
+    expect(await h.adapter.reconcile(req)).toMatchObject({ state: 'sent', nativeRef: { turnRef: uuid } });
+    // The raw-line rules (used when the chain view lacks the payload) agree.
+    expect(payloadRecords(raw, uuid).map((r) => r.turnRef)).toEqual([uuid]);
+  });
+
+  it('stays unknown when the raw read missed lines, even with one matching record (review r2 P1-1)', async () => {
+    const h = await started();
+    h.sdk.store(CWD, REF, lines(promptLine(uuid, text), ack(1)));
+    h.sdk.incompleteRead = 'read 600 of 700 transcript bytes; some lines did not parse';
+    const out = await h.adapter.reconcile(req);
+    expect(out).toMatchObject({ state: 'unknown', reason: 'read-failed', matches: [{ contentMatches: true }] });
+    expect(out.state === 'unknown' && out.detail).toContain('600 of 700');
   });
 
   it('sees a duplicate the SDK chain view hides (review r1 P1-1)', async () => {

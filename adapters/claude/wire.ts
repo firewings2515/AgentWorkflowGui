@@ -121,6 +121,17 @@ export interface WireTranscriptEntry {
 }
 
 /**
+ * The raw lines that could be read. `complete: false` when the file holds more than was read (a line
+ * the SDK skipped because it does not parse: truncated by a crash, damaged) or changed while reading;
+ * such a read proves neither absence nor uniqueness (CR-2).
+ */
+export interface WireTranscript {
+  lines: WireTranscriptEntry[];
+  complete: boolean;
+  detail?: string;
+}
+
+/**
  * Stored sessions are kept per project folder. The SDK finds a session under `dir` and also under
  * other git worktrees of the same repository (SP-07), so a successful read does not prove `dir` is the
  * folder the session ran in; the adapter checks the transcript's own `cwd` where that matters (R-06).
@@ -135,6 +146,6 @@ export interface ClaudeSdk {
   getSessionMessages(sessionId: string, options: WireReadOptions & { includeSystemMessages?: boolean }): Promise<WireSessionMessage[]>;
   listSubagents(sessionId: string, options: WireReadOptions): Promise<string[]>;
   getSubagentMessages(sessionId: string, agentId: string, options: WireReadOptions): Promise<WireSessionMessage[]>;
-  /** The main transcript's lines in file order; empty when the session is not found. */
-  readTranscript(sessionId: string, options: WireReadOptions): Promise<WireTranscriptEntry[]>;
+  /** The main transcript's lines in file order; empty (and complete) when the session is not found. */
+  readTranscript(sessionId: string, options: WireReadOptions): Promise<WireTranscript>;
 }

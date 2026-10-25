@@ -78,20 +78,42 @@ interface AgentCall {
 
 const messageOf = (m: WireSessionMessage): Json | undefined => (isObject(m.message) ? m.message : undefined);
 
-/** How a stored turn is known to have ended. Without one, the turn may still be running or was cut off. */
+// ---- turn rules -----------------------------------------------------------------------------------
+// Shared by readHistory (the SDK's chain view) and reconcile (raw lines), so both put a prompt in the
+// same turn. A turn is finished only on evidence: a final assistant message (stop_reason other than
+// tool_use) or the stored interrupt prompt. Without it the turn may still be running or was cut off.
+
+/** How a stored turn is known to have ended. */
 type TurnEnd = { state: 'completed' } | { state: 'interrupted' } | { state: 'failed'; failure: string };
+
+/**
+ * The end an assistant message shows: a TurnEnd, `undefined` when the turn goes on (tool_use), or
+ * `'none'` when the message says nothing. `<synthetic>` is the CLI's own message for an API error (R-12).
+ */
+const endOf = (message: Json): TurnEnd | undefined | 'none' => {
+  const stop = str(message.stop_reason);
+  if (!isNonEmptyString(stop)) return 'none';
+  if (stop === 'tool_use') return undefined;
+  return str(message.model) === '<synthetic>' ? { state: 'failed', failure: textOf(message.content) || 'API error' } : { state: 'completed' };
+};
+
+/** A prompt taken in while a turn ran joins that turn (as live, where it is folded in); any other starts one. */
+const joinsOpenTurn = (queued: boolean, open: { end?: TurnEnd | undefined } | undefined): boolean => queued && open !== undefined && open.end === undefined;
+
+/** User text that is not a prompt of its own: the stored interrupt notice, or CLI-local command output. */
+const notAPrompt = (text: string): 'interrupt' | 'local' | undefined => (text.startsWith(INTERRUPT_MARKER) ? 'interrupt' : LOCAL_COMMAND.test(text) ? 'local' : undefined);
 
 export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: TranscriptContext): MappedTranscript => {
   const entries: HistoryEntry[] = [];
   const agentCalls = new Map<string, AgentCall>();
   const notifications: MappedTranscript['notifications'] = new Map();
-  const items = new Map<string, { item: SessionItem; index: number }>();
+  // Open tool calls with the turn they belong to: a turn closes only its own calls (review r2 P2).
+  const items = new Map<string, { item: SessionItem; index: number; turnId: string | undefined }>();
   let complete = true;
   let lastTime = ctx.fallbackTime;
 
-  // Session turns (main transcript only). A turn is finished only on evidence: a final assistant message
-  // (stop_reason other than tool_use) or the stored interrupt prompt. Otherwise it stays running and the
-  // history is marked incomplete, because the transcript cannot tell "still running" from "cut off".
+  // Session turns (main transcript only). A turn without an end stays running and the history is
+  // marked incomplete; its open calls stay open too.
   let turn: { id: string; index: number; startedAt: Timestamp; lastAt: Timestamp; end?: TurnEnd | undefined } | undefined;
   const closeTurn = () => {
     if (!turn) return;
@@ -111,6 +133,7 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
     };
     entries[turn.index] = { kind: 'turn', turn: entry };
     for (const [id, open] of items) {
+      if (open.turnId !== turn.id) continue;
       const closed = closeOpenItem(open.item, end.state === 'interrupted' ? 'interrupted' : 'failed', turn.lastAt);
       if (closed) entries[open.index] = { kind: 'item', item: closed };
       items.delete(id);
@@ -144,15 +167,11 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
       const text = textOf(content);
       if (isPrompt(content)) {
         open = undefined;
-        if (text.startsWith(INTERRUPT_MARKER)) {
-          if (turn) turn.end = { state: 'interrupted' };
-          continue;
-        }
-        if (LOCAL_COMMAND.test(text)) continue;
+        const skip = notAPrompt(text);
+        if (skip === 'interrupt' && turn) turn.end = { state: 'interrupted' };
+        if (skip) continue;
         const notice = parseTaskNotification(text);
-        // A prompt taken in while the turn ran belongs to that turn (as live, where it is folded in).
-        const folded = m.isQueuedCommand === true && turn !== undefined && turn.end === undefined;
-        if (ctx.nativeTaskId === undefined && !folded) {
+        if (ctx.nativeTaskId === undefined && !joinsOpenTurn(m.isQueuedCommand === true, turn)) {
           closeTurn();
           turn = { id: m.uuid, index: entries.length, startedAt: at, lastAt: at };
           entries.push({ kind: 'turn', turn: { id: TurnId.parse(m.uuid), sessionId: ctx.sessionId, state: 'running', startedAt: at } });
@@ -211,11 +230,8 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
       const text = textOf(content);
       const model = str(inner.model);
       // Every stored block of an API message carries its final stop_reason.
-      const stop = str(inner.stop_reason);
-      if (turn && ctx.nativeTaskId === undefined && isNonEmptyString(stop)) {
-        // `<synthetic>` is the CLI's own message for an API error (R-12).
-        turn.end = stop === 'tool_use' ? undefined : model === '<synthetic>' ? { state: 'failed', failure: text || 'API error' } : { state: 'completed' };
-      }
+      const end = endOf(inner);
+      if (turn && ctx.nativeTaskId === undefined && end !== 'none') turn.end = end;
       if (text !== '') {
         if (open?.id === messageId) {
           open.message = { ...open.message, text: open.message.text + text };
@@ -250,7 +266,7 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
         }
         const item = startItem(placement(), use, ctx.cwd, at);
         if (!item) continue;
-        items.set(use.id, { item, index: entries.length });
+        items.set(use.id, { item, index: entries.length, turnId: turn?.id });
         entries.push({ kind: 'item', item });
       }
     }
@@ -311,7 +327,7 @@ export const rebuildNativeTasks = (
 };
 
 export interface PayloadRecord {
-  /** The turn it entered: its own uuid when it started one, else the latest prompt before it. */
+  /** The turn it entered, by the turn rules above. */
   turnRef: string;
   itemRef: string;
   sessionId: string | undefined;
@@ -320,27 +336,42 @@ export interface PayloadRecord {
 
 /**
  * Every stored record of a dispatched payload, from the raw transcript lines (CR2_DELIVERY_FIX §4): a
- * prompt line with this uuid, or a queued-command attachment carrying it as `source_uuid` (a payload
- * folded into a running turn; live-checked, T009). Raw lines are not deduplicated, so a payload stored
- * twice is seen twice; compaction leaves earlier lines in the file, so it does not hide them.
+ * line with this uuid, or a queued-command attachment carrying it as `source_uuid` (a payload taken in
+ * while a turn ran; live-checked, T009). Raw lines are not deduplicated, so a payload stored twice is
+ * seen twice; compaction leaves earlier lines in the file, so it does not hide them. Turns follow the
+ * same rules as mapTranscript; the adapter prefers mapTranscript's own answer when the chain has it.
  */
 export const payloadRecords = (lines: readonly WireTranscriptEntry[], uuid: string): PayloadRecord[] => {
   const out: PayloadRecord[] = [];
-  let turnRef: string | undefined;
+  let open: { id: string; end?: TurnEnd | undefined } | undefined;
+  const record = (itemRef: string, e: WireTranscriptEntry, content: unknown) => out.push({ turnRef: open?.id ?? itemRef, itemRef, sessionId: str(e.sessionId), content });
   for (const e of lines) {
     if (e.isSidechain === true) continue;
-    if (e.type === 'user' && isNonEmptyString(e.uuid) && isObject(e.message)) {
+    if (e.type === 'assistant' && isObject(e.message)) {
+      const end = endOf(e.message);
+      if (open && end !== 'none') open.end = end;
+    } else if (e.type === 'user' && isNonEmptyString(e.uuid) && isObject(e.message)) {
       const content = e.message.content;
-      const text = textOf(content);
-      const startsTurn =
-        isPrompt(content) && e.isMeta !== true && e.isCompactSummary !== true && !text.startsWith(INTERRUPT_MARKER) && !LOCAL_COMMAND.test(text);
-      if (startsTurn) turnRef = e.uuid;
-      if (e.uuid === uuid) out.push({ turnRef: startsTurn ? e.uuid : (turnRef ?? e.uuid), itemRef: e.uuid, sessionId: str(e.sessionId), content });
-    } else if (e.type === 'attachment' && isObject(e.attachment) && e.attachment.type === 'queued_command' && e.attachment.source_uuid === uuid) {
-      out.push({ turnRef: turnRef ?? uuid, itemRef: uuid, sessionId: str(e.sessionId), content: e.attachment.prompt });
+      const skip = notAPrompt(textOf(content));
+      if (skip === 'interrupt' && open) open.end = { state: 'interrupted' };
+      // The SDK's chain view leaves out meta lines (except those with an origin, like task notifications)
+      // and shows the compaction summary as no prompt; mapTranscript then sees no turn start either.
+      const startsTurn = isPrompt(content) && !skip && e.isCompactSummary !== true && (e.isMeta !== true || isObject(e.origin));
+      if (startsTurn) open = { id: e.uuid };
+      if (e.uuid === uuid) record(e.uuid, e, content);
+    } else if (e.type === 'attachment' && isObject(e.attachment) && e.attachment.type === 'queued_command' && isNonEmptyString(e.attachment.source_uuid)) {
+      const source = e.attachment.source_uuid;
+      if (!joinsOpenTurn(true, open)) open = { id: source };
+      if (source === uuid) record(uuid, e, e.attachment.prompt);
     }
   }
   return out;
+};
+
+/** The turn mapTranscript put a message in. */
+export const turnOfMessage = (entries: readonly HistoryEntry[], messageId: string): string | undefined => {
+  for (const e of entries) if (e.kind === 'message' && e.message.id === messageId) return e.message.turnId;
+  return undefined;
 };
 
 /** A compaction boundary line: the conversation before it was replaced by a summary. */

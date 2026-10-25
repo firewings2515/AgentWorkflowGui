@@ -161,6 +161,25 @@ describe('readHistory', () => {
     expect(boundaryOnly.complete).toBe(false);
   });
 
+  it("does not close one turn's open call when a later turn ends (review r2 P2)", async () => {
+    const history = await read(
+      transcript(REF, DIR, [promptLine(u(1), 'Run the tests.'), bash(2, 'npm test'), promptLine(u(3), 'Say hi.'), replyLine(u(4), { type: 'text', text: 'hi' })]),
+    );
+    expect(kinds(history.entries)).toEqual(['turn:running', 'user', 'command:running', 'turn:completed', 'user', 'assistant']);
+    const command = history.entries[2]!;
+    expect(command.kind === 'item' && command.item.endedAt).toBeUndefined();
+    expect(history.complete).toBe(false);
+    expectValid(history.entries);
+  });
+
+  it('marks the history incomplete when the raw read missed lines (review r2 P1-1)', async () => {
+    const h = setup();
+    h.sdk.store(DIR, REF, transcript(REF, DIR, [promptLine(u(1), 'hi'), replyLine(u(2), { type: 'text', text: 'hello' })]));
+    h.sdk.incompleteRead = 'read 600 of 700 transcript bytes; some lines did not parse';
+    const history = await h.adapter.readHistory({ sessionId: SESSION, nativeSessionRef: REF, cwd: DIR });
+    expect(history.complete).toBe(false);
+  });
+
   it('marks the history incomplete for a sub-agent it cannot place', async () => {
     const history = await read(transcript(REF, DIR, [promptLine(u(1), 'hi'), replyLine(u(2), { type: 'text', text: 'hello' })]), { 'a-unknown': [] });
     expect(history.complete).toBe(false);

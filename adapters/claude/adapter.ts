@@ -22,7 +22,7 @@ import {
   PermissionDecision,
   PermissionRequest,
   PermissionRequestId,
-  type SessionId,
+  SessionId,
   type SessionItem,
   type Timestamp,
   type Turn,
@@ -46,7 +46,7 @@ import type {
   SessionSettings,
   StartSessionOptions,
 } from '../../core/ports';
-import { INTERRUPT_MARKER, isCompacted, mapTranscript, payloadRecords, rebuildNativeTasks, recordedCwd } from './history';
+import { INTERRUPT_MARKER, isCompacted, mapTranscript, payloadRecords, rebuildNativeTasks, recordedCwd, turnOfMessage } from './history';
 import { InputQueue } from './input-queue';
 import {
   closeOpenItem,
@@ -74,7 +74,7 @@ import {
   toTokenCounts,
 } from './mapping';
 import { buildPermissionRequest, decisionToHookOutput, denyOutput, parsePreToolUse } from './permissions';
-import { type ClaudeSdk, isWireUuid, type WireHookOutput, type WireMcpServer, type WireOrigin, type WireQuery, type WireQueryOptions, type WireTranscriptEntry, type WireUserMessage } from './wire';
+import { type ClaudeSdk, isWireUuid, type WireHookOutput, type WireMcpServer, type WireOrigin, type WireQuery, type WireQueryOptions, type WireTranscript, type WireTranscriptEntry, type WireUserMessage } from './wire';
 
 export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
   /** The SDK functions; `claudeAgentSdk` from ./sdk in production, a fake in tests. */
@@ -251,9 +251,10 @@ export class ClaudeAdapter implements RuntimeAdapter {
    */
   async resumeSession(options: ResumeSessionOptions): Promise<NativeSessionInfo> {
     this.checkCwd(options.cwd, 'resumeSession');
+    // A read that missed lines (a crash cut the last one) still shows where the session ran.
     let lines: WireTranscriptEntry[];
     try {
-      lines = await this.options.sdk.readTranscript(options.nativeSessionRef, { dir: options.cwd });
+      ({ lines } = await this.options.sdk.readTranscript(options.nativeSessionRef, { dir: options.cwd }));
     } catch (error) {
       throw new Error(`resumeSession: could not read session ${options.nativeSessionRef} under ${options.cwd}: ${errorText(error)}`, { cause: error });
     }
@@ -347,20 +348,37 @@ export class ClaudeAdapter implements RuntimeAdapter {
   /**
    * Read-only (CR2_DELIVERY_FIX §2, §4): reads the session's raw transcript lines and looks for records
    * of this uuid in this session with the same text. Raw lines, because getSessionMessages keeps one
-   * entry per uuid and would hide a duplicate. Never resumes or starts a turn.
+   * entry per uuid and would hide a duplicate; and only a complete read counts, because the SDK skips a
+   * line it cannot parse. The turn is the one readHistory shows. Never resumes or starts a turn.
    */
   async reconcile(req: ReconcileRequest): Promise<ReconcileResult> {
-    let lines: WireTranscriptEntry[];
+    const dir = { dir: req.cwd };
+    let transcript: WireTranscript;
     try {
-      lines = await this.options.sdk.readTranscript(req.nativeSessionRef, { dir: req.cwd });
+      transcript = await this.options.sdk.readTranscript(req.nativeSessionRef, dir);
     } catch (error) {
       return { state: 'unknown', reason: 'read-failed', matches: [], detail: errorText(error) };
     }
-    const matches: ReconcileMatch[] = payloadRecords(lines, req.clientMessageId).map((r) => ({
-      turnRef: r.turnRef,
+    const { lines } = transcript;
+    const records = payloadRecords(lines, req.clientMessageId);
+    // readHistory's own turn for the payload, when the chain view has it; else the same rules on raw lines.
+    let historyTurn: string | undefined;
+    if (records.length > 0) {
+      try {
+        const messages = await this.options.sdk.getSessionMessages(req.nativeSessionRef, { ...dir, includeSystemMessages: true });
+        historyTurn = turnOfMessage(mapTranscript(messages, this.transcriptContext(SessionId.parse(req.nativeSessionRef), req.cwd)).entries, req.clientMessageId);
+      } catch (error) {
+        this.log('warn', 'could not read the chain view for a reconcile turn', error);
+      }
+    }
+    const matches: ReconcileMatch[] = records.map((r) => ({
+      turnRef: historyTurn ?? r.turnRef,
       itemRef: r.itemRef,
       contentMatches: r.sessionId === req.nativeSessionRef && sameText(r.content, req.text),
     }));
+    if (!transcript.complete) {
+      return { state: 'unknown', reason: 'read-failed', matches, detail: `the transcript could not be read whole: ${transcript.detail ?? 'unknown reason'}` };
+    }
     if (matches.length === 0) {
       const compacted = isCompacted(lines) ? ' (the session was compacted)' : '';
       return { state: 'unknown', reason: 'not-found', matches, detail: `no stored record of uuid ${req.clientMessageId} among ${lines.length} transcript lines of ${req.nativeSessionRef}${compacted}` };
@@ -379,13 +397,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
   async readHistory(req: HistoryRequest): Promise<HistoryResult> {
     const { sdk } = this.options;
     const dir = { dir: req.cwd };
-    const ctx = {
-      sessionId: req.sessionId,
-      cwd: req.cwd,
-      userOrigin: (uuid: string) => this.userOrigin(req.sessionId, uuid),
-      maxOutputChars: this.options.maxOutputChars ?? DEFAULT_MAX_OUTPUT,
-      fallbackTime: this.now(),
-    };
+    const ctx = this.transcriptContext(req.sessionId, req.cwd);
     if (req.nativeTask) {
       const messages = await sdk.getSubagentMessages(req.nativeSessionRef, req.nativeTask.nativeRef, dir);
       const mapped = mapTranscript(messages, { ...ctx, nativeTaskId: req.nativeTask.nativeTaskId });
@@ -394,9 +406,11 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const messages = await sdk.getSessionMessages(req.nativeSessionRef, { ...dir, includeSystemMessages: true });
     const mapped = mapTranscript(messages, ctx);
     let complete = mapped.complete;
-    // The chain view drops the compaction boundary's subtype, so the raw lines are checked too.
+    // The chain view drops the compaction boundary's subtype, so the raw lines are checked too; a raw read
+    // that missed lines means the chain view may have missed them as well.
     try {
-      if (isCompacted(await sdk.readTranscript(req.nativeSessionRef, dir))) complete = false;
+      const raw = await sdk.readTranscript(req.nativeSessionRef, dir);
+      if (!raw.complete || isCompacted(raw.lines)) complete = false;
     } catch (error) {
       this.log('warn', 'could not read the raw transcript of a stored session', error);
       complete = false;
@@ -1085,6 +1099,16 @@ export class ClaudeAdapter implements RuntimeAdapter {
   private checkCwd(cwd: string, method: string): void {
     const exists = this.options.cwdExists ?? existsSync;
     if (!exists(cwd)) throw new Error(`${method}: working folder ${cwd} does not exist; recreate the task worktree before using this session`);
+  }
+
+  private transcriptContext(sessionId: SessionId, cwd: string) {
+    return {
+      sessionId,
+      cwd,
+      userOrigin: (uuid: string) => this.userOrigin(sessionId, uuid),
+      maxOutputChars: this.options.maxOutputChars ?? DEFAULT_MAX_OUTPUT,
+      fallbackTime: this.now(),
+    };
   }
 
   private userOrigin(sessionId: SessionId, clientMessageId: string): MessageOrigin {
