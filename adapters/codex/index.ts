@@ -1,18 +1,12 @@
-// Codex app-server adapter (T003). See adapter.ts for what it does and deliberately does not do.
+// Codex app-server adapter (T003, aligned with the runtime port in T006). See adapter.ts for what it
+// does and deliberately does not do.
 export {
   CodexAdapter,
   type CodexAdapterEvent,
   type CodexAdapterOptions,
   type CodexThreadInfo,
-  type DispatchEntry,
-  type DispatchRequest,
-  type DispatchResult,
-  type HistoryEntry,
-  type PermissionHandle,
-  type ReconcileMatch,
-  type ReconcileRequest,
-  type ReconcileResult,
   type ResumeThreadOptions,
+  type ServerInfo,
   type StartThreadOptions,
   type ThreadSettings,
   type TurnInput,

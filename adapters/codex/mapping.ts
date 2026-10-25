@@ -1,20 +1,22 @@
 // Pure conversions from Codex wire shapes to contracts types. No state, no I/O; the adapter decides
 // which session / turn / native task a wire object belongs to and passes that in.
 import {
+  type Attachment,
   ItemId,
+  type Message,
   MessageId,
+  type MessageOrigin,
   type ModelOption,
   type ModelSelection,
   type NativeTaskId,
   type SessionId,
   type SessionItem,
   type Timestamp,
+  type TokenCounts,
   type TokenUsage,
   type Turn,
   TurnId,
-  type Message,
 } from '../../contracts';
-import type { Attachment, MessageOrigin, TokenCounts } from './contract-types';
 import type { WireItem, WireItemStatus, WireModel, WireTokenUsage, WireTokenUsageBreakdown, WireTurn, WireUserInput } from './protocol';
 type CommandItem = Extract<SessionItem, { kind: 'command' }>;
 type FileChangeItem = Extract<SessionItem, { kind: 'fileChange' }>;
@@ -54,6 +56,7 @@ export const toTokenCounts = (b: WireTokenUsageBreakdown): TokenCounts => ({
 export const toTokenUsage = (p: Placement, usage: WireTokenUsage, at: Timestamp): TokenUsage => ({
   sessionId: p.sessionId,
   ...opt('turnId', p.turnId === undefined ? undefined : TurnId.parse(p.turnId)),
+  ...opt('nativeTaskId', p.nativeTaskId),
   latest: toTokenCounts(usage.last),
   cumulative: toTokenCounts(usage.total),
   ...opt('contextWindow', usage.modelContextWindow !== null && usage.modelContextWindow > 0 ? usage.modelContextWindow : undefined),
@@ -64,17 +67,22 @@ export const toTokenUsage = (p: Placement, usage: WireTokenUsage, at: Timestamp)
 
 const turnStates = { inProgress: 'running', completed: 'completed', interrupted: 'interrupted', failed: 'failed' } as const;
 
-export const toTurn = (sessionId: SessionId, turn: WireTurn, opts: { now: Timestamp; requestedModel?: ModelSelection | undefined }): Turn => {
+export const toTurn = (
+  sessionId: SessionId,
+  turn: WireTurn,
+  opts: { now: Timestamp; requestedModel?: ModelSelection | undefined; nativeTaskId?: NativeTaskId | undefined },
+): Turn => {
   const state = turnStates[turn.status] ?? 'failed';
-  const startedAt = turn.startedAt !== null ? isoFromSeconds(turn.startedAt) : opts.now;
+  const startedAt = typeof turn.startedAt === 'number' ? isoFromSeconds(turn.startedAt) : opts.now;
   return {
     id: TurnId.parse(turn.id),
     sessionId,
+    ...opt('nativeTaskId', opts.nativeTaskId),
     state,
     ...opt('requestedModel', opts.requestedModel),
     ...(state === 'failed' && { failure: { message: turn.error?.message ?? `turn ended with status ${turn.status}` } }),
     startedAt,
-    ...(state !== 'running' && { endedAt: turn.completedAt !== null ? isoFromSeconds(turn.completedAt) : opts.now }),
+    ...(state !== 'running' && { endedAt: typeof turn.completedAt === 'number' ? isoFromSeconds(turn.completedAt) : opts.now }),
   };
 };
 
@@ -153,6 +161,7 @@ export const toCommandItem = (
     cwd: text(item.cwd, '(unknown)'),
     state,
     ...opt('exitCode', typeof item.exitCode === 'number' && Number.isInteger(item.exitCode) ? item.exitCode : undefined),
+    ...opt('nativeProcessRef', typeof item.processId === 'string' && item.processId !== '' ? item.processId : undefined),
     output: output.output,
     outputTruncated: output.truncated,
     ...ended<CommandItem['state']>(state, 'running', times),
