@@ -235,8 +235,10 @@ export class CodexAdapter implements RuntimeAdapter {
   private readonly turnModels = new Map<string, ModelSelection>();
   private readonly items = new Map<string, TrackedItem>();
   private readonly nativeTasks = new Map<string, NativeTask>();
-  /** State implied by each child thread's latest turn (running while a turn is open). */
+  /** State implied by each child thread's latest turn (running while a turn is open), seen live or read from history. */
   private readonly childTurnStates = new Map<string, NativeTask['state']>();
+  /** Children whose turn state came from live events: only these are trusted without reading the child again. */
+  private readonly liveChildTurns = new Set<string>();
   private readonly permissions = new Map<string, PermissionEntry>();
   private readonly dispatched = new Set<string>();
   private stderrTail = '';
@@ -680,7 +682,7 @@ export class CodexAdapter implements RuntimeAdapter {
     parentKind: string,
     parentAt: Timestamp,
   ): Promise<{ state: NativeTask['state']; lastActivity?: string | undefined; endedAt?: Timestamp | undefined; exact: boolean; fromTurn: boolean }> {
-    const live = this.childTurnStates.get(child);
+    const live = this.liveChildTurns.has(child) ? this.childTurnStates.get(child) : undefined;
     if (live !== undefined) {
       const task = this.nativeTasks.get(child);
       return { state: live, lastActivity: task?.lastActivity, endedAt: task?.endedAt, exact: true, fromTurn: true };
@@ -719,16 +721,21 @@ export class CodexAdapter implements RuntimeAdapter {
    * `sessionId`: binds their threads to the session (so they can be stopped, R-13) and records their state
    * the way live events would have, so later events follow the T003 rules (a child turn ends or resumes a
    * task; a late spawn report cannot revive it). A thread or child bound elsewhere is left alone, and
-   * what the adapter already saw live is kept.
+   * what the adapter saw of a child's own turns live is kept. Otherwise a child turn read now replaces
+   * older knowledge in both maps together, so the task and its turn state never disagree.
    */
   private async restoreChildren(sessionId: SessionId, threadId: string, parentTaskId: NativeTaskId | undefined, items: StoredItem[]) {
     this.adoptChildren(sessionId, threadId, items);
     const found = await this.nativeTasksIn(sessionId, threadId, parentTaskId, items);
     if (this.threads.get(threadId)?.sessionId === sessionId) {
       for (const task of found.tasks) {
-        if (this.threads.get(task.nativeRef)?.sessionId !== sessionId) continue;
-        if (!this.nativeTasks.has(task.nativeRef)) this.nativeTasks.set(task.nativeRef, task);
-        if (found.fromTurn.has(task.nativeRef) && !this.childTurnStates.has(task.nativeRef)) this.childTurnStates.set(task.nativeRef, task.state);
+        if (this.threads.get(task.nativeRef)?.sessionId !== sessionId || this.liveChildTurns.has(task.nativeRef)) continue;
+        if (found.fromTurn.has(task.nativeRef)) {
+          this.nativeTasks.set(task.nativeRef, task);
+          this.childTurnStates.set(task.nativeRef, task.state);
+        } else if (!this.nativeTasks.has(task.nativeRef)) {
+          this.nativeTasks.set(task.nativeRef, task);
+        }
       }
     }
     return found;
@@ -1187,6 +1194,7 @@ export class CodexAdapter implements RuntimeAdapter {
     const state = !ended ? 'running' : turn.status === 'interrupted' ? 'stopped' : turn.status === 'completed' ? 'completed' : 'failed';
     // Remembered so a late spawn activity on the parent cannot contradict it.
     this.childTurnStates.set(child, state);
+    this.liveChildTurns.add(child);
     const task = this.nativeTasks.get(child);
     if (task) this.updateNativeTask(task, state, `turn ${turn.status}`, at, false);
   }

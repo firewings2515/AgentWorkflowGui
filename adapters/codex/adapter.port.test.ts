@@ -505,6 +505,61 @@ describe('stopping a native task found in history (R-13)', () => {
     expect(h.of('nativeTask.updated')[0]!.task.endedAt).toBeUndefined();
     expect(h.fake.mismatches).toEqual([]);
   });
+
+  // Review r3 P1-1/P1-2: what an earlier history read showed is not taken for live evidence.
+  const spawnDone = { ...spawn, id: 'sa-done', kind: 'completed' };
+  const readScript = (base: number, parentItems: unknown[], child: (id: number) => ReplayRecord): ReplayRecord[] => [
+    out('thread/items/list', base, { threadId: THREAD_ID, ...ITEMS }),
+    reply(base, page(parentItems)),
+    out('thread/turns/list', base + 1, { threadId: THREAD_ID, ...ITEMS }),
+    reply(base + 1, page([wireTurn('turn-1', 'completed')])),
+    out('thread/turns/list', base + 2, { threadId: CHILD_A, limit: 1, sortDirection: 'desc' }),
+    child(base + 2),
+  ];
+  const childNow = (status: string) => (id: number) =>
+    reply(id, page([wireTurn(childTurnId, status, 1792739194, status === 'inProgress' ? null : 1792739195)]));
+
+  it('reads the child again on every history read instead of trusting what an earlier read showed', async () => {
+    const parentItems = [entry('turn-1', spawn), entry('turn-1', spawnDone, null, 1792739197000)];
+    const h = await resumed([
+      ...readScript(3, parentItems, childNow('inProgress')),
+      ...readScript(6, parentItems, childNow('inProgress')),
+      ...readScript(9, parentItems, childNow('failed')),
+    ]);
+    const first = await h.adapter.readHistory(historyRequest());
+    expect(first.nativeTasks[0]).toMatchObject({ state: 'running' });
+    expect(first.complete).toBe(false);
+    // Nothing changed: still unconfirmed, not suddenly complete.
+    const second = await h.adapter.readHistory(historyRequest());
+    expect(second.nativeTasks[0]).toMatchObject({ state: 'running' });
+    expect(second.complete).toBe(false);
+    // The child's turn has since failed: the new read shows it.
+    const third = await h.adapter.readHistory(historyRequest());
+    expect(third.nativeTasks[0]).toMatchObject({ state: 'failed', endedAt: new Date(1792739195000).toISOString() });
+    expect(third.complete).toBe(true);
+    expect(h.fake.received.filter((m) => m.method === 'thread/turns/list' && (m.params as { threadId?: string }).threadId === CHILD_A)).toHaveLength(3);
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
+  it('reports a new child turn as running after a later history read replaced an unconfirmed running task with failed', async () => {
+    const h = await resumed([
+      ...readScript(3, [entry('turn-1', spawn)], (id) => replyError(id, -32600, 'child not stored')),
+      ...readScript(6, [entry('turn-1', spawn)], childNow('failed')),
+      out('thread/loaded/list', 9),
+      reply(9, page([])),
+      childTurnEvent('turn/started', 'inProgress', null),
+    ]);
+    const first = await h.adapter.readHistory(historyRequest());
+    expect(first.nativeTasks[0]).toMatchObject({ state: 'running' });
+    expect(first.complete).toBe(false);
+    const second = await h.adapter.readHistory(historyRequest());
+    expect(second.nativeTasks[0]).toMatchObject({ state: 'failed' });
+    expect(h.of('nativeTask.updated')).toEqual([]);
+    await h.adapter.listLoadedThreads();
+    await until(() => h.of('nativeTask.updated').length > 0, 'task update');
+    expect(h.of('nativeTask.updated').map((e) => e.task.state)).toEqual(['running']);
+    expect(h.fake.mismatches).toEqual([]);
+  });
 });
 
 describe('pending model while a turn/start is in flight', () => {
