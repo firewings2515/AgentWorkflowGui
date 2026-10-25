@@ -40,6 +40,8 @@ import type { WireSessionMessage } from './wire';
 
 /** Text the CLI stores when the user interrupts a turn or a tool call. */
 export const INTERRUPT_MARKER = '[Request interrupted by user';
+/** The CLI's error result for a call the PreToolUse hook denied or did not answer in time. */
+const HOOK_REFUSAL = /^PreToolUse(:\S+)? hook (error|did not respond)/;
 /** Output of CLI-local commands (e.g. the model switch of setModel) is stored as user text but is no prompt. */
 const LOCAL_COMMAND = /^<(local-command-stdout|local-command-stderr|local-command-caveat|command-name)>/;
 
@@ -183,7 +185,7 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
         if (!tracked) continue;
         const finished = finishItem(tracked.item, result, {
           endedAt: at,
-          declined: false,
+          declined: result.isError && HOOK_REFUSAL.test(text),
           interrupted: text.startsWith(INTERRUPT_MARKER),
           maxOutputChars: ctx.maxOutputChars,
         });

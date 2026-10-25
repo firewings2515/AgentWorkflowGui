@@ -99,7 +99,8 @@ export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
   startTimeoutMs?: number;
   /**
    * PreToolUse hook timeout in seconds. Answers may be held for a long time (R-07 locks, R-05 user
-   * approvals), so it defaults to 7 days instead of the CLI's short default.
+   * approvals), so it defaults to 7 days instead of the CLI's short default. On timeout the CLI does not
+   * run the tool and aborts the hook, which withdraws the request (live-checked, T009).
    */
   hookTimeoutSeconds?: number;
   /** Folder for the short-lived query that lists models when no session is open (default: OS temp). */
@@ -125,7 +126,7 @@ interface OpenMessage {
 
 interface PendingAck {
   text: string;
-  resolve: (turnId: string | undefined) => void;
+  resolve: (ack: { turnId: string | undefined; frame: string }) => void;
 }
 
 interface PermissionEntry {
@@ -296,7 +297,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const uuid: ClientMessageId = attempt.clientMessageId;
     // ClientMessageId is already a validated UUID; this only narrows the type for the SDK.
     if (!isWireUuid(uuid)) throw new Error(`dispatchOnce: clientMessageId ${uuid} is not a UUID`);
-    const acked = new Promise<string | undefined>((resolve) => s.acks.set(uuid, { text: req.text, resolve }));
+    const acked = new Promise<{ turnId: string | undefined; frame: string }>((resolve) => s.acks.set(uuid, { text: req.text, resolve }));
     const message: WireUserMessage = {
       type: 'user',
       uuid,
@@ -312,7 +313,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
       return { state: 'unknown', reason: 'not-running', written: false, detail: 'the session input closed before the payload was queued' };
     }
     const timeoutMs = req.timeoutMs ?? this.options.dispatchTimeoutMs ?? 60_000;
-    const outcome = await within(Promise.race([acked.then((turnId) => ({ acked: true as const, turnId })), s.done.then(() => ({ acked: false as const }))]), timeoutMs);
+    const outcome = await within(Promise.race([acked.then((ack) => ({ acked: true as const, ...ack })), s.done.then(() => ({ acked: false as const }))]), timeoutMs);
     if (!outcome) {
       return { state: 'unknown', reason: 'timeout', written: true, detail: `no reply frame echoed uuid ${uuid} within ${timeoutMs} ms` };
     }
@@ -320,11 +321,11 @@ export class ClaudeAdapter implements RuntimeAdapter {
       s.acks.delete(uuid);
       return { state: 'unknown', reason: 'disconnected', written: true, detail: 'the Claude process ended before echoing the payload uuid' };
     }
-    const turnId = outcome.value.turnId;
+    const { turnId, frame } = outcome.value;
     return {
       state: 'sent',
       nativeRef: { sessionRef: s.ref, ...opt('turnRef', turnId), itemRef: uuid },
-      evidence: { kind: 'live-ack', at: this.now(), detail: `reply frame${turnId ? ` in turn ${turnId}` : ''} echoed user_message_uuid ${uuid}` },
+      evidence: { kind: 'live-ack', at: this.now(), detail: `${frame} frame${turnId ? ` in turn ${turnId}` : ''} listed user_message_uuid ${uuid}` },
     };
   }
 
@@ -752,15 +753,21 @@ export class ClaudeAdapter implements RuntimeAdapter {
         },
       });
     }
+    // A cancel answer (`continue: false`) stops the loop with a successful result and this reason.
+    if (open.interruptRequested || m.terminal_reason === 'hook_stopped') return this.endTurn(s, 'interrupted', at);
     const ok = m.subtype === 'success' && m.is_error !== true;
     if (ok) return this.endTurn(s, 'completed', at);
-    if (open.interruptRequested) return this.endTurn(s, 'interrupted', at);
     const errors = Array.isArray(m.errors) ? m.errors.filter(isNonEmptyString) : [];
     const detail = errors.join('; ') || str(m.result) || `turn ended with ${String(m.subtype)}`;
     this.endTurn(s, 'failed', at, detail);
   }
 
-  /** Acknowledges dispatched uuids echoed on a main-loop reply frame (CR2_DELIVERY_FIX §4). */
+  /**
+   * Acknowledges dispatched uuids listed on a main-loop frame (CR2_DELIVERY_FIX §4). The CLI stamps
+   * `user_message_uuid(s)` on the frames of the turn that consumes a prompt: system/init and
+   * system/status as the turn starts, then assistant / stream_event / result; a prompt folded into a
+   * running turn first shows up on a system/status frame and the result (live-checked, T009).
+   */
   private ack(s: LiveSession, m: Json): void {
     const uuids = new Set<string>(Array.isArray(m.user_message_uuids) ? m.user_message_uuids.filter(isNonEmptyString) : []);
     if (isNonEmptyString(m.user_message_uuid)) uuids.add(m.user_message_uuid);
@@ -783,7 +790,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
           createdAt: this.now(),
         },
       });
-      pending.resolve(turnId);
+      pending.resolve({ turnId, frame: [str(m.type), str(m.subtype)].filter(isNonEmptyString).join('/') || 'unknown' });
     }
   }
 

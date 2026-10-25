@@ -67,6 +67,24 @@ describe('dispatchOnce', () => {
     expect(await second).toMatchObject({ state: 'sent', nativeRef: { turnRef: a.attempt.clientMessageId, itemRef: b.attempt.clientMessageId } });
   });
 
+  it('acknowledges a payload inserted into a busy turn on the status frame that lists it (live, T009)', async () => {
+    const h = await started();
+    const q = h.sdk.last;
+    const first = request();
+    const sending = h.adapter.dispatchOnce(first);
+    await until(() => q.inputs.length === 1, 'first input');
+    q.emit({ ...init(), user_message_uuids: [first.attempt.clientMessageId] });
+    await sending;
+    const insert = request({ entry: { kind: 'insert', expectedTurnRef: first.attempt.clientMessageId } });
+    const inserted = h.adapter.dispatchOnce(insert);
+    await until(() => q.inputs.length === 2, 'insert written');
+    // The fold shows on a system/status frame; the assistant frames keep the typed prompt's uuid.
+    q.emit({ type: 'system', subtype: 'status', status: 'requesting', session_id: REF, uuid: 's2', user_message_uuids: [first.attempt.clientMessageId, insert.attempt.clientMessageId] });
+    const sent = await inserted;
+    expect(sent).toMatchObject({ state: 'sent', nativeRef: { turnRef: first.attempt.clientMessageId, itemRef: insert.attempt.clientMessageId } });
+    expect(sent.state === 'sent' && sent.evidence.detail).toMatch(/^system\/status frame/);
+  });
+
   it('reports timeout as unknown and never writes again (CR-2)', async () => {
     const h = await started();
     const req = request({ timeoutMs: 20 });

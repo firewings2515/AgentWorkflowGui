@@ -76,12 +76,21 @@ describe('permission requests', () => {
     expectValidEvents(h.events);
   });
 
-  it('cancel denies and stops the agent loop', async () => {
+  it('cancel denies and stops the agent loop; the turn ends as interrupted', async () => {
     const h = await started();
-    const { output } = h.sdk.last.callHook(bash('rm -rf build'));
+    const q = h.sdk.last;
+    q.emit(init());
+    await until(() => h.of('turn.updated').length === 1, 'turn');
+    const { output } = q.callHook(bash('rm -rf build'));
     await until(() => h.permissions.length === 1, 'request');
     h.permissions[0]!.answer(decide('cancel'));
     expect(await output).toMatchObject({ continue: false, hookSpecificOutput: { permissionDecision: 'deny' } });
+    // Live (T009): the CLI then ends the turn with a successful result and terminal_reason hook_stopped.
+    q.emit({ type: 'result', subtype: 'success', is_error: false, stop_reason: 'tool_use', terminal_reason: 'hook_stopped', session_id: REF });
+    await until(() => h.of('turn.updated').length === 2, 'turn end');
+    expect(h.of('turn.updated')[1]!.turn.state).toBe('interrupted');
+    expect(h.of('session.activity').at(-1)!.activity).toBe('interrupted');
+    expectValidEvents(h.events);
   });
 
   it('rejects an invalid answer without answering the runtime', async () => {

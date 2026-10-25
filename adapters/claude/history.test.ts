@@ -108,6 +108,24 @@ describe('readHistory', () => {
     expect(history.nativeTasks).toEqual([]);
   });
 
+  it('shows calls the GUI refused or did not answer in time as declined (live, T009)', async () => {
+    const h = setup();
+    const at = '2026-10-25T11:00:00.000Z';
+    const write = (id: string): WireSessionMessage => ({ type: 'assistant', uuid: `a-${id}`, session_id: 's', message: { id: `msg_${id}`, model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use', id, name: 'Write', input: { file_path: 'E:\\w\\x.txt', content: 'hi' } }] }, parent_tool_use_id: null, timestamp: at });
+    const refused = (id: string, text: string): WireSessionMessage => ({ type: 'user', uuid: `r-${id}`, session_id: 's', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, is_error: true, content: text }] }, parent_tool_use_id: null, timestamp: at });
+    h.sdk.store('E:\\w', 's', [
+      { type: 'user', uuid: '11111111-0000-4000-8000-000000000001', session_id: 's', message: { role: 'user', content: 'write it' }, parent_tool_use_id: null, timestamp: at },
+      write('t1'),
+      refused('t1', 'PreToolUse:Write hook error: declined by AgentWorkflowGui'),
+      write('t2'),
+      refused('t2', 'PreToolUse hook did not respond before its timeout (host client may be unreachable). The tool call was not executed; other configured hooks may not have completed.'),
+      write('t3'),
+      refused('t3', 'EACCES: permission denied'),
+    ]);
+    const history = await h.adapter.readHistory({ sessionId: SESSION, nativeSessionRef: 's', cwd: 'E:\\w' });
+    expect(kinds(history.entries)).toEqual(['turn:completed', 'user', 'fileChange:declined', 'fileChange:declined', 'fileChange:failed']);
+  });
+
   it('skips CLI-local command output and keeps an interrupted turn interrupted', async () => {
     const h = setup();
     const at = '2026-10-25T11:00:00.000Z';
