@@ -1,0 +1,8 @@
+AgentWorkflowGui
+Copyright 2026 firewings2515
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party components used by this product are licensed under their own terms,
+including the Claude Agent SDK by Anthropic (Anthropic's license terms) and the
+Codex CLI by OpenAI (Apache License 2.0).
