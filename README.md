@@ -46,6 +46,6 @@ npm test           # 執行測試
 
 ## 授權
 
-本專案以 [GNU General Public License v3.0 或之後的版本](LICENSE)（GPL-3.0-or-later）釋出。
+本專案以 [GNU General Public License v3.0 或之後的版本](LICENSE)（GPL-3.0-or-later）釋出，並附一項依 GPL 第 7 條提供的[額外許可](LICENSE-EXCEPTION.md)：允許本專案與 Anthropic 的 Claude Agent SDK 一起連結、散布。Claude Agent SDK 本身仍適用 Anthropic 的授權條款；Codex 是以獨立程式執行，不需要額外許可。
 
 Copyright (C) 2026 firewings2515
