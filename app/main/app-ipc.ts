@@ -4,16 +4,10 @@ import type { EventBus } from './event-bus';
 import { failure, type AppFacade } from './facade';
 import { handleTrusted } from './ipc';
 import type { TrustedSender } from './ipc-guard';
+import { describeIssues } from './issues';
 
 /** Used when a malformed command carries no usable requestId, so the reply is still a valid CommandResult. */
 export const UNKNOWN_REQUEST_ID = RequestId.parse('unknown');
-
-/** Names the offending fields without echoing their values (a bad command may hold large or private text). */
-function describeIssues(error: { issues: readonly { path: readonly PropertyKey[]; message: string }[] }): string {
-  const shown = error.issues.slice(0, 5).map((i) => `${i.path.map(String).join('.') || '(command)'}: ${i.message}`);
-  const more = error.issues.length - shown.length;
-  return `Invalid command. ${shown.join('; ')}${more > 0 ? `; and ${String(more)} more` : ''}`;
-}
 
 function requestIdOf(raw: unknown): RequestId {
   if (typeof raw !== 'object' || raw === null) return UNKNOWN_REQUEST_ID;
@@ -28,7 +22,7 @@ function requestIdOf(raw: unknown): RequestId {
 export async function runCommand(facade: AppFacade, raw: unknown): Promise<CommandResult> {
   const requestId = requestIdOf(raw);
   const command = Command.safeParse(raw);
-  if (!command.success) return failure(requestId, 'invalid_request', describeIssues(command.error));
+  if (!command.success) return failure(requestId, 'invalid_request', `Invalid command. ${describeIssues(command.error)}`);
   try {
     const result = CommandResult.safeParse(await facade.execute(command.data));
     if (result.success && result.data.requestId === command.data.requestId) return result.data;
@@ -39,9 +33,29 @@ export async function runCommand(facade: AppFacade, raw: unknown): Promise<Comma
   }
 }
 
-/** The Snapshot, checked against the contract before it leaves the main process. */
-export function readSnapshot(facade: AppFacade): Snapshot {
-  return Snapshot.parse(facade.snapshot());
+/** What the renderer sees when no valid Snapshot can be produced; the reason stays in the main process log. */
+export const SNAPSHOT_UNAVAILABLE = 'The state snapshot is not available';
+
+/**
+ * The Snapshot, checked against the contract before it leaves the main process. Electron hands a handler's
+ * thrown message to the renderer, so a failure is logged here (field paths only) and rethrown as fixed text.
+ */
+export function readSnapshot(facade: AppFacade, log: (message: string) => void = console.error): Snapshot {
+  let raw: unknown;
+  let failed = false;
+  try {
+    raw = facade.snapshot();
+  } catch (error) {
+    log(`[ipc] the backend failed to produce a snapshot (${error instanceof Error ? error.name : 'non-error thrown'})`);
+    failed = true;
+  }
+  if (failed) throw new Error(SNAPSHOT_UNAVAILABLE);
+  const parsed = Snapshot.safeParse(raw);
+  if (!parsed.success) {
+    log(`[ipc] the backend produced an invalid snapshot: ${describeIssues(parsed.error)}`);
+    throw new Error(SNAPSHOT_UNAVAILABLE);
+  }
+  return parsed.data;
 }
 
 /** The part of `WebContents` that event forwarding needs. */

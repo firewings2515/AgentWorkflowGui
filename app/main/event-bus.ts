@@ -1,4 +1,5 @@
 import { AppEvent, CONTRACTS_VERSION, EventEnvelope } from '../../contracts';
+import { describeIssues } from './issues';
 
 export interface EventBusOptions {
   /** Seq of the state already in the Snapshot; the first published envelope gets `seq + 1`. */
@@ -34,7 +35,7 @@ export class EventBus {
   publish(event: AppEvent): EventEnvelope | null {
     const parsedEvent = AppEvent.safeParse(event);
     if (!parsedEvent.success) {
-      this.#onRejected(parsedEvent.error.message);
+      this.#onRejected(describeIssues(parsedEvent.error));
       return null;
     }
     const envelope = EventEnvelope.parse({ schemaVersion: CONTRACTS_VERSION, seq: this.#seq + 1, event: parsedEvent.data });

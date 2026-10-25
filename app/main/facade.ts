@@ -36,14 +36,14 @@ export function createFakeFacade(deps: { bus: Pick<EventBus, 'seq' | 'publish'>;
   function reparent(command: Extract<Command, { type: 'session.reparent' }>): CommandResult {
     const { requestId, sessionId, parentId, expectedRevision } = command;
     const session = state.sessions.find((s) => s.id === sessionId);
-    if (!session) return failure(requestId, 'not_found', `Unknown session ${sessionId}`);
+    if (!session) return failure(requestId, 'not_found', 'Unknown session');
     // A workflow session's parent is the session that created it; only the ordinary tree can be reorganised (WB-01).
     if (session.kind !== 'ordinary') return failure(requestId, 'invalid_transition', 'Only ordinary sessions can be moved in the tree');
     if (session.revision !== expectedRevision) {
-      return failure(requestId, 'stale_revision', `Session is at revision ${session.revision}, not ${expectedRevision}`, { retryable: true });
+      return failure(requestId, 'stale_revision', 'The session has changed since it was loaded', { retryable: true });
     }
     if (parentId !== null) {
-      if (!state.sessions.some((s) => s.id === parentId)) return failure(requestId, 'not_found', `Unknown parent session ${parentId}`);
+      if (!state.sessions.some((s) => s.id === parentId)) return failure(requestId, 'not_found', 'Unknown parent session');
       // Walking up from the new parent must never reach the session itself.
       let cursor: string | undefined = parentId;
       while (cursor !== undefined) {

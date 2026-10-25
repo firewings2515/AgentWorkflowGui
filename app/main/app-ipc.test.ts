@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { CommandResult, Snapshot, type Command, type EventEnvelope } from '../../contracts';
 import { fixtureSnapshot } from '../../contracts/fixtures/snapshot';
 import { COMMAND_CHANNEL, EVENT_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
-import { registerAppIpc, runCommand, UNKNOWN_REQUEST_ID, type EventTarget } from './app-ipc';
+import { readSnapshot, registerAppIpc, runCommand, SNAPSHOT_UNAVAILABLE, UNKNOWN_REQUEST_ID, type EventTarget } from './app-ipc';
 import { EventBus } from './event-bus';
 import { createFakeFacade, type AppFacade } from './facade';
 import type { IpcSenderEvent, TrustedSender } from './ipc-guard';
@@ -85,10 +85,53 @@ describe('snapshot', () => {
     expect(second.seq).toBe(first.seq + 1);
   });
 
-  it('refuses to hand out a Snapshot that breaks the contract', () => {
-    const broken = { ...fixtureSnapshot, schemaVersion: '0.0.1' } as unknown as Snapshot;
-    const { call } = setup({ facade: { snapshot: () => broken, execute: vi.fn() } });
-    expect(() => call(SNAPSHOT_CHANNEL, trustedEvent)).toThrow();
+  describe('when no valid Snapshot can be produced', () => {
+    const MARKER = 'SENSITIVE_INPUT_MARKER';
+    const capture = (facade: AppFacade) => {
+      const log = vi.fn();
+      let thrown: unknown;
+      try {
+        readSnapshot(facade, log);
+      } catch (error) {
+        thrown = error;
+      }
+      return { log, thrown };
+    };
+
+    it('throws fixed text and keeps a private-path exception out of the renderer and the log', () => {
+      const { log, thrown } = capture({
+        snapshot: () => {
+          throw new Error('cannot read C:/Users/someone/' + MARKER + '/state.db');
+        },
+        execute: vi.fn(),
+      });
+      expect(thrown).toEqual(new Error(SNAPSHOT_UNAVAILABLE));
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(String(log.mock.calls[0]?.[0])).not.toContain(MARKER);
+      expect(String(log.mock.calls[0]?.[0])).not.toContain('someone');
+    });
+
+    it('throws fixed text and keeps IDs from an invalid Snapshot out of the renderer and the log', () => {
+      const broken = { ...fixtureSnapshot, schemaVersion: '0.0.1', workflows: [{ ...fixtureSnapshot.workflows[0], id: MARKER, nodes: MARKER }] } as unknown as Snapshot;
+      const { log, thrown } = capture({ snapshot: () => broken, execute: vi.fn() });
+      expect(thrown).toEqual(new Error(SNAPSHOT_UNAVAILABLE));
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(String(log.mock.calls[0]?.[0])).not.toContain(MARKER);
+      expect(String(log.mock.calls[0]?.[0])).toContain('schemaVersion');
+    });
+
+    it('rejects the snapshot call with the fixed text through the IPC handler', () => {
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const { call } = setup({
+        facade: {
+          snapshot: () => {
+            throw new Error(`leaks ${MARKER}`);
+          },
+          execute: vi.fn(),
+        },
+      });
+      expect(() => call(SNAPSHOT_CHANNEL, trustedEvent)).toThrow(SNAPSHOT_UNAVAILABLE);
+    });
   });
 });
 
@@ -133,12 +176,47 @@ describe('commands', () => {
     expect(await runCommand(facade, { type: 'nope', requestId: 12 })).toMatchObject({ requestId: UNKNOWN_REQUEST_ID });
   });
 
-  it('does not echo field values in the error message', async () => {
-    const { facade } = setup();
-    const secret = 'sk-very-secret-value';
-    const result = await runCommand(facade, { type: 'preferences.set', requestId: 'req-s', preferences: { theme: secret } });
-    expect(result.ok).toBe(false);
-    expect(JSON.stringify(result)).not.toContain(secret);
+  describe('error messages never quote input', () => {
+    const MARKER = 'SENSITIVE_INPUT_MARKER';
+    const workflowWithBadEdge = () => {
+      const workflow = structuredClone(fixtureSnapshot.workflows[0]);
+      if (!workflow) throw new Error('fixture has no workflow');
+      return { ...workflow, edges: [...workflow.edges, { source: MARKER, target: 'n-plan' }] };
+    };
+
+    it('for a field value that fails validation', async () => {
+      const { facade } = setup();
+      const result = await runCommand(facade, { type: 'preferences.set', requestId: 'req-s', preferences: { theme: MARKER } });
+      expect(result).toMatchObject({ ok: false, code: 'invalid_request' });
+      expect(JSON.stringify(result)).not.toContain(MARKER);
+    });
+
+    it('for a workflow refinement that names an ID', async () => {
+      const { facade } = setup();
+      const result = await runCommand(facade, { type: 'workflow.save', requestId: 'req-w', workflow: workflowWithBadEdge(), expectedRevision: null });
+      expect(result).toMatchObject({ ok: false, code: 'invalid_request' });
+      expect(JSON.stringify(result)).not.toContain(MARKER);
+      expect((result as { message: string }).message).toContain('workflow: custom');
+    });
+
+    it('for an unknown key', async () => {
+      const { facade } = setup();
+      const result = await runCommand(facade, { ...(setPreferences('req-k') as object), [MARKER]: true });
+      expect(result).toMatchObject({ ok: false, code: 'invalid_request' });
+      expect(JSON.stringify(result)).not.toContain(MARKER);
+    });
+
+    it.each([
+      ['an unknown session', { sessionId: MARKER, parentId: null, expectedRevision: 1 }],
+      ['an unknown parent', { sessionId: 's-research', parentId: MARKER, expectedRevision: 2 }],
+      ['a stale revision', { sessionId: 's-research', parentId: null, expectedRevision: 987654 }],
+    ])('from the fake facade for %s', async (_name, fields) => {
+      const { facade } = setup();
+      const result = await runCommand(facade, { type: 'session.reparent', requestId: 'req-r', ...fields });
+      expect(result.ok).toBe(false);
+      expect(JSON.stringify(result)).not.toContain(MARKER);
+      expect(JSON.stringify(result)).not.toContain('987654');
+    });
   });
 
   it('turns a throwing facade into a failed result that warns about side effects', async () => {
