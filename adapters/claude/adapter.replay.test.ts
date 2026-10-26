@@ -1,6 +1,19 @@
 // Replays SDK messages recorded by the spikes (fixtures/*.jsonl, SDK 0.3.309 / Claude Code 2.1.309).
 import { describe, expect, it } from 'vitest';
-import { expectValidEvents, loadMessages, REF, settle, started, turnsOf, until } from './testing/harness';
+import { expectValidEvents, loadMessages, REF, SESSION, settle, started, turnsOf, until } from './testing/harness';
+import type { WireQueryOptions } from './wire';
+
+describe('process (T013, R-14)', () => {
+  it('starts each session’s claude.exe through the injected spawn, so it runs in the session’s Job', async () => {
+    const asked: unknown[] = [];
+    const spawn: NonNullable<WireQueryOptions['spawnClaudeCodeProcess']> = () => {
+      throw new Error('not started in this test');
+    };
+    const h = await started({ spawnProcess: (info) => (asked.push(info), spawn) });
+    expect(h.sdk.last.options.spawnClaudeCodeProcess).toBe(spawn);
+    expect(asked).toEqual([{ sessionId: SESSION }]);
+  });
+});
 
 describe('streaming turns (SP-01)', () => {
   it('opens a policy-isolated session, streams two turns and closes by interrupting first', async () => {

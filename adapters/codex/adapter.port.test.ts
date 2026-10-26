@@ -3,10 +3,10 @@
 import { describe, expect, it } from 'vitest';
 import { AttemptId, ClientMessageId, NativeTaskId } from '../../contracts';
 import type { DispatchRequest, RuntimeAdapter } from '../../core/ports';
-import { CodexAdapter } from './adapter';
+import { CodexAdapter, type CodexAdapterOptions } from './adapter';
 import { ISOLATION_CONFIG } from './protocol';
-import { loadFixture, notify, out, recordedResult, reply, replyError, type ReplayRecord } from './testing/fake-app-server';
-import { expectValidEvents, SESSION, setup, until } from './testing/harness';
+import { FakeAppServer, loadFixture, notify, out, recordedResult, reply, replyError, type ReplayRecord } from './testing/fake-app-server';
+import { expectValidEvents, SESSION, sentParams, setup, until } from './testing/harness';
 
 const sp01 = loadFixture('sp01-create.jsonl');
 const THREAD_ID = '01a16795-2bff-74f2-9fd1-6198ee6b4ee7';
@@ -35,8 +35,8 @@ const attempt = (n: number): DispatchRequest['attempt'] => ({
 });
 const dispatch = (n: number, entry: DispatchRequest['entry'], t = `payload ${n}`): DispatchRequest => ({ nativeSessionRef: THREAD_ID, attempt: attempt(n), text: t, entry });
 
-const resumed = async (records: ReplayRecord[]) => {
-  const h = setup([...init(), out('thread/resume', 2), reply(2, recordedResult(sp01, 'thread/start')), ...records]);
+const resumed = async (records: ReplayRecord[], options: Partial<CodexAdapterOptions> = {}) => {
+  const h = setup([...init(), out('thread/resume', 2), reply(2, recordedResult(sp01, 'thread/start')), ...records], options);
   await h.adapter.start();
   await h.adapter.resumeThread({ sessionId: SESSION, threadId: THREAD_ID });
   return h;
@@ -166,12 +166,49 @@ describe('inserting into the running turn', () => {
 });
 
 describe('interrupt and stopNativeTask', () => {
-  it('interrupts the turn it saw start', async () => {
-    const h = await resumed([turnStarted, out('turn/interrupt', 3, { threadId: THREAD_ID, turnId: TURN_ID }), reply(3, {})]);
+  const terminal = (processId: string) => ({ itemId: `exec-${processId}`, processId, command: 'node worker.mjs', cwd: CWD, osPid: null, cpuPercent: null, rssKb: null });
+  const listTerminals = (id: number, cursor: string | null = null) => out('thread/backgroundTerminals/list', id, { threadId: THREAD_ID, limit: 100, cursor });
+
+  it('interrupts the turn it saw start, then ends its commands by thread and process ID (CR-7)', async () => {
+    const h = await resumed([
+      turnStarted,
+      out('turn/interrupt', 3, { threadId: THREAD_ID, turnId: TURN_ID }),
+      reply(3, {}),
+      listTerminals(4),
+      reply(4, { data: [terminal('31441')], nextCursor: '31441' }),
+      listTerminals(5, '31441'),
+      reply(5, { data: [terminal('3821')], nextCursor: null }),
+      out('thread/backgroundTerminals/terminate', 6, { threadId: THREAD_ID, processId: '31441' }),
+      reply(6, { terminated: true }),
+      out('thread/backgroundTerminals/terminate', 7, { threadId: THREAD_ID, processId: '3821' }),
+      // Already gone: logged, not thrown.
+      reply(7, { terminated: false }),
+    ]);
     await h.fake.idle();
     await h.adapter.interrupt(THREAD_ID);
     expect(h.fake.mismatches).toEqual([]);
     expect(h.fake.received.filter((m) => m.method === 'turn/interrupt')).toHaveLength(1);
+    expect(h.fake.received.filter((m) => m.method === 'thread/backgroundTerminals/terminate').map((m) => m.params)).toEqual([
+      { threadId: THREAD_ID, processId: '31441' },
+      { threadId: THREAD_ID, processId: '3821' },
+    ]);
+  });
+
+  it('asks for the experimental API that the terminal calls need', async () => {
+    const h = await resumed([]);
+    expect(sentParams(h.fake, 'initialize').capabilities).toEqual({ experimentalApi: true });
+  });
+
+  it('still counts the interrupt when the terminal calls fail', async () => {
+    const warnings: string[] = [];
+    const h = await resumed(
+      [turnStarted, out('turn/interrupt', 3, { threadId: THREAD_ID, turnId: TURN_ID }), reply(3, {}), listTerminals(4), replyError(4, -32601, 'method not found')],
+      { log: (level, message) => level === 'warn' && warnings.push(message) },
+    );
+    await h.fake.idle();
+    await h.adapter.interrupt(THREAD_ID);
+    expect(warnings).toEqual([`listing the background terminals of ${THREAD_ID} failed`]);
+    expect(h.fake.mismatches).toEqual([]);
   });
 
   it('looks for a running turn it did not see start, and does nothing when there is none', async () => {
@@ -181,8 +218,12 @@ describe('interrupt and stopNativeTask', () => {
       reply(3, { data: [wireTurn(TURN_ID, 'inProgress')], nextCursor: null }),
       out('turn/interrupt', 4, { threadId: THREAD_ID, turnId: TURN_ID }),
       reply(4, {}),
-      out('thread/turns/list', 5, list),
-      reply(5, { data: [wireTurn(TURN_ID, 'completed')], nextCursor: null }),
+      listTerminals(5),
+      reply(5, { data: [], nextCursor: null }),
+      out('thread/turns/list', 6, list),
+      reply(6, { data: [wireTurn(TURN_ID, 'completed')], nextCursor: null }),
+      listTerminals(7),
+      reply(7, { data: [], nextCursor: null }),
     ]);
     await h.adapter.interrupt(THREAD_ID);
     await h.adapter.interrupt(THREAD_ID);
@@ -226,6 +267,38 @@ describe('native process reference', () => {
     // An empty handle is no handle.
     expect(items[2]).not.toHaveProperty('nativeProcessRef');
     expectValidEvents(h.events);
+  });
+});
+
+describe('closeSession (R-14, one app-server per GUI session)', () => {
+  it('closes the app-server through stdin', async () => {
+    let jobEnded = false;
+    const h = await resumed([], { endJob: () => Promise.resolve((jobEnded = true)) });
+    expect(await h.adapter.closeSession(THREAD_ID)).toEqual({ forced: false });
+    expect(h.adapter.running).toBe(false);
+    expect(jobEnded).toBe(false);
+  });
+
+  it('ends the session Job when the app-server does not exit in time', async () => {
+    const fake = new FakeAppServer([...init(), out('thread/resume', 2), reply(2, recordedResult(sp01, 'thread/start'))], { exitOnStdinEnd: false });
+    let jobEnded = 0;
+    const adapter = new CodexAdapter({
+      spawn: () => fake,
+      onPermissionRequest: () => undefined,
+      // The Job ends the app-server with everything else in it.
+      endJob: () => Promise.resolve(void (jobEnded++, fake.kill())),
+    });
+    await adapter.start();
+    await adapter.resumeThread({ sessionId: SESSION, threadId: THREAD_ID });
+    expect(await adapter.closeSession(THREAD_ID, 20)).toEqual({ forced: true });
+    expect(jobEnded).toBe(1);
+    expect(adapter.running).toBe(false);
+  });
+
+  it('refuses a thread it does not host', async () => {
+    const h = await resumed([]);
+    await expect(h.adapter.closeSession('other-thread')).rejects.toThrow(/not bound/);
+    expect(h.adapter.running).toBe(true);
   });
 });
 
