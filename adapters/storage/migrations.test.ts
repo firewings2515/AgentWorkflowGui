@@ -29,7 +29,26 @@ describe('openDatabase', () => {
       expect(db.prepare('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
       expect(db.prepare('PRAGMA busy_timeout').get()).toEqual({ timeout: 1234 });
       const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map((r) => r.name);
-      expect(tables).toEqual(['delivery', 'dispatch_attempt', 'provision', 'receive_admission', 'schema_migration']);
+      expect(tables).toEqual([
+        'agent',
+        'artifact',
+        'blob',
+        'delivery',
+        'dispatch_attempt',
+        'escalation',
+        'logical_session',
+        'message',
+        'native_task',
+        'owned_process',
+        'permission_request',
+        'preference',
+        'provision',
+        'receive_admission',
+        'schema_migration',
+        'session_item',
+        'turn',
+        'workflow',
+      ]);
     } finally {
       db.close();
     }
