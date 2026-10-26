@@ -2,6 +2,8 @@ import type { LogicalSession, NativeTask, SessionId, Snapshot, WorkflowInstance 
 import { detailPanels } from './workbench-state';
 import type { DetailTab } from './workbench-state';
 import { Empty, formatTime, observedModelText, Status } from './ui';
+import { RequestId } from '../../../contracts';
+import type { RendererStore } from './renderer-store';
 
 interface DetailProps {
   snapshot: Snapshot;
@@ -11,6 +13,7 @@ interface DetailProps {
   onTab: (tab: DetailTab) => void;
   onOpen: (id: SessionId) => void;
   onNotice: (text: string) => void;
+  store?: RendererStore | undefined;
 }
 
 export function WorkflowSummary({ snapshot, instance }: { snapshot: Snapshot; instance: WorkflowInstance }) {
@@ -28,11 +31,12 @@ export function WorkflowSummary({ snapshot, instance }: { snapshot: Snapshot; in
     {snapshot.handoffs.filter(handoff => handoff.instanceId === instance.id).map(handoff => <article className="detail-card" key={handoff.id}>
       <p>{template?.nodes.find(node => node.id === handoff.fromNodeId)?.label ?? handoff.fromNodeId} → {handoff.toNodeId ? (template?.nodes.find(node => node.id === handoff.toNodeId)?.label ?? handoff.toNodeId) : 'root'}</p>
       <p>{handoff.payload}</p><Status value={handoff.delivery.state} />
+      {handoff.outcome && <p>操作結果：<Status value={handoff.outcome.kind} /> {handoff.outcome.detail}</p>}
     </article>)}
   </section>;
 }
 
-function NativeTasks({ snapshot, session, onNotice }: Pick<DetailProps, 'snapshot' | 'session' | 'onNotice'>) {
+function NativeTasks({ snapshot, session, onNotice, store }: Pick<DetailProps, 'snapshot' | 'session' | 'onNotice' | 'store'>) {
   const tasks = snapshot.nativeTasks.filter(task => task.sessionId === session.id);
   const renderTask = (task: NativeTask) => {
     const children = tasks.filter(child => child.parentTaskId === task.id);
@@ -48,7 +52,10 @@ function NativeTasks({ snapshot, session, onNotice }: Pick<DetailProps, 'snapsho
           {snapshot.messages.filter(message => message.sessionId === session.id && message.nativeTaskId === task.id).map(message => <p key={message.id}>{message.text}</p>)}
           {snapshot.items.filter(item => item.sessionId === session.id && item.nativeTaskId === task.id).map(item => <p key={item.id}>{item.kind === 'command' ? item.command : item.kind === 'toolCall' ? `${item.tool} · ${item.summary}` : item.changes.map(change => change.path).join('、')} · {item.state}</p>)}
         </details>
-        {task.state === 'running' && <button className="danger-button" onClick={() => onNotice(`示意操作：停止「${task.label}」（${session.title}）。尚未連接 runtime，未送出停止指令。`)}>停止這個子 agent</button>}
+        {task.state === 'running' && <button className="danger-button" disabled={store?.isBlocked('nativeTask.stop', `nativeTask:${JSON.stringify([session.id, task.id])}`)} onClick={() => {
+          if (store) void store.send({ type: 'nativeTask.stop', requestId: RequestId.parse(crypto.randomUUID()), sessionId: session.id, nativeTaskId: task.id });
+          else onNotice(`示意操作：停止「${task.label}」（${session.title}）。尚未連接 runtime，未送出停止指令。`);
+        }}>停止這個子 agent</button>}
       </article>
       {children.length > 0 && <ul>{children.map(renderTask)}</ul>}
     </li>;
@@ -127,7 +134,7 @@ export function DetailPanel(props: DetailProps) {
         {peers.map(message => <article className="detail-card" key={message.id}>
           <div className="peer-route"><button onClick={() => onOpen(message.fromSessionId)}>{snapshot.sessions.find(source => source.id === message.fromSessionId)?.title ?? message.fromSessionId}</button><span>→</span><button onClick={() => onOpen(message.toSessionId)}>{snapshot.sessions.find(target => target.id === message.toSessionId)?.title ?? message.toSessionId}</button></div>
           <p>{message.text}</p><Status value={message.delivery.state} /><p className="muted"><time dateTime={message.createdAt}>{formatTime(message.createdAt)}</time></p>
-          {message.outcome && <p>{message.outcome.detail}</p>}
+          {message.outcome && <p>操作結果：<Status value={message.outcome.kind} /> {message.outcome.detail}</p>}
         </article>)}
       </section>}
       {tab === 'info' && <SessionInfo {...props} />}

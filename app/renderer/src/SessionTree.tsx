@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import type { LogicalSession, SessionId, Snapshot } from '../../../contracts';
 import { Status } from './ui';
 
-export function SessionTree({ snapshot, selectedId, onOpen }: { snapshot: Snapshot; selectedId: SessionId | undefined; onOpen: (id: SessionId) => void }) {
+export function SessionTree({ snapshot, demo = true, selectedId, onOpen }: { snapshot: Snapshot; demo?: boolean; selectedId: SessionId | undefined; onOpen: (id: SessionId) => void }) {
   const [mode, setMode] = useState<'ordinary' | 'workflow'>('ordinary');
   const [collapsed, setCollapsed] = useState<Set<SessionId>>(new Set());
   const tree = useRef<HTMLUListElement>(null);
@@ -53,6 +53,6 @@ export function SessionTree({ snapshot, selectedId, onOpen }: { snapshot: Snapsh
         buttons[current + (event.key === 'ArrowDown' ? 1 : -1)]?.focus();
       }
     }}>{sessions.filter(session => !sessions.some(parent => parent.id === session.parentId)).map(renderBranch)}</ul>
-    <p className="sidebar-foot">示意資料 · {snapshot.sessions.length} 個 sessions<br />收合僅隱藏樹狀子項。</p>
+    <p className="sidebar-foot">{demo ? '示意資料 · ' : ''}{snapshot.sessions.length} 個 sessions<br />收合僅隱藏樹狀子項。</p>
   </aside>;
 }

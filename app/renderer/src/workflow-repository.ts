@@ -1,21 +1,32 @@
 import { Command, RequestId, WorkflowTemplate } from '../../../contracts';
 import type { CommandResult } from '../../../contracts';
+import type { RendererStore } from './renderer-store';
 
 export type SaveWorkflowCommand = Extract<Command, { type: 'workflow.save' }>;
 export interface WorkflowRepository {
+  readonly mode: 'demo' | 'ipc';
   getSnapshot: () => readonly WorkflowTemplate[];
   subscribe: (listener: () => void) => () => void;
   save: (command: SaveWorkflowCommand) => Promise<CommandResult>;
+  isBlocked?: (id: string) => boolean;
+  acknowledge?: (id: string) => void;
+}
+const emptyWorkflows: readonly WorkflowTemplate[] = [];
+export function createIpcWorkflowRepository(store: RendererStore): WorkflowRepository {
+  return { mode: 'ipc', getSnapshot: () => store.getSnapshot().snapshot?.workflows ?? emptyWorkflows, subscribe: store.subscribe,
+    save: store.send, isBlocked: id => store.isBlocked('workflow.save', `workflow:${id}`),
+    acknowledge: id => store.acknowledge('workflow.save', `workflow:${id}`) };
 }
 export const workflowSaveCommand = (workflow: WorkflowTemplate, expectedRevision: number | null): SaveWorkflowCommand => ({
   type: 'workflow.save', requestId: RequestId.parse(crypto.randomUUID()), workflow, expectedRevision,
 });
 
-// Demo facade: only fixtures and explicit user edits. T018 can replace this with IPC.
+// Demo facade: only fixtures and explicit user edits, used when no preload bridge exists.
 export function createWorkflowRepository(initial: readonly WorkflowTemplate[], shouldFail: (command: SaveWorkflowCommand) => boolean = () => false): WorkflowRepository {
   let workflows = initial.map(item => WorkflowTemplate.parse(item));
   const listeners = new Set<() => void>();
   return {
+    mode: 'demo',
     getSnapshot: () => workflows,
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     save: async command => {

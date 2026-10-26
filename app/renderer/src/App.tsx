@@ -11,6 +11,12 @@ import { AgentCatalog } from './AgentCatalog';
 import { createAgentDemo } from './agent-demo';
 import { WorkflowEditor } from './WorkflowEditor';
 import { createWorkflowDemo } from './workflow-demo';
+import { RequestId } from '../../../contracts';
+import { createIpcAgentRepository } from './agent-repository';
+import { createIpcWorkflowRepository } from './workflow-repository';
+import { rendererStore } from './renderer-store';
+import type { RendererStore, RendererState } from './renderer-store';
+import { ConnectionStatus } from './ConnectionStatus';
 import './styles.css';
 
 export const APP_NAME = 'AgentWorkflowGui';
@@ -56,13 +62,33 @@ function TransferDialog({ snapshot, preview, onClose }: { snapshot: Snapshot; pr
   </dialog>;
 }
 
-export function App({ snapshot = fixtureSnapshot }: { snapshot?: Snapshot }) {
-  const [{ repository: agentRepository, controls: agentDemo }] = useState(() => createAgentDemo(snapshot.agents));
-  const [{ repository: workflowRepository, controls: workflowDemo }] = useState(() => createWorkflowDemo(snapshot.workflows));
+export function App({ snapshot }: { snapshot?: Snapshot }) {
+  return window.awg ? <ConnectedApp store={rendererStore(window.awg)} /> : <AppContent snapshot={snapshot ?? fixtureSnapshot} />;
+}
+
+function ConnectedApp({ store }: { store: RendererStore }) {
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
+  useEffect(() => {
+    void store.start();
+    const reconnect = () => { void store.reconnect(); };
+    window.addEventListener('online', reconnect);
+    return () => { window.removeEventListener('online', reconnect); store.dispose(); };
+  }, [store]);
+  if (!state.snapshot) return <div className="connection-screen"><h1>{APP_NAME}</h1><ConnectionStatus state={state} store={store} /></div>;
+  return <AppContent snapshot={state.snapshot} store={store} ipcState={state} />;
+}
+
+function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?: RendererStore; ipcState?: RendererState }) {
+  const [{ repository: workflowRepository, controls: workflowDemo }] = useState(() => store
+    ? { repository: createIpcWorkflowRepository(store), controls: undefined } : createWorkflowDemo(snapshot.workflows));
+  const [{ repository: agentRepository, controls: agentDemo }] = useState(() => store
+    ? { repository: createIpcAgentRepository(store), controls: undefined }
+    : createAgentDemo(snapshot.agents, id => snapshot.sessions.some(session => session.agent.id === id) || workflowRepository.getSnapshot().some(workflow => workflow.nodes.some(node => node.kind === 'agent' && node.agentId === id))));
   const agentOptions = useSyncExternalStore(agentRepository.subscribe, agentRepository.getSnapshot);
   const [workspace, dispatch] = useReducer(workspaceReducer, snapshot.sessions, initialWorkspace);
   const [route, setRoute] = useState(currentRoute);
-  const [theme, setTheme] = useState<Theme>(() => readTheme(snapshot.preferences.theme));
+  const [demoTheme, setTheme] = useState<Theme>(() => readTheme(snapshot.preferences.theme));
+  const theme = store ? snapshot.preferences.theme : demoTheme;
   const narrow = useSyncExternalStore(subscribeWidth, isNarrow);
   const [notice, setNotice] = useState('');
   const [selections, setSelections] = useState<Record<string, Selection>>({});
@@ -109,7 +135,11 @@ export function App({ snapshot = fixtureSnapshot }: { snapshot?: Snapshot }) {
     if (!session) return;
     setSelections(previous => ({ ...previous, [sessionId]: { ...(previous[sessionId] ?? { agentId: session.agent.id, model: session.requestedModel }), ...patch } }));
   };
-  const changeAgent = (sessionId: SessionId, agentId: AgentId) => changeSelection(sessionId, { agentId });
+  const changeAgent = (sessionId: SessionId, agentId: AgentId) => {
+    const session = snapshot.sessions.find(item => item.id === sessionId);
+    if (store && session) void store.send({ type: 'session.setAgent', requestId: RequestId.parse(crypto.randomUUID()), sessionId, expectedRevision: session.revision, agentId });
+    else changeSelection(sessionId, { agentId });
+  };
   const closeTransfer = () => {
     const viewId = transfer?.viewId;
     setTransfer(null);
@@ -124,10 +154,14 @@ export function App({ snapshot = fixtureSnapshot }: { snapshot?: Snapshot }) {
   const instance = snapshot.instances.find(item => item.id === entityId);
 
   return <div className="app-shell">
-    <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true">≋</span><strong>{APP_NAME}</strong><span className="demo-badge">示意模式</span></div>
-      <label className="theme-picker">外觀<select aria-label="外觀主題" value={theme} onChange={event => setTheme(event.target.value === 'light' ? 'light' : 'dark')}><option value="dark">深色</option><option value="light">淺色</option></select></label>
+    <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true">≋</span><strong>{APP_NAME}</strong>{!store && <span className="demo-badge">示意資料 · 示意模式</span>}</div>
+      <label className="theme-picker">外觀<select aria-label="外觀主題" value={theme} disabled={store?.isBlocked('preferences.set', 'preferences')} onChange={event => {
+        const next = event.target.value === 'light' ? 'light' : 'dark';
+        if (store) void store.send({ type: 'preferences.set', requestId: RequestId.parse(crypto.randomUUID()), preferences: { ...snapshot.preferences, theme: next } });
+        else setTheme(next);
+      }}><option value="dark">深色</option><option value="light">淺色</option></select></label>
     </header>
-    <nav className="app-nav" aria-label="主要導覽">{pageRegistry.filter(entry => entry.navigation).map(entry => <a key={entry.id} href={`#${routes[entry.id]}`} aria-current={page?.id === entry.id ? 'page' : undefined} onClick={event => { event.preventDefault(); navigate(routes[entry.id] ?? '/workbench'); }}>{entry.title}</a>)}<span className="nav-note">以契約假資料預覽工作台</span></nav>
+    <nav className="app-nav" aria-label="主要導覽">{pageRegistry.filter(entry => entry.navigation).map(entry => <a key={entry.id} href={`#${routes[entry.id]}`} aria-current={page?.id === entry.id ? 'page' : undefined} onClick={event => { event.preventDefault(); navigate(routes[entry.id] ?? '/workbench'); }}>{entry.title}</a>)}<span className="nav-note">{store ? '資料來自應用程式服務' : '以契約假資料預覽工作台'}</span></nav>
     <div className="page-toolbar"><h1 ref={pageHeading} tabIndex={-1}>{page?.title ?? '找不到頁面'}</h1>
       {workbenchVisible && <button className="primary" disabled={workspace.views.length >= 2 || snapshot.sessions.length === 0} title={workspace.views.length >= 2 ? '此階段提供兩組工作區' : '開啟第二組並排工作區'} onClick={() => {
         const sessionId = workspace.closedViews.at(-1)?.sessionId ?? snapshot.sessions.find(session => !workspace.views.some(view => view.sessionId === session.id))?.id ?? snapshot.sessions[0]?.id;
@@ -136,11 +170,11 @@ export function App({ snapshot = fixtureSnapshot }: { snapshot?: Snapshot }) {
     </div>
     <main className="page-content">
       <div className="workbench" hidden={!workbenchVisible}>
-        <SessionTree snapshot={snapshot} selectedId={activeView?.sessionId} onOpen={id => openSession(id)} />
+        <SessionTree snapshot={snapshot} demo={!store} selectedId={activeView?.sessionId} onOpen={id => openSession(id)} />
         <div className="workspace-area">
           {workspace.views.length > 1 && <div className="workspace-switcher" aria-label="可見工作區">{workspace.views.map(view => <button key={view.id} aria-pressed={view.id === workspace.activeViewId} onClick={() => { dispatch({ type: 'focus', viewId: view.id }); focusView(view.id); }}>{snapshot.sessions.find(session => session.id === view.sessionId)?.title ?? view.sessionId}</button>)}</div>}
           {workspace.views.length === 0 && <div className="empty-workbench"><h2>開啟一段對話</h2><p>從左側選取 session，恢復工作區。</p><p className="muted">Sessions 仍保留在清單中。</p></div>}
-          <div className={`workspace-grid ${workspace.views.length > 1 ? 'split' : ''}`}>{workspace.views.map(view => <SessionWorkspace key={view.id} snapshot={snapshot} agentOptions={agentOptions} view={view} active={view.id === workspace.activeViewId} visible={workbenchVisible && (!narrow || view.id === workspace.activeViewId)} selection={selections[view.sessionId]}
+          <div className={`workspace-grid ${workspace.views.length > 1 ? 'split' : ''}`}>{workspace.views.map(view => <SessionWorkspace key={view.id} snapshot={snapshot} store={store} ipcState={ipcState} agentOptions={agentOptions} view={view} active={view.id === workspace.activeViewId} visible={workbenchVisible && (!narrow || view.id === workspace.activeViewId)} selection={selections[view.sessionId]}
             onFocus={() => { if (view.id !== workspace.activeViewId) dispatch({ type: 'focus', viewId: view.id }); }}
             onClose={() => {
               dispatch({ type: 'close', viewId: view.id });
@@ -153,7 +187,11 @@ export function App({ snapshot = fixtureSnapshot }: { snapshot?: Snapshot }) {
             onModel={model => {
               const session = snapshot.sessions.find(candidate => candidate.id === view.sessionId);
               if (model.runtime !== session?.requestedModel.runtime) setTransfer({ sessionId: view.sessionId, model, viewId: view.id });
-              else changeSelection(view.sessionId, { model: { runtime: model.runtime, model: model.model, ...(model.defaultEffort ? { effort: model.defaultEffort } : {}) } });
+              else {
+                const selection = { runtime: model.runtime, model: model.model, ...(model.defaultEffort ? { effort: model.defaultEffort } : {}) };
+                if (store && session) void store.send({ type: 'session.setModel', requestId: RequestId.parse(crypto.randomUUID()), sessionId: session.id, expectedRevision: session.revision, model: selection });
+                else changeSelection(view.sessionId, { model: selection });
+              }
             }}
             onProgress={instanceId => { returnAnchor.current = { viewId: view.id, sessionId: view.sessionId }; navigate(`/workflow-instances/${encodeURIComponent(instanceId)}`); }} onNotice={setNotice} />)}</div>
         </div>
@@ -169,7 +207,7 @@ export function App({ snapshot = fixtureSnapshot }: { snapshot?: Snapshot }) {
         }}>返回工作台</button>
       </section>}
     </main>
-    <footer className="app-footer"><span>示意模式 · 未連接 runtime</span><span>{workspace.views.length} 組工作區</span></footer>
+    <footer className="app-footer">{store && ipcState ? <ConnectionStatus store={store} state={ipcState} /> : <span>示意資料 · 示意模式 · 未連接 runtime</span>}<span>{workspace.views.length} 組工作區</span></footer>
     {notice && <div className="notice" role="status"><span>{notice}</span><button aria-label="關閉提示" onClick={() => setNotice('')}>×</button></div>}
     {transfer && <TransferDialog snapshot={snapshot} preview={transfer} onClose={closeTransfer} />}
   </div>;
