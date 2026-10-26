@@ -175,7 +175,7 @@ export class DeliveryService {
   private async acceptIssues(input: AcceptInput): Promise<string[]> {
     const parsed = DeliveryTargetSchema.safeParse(input.target);
     if (!parsed.success) return parsed.error.issues.map((i) => `target: ${i.message}`);
-    const issues = deliveryTargetIssues(undefined, input.target);
+    const issues: string[] = deliveryTargetIssues(undefined, input.target);
     if (input.kind === 'provision') {
       if (input.target.provision?.operationId !== input.operationId) issues.push('a provision describes itself in target.provision');
     } else if ((await this.options.hashPayload(input.payload)) !== input.payloadHash) {

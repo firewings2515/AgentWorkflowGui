@@ -19,7 +19,8 @@ import {
   TransferId,
   WorkflowId,
 } from './common';
-import { DeliveryRecord, DeliveryTarget, deliveryTargetIssues } from './delivery';
+import { DeliveryRecord, DeliveryTarget, OperationOutcome, deliveryTargetIssues } from './delivery';
+import { addRuleIssue, type ContractRule } from './rules';
 
 /** Input rule: natural-language condition for the AI, plus the only fields the GUI enforces (R-04). */
 export const InputRule = z.strictObject({
@@ -86,18 +87,19 @@ export const WorkflowTemplate = z
     updatedAt: Timestamp,
   })
   .superRefine((w, ctx) => {
-    const fail = (message: string) => ctx.addIssue({ code: 'custom', message });
     const ids = new Set<string>(w.nodes.map((n) => n.id));
-    if (ids.size !== w.nodes.length) fail('node IDs must be unique');
-    if (w.nodes.filter((n) => n.kind === 'agent' && n.isRoot).length !== 1) fail('exactly one node is the root');
+    if (ids.size !== w.nodes.length) addRuleIssue(ctx, 'workflow.node-id-unique', ['nodes']);
+    if (w.nodes.filter((n) => n.kind === 'agent' && n.isRoot).length !== 1) addRuleIssue(ctx, 'workflow.one-root', ['nodes']);
     const edges = new Set(w.edges.map((e) => `${e.source}->${e.target}`));
-    for (const e of w.edges) if (!ids.has(e.source) || !ids.has(e.target)) fail(`edge ${e.source}->${e.target} references a missing node`);
+    w.edges.forEach((e, i) => {
+      if (!ids.has(e.source) || !ids.has(e.target)) addRuleIssue(ctx, 'workflow.edge-missing-node', ['edges', i]);
+    });
     // An output rule's destination draws its edge (R-04, R-09), so every node target needs one.
-    for (const n of w.nodes) {
-      for (const r of n.outputRules) {
-        if (r.target.kind === 'node' && !edges.has(`${n.id}->${r.target.nodeId}`)) fail(`output rule ${r.id} targets ${r.target.nodeId} without an edge`);
-      }
-    }
+    w.nodes.forEach((n, ni) => {
+      n.outputRules.forEach((r, ri) => {
+        if (r.target.kind === 'node' && !edges.has(`${n.id}->${r.target.nodeId}`)) addRuleIssue(ctx, 'workflow.output-needs-edge', ['nodes', ni, 'outputRules', ri, 'target']);
+      });
+    });
   });
 export type WorkflowTemplate = z.infer<typeof WorkflowTemplate>;
 
@@ -132,10 +134,10 @@ export const WorkflowInstance = z
   })
   .superRefine((inst, ctx) => {
     const ids = new Set<string>(inst.tasks.map((t) => t.id));
-    for (const t of inst.tasks) {
-      if (t.instanceId !== inst.id) ctx.addIssue({ code: 'custom', message: `task ${t.id} belongs to another instance` });
-      for (const d of t.dependsOn) if (d === t.id || !ids.has(d)) ctx.addIssue({ code: 'custom', message: `task ${t.id} depends on invalid task ${d}` });
-    }
+    inst.tasks.forEach((t, i) => {
+      if (t.instanceId !== inst.id) addRuleIssue(ctx, 'instance.task-other-instance', ['tasks', i, 'instanceId']);
+      if (t.dependsOn.some((d) => d === t.id || !ids.has(d))) addRuleIssue(ctx, 'instance.task-invalid-dependency', ['tasks', i, 'dependsOn']);
+    });
   });
 export type WorkflowInstance = z.infer<typeof WorkflowInstance>;
 
@@ -166,17 +168,19 @@ export const Handoff = z
     /** Target GUI session and its native binding once bound; `provision` when it had to be created (CR2 §3). */
     target: DeliveryTarget,
     delivery: DeliveryRecord,
+    /** Cancelled, rejected or failed apart from delivery (C-05); e.g. its target's provision was cancelled. */
+    outcome: OperationOutcome.optional(),
     /** When the acceptance transaction counted it (once per operationId). */
     acceptedAt: Timestamp,
   })
   .superRefine((h, ctx) => {
-    const fail = (message: string) => ctx.addIssue({ code: 'custom', message });
-    if (h.fromNodeId === h.toNodeId) fail('a node does not hand off to itself');
+    const fail = (rule: ContractRule) => addRuleIssue(ctx, rule);
+    if (h.fromNodeId === h.toNodeId) fail('handoff.not-self');
     if (h.expectedUpstream) {
-      if (new Set(h.expectedUpstream).size !== h.expectedUpstream.length) fail('expectedUpstream must be unique');
-      if (!h.expectedUpstream.includes(h.fromNodeId)) fail('expectedUpstream must include the sender');
+      if (new Set(h.expectedUpstream).size !== h.expectedUpstream.length) fail('handoff.upstream-unique');
+      if (!h.expectedUpstream.includes(h.fromNodeId)) fail('handoff.upstream-includes-sender');
     }
-    for (const issue of deliveryTargetIssues(h.delivery, h.target)) fail(issue);
+    for (const rule of deliveryTargetIssues(h.delivery, h.target)) fail(rule);
   });
 export type Handoff = z.infer<typeof Handoff>;
 
@@ -190,6 +194,11 @@ export const EscalationRef = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('peerMessage'), peerMessageId: PeerMessageId }),
   z.strictObject({ kind: z.literal('transfer'), transferId: TransferId }),
   z.strictObject({ kind: z.literal('task'), taskId: TaskId }),
+  /**
+   * Creating a target session whose outcome stayed unknown (C-06); `blocked` are the payload operations
+   * waiting for it, so the root screen can show what the decision affects.
+   */
+  z.strictObject({ kind: z.literal('provision'), operationId: OperationId, blocked: z.array(OperationId) }),
 ]);
 
 export const Escalation = z
@@ -211,12 +220,12 @@ export const Escalation = z
     resolvedAt: Timestamp.optional(),
   })
   .superRefine((e, ctx) => {
-    const fail = (message: string) => ctx.addIssue({ code: 'custom', message });
+    const fail = (rule: ContractRule) => addRuleIssue(ctx, rule);
     const open = e.state === 'open';
-    if (open !== (e.resolvedAt === undefined) || open !== (e.resolvedBy === undefined)) fail('resolvedAt and resolvedBy are set exactly when closed');
-    if ((e.state === 'approved' || e.state === 'declined') && e.resolvedBy !== 'user') fail('only the user approves or declines');
-    if (e.kind === 'permission' && e.ref?.kind !== 'permission') fail('a permission escalation points at its request');
-    if (e.kind === 'delivery-unknown' && !['handoff', 'peerMessage', 'transfer'].includes(e.ref?.kind ?? '')) fail('a delivery escalation points at its operation');
+    if (open !== (e.resolvedAt === undefined) || open !== (e.resolvedBy === undefined)) fail('escalation.resolved-fields');
+    if ((e.state === 'approved' || e.state === 'declined') && e.resolvedBy !== 'user') fail('escalation.user-decides');
+    if (e.kind === 'permission' && e.ref?.kind !== 'permission') fail('escalation.permission-ref');
+    if (e.kind === 'delivery-unknown' && !['handoff', 'peerMessage', 'transfer', 'provision'].includes(e.ref?.kind ?? '')) fail('escalation.delivery-ref');
   });
 export type Escalation = z.infer<typeof Escalation>;
 

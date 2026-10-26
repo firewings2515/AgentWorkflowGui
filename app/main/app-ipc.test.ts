@@ -196,7 +196,8 @@ describe('commands', () => {
       const result = await runCommand(facade, { type: 'workflow.save', requestId: 'req-w', workflow: workflowWithBadEdge(), expectedRevision: null });
       expect(result).toMatchObject({ ok: false, code: 'invalid_request' });
       expect(JSON.stringify(result)).not.toContain(MARKER);
-      expect((result as { message: string }).message).toContain('workflow: custom');
+      // Contracts 0.4 point the issue at the offending edge (C-04).
+      expect((result as { message: string }).message).toMatch(/workflow\.edges\.\d+: custom/);
     });
 
     it('for an unknown key', async () => {

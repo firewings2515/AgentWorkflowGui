@@ -19,7 +19,8 @@ import {
   Timestamp,
   TurnId,
 } from './common';
-import { DeliveryRecord, deliveryTargetIssues } from './delivery';
+import { DeliveryRecord, OperationOutcome, deliveryTargetIssues } from './delivery';
+import { addRuleIssue, ruleIssue } from './rules';
 
 /** Ordinary sessions can change Agent; workflow sessions keep the Agent fixed and may change Model (WB-02). */
 export const SessionKind = z.enum(['ordinary', 'workflow']);
@@ -69,7 +70,7 @@ export const TokenUsage = z
     contextWindow: z.number().int().positive().optional(),
     at: Timestamp,
   })
-  .refine((u) => u.latest !== undefined || u.cumulative !== undefined, { message: 'usage needs latest or cumulative counts' });
+  .refine((u) => u.latest !== undefined || u.cumulative !== undefined, ruleIssue('usage.needs-counts'));
 export type TokenUsage = z.infer<typeof TokenUsage>;
 
 /**
@@ -84,9 +85,7 @@ export const FolderScope = z
     writableRoots: z.array(z.string().min(1)),
     readableRoots: z.array(z.string().min(1)).default([]),
   })
-  .refine((s) => s.writableRoots.length === 0 || s.writableRoots.includes(s.workspaceRoot), {
-    message: 'a writable session can write its own workspace',
-  });
+  .refine((s) => s.writableRoots.length === 0 || s.writableRoots.includes(s.workspaceRoot), ruleIssue('scope.writable-includes-workspace'));
 export type FolderScope = z.infer<typeof FolderScope>;
 
 const sessionShape = {
@@ -135,8 +134,8 @@ export const Turn = z
     startedAt: Timestamp,
     endedAt: Timestamp.optional(),
   })
-  .refine((t) => (t.state === 'running') === (t.endedAt === undefined), { message: 'endedAt is set exactly when the turn is over' })
-  .refine((t) => t.state === 'failed' || t.failure === undefined, { message: 'only failed turns carry a failure' });
+  .refine((t) => (t.state === 'running') === (t.endedAt === undefined), ruleIssue('turn.ended-at'))
+  .refine((t) => t.state === 'failed' || t.failure === undefined, ruleIssue('turn.failure-only-failed'));
 export type Turn = z.infer<typeof Turn>;
 
 /**
@@ -177,11 +176,15 @@ export const Message = z
     observedModel: z.string().min(1).optional(),
     createdAt: Timestamp,
   })
-  .refine((m) => (originsByRole[m.role] as readonly string[]).includes(m.origin.kind), { message: 'origin does not fit the role' })
-  .refine((m) => m.role === 'assistant' || m.observedModel === undefined, { message: 'only assistant messages carry a model' });
+  .refine((m) => (originsByRole[m.role] as readonly string[]).includes(m.origin.kind), ruleIssue('message.origin-role'))
+  .refine((m) => m.role === 'assistant' || m.observedModel === undefined, ruleIssue('message.model-only-assistant'));
 export type Message = z.infer<typeof Message>;
 
-/** A sub-agent spawned by the runtime itself, observed but not resumable as a GUI session (R-13). */
+/**
+ * A sub-agent spawned by the runtime itself, observed but not resumable as a GUI session (R-13).
+ * There is no `unknown` state (C-09): a task read from history without proof that it ended stays
+ * `running`, and the read reports `complete: false`, so `running` alone never proves it is still running.
+ */
 export const NativeTask = z.strictObject({
   id: NativeTaskId,
   sessionId: SessionId,
@@ -223,7 +226,7 @@ export const Artifact = z
     turnId: TurnId.optional(),
     updatedAt: Timestamp,
   })
-  .refine((a) => (a.source === 'user-attachment') === (a.section === 'input'), { message: 'inputs are exactly the user attachments' });
+  .refine((a) => (a.source === 'user-attachment') === (a.section === 'input'), ruleIssue('artifact.inputs-are-attachments'));
 export type Artifact = z.infer<typeof Artifact>;
 
 /**
@@ -248,14 +251,12 @@ export const PeerMessage = z
     entry: z.enum(['new-turn', 'insert']).optional(),
     delivery: DeliveryRecord,
     /** Cancelling stops follow-up work; a delivery reconciled as sent afterwards is still recorded (CR2 §2). */
-    outcome: z.strictObject({ kind: z.enum(['cancelled', 'rejected', 'failed']), detail: z.string(), at: Timestamp }).optional(),
+    outcome: OperationOutcome.optional(),
     createdAt: Timestamp,
   })
   .superRefine((m, ctx) => {
-    if (m.fromSessionId === m.toSessionId) ctx.addIssue({ code: 'custom', message: 'a session does not message itself' });
-    for (const message of deliveryTargetIssues(m.delivery, { sessionId: m.toSessionId, nativeSessionRef: m.toNativeSessionRef })) {
-      ctx.addIssue({ code: 'custom', message });
-    }
+    if (m.fromSessionId === m.toSessionId) addRuleIssue(ctx, 'peer.not-self');
+    for (const rule of deliveryTargetIssues(m.delivery, { sessionId: m.toSessionId, nativeSessionRef: m.toNativeSessionRef })) addRuleIssue(ctx, rule);
   });
 export type PeerMessage = z.infer<typeof PeerMessage>;
 

@@ -8,6 +8,7 @@ import type {
   DispatchResult,
   NativeSessionInfo,
   ReconcileMatch,
+  ReconcileProvisionResult,
   ReconcileRequest,
   ReconcileResult,
   RuntimeAdapter,
@@ -74,6 +75,14 @@ export class FakeRuntime implements RuntimeAdapter {
 
   close(): Promise<{ forced: boolean }> {
     return Promise.resolve({ forced: false });
+  }
+
+  closeSession(): Promise<{ forced: boolean }> {
+    return Promise.resolve({ forced: false });
+  }
+
+  reconcileProvision(): Promise<ReconcileProvisionResult> {
+    return Promise.resolve({ state: 'unknown', reason: 'unsupported', detail: 'fake runtime' });
   }
 
   startSession(options: StartSessionOptions): Promise<NativeSessionInfo> {
