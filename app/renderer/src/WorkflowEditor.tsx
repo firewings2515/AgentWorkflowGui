@@ -4,6 +4,7 @@ import type { AgentDefinition, ModelOption, WorkflowNode, WorkflowTemplate } fro
 import type { WorkflowRepository } from './workflow-repository';
 import { workflowSaveCommand } from './workflow-repository';
 import type { WorkflowDemoControls } from './workflow-demo';
+import { blocksResubmit, commandFeedback, unknownResult } from './command-feedback';
 import { connectNodes, destinationKey, destinationValue, isolationLabels, removeGraphSelection, replaceNode, setRoot, updateDraftGraph, workflowIssues } from './workflow-editor-state';
 import type { GraphSelection, WorkflowIssue } from './workflow-editor-state';
 import { workflowIssueLabel } from './workflow-validation';
@@ -17,12 +18,14 @@ interface Draft {
   automaticEdges: string[];
   deletedEdges: string[]; connectionTarget: string;
   destinationChoices: Record<string, string>; destinationPrompt: boolean;
+  blocked: boolean;
+  warning: boolean;
 }
 const newDraft = (workflow: WorkflowTemplate): Draft => ({
   workflow: structuredClone(workflow), expectedRevision: workflow.revision, dirty: false, selection: null,
   pending: false, error: '', message: '', attempted: false, failNext: false, conflict: false,
   automaticEdges: [], deletedEdges: [], connectionTarget: '',
-  destinationChoices: {}, destinationPrompt: false,
+  destinationChoices: {}, destinationPrompt: false, blocked: false, warning: false,
 });
 
 function DeleteGraphDialog({ workflow, selection, onCancel, onConfirm }: {
@@ -57,10 +60,11 @@ function DeleteGraphDialog({ workflow, selection, onCancel, onConfirm }: {
 }
 
 export function WorkflowEditor({ repository, demo, agents, models, selectedId, visible, onSelect }: {
-  repository: WorkflowRepository; demo?: WorkflowDemoControls; agents: readonly AgentDefinition[]; models: readonly ModelOption[];
+  repository: WorkflowRepository; demo?: WorkflowDemoControls | undefined; agents: readonly AgentDefinition[]; models: readonly ModelOption[];
   selectedId: string; visible: boolean; onSelect: (id: string) => void;
 }) {
   const workflows = useSyncExternalStore(repository.subscribe, repository.getSnapshot);
+  const isDemo = repository.mode === 'demo';
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [deleteTarget, setDeleteTarget] = useState<GraphSelection>(null);
   const [renderedId, setRenderedId] = useState(selectedId);
@@ -135,7 +139,7 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
     requestFocus(issue.path || 'nodes');
   };
   const save = async (externalUpdate = false) => {
-    if (!draft || !workflow || pending || stale || locks.current.has(selectedId)) return;
+    if (!draft || !workflow || pending || draft.blocked || repository.isBlocked?.(selectedId) || stale || locks.current.has(selectedId)) return;
     if (!externalUpdate) {
       if (unapplied.length) {
         patch(selectedId, { destinationPrompt: true, message: '' });
@@ -154,18 +158,18 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
     try {
       const result = await repository.save(command);
       if (!mounted.current) return;
-      if (result.requestId !== command.requestId) patch(target, { pending: false, error: '無法核對儲存回覆，草稿仍保留，請重新確認狀態。' });
-      else if (!result.ok) patch(target, { pending: false, error: result.message, conflict: result.code === 'stale_revision' });
+      if (result.requestId !== null && result.requestId !== command.requestId) patch(target, { pending: false, blocked: true, warning: true, error: '無法核對儲存回覆。' + commandFeedback(unknownResult(command.requestId)) });
+      else if (!result.ok) patch(target, { pending: false, blocked: blocksResubmit(result), warning: result.code === 'unknown_outcome', error: isDemo ? result.message : commandFeedback(result), conflict: result.code === 'stale_revision' });
       else if (externalUpdate) patch(target, { pending: false });
       else {
         const record = repository.getSnapshot().find(item => item.id === target);
-        if (result.revision === undefined) patch(target, { pending: false, error: '儲存回覆缺少 revision，草稿仍保留，請重新確認狀態。' });
+        if (result.revision === undefined || (!isDemo && record?.revision !== result.revision)) patch(target, { pending: false, blocked: true, warning: true, error: '操作已接受，但尚未取得儲存後的版本。草稿保留，請重新讀取並核對資料。' });
         else patch(target, {
           workflow: record?.revision === result.revision ? structuredClone(record) : { ...command.workflow, revision: result.revision },
           expectedRevision: result.revision, pending: false, dirty: false, attempted: false, conflict: false,
           automaticEdges: [], deletedEdges: [], connectionTarget: '',
           destinationChoices: {}, destinationPrompt: false,
-          message: `示意模式 · 已儲存「${command.workflow.name}」，revision ${result.revision}。僅保留於本次開啟期間。`,
+          message: `${isDemo ? '示意模式 · ' : ''}已儲存「${command.workflow.name}」，revision ${result.revision}。${isDemo ? '僅保留於本次開啟期間。' : ''}`,
         });
       }
     } catch { if (mounted.current) patch(target, { pending: false, error: '儲存服務無法回應，草稿仍保留。' }); }
@@ -197,11 +201,16 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
     <header className="workflow-toolbar"><div><span className="eyebrow">設定 / Workflow</span><h2 ref={heading} tabIndex={-1}>{workflow?.name || (workflow ? '未命名 Workflow' : '找不到指定的 Workflow 範本')}</h2>
       <p className="muted">{workflow ? `revision ${draft?.expectedRevision} · ${draft?.dirty ? '有未儲存草稿' : '已載入範本'}` : workflows.length ? `範本 ID：${selectedId}` : '尚無 Workflow 範本'}</p></div>
       <div className="workflow-actions"><label>範本<select aria-label="Workflow 範本" value={saved?.id ?? ''} onChange={event => { setDeleteTarget(null); onSelect(event.target.value); }}><option disabled value="">選取範本</option>{workflows.map(item => <option key={item.id} value={item.id}>{item.name}{drafts[item.id]?.dirty ? ' · 草稿' : ''}</option>)}</select></label>
-        {workflow && <button id={workflowFieldId('save')} className="primary" disabled={pending || stale} onClick={() => { void save(); }}>{pending ? '儲存中…' : '儲存 Workflow'}</button>}
+        {workflow && <button id={workflowFieldId('save')} className="primary" disabled={pending || draft?.blocked || repository.isBlocked?.(selectedId) || stale} onClick={() => { void save(); }}>{pending ? '儲存中…' : '儲存 Workflow'}</button>}
       </div>
     </header>
     {draft && workflow && <>
       <div className="workflow-feedback-area">
+        {!pending && (draft.blocked || repository.isBlocked?.(selectedId)) && <button onClick={() => {
+          repository.acknowledge?.(selectedId);
+          patch(selectedId, { blocked: false, warning: false, error: '' });
+        }}>已核對結果，保留草稿</button>}
+        {!pending && !draft.error && repository.isBlocked?.(selectedId) && <p role="status">此 Workflow 有處理中或結果未知的操作，請查看操作結果並核對資料。</p>}
         {unapplied.length > 0 && <p className="muted">有 {unapplied.length} 項 Output 目的地尚未套用。</p>}
         {draft.destinationPrompt && unapplied.length > 0 && <div className="workflow-validation" role="alert" tabIndex={-1} id={workflowFieldId('pending-destinations')}>
           <strong>尚未儲存：請先套用或放棄以下目的地選擇，再按「儲存 Workflow」。</strong>
@@ -225,7 +234,7 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
             <button disabled={pending || saved.revision === draft.expectedRevision} onClick={() => { patch(selectedId, { workflow: { ...workflow, revision: saved.revision }, expectedRevision: saved.revision, dirty: true, error: '', conflict: false }); requestFocus('name'); }}>已比對，保留草稿並以 revision {saved.revision} 重新編輯</button>
             <button disabled={pending} onClick={() => { demo?.setSaveFailure(selectedId, false); patch(selectedId, newDraft(saved)); setDeleteTarget(null); requestFocus('name'); }}>捨棄草稿、改用已儲存版本</button></>}
         </div>}
-        {error && <p className="field-error" data-workflow-feedback role="alert" tabIndex={-1}>{error}</p>}
+        {error && <p className={draft.warning ? 'command-warning' : 'field-error'} data-workflow-feedback role={draft.warning ? 'status' : 'alert'} tabIndex={-1}>{error}</p>}
         {issues.length > 0 && <div className="workflow-validation" role="alert"><strong>請修正 {issues.length} 項驗證錯誤：</strong>{issues.map((issue, index) => <button key={index} onClick={() => jumpToIssue(issue)}>{workflowIssueLabel(workflow, issue)}：{issue.message}</button>)}</div>}
       </div>
       <div className="workflow-body">

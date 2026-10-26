@@ -8,7 +8,7 @@ const labels: Record<string, string> = {
   completed: '已完成', failed: '失敗', stopped: '已停止', pending: '等待中',
   available: '可存取', missing: '檔案遺失', 'out-of-scope': '範圍外', unreadable: '無法讀取',
   sent: '已送達（不代表已讀）', unknown: '送達結果未知', 'not-sent': '尚未送出',
-  merged: '已合併', blocked: '受阻', cancelled: '已取消',
+  merged: '已合併', blocked: '受阻', cancelled: '已取消', rejected: '已拒絕', declined: '已拒絕',
 };
 export function Status({ value }: { value: string }) {
   return <span className="status" data-state={value}><span aria-hidden="true">●</span> {labels[value] ?? value}</span>;

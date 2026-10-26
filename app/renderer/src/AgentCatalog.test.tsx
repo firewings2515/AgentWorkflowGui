@@ -176,7 +176,7 @@ describe('T011 Agent 管理', () => {
     await screen.findByText(/已儲存「規劃 Agent」/);
   });
 
-  it('shows deletion target, disables unsupported deletion, and restores keyboard focus on cancel', () => {
+  it('shows deletion target, enables confirmation, and restores keyboard focus on cancel', () => {
     const repository = createAgentRepository(fixtureSnapshot.agents);
     const send = vi.spyOn(repository, 'save');
     render(<CatalogHarness repository={repository} />);
@@ -185,7 +185,7 @@ describe('T011 Agent 管理', () => {
     fireEvent.click(trigger);
     const dialog = screen.getByRole('dialog', { name: '刪除「規劃 Agent」？' });
     expect(within(dialog).getByText(planner.id)).toBeTruthy();
-    expect(within(dialog).getByRole<HTMLButtonElement>('button', { name: '確認刪除（尚未提供）' }).disabled).toBe(true);
+    expect(within(dialog).getByRole<HTMLButtonElement>('button', { name: '確認刪除' }).disabled).toBe(false);
     fireEvent.keyDown(dialog, { key: 'Escape' });
     fireEvent(dialog, new Event('cancel', { cancelable: true }));
     expect(screen.queryByRole('dialog')).toBeNull();
@@ -196,7 +196,7 @@ describe('T011 Agent 管理', () => {
 
   it('closes deletion once through the native cancel event after Escape', () => {
     const close = vi.fn();
-    render(<DeleteConfirmation agent={planner} onClose={close} />);
+    render(<DeleteConfirmation agent={planner} onClose={close} onDelete={vi.fn()} onDeleted={vi.fn()} />);
     const dialog = screen.getByRole('dialog');
     expect(document.activeElement).toBe(within(dialog).getByRole('button', { name: '取消' }));
     fireEvent.keyDown(dialog, { key: 'Escape' });
