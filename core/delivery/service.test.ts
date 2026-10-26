@@ -325,16 +325,30 @@ describe('user decisions on unknown', () => {
     expect(await g.service.resolve({ operationId: OP, attemptId, decision: 'retry', acceptDuplicateRisk: true })).toEqual({ status: 'stale' });
   });
 
-  it('refuses a retry while this process is still inside the attempt’s runtime call', async () => {
+  it('refuses a retry while this process is still inside the attempt’s runtime call, but records wait or cancel', async () => {
     const g = await accepted(gui());
     g.codex.dispatchModes.push('crash-before-send');
     void g.service.dispatch(OP);
     await flush();
     const attempt = valid(await g.store.get(OP)).delivery.attempts[0];
     if (attempt === undefined) throw new Error('no attempt');
-    expect(await g.service.resolve({ operationId: OP, attemptId: attempt.attemptId, decision: 'retry', acceptDuplicateRisk: true })).toEqual({ status: 'refused', reason: 'in-flight' });
+    const decide = (decision: 'wait' | 'cancel' | 'retry') => g.service.resolve({ operationId: OP, attemptId: attempt.attemptId, decision, acceptDuplicateRisk: true });
+    expect(await decide('retry')).toEqual({ status: 'refused', reason: 'in-flight' });
     expect(await g.service.reconcile(OP)).toEqual({ status: 'in-flight' });
-    expect(await stateOf(g)).toBe('unknown');
+    expect(await decide('wait')).toEqual({ status: 'recorded', decision: 'wait' });
+    expect(await decide('cancel')).toEqual({ status: 'recorded', decision: 'cancel' });
+    expect(valid(await g.store.get(OP)).delivery).toMatchObject({ state: 'unknown', attempts: [{ resolution: { decision: 'cancel' } }] });
+  });
+
+  // Review r1 P2: IDs are unique across deliveries, as in SQLite; a collision fails the claim before the runtime.
+  it('a reused attempt or client message ID fails the claim, keeps the delivery pending and never calls the runtime', async () => {
+    const g = gui(new MemoryDeliveryStore(), undefined, { uuid: () => '00000000-0000-4000-8000-00000000abcd' });
+    await accepted(g);
+    await accepted(g, payloadInput({ operationId: op('op-2') }));
+    expect((await g.service.dispatch(OP)).status).toBe('sent');
+    expect(await g.service.dispatch(op('op-2'))).toMatchObject({ status: 'not-dispatched', reason: 'store-failed' });
+    expect(g.codex.dispatched).toHaveLength(1);
+    expect(valid(await g.store.get(op('op-2'))).delivery).toEqual({ state: 'pending', attempts: [] });
   });
 });
 
@@ -386,6 +400,72 @@ describe('provision and payload are separate deliveries', () => {
     ]);
     expect(second.claude.started).toHaveLength(1);
     expect(g.history.received(created)).toHaveLength(1);
+  });
+
+  // Review r1 P1: a cancel recorded after the create call left keeps the created session but sends no payload (CR2 §3).
+  it('a cancel recorded by another GUI while the create call runs keeps the session and never sends the payload', async () => {
+    const a = gui();
+    await accepted(a, provisionInput());
+    await accepted(a, waitingPayload());
+    a.claude.startModes.push('held');
+    const creating = a.service.dispatch(op('provision-1'));
+    await flush();
+    const attempt = valid(await a.store.get(op('provision-1'))).delivery.attempts[0];
+    if (attempt === undefined) throw new Error('no attempt');
+    const b = a.restart();
+    expect(await b.service.resolve({ operationId: op('provision-1'), attemptId: attempt.attemptId, decision: 'cancel', acceptDuplicateRisk: false })).toEqual({
+      status: 'recorded',
+      decision: 'cancel',
+    });
+    // The create response arrives afterwards: the session is recorded, the cancel kept.
+    a.claude.release();
+    expect(await creating).toMatchObject({ status: 'sent', nativeRef: { sessionRef: created } });
+    expect(valid(await a.store.get(op('provision-1')))).toMatchObject({
+      target: { nativeSessionRef: created },
+      delivery: { state: 'sent', attempts: [{ state: 'sent', resolution: { decision: 'cancel', decidedBy: 'user' } }] },
+    });
+    const report = await b.service.recover();
+    expect(report.dispatched).toEqual([
+      { operationId: 'payload-for-1', outcome: expect.objectContaining({ status: 'not-dispatched', reason: 'provision-cancelled', provisionState: 'sent' }) as unknown },
+    ]);
+    expect(await a.service.dispatch(op('payload-for-1'))).toMatchObject({ status: 'not-dispatched', reason: 'provision-cancelled' });
+    expect(a.claude.dispatched.length + b.claude.dispatched.length).toBe(0);
+    // Left pending and unbound: cancel is the operation's outcome, kept by the layer above, not a delivery state.
+    expect(valid(await a.store.get(op('payload-for-1')))).toMatchObject({ target: waitingPayload().target, delivery: { state: 'pending', attempts: [] } });
+    expect(a.history.received()).toHaveLength(0);
+  });
+
+  it('the same GUI records a cancel while its own create call runs, but refuses a retry', async () => {
+    const g = gui();
+    await accepted(g, provisionInput());
+    await accepted(g, waitingPayload());
+    g.claude.startModes.push('held');
+    const creating = g.service.dispatch(op('provision-1'));
+    await flush();
+    const attempt = valid(await g.store.get(op('provision-1'))).delivery.attempts[0];
+    if (attempt === undefined) throw new Error('no attempt');
+    const decide = (decision: 'cancel' | 'retry') => g.service.resolve({ operationId: op('provision-1'), attemptId: attempt.attemptId, decision, acceptDuplicateRisk: true });
+    expect(await decide('retry')).toEqual({ status: 'refused', reason: 'in-flight' });
+    expect(await decide('cancel')).toEqual({ status: 'recorded', decision: 'cancel' });
+    g.claude.release();
+    expect((await creating).status).toBe('sent');
+    expect(await g.service.dispatch(op('payload-for-1'))).toMatchObject({ status: 'not-dispatched', reason: 'provision-cancelled' });
+    expect((await g.service.recover()).dispatched.map((d) => d.outcome)).toMatchObject([{ reason: 'provision-cancelled' }]);
+    expect(g.claude.started).toHaveLength(1);
+    expect(g.claude.dispatched).toHaveLength(0);
+  });
+
+  it('a cancelled provision whose result stays unknown blocks its payload as cancelled', async () => {
+    const g = gui();
+    await accepted(g, provisionInput());
+    await accepted(g, waitingPayload());
+    g.claude.startModes.push('lost-response');
+    const outcome = await g.service.dispatch(op('provision-1'));
+    if (outcome.status !== 'unknown') throw new Error('expected unknown');
+    await g.service.resolve({ operationId: op('provision-1'), attemptId: outcome.attemptId, decision: 'cancel', acceptDuplicateRisk: false });
+    expect(await g.service.dispatch(op('payload-for-1'))).toMatchObject({ status: 'not-dispatched', reason: 'provision-cancelled', provisionState: 'unknown' });
+    expect(g.claude.started).toHaveLength(1);
+    expect(g.claude.dispatched).toHaveLength(0);
   });
 
   it('recovery dispatches provisions before the payloads that wait for them', async () => {

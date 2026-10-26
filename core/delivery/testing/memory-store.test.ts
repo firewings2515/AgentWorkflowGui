@@ -86,6 +86,18 @@ describe('MemoryDeliveryStore (T007 semantics)', () => {
     expect((await store.claim(claimInput(payload, { expectedNativeSessionRef: created }))).status).toBe('claimed');
   });
 
+  it('keeps attempt and client message IDs unique across deliveries, as SQLite’s keys do', async () => {
+    const store = new MemoryDeliveryStore();
+    await store.accept(payloadInput());
+    await store.accept(payloadInput({ operationId: op('op-2') }));
+    const first = claimInput();
+    expect((await store.claim(first)).status).toBe('claimed');
+    await expect(store.claim(claimInput(op('op-2'), { attemptId: first.attemptId }))).rejects.toThrow('unique');
+    await expect(store.claim(claimInput(op('op-2'), { clientMessageId: first.clientMessageId }))).rejects.toThrow('unique');
+    expect((await store.get(op('op-2')))?.delivery).toEqual({ state: 'pending', attempts: [] });
+    expect((await store.claim(claimInput(op('op-2')))).status).toBe('claimed');
+  });
+
   it('injects failed, uncertain and hanging writes', async () => {
     const store = new MemoryDeliveryStore();
     await store.accept(payloadInput());

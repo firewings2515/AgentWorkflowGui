@@ -128,8 +128,10 @@ export class DeliveryService {
    */
   async resolve(input: ResolveInput): Promise<ResolveOutcome> {
     if (input.decision === 'retry' && !input.acceptDuplicateRisk) return { status: 'refused', reason: 'duplicate-risk-not-accepted' };
-    // The old executor must have stopped before a retry; this process's own call is still running.
-    if (this.inFlight.has(input.operationId)) return { status: 'refused', reason: 'in-flight' };
+    // The old executor must have stopped before a retry, which would reach the runtime again. Wait and
+    // cancel never do, so they are recorded while the call is still running (e.g. cancel after a create
+    // request left); the store keeps them when that call turns out sent.
+    if (input.decision === 'retry' && this.inFlight.has(input.operationId)) return { status: 'refused', reason: 'in-flight' };
     try {
       const written = await this.options.store.recordResolution(input.operationId, input.attemptId, {
         decision: input.decision,
@@ -263,6 +265,16 @@ export class DeliveryService {
       const provision = provisionId === undefined ? undefined : await store.get(provisionId);
       if (provision?.kind !== 'provision') {
         return { status: 'not-dispatched', reason: 'provision-not-sent', detail: `the target's provision ${provisionId ?? ''} is not recorded` };
+      }
+      // The user cancelled after the create call left (CR2 §3): the created session stays recorded on the
+      // provision, but no payload goes to it. A sent attempt can no longer be decided on, so this is final.
+      if (provision.delivery.attempts.at(-1)?.resolution?.decision === 'cancel') {
+        return {
+          status: 'not-dispatched',
+          reason: 'provision-cancelled',
+          detail: `the user cancelled the target's provision ${provision.operationId}`,
+          provisionState: provision.delivery.state,
+        };
       }
       if (provision.delivery.state !== 'sent') {
         return {

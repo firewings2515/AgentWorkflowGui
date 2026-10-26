@@ -41,8 +41,12 @@ export class FakeHistory {
  * the ack names another session.
  */
 export type DispatchMode = 'ack' | 'crash-before-send' | 'crash-after-receive' | 'timeout' | 'reject' | 'throw' | 'ack-elsewhere';
-/** `ok`: created and returned. `lost-response`: created, then the call fails. `crash`: created, never settles. `fail`: nothing created. */
-export type StartMode = 'ok' | 'lost-response' | 'crash' | 'fail';
+/**
+ * `ok`: created and returned. `lost-response`: created, then the call fails. `crash`: created, never
+ * settles. `fail`: nothing created. `held`: created, and the response arrives when the test calls
+ * `release()` (a slow create the user may cancel meanwhile).
+ */
+export type StartMode = 'ok' | 'lost-response' | 'crash' | 'fail' | 'held';
 /** `history`: read `history`. `read-failed` / `throw`: the read fails. `lagging`: the history is not flushed yet. */
 export type ReconcileMode = 'history' | 'read-failed' | 'throw' | 'lagging';
 
@@ -55,6 +59,7 @@ export class FakeRuntime implements RuntimeAdapter {
   readonly dispatchModes: DispatchMode[] = [];
   readonly startModes: StartMode[] = [];
   readonly reconcileModes: ReconcileMode[] = [];
+  private readonly held: (() => void)[] = [];
 
   constructor(
     readonly runtime: Runtime,
@@ -79,7 +84,14 @@ export class FakeRuntime implements RuntimeAdapter {
     this.history.sessions.push(ref);
     if (mode === 'crash') return never();
     if (mode === 'lost-response') return Promise.reject(new Error('the create response was lost'));
-    return Promise.resolve({ sessionId: options.sessionId, nativeSessionRef: ref, cwd: options.cwd, model: { source: 'unknown' } });
+    const info: NativeSessionInfo = { sessionId: options.sessionId, nativeSessionRef: ref, cwd: options.cwd, model: { source: 'unknown' } };
+    if (mode === 'held') return new Promise((resolve) => this.held.push(() => resolve(info)));
+    return Promise.resolve(info);
+  }
+
+  /** Lets the oldest `held` call answer. */
+  release(): void {
+    this.held.shift()?.();
   }
 
   resumeSession(): Promise<NativeSessionInfo> {

@@ -78,6 +78,11 @@ export type NotDispatchedReason =
   | Exclude<ClaimResult['status'], 'claimed'>
   /** A payload whose provision is not sent: it waits; it is never sent to a guessed target (CR2 §3). */
   | 'provision-not-sent'
+  /**
+   * The user cancelled the payload's provision. The payload stays pending (contracts keep cancel out of
+   * the delivery states) and is never dispatched; the layer above records the operation as cancelled.
+   */
+  | 'provision-cancelled'
   | 'no-runtime'
   | 'prepare-failed'
   /** A claim or binding write whose commit could not be confirmed; recovery reconciles if it applied. */
@@ -174,6 +179,7 @@ export type ResolveOutcome =
   | { status: 'recorded'; decision: ResolveInput['decision'] }
   /** Not the live unknown attempt any more (reconciled, or already retried). */
   | { status: 'stale' }
+  /** `in-flight`: a retry while this process is still inside the attempt's runtime call (wait / cancel are recorded). */
   | { status: 'refused'; reason: 'duplicate-risk-not-accepted' | 'in-flight' }
   | { status: 'commit-uncertain'; detail: string };
 

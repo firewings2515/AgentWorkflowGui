@@ -157,8 +157,10 @@ export class MemoryDeliveryStore implements DeliveryStore {
       const target = parse<DeliveryTarget>(row.target);
       const blocked = row.kind === 'provision' ? this.provisionBlocked(target, input) : this.payloadBlocked(row, target, input);
       if (blocked !== undefined) return { value: { status: blocked } };
-      if (row.attempts.some((a) => a.attempt.attemptId === input.attemptId || a.attempt.clientMessageId === input.clientMessageId)) {
-        throw new Error('attemptId and clientMessageId must be new');
+      // Unique across every operation, as SQLite's keys on dispatch_attempt: a reused ID fails the transaction.
+      const used = [...this.rows.values()].flatMap((r) => r.attempts);
+      if (used.some((a) => a.attempt.attemptId === input.attemptId || a.attempt.clientMessageId === input.clientMessageId)) {
+        throw new Error('attemptId and clientMessageId must be unique across all deliveries');
       }
       const attempt = { state: 'unknown' as const, attemptId: input.attemptId, clientMessageId: input.clientMessageId, dispatchStartedAt: input.at };
       return {
