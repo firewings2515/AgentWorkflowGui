@@ -1,26 +1,25 @@
-import { useState } from 'react';
 import type { ReactNode } from 'react';
 import { AgentId, NodeId } from '../../../contracts';
 import type { AgentDefinition, InputRule, ModelOption, OutputRule, WorkflowNode, WorkflowTemplate } from '../../../contracts';
-import { isolationLabels, writePolicyLabels } from './workflow-editor-state';
+import { destinationKey, destinationValue, isolationLabels, writePolicyLabels } from './workflow-editor-state';
 import type { WorkflowIssue } from './workflow-editor-state';
 
 export const workflowFieldId = (path: string) => `workflow-field-${path}`;
-function OutputDestination({ workflow, node, rule, ruleIndex, inputProps, onApply }: {
+function OutputDestination({ workflow, node, rule, ruleIndex, inputProps, choice, onChoice, onApply }: {
   workflow: WorkflowTemplate; node: WorkflowNode; rule: OutputRule; ruleIndex: number;
   inputProps: { id: string; 'aria-invalid': boolean; 'aria-describedby': string | undefined };
   onApply: (target: OutputRule['target']) => void;
+  choice: string | undefined; onChoice: (value: string) => void;
 }) {
-  const current = rule.target.kind === 'root' ? 'root' : `node:${rule.target.nodeId}`;
-  const [choice, setChoice] = useState({ current, value: current });
-  if (choice.current !== current) setChoice({ current, value: current });
-  const value = choice.current === current ? choice.value : current;
+  const current = destinationValue(rule.target);
+  const value = choice ?? current;
   return <>
-    <select {...inputProps} value={value} onChange={event => setChoice({ current, value: event.target.value })}>
+    <select {...inputProps} value={value} onChange={event => onChoice(event.target.value)}>
+      {value !== 'root' && !workflow.nodes.some(item => `node:${item.id}` === value && item.id !== node.id) && <option value={value}>目的地節點已不存在，請重新選取</option>}
       <option value="root">回報 root</option>{workflow.nodes.filter(item => item.id !== node.id).map(item => <option key={item.id} value={`node:${item.id}`}>{item.label}{workflow.edges.some(edge => edge.source === node.id && edge.target === item.id) ? '（已連線）' : '（套用時自動連線）'}</option>)}
     </select>
     <button type="button" onClick={() => onApply(value === 'root' ? { kind: 'root' } : { kind: 'node', nodeId: NodeId.parse(value.slice(5)) })}>套用 Output {ruleIndex + 1} 目的地</button>
-    {value !== current && <p className="muted">目的地尚未套用，儲存仍使用原目的地。</p>}
+    {value !== current && <p className="muted">目的地尚未套用；切換節點會保留選擇，儲存前需套用或放棄。</p>}
   </>;
 }
 export function WorkflowField({ path, label, issues, children }: {
@@ -51,9 +50,10 @@ export function WorkflowSettings({ workflow, issues, onChange, onRoot }: {
   </>;
 }
 
-export function WorkflowInspector({ workflow, node, agents, models, issues, onChange }: {
+export function WorkflowInspector({ workflow, node, agents, models, issues, destinationChoices, onDestinationChoice, onChange }: {
   workflow: WorkflowTemplate; node: WorkflowNode; agents: readonly AgentDefinition[]; models: readonly ModelOption[];
   issues: WorkflowIssue[]; onChange: (node: WorkflowNode, applyDestination?: boolean) => void;
+  destinationChoices: Record<string, string>; onDestinationChoice: (ruleId: string, value: string) => void;
 }) {
   const index = workflow.nodes.findIndex(item => item.id === node.id);
   const path = `nodes.${index}`;
@@ -103,7 +103,7 @@ export function WorkflowInspector({ workflow, node, agents, models, issues, onCh
     {node.outputRules.map((rule, ruleIndex) => <fieldset className="workflow-rule" key={rule.id}><legend>Output {ruleIndex + 1}</legend>
       {field(`outputRules.${ruleIndex}.condition`, `Output ${ruleIndex + 1} 什麼情況`, props => <textarea {...props} rows={2} value={rule.condition} onChange={event => updateOutput(rule.id, { ...rule, condition: event.target.value })} />)}
       {field(`outputRules.${ruleIndex}.payload`, `Output ${ruleIndex + 1} 送什麼`, props => <textarea {...props} rows={2} value={rule.payload} onChange={event => updateOutput(rule.id, { ...rule, payload: event.target.value })} />)}
-      {field(`outputRules.${ruleIndex}.target`, `Output ${ruleIndex + 1} 目的地`, props => <OutputDestination workflow={workflow} node={node} rule={rule} ruleIndex={ruleIndex} inputProps={props} onApply={target => updateOutput(rule.id, { ...rule, target }, true)} />)}
+      {field(`outputRules.${ruleIndex}.target`, `Output ${ruleIndex + 1} 目的地`, props => <OutputDestination workflow={workflow} node={node} rule={rule} ruleIndex={ruleIndex} inputProps={props} choice={destinationChoices[destinationKey(node.id, rule.id)]} onChoice={value => onDestinationChoice(rule.id, value)} onApply={target => updateOutput(rule.id, { ...rule, target }, true)} />)}
       <label className="workflow-check"><input type="checkbox" checked={rule.requiresUserConfirmation} onChange={event => updateOutput(rule.id, { ...rule, requiresUserConfirmation: event.target.checked })} />Output {ruleIndex + 1} 經 root 請使用者確認</label>
       <button type="button" onClick={() => { onChange({ ...node, outputRules: node.outputRules.filter(item => item.id !== rule.id) }); focusAdd('output'); }}>移除 Output {ruleIndex + 1}</button>
     </fieldset>)}

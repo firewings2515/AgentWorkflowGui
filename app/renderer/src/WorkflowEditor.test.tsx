@@ -39,7 +39,10 @@ describe('T019 Workflow editor', () => {
       expect(screen.getByText('連線（6）')).toBeTruthy();
       expect(screen.getByText(/已載入範本/)).toBeTruthy();
     }
+    screen.getByRole('button', { name: '新增連線' }).focus();
     click('新增連線');
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(target);
     expect(screen.getByText('連線（7）')).toBeTruthy();
     expect(screen.getByRole<HTMLSelectElement>('combobox', { name: '連接到節點' }).value).toBe('');
     fireEvent.change(target, { target: { value: 'n-review' } });
@@ -55,6 +58,7 @@ describe('T019 Workflow editor', () => {
 
   it('stages output destinations without changing rules or edges until applied', async () => {
     const repository = createWorkflowRepository([template]);
+    const save = vi.spyOn(repository, 'save');
     render(<Harness repository={repository} />);
     selectNode('規劃 · root');
     const target = screen.getByRole('combobox', { name: 'Output 1 目的地' });
@@ -64,7 +68,9 @@ describe('T019 Workflow editor', () => {
       expect(screen.getByText(/已載入範本/)).toBeTruthy();
     }
     click('儲存 Workflow');
-    await screen.findByText(/已儲存/);
+    expect(save).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(screen.getByRole('alert'));
+    expect(within(screen.getByRole('alert')).getByText(/規劃 · Output 1/)).toBeTruthy();
     expect(repository.getSnapshot()[0]!.nodes[0]!.outputRules).toEqual(template.nodes[0]!.outputRules);
     click('套用 Output 1 目的地');
     expect(screen.getByText('連線（7）')).toBeTruthy();
@@ -74,6 +80,76 @@ describe('T019 Workflow editor', () => {
     expect(screen.getByText('連線（6）')).toBeTruthy();
     click('儲存 Workflow');
     await waitFor(() => expect(repository.getSnapshot()[0]!.nodes[0]!.outputRules[0]!.target).toEqual({ kind: 'root' }));
+  });
+
+  it('retains choices across nodes and templates, then applies all before saving', async () => {
+    const other = { ...template, id: WorkflowId.parse('wf-other'), name: '另一範本' };
+    const repository = createWorkflowRepository([template, other]);
+    const save = vi.spyOn(repository, 'save');
+    render(<Harness repository={repository} />);
+    selectNode('規劃 · root');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Output 1 目的地' }), { target: { value: 'node:n-review' } });
+    selectNode('實作');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Output 1 目的地' }), { target: { value: 'root' } });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Workflow 範本' }), { target: { value: other.id } });
+    expect(screen.queryByText(/項 Output 目的地尚未套用/)).toBeNull();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Workflow 範本' }), { target: { value: template.id } });
+    selectNode('規劃 · root');
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Output 1 目的地' }).value).toBe('node:n-review');
+    selectNode('Review');
+    click('儲存 Workflow');
+    expect(save).not.toHaveBeenCalled();
+    const alert = screen.getByRole('alert');
+    expect(within(alert).getByText(/規劃 · Output 1/)).toBeTruthy();
+    expect(within(alert).getByText(/實作 · Output 1/)).toBeTruthy();
+    fireEvent.click(within(alert).getByRole('button', { name: /規劃 · Output 1/ }));
+    expect(document.activeElement).toBe(screen.getByRole('combobox', { name: 'Output 1 目的地' }));
+    click('套用所有目的地');
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: '儲存 Workflow' }));
+    expect(save).not.toHaveBeenCalled();
+    click('儲存 Workflow');
+    await screen.findByText(/已儲存/);
+    const saved = repository.getSnapshot()[0]!;
+    expect(saved.nodes[0]!.outputRules[0]!.target).toEqual({ kind: 'node', nodeId: 'n-review' });
+    expect(saved.nodes[1]!.outputRules[0]!.target).toEqual({ kind: 'root' });
+    expect(saved.edges).toContainEqual({ source: 'n-plan', target: 'n-review' });
+    expect(repository.getSnapshot()[1]).toEqual(other);
+  });
+
+  it('only discards unapplied destinations after an explicit choice', async () => {
+    const repository = createWorkflowRepository([template]);
+    const save = vi.spyOn(repository, 'save');
+    render(<Harness repository={repository} />);
+    selectNode('規劃 · root');
+    change('Output 1 什麼情況', '保留其他修改');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Output 1 目的地' }), { target: { value: 'node:n-review' } });
+    selectNode('實作');
+    click('儲存 Workflow');
+    expect(save).not.toHaveBeenCalled();
+    click('放棄所有目的地選擇');
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: '儲存 Workflow' }));
+    selectNode('規劃 · root');
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Output 1 目的地' }).value).toBe('node:n-build');
+    click('儲存 Workflow');
+    await screen.findByText(/已儲存/);
+    expect(repository.getSnapshot()[0]!.nodes[0]!.outputRules[0]).toEqual({ ...template.nodes[0]!.outputRules[0], condition: '保留其他修改' });
+    expect(repository.getSnapshot()[0]!.edges).toEqual(template.edges);
+  });
+
+  it('clears staged choices when reverting the selection or removing its rule', async () => {
+    const repository = createWorkflowRepository([template]);
+    render(<Harness repository={repository} />);
+    selectNode('規劃 · root');
+    const target = screen.getByRole('combobox', { name: 'Output 1 目的地' });
+    fireEvent.change(target, { target: { value: 'node:n-review' } });
+    fireEvent.change(target, { target: { value: 'node:n-build' } });
+    expect(screen.queryByText(/項 Output 目的地尚未套用/)).toBeNull();
+    fireEvent.change(target, { target: { value: 'node:n-review' } });
+    click('移除 Output 1');
+    expect(screen.queryByText(/項 Output 目的地尚未套用/)).toBeNull();
+    click('儲存 Workflow');
+    await screen.findByText(/已儲存/);
+    expect(repository.getSnapshot()[0]!.nodes[0]!.outputRules).toEqual([]);
   });
 
   it('does not repair graph structure when an ordinary field select changes', () => {

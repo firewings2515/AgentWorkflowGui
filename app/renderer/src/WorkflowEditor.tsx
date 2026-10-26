@@ -4,7 +4,7 @@ import type { AgentDefinition, ModelOption, WorkflowNode, WorkflowTemplate } fro
 import type { WorkflowRepository } from './workflow-repository';
 import { workflowSaveCommand } from './workflow-repository';
 import type { WorkflowDemoControls } from './workflow-demo';
-import { connectNodes, isolationLabels, removeGraphSelection, replaceNode, setRoot, updateDraftGraph, workflowIssues } from './workflow-editor-state';
+import { connectNodes, destinationKey, destinationValue, isolationLabels, removeGraphSelection, replaceNode, setRoot, updateDraftGraph, workflowIssues } from './workflow-editor-state';
 import type { GraphSelection, WorkflowIssue } from './workflow-editor-state';
 import { workflowIssueLabel } from './workflow-validation';
 import { WorkflowInspector, WorkflowSettings, workflowFieldId } from './WorkflowInspector';
@@ -16,11 +16,13 @@ interface Draft {
   pending: boolean; error: string; message: string; attempted: boolean; failNext: boolean; conflict: boolean;
   automaticEdges: string[];
   deletedEdges: string[]; connectionTarget: string;
+  destinationChoices: Record<string, string>; destinationPrompt: boolean;
 }
 const newDraft = (workflow: WorkflowTemplate): Draft => ({
   workflow: structuredClone(workflow), expectedRevision: workflow.revision, dirty: false, selection: null,
   pending: false, error: '', message: '', attempted: false, failNext: false, conflict: false,
   automaticEdges: [], deletedEdges: [], connectionTarget: '',
+  destinationChoices: {}, destinationPrompt: false,
 });
 
 function DeleteGraphDialog({ workflow, selection, onCancel, onConfirm }: {
@@ -86,6 +88,11 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
   const issues = draft?.attempted && workflow ? workflowIssues(workflow) : [];
   const pending = draft?.pending ?? false;
   const error = draft?.error;
+  const unapplied = workflow?.nodes.flatMap((node, nodeIndex) => node.outputRules.flatMap((rule, ruleIndex) => {
+    const key = destinationKey(node.id, rule.id);
+    const value = draft?.destinationChoices[key];
+    return value && value !== destinationValue(rule.target) ? [{ key, value, node, rule, nodeIndex, ruleIndex }] : [];
+  })) ?? [];
 
   useLayoutEffect(() => { if (visible) heading.current?.focus(); }, [visible, selectedId]);
   useLayoutEffect(() => {
@@ -110,7 +117,14 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
     return current ? { ...previous, [id]: { ...current, ...value } } : previous;
   });
   const change = (value: WorkflowTemplate, manualEdge?: { source: string; target: string }) => {
-    if (!pending && draft && workflow) patch(selectedId, { ...updateDraftGraph(workflow, value, draft.automaticEdges, saved?.edges ?? [], manualEdge, draft.deletedEdges), dirty: true, message: '', error: '' });
+    if (!pending && draft && workflow) {
+      const destinationChoices = Object.fromEntries(value.nodes.flatMap(node => node.outputRules.flatMap(rule => {
+        const key = destinationKey(node.id, rule.id);
+        const choice = draft.destinationChoices[key];
+        return choice && choice !== destinationValue(rule.target) ? [[key, choice]] : [];
+      })));
+      patch(selectedId, { ...updateDraftGraph(workflow, value, draft.automaticEdges, saved?.edges ?? [], manualEdge, draft.deletedEdges), destinationChoices, dirty: true, message: '', error: '' });
+    }
   };
   const connect = (source: string, target: string) => { if (workflow) change(connectNodes(workflow, source, target), { source, target }); };
   const select = (value: GraphSelection) => { patch(selectedId, { selection: value, connectionTarget: '' }); setDeleteTarget(null); };
@@ -123,6 +137,11 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
   const save = async (externalUpdate = false) => {
     if (!draft || !workflow || pending || stale || locks.current.has(selectedId)) return;
     if (!externalUpdate) {
+      if (unapplied.length) {
+        patch(selectedId, { destinationPrompt: true, message: '' });
+        requestFocus('pending-destinations');
+        return;
+      }
       const errors = workflowIssues(workflow);
       patch(selectedId, { attempted: true });
       if (errors[0]) { jumpToIssue(errors[0]); return; }
@@ -145,6 +164,7 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
           workflow: record?.revision === result.revision ? structuredClone(record) : { ...command.workflow, revision: result.revision },
           expectedRevision: result.revision, pending: false, dirty: false, attempted: false, conflict: false,
           automaticEdges: [], deletedEdges: [], connectionTarget: '',
+          destinationChoices: {}, destinationPrompt: false,
           message: `示意模式 · 已儲存「${command.workflow.name}」，revision ${result.revision}。僅保留於本次開啟期間。`,
         });
       }
@@ -177,11 +197,27 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
     <header className="workflow-toolbar"><div><span className="eyebrow">設定 / Workflow</span><h2 ref={heading} tabIndex={-1}>{workflow?.name || (workflow ? '未命名 Workflow' : '找不到指定的 Workflow 範本')}</h2>
       <p className="muted">{workflow ? `revision ${draft?.expectedRevision} · ${draft?.dirty ? '有未儲存草稿' : '已載入範本'}` : workflows.length ? `範本 ID：${selectedId}` : '尚無 Workflow 範本'}</p></div>
       <div className="workflow-actions"><label>範本<select aria-label="Workflow 範本" value={saved?.id ?? ''} onChange={event => { setDeleteTarget(null); onSelect(event.target.value); }}><option disabled value="">選取範本</option>{workflows.map(item => <option key={item.id} value={item.id}>{item.name}{drafts[item.id]?.dirty ? ' · 草稿' : ''}</option>)}</select></label>
-        {workflow && <button className="primary" disabled={pending || stale} onClick={() => { void save(); }}>{pending ? '儲存中…' : '儲存 Workflow'}</button>}
+        {workflow && <button id={workflowFieldId('save')} className="primary" disabled={pending || stale} onClick={() => { void save(); }}>{pending ? '儲存中…' : '儲存 Workflow'}</button>}
       </div>
     </header>
     {draft && workflow && <>
       <div className="workflow-feedback-area">
+        {unapplied.length > 0 && <p className="muted">有 {unapplied.length} 項 Output 目的地尚未套用。</p>}
+        {draft.destinationPrompt && unapplied.length > 0 && <div className="workflow-validation" role="alert" tabIndex={-1} id={workflowFieldId('pending-destinations')}>
+          <strong>尚未儲存：請先套用或放棄以下目的地選擇，再按「儲存 Workflow」。</strong>
+          <ul>{unapplied.map(item => <li key={item.key}><button onClick={() => { select({ kind: 'node', id: item.node.id }); requestFocus(`nodes.${item.nodeIndex}.outputRules.${item.ruleIndex}.target`); }}>
+            {item.node.label} · Output {item.ruleIndex + 1}：{item.rule.condition || '未填條件'} → {item.value === 'root' ? '回報 root' : workflow.nodes.find(node => `node:${node.id}` === item.value)?.label ?? '目的地節點已不存在，請重新選取'}
+          </button></li>)}</ul>
+          <button disabled={pending} onClick={() => {
+            let next = workflow;
+            for (const item of unapplied) {
+              const node = next.nodes.find(node => node.id === item.node.id)!;
+              next = replaceNode(next, { ...node, outputRules: node.outputRules.map(rule => rule.id === item.rule.id ? { ...rule, target: item.value === 'root' ? { kind: 'root' } : { kind: 'node', nodeId: NodeId.parse(item.value.slice(5)) } } : rule) });
+            }
+            change(next); requestFocus('save');
+          }}>套用所有目的地</button>
+          <button disabled={pending} onClick={() => { patch(selectedId, { destinationChoices: {}, destinationPrompt: false }); requestFocus('save'); }}>放棄所有目的地選擇</button>
+        </div>}
         {draft.message && <p role="status">{draft.message}</p>}
         {stale && <div className="workflow-feedback" data-workflow-feedback role="alert" tabIndex={-1}>
           <p>版本已變更：草稿基於 revision {draft.expectedRevision}，目前為 {saved?.revision ?? '不存在'}。草稿未被覆蓋，請比對後再處理。</p>
@@ -207,7 +243,11 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
         </div>
         <aside className="workflow-inspector" aria-label="Workflow 屬性檢視器"><h3 ref={inspectorHeading} tabIndex={-1}>{selectedNode ? `節點：${selectedNode.label}` : selection?.kind === 'edge' ? '連線設定' : '範本設定'}</h3>
           <fieldset className="workflow-inspector-fields" disabled={pending}>
-            {selectedNode ? <WorkflowInspector key={selectedNode.id} workflow={workflow} node={selectedNode} agents={agents} models={models} issues={issues} onChange={(node, applyDestination = false) => change(replaceNode(workflow, node, applyDestination))} />
+            {selectedNode ? <WorkflowInspector key={selectedNode.id} workflow={workflow} node={selectedNode} agents={agents} models={models} issues={issues} destinationChoices={draft.destinationChoices} onDestinationChoice={(ruleId, value) => {
+              const destinationChoices = { ...draft.destinationChoices, [destinationKey(selectedNode.id, ruleId)]: value };
+              if (value === destinationValue(selectedNode.outputRules.find(rule => rule.id === ruleId)!.target)) delete destinationChoices[destinationKey(selectedNode.id, ruleId)];
+              patch(selectedId, { destinationChoices, message: '' });
+            }} onChange={(node, applyDestination = false) => change(replaceNode(workflow, node, applyDestination))} />
               : selection?.kind === 'edge' ? <>
                 <p>此連線允許兩個節點交接。條件、內容及目的地請在來源節點的 Output 規則設定。</p>
                 <h4>經過此連線的 Output 規則</h4>
@@ -219,7 +259,7 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
               </>
                 : <WorkflowSettings workflow={workflow} issues={issues} onChange={change} onRoot={id => change(setRoot(workflow, id))} />}
             {selectedNode && <div className="workflow-keyboard-connect"><h4>新增連線</h4><label htmlFor="workflow-connect-target">連接到節點</label><select id="workflow-connect-target" value={draft.connectionTarget} onChange={event => patch(selectedId, { connectionTarget: event.target.value })}><option value="">選取目的地</option>{workflow.nodes.filter(node => node.id !== selectedNode.id).map(node => <option key={node.id} value={node.id}>{node.label}{workflow.edges.some(edge => edge.source === selectedNode.id && edge.target === node.id) ? '（已連線，可保留為手動連線）' : '（保留手動連線）'}</option>)}</select>
-              <button type="button" disabled={!draft.connectionTarget} onClick={() => { connect(selectedNode.id, draft.connectionTarget); patch(selectedId, { connectionTarget: '' }); }}>新增連線</button><p className="muted">選好目的地後按「新增連線」。也可在畫布從右側圓點拉線到另一節點左側。</p></div>}
+              <button type="button" disabled={!draft.connectionTarget} onClick={() => { connect(selectedNode.id, draft.connectionTarget); patch(selectedId, { connectionTarget: '' }); document.getElementById('workflow-connect-target')?.focus(); }}>新增連線</button><p className="muted">選好目的地後按「新增連線」。也可在畫布從右側圓點拉線到另一節點左側。</p></div>}
             {selection && <button className="workflow-delete" onClick={() => setDeleteTarget(selection)}>刪除所選{selection.kind === 'node' ? '節點' : '連線'}</button>}
           </fieldset>
           {demo && <details className="workflow-demo"><summary>示意模式測試</summary><label className="workflow-check"><input type="checkbox" disabled={pending} checked={draft.failNext} onChange={event => { demo.setSaveFailure(selectedId, event.target.checked); patch(selectedId, { failNext: event.target.checked }); }} />下次儲存模擬失敗</label><button disabled={pending || stale} onClick={() => { void save(true); }}>模擬他人已更新此 Workflow</button></details>}

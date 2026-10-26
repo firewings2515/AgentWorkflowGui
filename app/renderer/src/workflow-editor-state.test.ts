@@ -160,8 +160,10 @@ describe('T019 domain / canvas boundary', () => {
     invalid.edges = invalid.edges.filter(edge => edge.source !== 'n-plan');
     const issues = workflowIssues(invalid);
     expect(new Set(issues.map(issue => issue.rule))).toEqual(new Set(Object.keys(workflowRuleMessages)));
-    expect(issues.find(issue => issue.rule === 'workflow.edge-missing-node')?.path).toMatch(/^edges\.\d+$/u);
-    expect(issues.find(issue => issue.rule === 'workflow.output-needs-edge')?.path).toBe('nodes.0.outputRules.0.target');
+    expect(issues).toContainEqual({ path: 'nodes', rule: 'workflow.node-id-unique', message: '節點 ID 不可重複。' });
+    expect(issues).toContainEqual({ path: 'nodes', rule: 'workflow.one-root', message: '請指定且只指定一個 Agent 節點作為 root。' });
+    expect(issues).toContainEqual({ path: `edges.${invalid.edges.length - 1}`, rule: 'workflow.edge-missing-node', message: '連線的來源或目的地節點不存在，請移除此連線或補回節點。' });
+    expect(issues).toContainEqual({ path: 'nodes.0.outputRules.0.target', nodeId: 'n-plan', rule: 'workflow.output-needs-edge', message: 'Output 目的地缺少連線，請重新選取目的地或建立連線。' });
   });
 });
 

@@ -1,15 +1,15 @@
 import type { z } from 'zod';
-import { WorkflowTemplate } from '../../../contracts';
+import { issueRule, WorkflowTemplate } from '../../../contracts';
+import type { ContractRule } from '../../../contracts';
 
-// Exact workflow.* keys from contracts 0.4 (d428e61:contracts/rules.ts).
-export const workflowRuleMessages = {
+type WorkflowRule = Extract<ContractRule, `workflow.${string}`>;
+export const workflowRuleMessages: Record<WorkflowRule, string> = {
   'workflow.node-id-unique': '節點 ID 不可重複。',
   'workflow.one-root': '請指定且只指定一個 Agent 節點作為 root。',
   'workflow.edge-missing-node': '連線的來源或目的地節點不存在，請移除此連線或補回節點。',
   'workflow.output-needs-edge': 'Output 目的地缺少連線，請重新選取目的地或建立連線。',
-} as const;
-type WorkflowRule = keyof typeof workflowRuleMessages;
-export interface WorkflowIssue { path: string; message: string; nodeId?: string; rule?: WorkflowRule }
+};
+export interface WorkflowIssue { path: string; message: string; nodeId?: string; rule?: ContractRule }
 
 const fieldLabels: Record<string, string> = {
   name: '範本名稱', description: '範本說明', nodes: 'Root 節點（升級對象）', isolation: 'Task 隔離', reworkLimit: '返工上限',
@@ -41,19 +41,12 @@ export function workflowIssueLabel(workflow: WorkflowTemplate, issue: WorkflowIs
   return fieldLabels[field] ?? '整體流程';
 }
 
-// Integration seam: replace this compatibility reader with contracts.issueRule in 0.4.
-function workflowIssueRule(issue: z.core.$ZodIssue): WorkflowRule | undefined {
-  const rule: unknown = issue.code === 'custom' ? issue.params?.['rule'] : undefined;
-  return typeof rule === 'string' && Object.hasOwn(workflowRuleMessages, rule) ? rule as WorkflowRule : undefined;
-}
-
 export function workflowIssueMessage(issue: z.core.$ZodIssue): string {
-  const rule = workflowIssueRule(issue);
-  if (rule) return workflowRuleMessages[rule];
+  const rule = issueRule(issue);
+  const messages: Partial<Record<ContractRule, string>> = workflowRuleMessages;
+  if (rule && messages[rule]) return messages[rule];
   const field = String(issue.path.at(-1) ?? '');
   if (issue.code === 'custom') {
-    if (issue.path[0] === 'edges') return workflowRuleMessages['workflow.edge-missing-node'];
-    if (field === 'target') return workflowRuleMessages['workflow.output-needs-edge'];
     return '流程設定不符合規則，請檢查節點、root 與連線。';
   }
   if (['concurrency', 'acceptanceLimit', 'reworkLimit', 'revision'].includes(field)) {
@@ -67,36 +60,12 @@ export function workflowIssueMessage(issue: z.core.$ZodIssue): string {
   return '欄位格式不正確，請檢查後再儲存。';
 }
 
-// 0.3 custom graph issues have neither rule nor path. Recover locations from the
-// graph invariants only when those issues occur; never inspect English messages.
-function legacyGraphIssues(workflow: WorkflowTemplate): WorkflowIssue[] {
-  const issues: WorkflowIssue[] = [];
-  const add = (rule: WorkflowRule, path: string, nodeId?: string) => issues.push({ rule, path, message: workflowRuleMessages[rule], ...(nodeId ? { nodeId } : {}) });
-  const ids = new Set<string>();
-  workflow.nodes.forEach((node, index) => {
-    if (ids.has(node.id)) add('workflow.node-id-unique', `nodes.${index}.id`, node.id);
-    ids.add(node.id);
-  });
-  if (workflow.nodes.filter(node => node.kind === 'agent' && node.isRoot).length !== 1) add('workflow.one-root', 'nodes');
-  workflow.edges.forEach((edge, index) => {
-    if (!ids.has(edge.source) || !ids.has(edge.target)) add('workflow.edge-missing-node', `edges.${index}`);
-  });
-  workflow.nodes.forEach((node, index) => node.outputRules.forEach((rule, ruleIndex) => {
-    const target = rule.target;
-    if (target.kind === 'node' && !workflow.edges.some(edge => edge.source === node.id && edge.target === target.nodeId)) {
-      add('workflow.output-needs-edge', `nodes.${index}.outputRules.${ruleIndex}.target`, node.id);
-    }
-  }));
-  return issues;
-}
-
 export function workflowIssues(workflow: WorkflowTemplate): WorkflowIssue[] {
   const result = WorkflowTemplate.safeParse(workflow);
   if (result.success) return [];
-  const legacy = result.error.issues.some(issue => issue.code === 'custom' && !issue.path.length && !workflowIssueRule(issue));
-  return [...result.error.issues.filter(issue => !(legacy && issue.code === 'custom' && !issue.path.length && !workflowIssueRule(issue))).map(issue => {
+  return result.error.issues.map(issue => {
     const node = issue.path[0] === 'nodes' && typeof issue.path[1] === 'number' ? workflow.nodes[issue.path[1]] : undefined;
-    const rule = workflowIssueRule(issue);
+    const rule = issueRule(issue);
     return { path: issue.path.map(String).join('.'), message: workflowIssueMessage(issue), ...(node ? { nodeId: node.id } : {}), ...(rule ? { rule } : {}) };
-  }), ...(legacy ? legacyGraphIssues(workflow) : [])];
+  });
 }
