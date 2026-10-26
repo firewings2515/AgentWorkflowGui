@@ -1,0 +1,36 @@
+.workflow-canvas { min-height: 180px; flex: 1; position: relative; }
+.workflow-canvas .react-flow {
+  --xy-background-color: var(--panel);
+  --xy-background-pattern-dots-color: var(--line);
+  --xy-edge-stroke: var(--muted);
+  --xy-edge-stroke-selected: var(--accent);
+  --xy-edge-stroke-width: 2;
+  --xy-connectionline-stroke: var(--accent);
+  --xy-handle-background-color: var(--accent);
+  --xy-handle-border-color: var(--panel);
+  --xy-controls-button-background-color: var(--surface);
+  --xy-controls-button-background-color-hover: var(--hover);
+  --xy-controls-button-color: var(--text);
+  --xy-controls-button-color-hover: var(--text);
+  --xy-controls-button-border-color: var(--line);
+  --xy-controls-box-shadow: 0 0 4px var(--shadow);
+  --xy-attribution-background-color: var(--surface);
+  --xy-selection-background-color: var(--accent-bg);
+  --xy-selection-border: 1px dotted var(--accent);
+}
+.workflow-canvas .react-flow__attribution a { color: var(--muted); }
+.workflow-canvas .react-flow__edge.selected .react-flow__edge-path { stroke: var(--accent); }
+.workflow-canvas .react-flow__node:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+.workflow-canvas .react-flow__handle { width: 32px; height: 32px; border: 0; background: transparent; }
+.workflow-canvas .react-flow__handle::after { content: ''; position: absolute; inset: 8px; border-radius: 50%; background: var(--accent); border: 2px solid var(--panel); pointer-events: none; }
+.workflow-canvas .react-flow__handle-left { left: 0; }
+.workflow-canvas .react-flow__handle-right { right: 0; }
+.workflow-canvas .react-flow__edge-text { fill: var(--text); font-size: 15px; }
+.workflow-canvas .react-flow__edge-textbg { fill: var(--surface); }
+.workflow-node-card { width: 220px; display: flex; flex-direction: column; gap: 7px; padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); color: var(--text); box-shadow: 0 3px 12px var(--shadow); font-size: 15px; overflow-wrap: anywhere; }
+.workflow-node-card.merge { border-style: dashed; }
+.workflow-node-title { display: flex; justify-content: space-between; gap: 8px; font-size: 16px; }
+.workflow-node-title .badge { color: var(--accent); background: var(--accent-bg); border-radius: 4px; padding: 1px 5px; font-size: 15px; }
+.workflow-node-card small { color: var(--muted); font-size: 15px; }
+.workflow-node-card .workflow-wait { color: var(--warning); }
+.workflow-canvas .selected .workflow-node-card { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }

@@ -10,6 +10,7 @@ const tab = (name: string, id = 'view-1') => fireEvent.click(pane(id).getByRole(
 const draft = (id = 'view-1') => pane(id).getByRole<HTMLTextAreaElement>('textbox');
 
 beforeEach(() => {
+  vi.stubGlobal('ResizeObserver', class { observe = vi.fn(); unobserve = vi.fn(); disconnect = vi.fn(); });
   localStorage.clear();
   window.history.replaceState(null, '', '/#/workbench');
 });
@@ -105,7 +106,8 @@ describe('T004 工作台外殼', () => {
     expect(pane().getByLabelText('規劃想法 對話').scrollTop).toBe(125);
     fireEvent.click(screen.getByRole('link', { name: 'Workflow 編輯器' }));
     expect(window.location.hash).toBe('#/workflows/wf-default/edit');
-    expect(screen.getByText(/圖形編輯器將於後續任務提供/)).toBeTruthy();
+    expect(screen.getByRole('region', { name: 'Workflow 編輯內容' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '儲存 Workflow' })).toBeTruthy();
     fireEvent.click(screen.getByRole('link', { name: 'Agent 管理' }));
     expect(window.location.hash).toBe('#/agents');
     fireEvent.click(screen.getByRole('link', { name: '工作台' }));
