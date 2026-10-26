@@ -33,6 +33,7 @@ import type {
   NativeSessionInfo,
   PermissionHandle,
   ReconcileMatch,
+  ReconcileProvisionResult,
   ReconcileRequest,
   ReconcileResult,
   ResumeSessionOptions,
@@ -327,6 +328,19 @@ export class CodexAdapter implements RuntimeAdapter {
     const info = await this.resumeThread({ sessionId: options.sessionId, threadId: options.nativeSessionRef, cwd: options.cwd, ...this.settingsOf(options, model) });
     this.keepEffort(info.threadId, model);
     return { sessionId: options.sessionId, nativeSessionRef: info.threadId, cwd: info.cwd, model: info.configuredModel };
+  }
+
+  /**
+   * Not supported yet (C-07): closing one thread without touching the others on this app-server needs the
+   * per-session app-server and Job of T013, which then closes the whole host for the session.
+   */
+  closeSession(nativeSessionRef: string): Promise<{ forced: boolean }> {
+    return Promise.reject(new Error(`closeSession: not supported by the Codex adapter yet (T013), thread ${nativeSessionRef}`));
+  }
+
+  /** Codex picks the thread ID only in the thread/start response, so a lost create cannot be looked up (C-08). */
+  reconcileProvision(): Promise<ReconcileProvisionResult> {
+    return Promise.resolve({ state: 'unknown', reason: 'unsupported', detail: 'Codex has no thread ID before thread/start' });
   }
 
   /** Codex has no call to change a thread's model; it is sent with the next turn/start (R-12). */

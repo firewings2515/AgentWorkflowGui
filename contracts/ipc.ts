@@ -22,6 +22,7 @@ import {
   WorkflowId,
 } from './common';
 import { PermissionRequest, SessionItem } from './items';
+import { ruleIssue } from './rules';
 import { Artifact, Attachment, LogicalSession, Message, NativeTask, PeerMessage, SessionActivity, TokenUsage, Turn } from './session';
 import { TransferProposal, UiPreferences } from './transfer';
 import { Escalation, Handoff, WorkflowInstance, WorkflowTemplate } from './workflow';
@@ -40,6 +41,8 @@ export const Command = z.discriminatedUnion('type', [
   cmd('session.reparent', { sessionId: SessionId, expectedRevision: Revision, parentId: SessionId.nullable() }),
   cmd('nativeTask.stop', { sessionId: SessionId, nativeTaskId: NativeTaskId }),
   cmd('agent.save', { agent: AgentDefinition, expectedRevision: Revision.nullable() }),
+  /** Rejected with `invalid_transition` while a workflow template or a session uses the Agent (C-01). */
+  cmd('agent.delete', { agentId: AgentId, expectedRevision: Revision }),
   cmd('workflow.save', { workflow: WorkflowTemplate, expectedRevision: Revision.nullable() }),
   cmd('workflow.start', {
     instanceId: InstanceId,
@@ -54,7 +57,7 @@ export const Command = z.discriminatedUnion('type', [
   /** `content`: the user's form answers when approving an MCP elicitation (becomes `PermissionDecision.content`). */
   cmd('escalation.respond', { escalationId: EscalationId, decision: z.enum(['approve', 'decline']), note: z.string().optional(), content: z.json().optional() }).refine(
     (c) => c.content === undefined || c.decision === 'approve',
-    { message: 'only an approval carries form content' },
+    ruleIssue('escalation-respond.content-only-on-approve'),
   ),
   /**
    * The user's decision on a delivery whose outcome stayed unknown (CR2_DELIVERY_FIX §2). A retry may
@@ -62,7 +65,7 @@ export const Command = z.discriminatedUnion('type', [
    */
   cmd('delivery.resolve', { escalationId: EscalationId, decision: z.enum(['wait', 'cancel', 'retry']), acceptDuplicateRisk: z.boolean() }).refine(
     (c) => c.decision !== 'retry' || c.acceptDuplicateRisk,
-    { message: 'a retry needs acceptDuplicateRisk' },
+    ruleIssue('delivery-resolve.retry-needs-risk-ack'),
   ),
   cmd('transfer.prepare', { transferId: TransferId, sourceSessionId: SessionId, target: ModelSelection, noteSource: z.enum(['agent', 'gui-digest']) }),
   cmd('transfer.confirm', { transferId: TransferId, expectedRevision: Revision }),
@@ -84,6 +87,7 @@ export const ErrorCode = z.enum([
   'already_exists', // a create command reused an existing ID
   'invalid_request',
   'usage_limit', // a RULES.md threshold stopped the action
+  'internal_error', // the main process failed or produced a result outside the contracts (C-02)
 ]);
 
 /** Receipt of what a command created; the IDs are the ones the command carried. */
@@ -98,7 +102,8 @@ export const CommandResult = z.discriminatedUnion('ok', [
   z.strictObject({ ok: z.literal(true), requestId: RequestId, revision: Revision.optional(), created: z.array(CreatedRef).default([]) }),
   z.strictObject({
     ok: z.literal(false),
-    requestId: RequestId,
+    /** `null` only when the command could not be parsed far enough to read its requestId (C-02). */
+    requestId: RequestId.nullable(),
     code: ErrorCode,
     message: z.string(),
     retryable: z.boolean(),
@@ -144,6 +149,8 @@ export const AppEvent = z.discriminatedUnion('type', [
     at: Timestamp,
   }),
   z.strictObject({ type: z.literal('modelOptions.updated'), runtime: Runtime, options: z.array(ModelOption), at: Timestamp }),
+  /** The saved preferences after `preferences.set`, so every window shows the same (C-03). */
+  z.strictObject({ type: z.literal('preferences.updated'), preferences: UiPreferences, at: Timestamp }),
   /** A new model observation for a session, including reroutes (R-12); Codex reports only "configured". */
   z.strictObject({ type: z.literal('model.observed'), sessionId: SessionId, observed: ObservedModel, at: Timestamp }),
   /**
