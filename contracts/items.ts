@@ -15,7 +15,6 @@ const itemShape = {
 };
 
 const ended = (open: readonly string[]) => (i: { state: string; endedAt?: string | undefined }) => open.includes(i.state) === (i.endedAt === undefined);
-const endedMessage = ruleIssue('item.ended-at');
 
 /** A shell command the agent ran (Codex commandExecution, Claude Bash). */
 export const CommandItem = z
@@ -41,7 +40,7 @@ export const CommandItem = z
     output: z.string().default(''),
     outputTruncated: z.boolean().default(false),
   })
-  .refine(ended(['running']), endedMessage);
+  .refine(ended(['running']), ruleIssue('item.ended-at'));
 
 /** A file edit (Codex fileChange, Claude Edit/Write). `proposed` waits for a permission answer (R-07). */
 export const FileChangeItem = z
@@ -54,7 +53,7 @@ export const FileChangeItem = z
     state: z.enum(['proposed', 'applied', 'declined', 'failed']),
     diff: z.string().optional(),
   })
-  .refine(ended(['proposed']), endedMessage);
+  .refine(ended(['proposed']), ruleIssue('item.ended-at'));
 
 /** Any other tool call (MCP tools including the GUI's own, web search, ...). */
 export const ToolCallItem = z
@@ -66,7 +65,7 @@ export const ToolCallItem = z
     summary: z.string(),
     state: z.enum(['running', 'completed', 'failed', 'declined']),
   })
-  .refine(ended(['running']), endedMessage);
+  .refine(ended(['running']), ruleIssue('item.ended-at'));
 
 export const SessionItem = z.discriminatedUnion('kind', [CommandItem, FileChangeItem, ToolCallItem]);
 export type SessionItem = z.infer<typeof SessionItem>;

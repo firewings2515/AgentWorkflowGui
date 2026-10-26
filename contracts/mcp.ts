@@ -22,6 +22,13 @@ export const McpRejection = z.strictObject({
 });
 export type McpRejection = z.infer<typeof McpRejection>;
 
+/**
+ * A new tool call that retries an earlier one names the operation it retries (CR2_DELIVERY_FIX §4); the GUI
+ * never guesses a retry from equal content, and accepts it only for an operation the same session created.
+ * A resend of the same call is recognised by its native call ID instead and needs nothing here.
+ */
+const retryOf = OperationId.optional();
+
 /** `handoff(ruleId, target, content, taskId)`: a formal handoff to another node or to root (R-04). */
 export const HandoffToolInput = z.strictObject({
   ruleId: z.string().min(1),
@@ -29,12 +36,15 @@ export const HandoffToolInput = z.strictObject({
   content: z.string().min(1),
   /** Absent only for the root session, which has no task. */
   taskId: TaskId.optional(),
+  retryOf,
 });
 export type HandoffToolInput = z.infer<typeof HandoffToolInput>;
 
 /**
- * `accepted`: recorded and counted once (R-04 step 3). `duplicate`: a resend of the same tool call, mapped
- * to the operation it already created (CR2 §4). `escalated`: over a limit or needing the user (R-05).
+ * `accepted`: recorded and counted once (R-04 step 3). `duplicate`: a resend of the same tool call, or a
+ * `retryOf` with the same payload, target and revision, mapped to the operation it already created
+ * (CR2 §4); a `retryOf` that changes any of them is `rejected` as `invalid-input`. `escalated`: over a
+ * limit or needing the user (R-05).
  */
 export const HandoffToolResult = z.discriminatedUnion('status', [
   z.strictObject({ status: z.literal('accepted'), handoffId: HandoffId, operationId: OperationId, delivery: DeliveryState }),
@@ -78,7 +88,7 @@ export const CreateTasksToolResult = z.discriminatedUnion('status', [
 export type CreateTasksToolResult = z.infer<typeof CreateTasksToolResult>;
 
 /** `send_message(to, content)` to another GUI session, same tool or cross-tool (R-03). */
-export const SendMessageToolInput = z.strictObject({ to: SessionId, content: z.string().min(1) });
+export const SendMessageToolInput = z.strictObject({ to: SessionId, content: z.string().min(1), retryOf });
 export type SendMessageToolInput = z.infer<typeof SendMessageToolInput>;
 
 /** Cross-tool sends outside the caller's instance need the user's confirmation first (R-11). */

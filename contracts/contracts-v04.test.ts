@@ -15,6 +15,7 @@ import {
   issueRule,
   OwnedProcess,
   PeerMessage,
+  SendMessageToolInput,
   TransferProposal,
   WorkflowInstance,
   WorkflowTemplate,
@@ -129,6 +130,12 @@ describe('MCP tools (C-10)', () => {
     expect(HandoffToolInput.safeParse({ ruleId: 'r', target: { kind: 'root' }, content: 'done' }).success).toBe(true);
     expect(HandoffToolInput.safeParse({ ruleId: 'r', target: { kind: 'node', nodeId: 'n-2' }, content: 'x', taskId: 't-1' }).success).toBe(true);
     expect(HandoffToolInput.safeParse({ ruleId: 'r', target: 'n-2', content: 'x' }).success).toBe(false);
+  });
+
+  it('a new tool call may name the operation it retries (CR2 §4, review r1 P1-2)', () => {
+    expect(HandoffToolInput.safeParse({ ruleId: 'r', target: { kind: 'root' }, content: 'done', retryOf: 'op-1' }).success).toBe(true);
+    expect(SendMessageToolInput.safeParse({ to: 's-2', content: 'hi', retryOf: 'op-2' }).success).toBe(true);
+    expect(SendMessageToolInput.safeParse({ to: 's-2', content: 'hi', retryOf: '' }).success).toBe(false);
   });
 
   it('a resend maps to the operation it already created', () => {

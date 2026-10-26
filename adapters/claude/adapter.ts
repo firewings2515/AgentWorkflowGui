@@ -250,8 +250,9 @@ export class ClaudeAdapter implements RuntimeAdapter {
     let lines: WireTranscriptEntry[];
     try {
       ({ lines } = await this.options.sdk.readTranscript(ref, { dir: request.cwd }));
-    } catch (error) {
-      return { state: 'unknown', reason: 'read-failed', detail: errorText(error) };
+    } catch {
+      // Fixed text: the SDK's error may quote paths or transcript content, and this result can end up in an escalation.
+      return { state: 'unknown', reason: 'read-failed', detail: 'the stored transcript could not be read' };
     }
     if (lines.length === 0) return { state: 'unknown', reason: 'not-found', detail: 'no stored transcript for the pre-allocated session' };
     const recorded = recordedCwd(lines);
