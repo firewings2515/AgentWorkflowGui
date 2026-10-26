@@ -9,6 +9,8 @@ import { WorkflowSummary } from './DetailPanel';
 import { readTheme, THEME_KEY, type Theme } from './theme';
 import { AgentCatalog } from './AgentCatalog';
 import { createAgentDemo } from './agent-demo';
+import { WorkflowEditor } from './WorkflowEditor';
+import { createWorkflowDemo } from './workflow-demo';
 import './styles.css';
 
 export const APP_NAME = 'AgentWorkflowGui';
@@ -56,6 +58,7 @@ function TransferDialog({ snapshot, preview, onClose }: { snapshot: Snapshot; pr
 
 export function App({ snapshot = fixtureSnapshot }: { snapshot?: Snapshot }) {
   const [{ repository: agentRepository, controls: agentDemo }] = useState(() => createAgentDemo(snapshot.agents));
+  const [{ repository: workflowRepository, controls: workflowDemo }] = useState(() => createWorkflowDemo(snapshot.workflows));
   const agentOptions = useSyncExternalStore(agentRepository.subscribe, agentRepository.getSnapshot);
   const [workspace, dispatch] = useReducer(workspaceReducer, snapshot.sessions, initialWorkspace);
   const [route, setRoute] = useState(currentRoute);
@@ -86,7 +89,7 @@ export function App({ snapshot = fixtureSnapshot }: { snapshot?: Snapshot }) {
     catch { /* In restricted environments the in-memory choice still works. */ }
   }, [theme]);
   // AgentCatalog owns focus for entering the page and changing its selection.
-  useEffect(() => { if (page?.id !== 'agents') pageHeading.current?.focus(); }, [path, page?.id]);
+  useEffect(() => { if (page?.id !== 'agents' && page?.id !== 'workflow') pageHeading.current?.focus(); }, [path, page?.id]);
   useEffect(() => {
     if (workbenchVisible) {
       const query = new URLSearchParams({ workspaceViewIds });
@@ -119,7 +122,6 @@ export function App({ snapshot = fixtureSnapshot }: { snapshot?: Snapshot }) {
   let entityId = page?.pattern.exec(path)?.[1] ?? '';
   try { entityId = decodeURIComponent(entityId); } catch { /* Keep a malformed ID visible as missing. */ }
   const instance = snapshot.instances.find(item => item.id === entityId);
-  const template = snapshot.workflows.find(item => item.id === entityId);
 
   return <div className="app-shell">
     <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true">≋</span><strong>{APP_NAME}</strong><span className="demo-badge">示意模式</span></div>
@@ -157,8 +159,8 @@ export function App({ snapshot = fixtureSnapshot }: { snapshot?: Snapshot }) {
         </div>
       </div>
       <AgentCatalog repository={agentRepository} demo={agentDemo} selectedId={page?.id === 'agents' ? entityId : ''} visible={page?.id === 'agents'} onSelect={id => navigate(id ? `/agents/${encodeURIComponent(id)}` : '/agents')} />
-      {!workbenchVisible && page?.id !== 'agents' && <section className="placeholder-page">
-        {page?.id === 'workflow' && <><span className="eyebrow">Workflow 編輯器</span><h2>{template?.name ?? '找不到指定的 Workflow 範本'}</h2><p>{template ? `Revision ${template.revision} · 圖形編輯器將於後續任務提供。` : `範本 ID：${entityId || '無效 ID'}`}</p></>}
+      <WorkflowEditor repository={workflowRepository} demo={workflowDemo} agents={agentOptions} models={snapshot.modelOptions} selectedId={page?.id === 'workflow' ? entityId : ''} visible={page?.id === 'workflow'} onSelect={id => navigate(`/workflows/${encodeURIComponent(id)}/edit`)} />
+      {!workbenchVisible && page?.id !== 'agents' && page?.id !== 'workflow' && <section className="placeholder-page">
         {page?.id === 'progress' && <><span className="eyebrow">唯讀 · 指定執行群組</span><h2>{instance?.title ?? '找不到指定的 Workflow 執行群組'}</h2><p className="muted">{entityId || '無效 ID'} · 完整進度畫布將於後續任務提供。</p>{instance && <WorkflowSummary snapshot={snapshot} instance={instance} />}</>}
         {!page && <p>無法辨識路由：<code>{path}</code></p>}
         <button onClick={() => {
