@@ -129,11 +129,11 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
   items: [
     { id: 'it-1', sessionId: 's-wf-build-a', turnId: 'turn-a1', kind: 'command', command: 'npm test', cwd: 'E:/work/.awg/wt/t1', state: 'completed', exitCode: 0, output: 'Tests  12 passed (12)', startedAt: t('11:18'), endedAt: t('11:19') },
     { id: 'it-2', sessionId: 's-wf-build-a', turnId: 'turn-a1', kind: 'fileChange', changes: [{ path: 'src/form/validate.ts', change: 'update' }, { path: 'src/form/validate.test.ts', change: 'add' }], state: 'applied', startedAt: t('11:15'), endedAt: t('11:15') },
-    { id: 'it-3', sessionId: 's-wf-build-b', turnId: 'turn-b1', nativeTaskId: 'nt-3', kind: 'command', command: 'npm run migrate:gen', nativeProcessRef: 'proc-demo-1', cwd: 'E:/work/.awg/wt/t2', state: 'running', output: 'generating…', startedAt: t('11:24') },
+    { id: 'it-3', sessionId: 's-wf-build-b', turnId: 'turn-b1', nativeTaskId: 'nt-3', kind: 'command', command: 'npm run migrate:gen', nativeProcessRef: 'proc-demo-1', background: true, cwd: 'E:/work/.awg/wt/t2', state: 'running', output: 'generating…', startedAt: t('11:24') },
     { id: 'it-4', sessionId: 's-research', turnId: 'turn-r1', nativeTaskId: 'nt-2', kind: 'toolCall', tool: 'Read', summary: 'refs/b.md', state: 'running', startedAt: t('10:20') },
   ],
   permissionRequests: [
-    { id: 'pr-1', sessionId: 's-wf-build-b', turnId: 'turn-b1', kind: 'command', summary: '執行 git push', command: 'git push origin task/t2', cwd: 'E:/work/.awg/wt/t2', matchedRule: 'git-push',
+    { id: 'pr-1', sessionId: 's-wf-build-b', turnId: 'turn-b1', kind: 'command', summary: '執行 git push', command: 'git push origin task/t2', cwd: 'E:/work/.awg/wt/t2', matchedRule: 'git-remote',
       state: 'held', hold: { reason: 'awaiting-user', escalationId: 'esc-1' }, createdAt: t('11:26') },
     { id: 'pr-2', sessionId: 's-wf-build-a', turnId: 'turn-a1', itemId: 'it-1', kind: 'command', summary: '執行 npm test', command: 'npm test', cwd: 'E:/work/.awg/wt/t1',
       state: 'answered', decision: { outcome: 'approve', decidedBy: 'policy', at: t('11:18') }, createdAt: t('11:18') },
@@ -185,7 +185,7 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
       delivery: { state: 'unknown', attempts: [{ attemptId: 'att-5', clientMessageId: uuid(5), state: 'unknown', dispatchStartedAt: t('11:29') }] }, createdAt: t('11:29') },
   ],
   escalations: [
-    { id: 'esc-1', instanceId: 'inst-login', rootSessionId: 's-wf-root', fromSessionId: 's-wf-build-b', kind: 'permission', title: '要求執行 git push', detail: 'git push origin task/t2', rule: 'git-push',
+    { id: 'esc-1', instanceId: 'inst-login', rootSessionId: 's-wf-root', fromSessionId: 's-wf-build-b', kind: 'permission', title: '要求執行 git push', detail: 'git push origin task/t2', rule: 'git-remote',
       ref: { kind: 'permission', permissionRequestId: 'pr-1' }, state: 'open', createdAt: t('11:26') },
     { id: 'esc-2', instanceId: 'inst-login', rootSessionId: 's-wf-root', fromSessionId: 's-wf-root', kind: 'confirmation', title: '確認 task 清單', detail: '3 個 task，task C 依賴 task A',
       state: 'approved', resolvedBy: 'user', createdAt: t('11:05'), resolvedAt: t('11:06') },

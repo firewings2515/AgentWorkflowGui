@@ -34,9 +34,9 @@ export interface PayloadContext {
   entry: DispatchEntry;
   /**
    * The target session's settings at acceptance, so a restarted GUI can resume it before dispatching
-   * (`ResumeSessionOptions`) without any other store.
+   * (`ResumeSessionOptions`) without any other store. Stored as is, so never the MCP mount (C-07).
    */
-  session: SessionSettings;
+  session: SessionSettings & { mcp?: never };
 }
 
 /** Everything needed to create the target session again after a restart. */
@@ -46,6 +46,11 @@ export interface ProvisionSpec extends SessionSettings {
   cwd: string;
   /** Claude: the session UUID chosen before the call, so a lost create response can be reconciled. */
   preallocatedRef?: string;
+  /**
+   * Stored as is, so it must never carry the session's MCP token (C-07): spreading `StartSessionOptions`
+   * into a spec does not compile. The mount is added when the spec is turned back into a start call.
+   */
+  mcp?: never;
 }
 
 interface StoredBase {

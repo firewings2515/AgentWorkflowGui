@@ -7,6 +7,7 @@ import type {
   DeliveryEvidence,
   DispatchAttempt,
   Message,
+  MessageOrigin,
   ModelOption,
   ModelSelection,
   NativeRef,
@@ -78,9 +79,19 @@ export interface SessionSettings {
   instructions?: string;
 }
 
+/**
+ * The GUI MCP server mounted on one session (R-03, SP-05): localhost streamable HTTP with a token that
+ * identifies this session. Given at every start and resume, never persisted with the session settings.
+ */
+export interface McpMount {
+  url: string;
+  token: string;
+}
+
 export interface StartSessionOptions extends SessionSettings {
   sessionId: SessionId;
   cwd: string;
+  mcp?: McpMount;
   /**
    * Native session ID chosen by the GUI before the call, when the runtime allows it (Claude `sessionId`),
    * so a lost create response can still be reconciled (CR2_DELIVERY_FIX §3). Ignored where unsupported.
@@ -93,6 +104,7 @@ export interface ResumeSessionOptions extends SessionSettings {
   nativeSessionRef: string;
   /** Always the original cwd (R-06). */
   cwd: string;
+  mcp?: McpMount;
 }
 
 /** How a payload enters the session: a new turn when idle, or inserted into the running turn (SP-05). */
@@ -104,6 +116,11 @@ export interface DispatchRequest {
   attempt: Extract<DispatchAttempt, { state: 'unknown' }>;
   text: string;
   entry: DispatchEntry;
+  /**
+   * Who the payload comes from (C-07). Adapters mark peer and handoff payloads as not from the user (R-03:
+   * Codex gets a text envelope naming the source). Absent means the user.
+   */
+  origin?: MessageOrigin;
   timeoutMs?: number;
 }
 
@@ -145,6 +162,22 @@ export type ReconcileResult =
       detail: string;
     };
 
+export interface ReconcileProvisionRequest {
+  /** The cwd the session was created in. */
+  cwd: string;
+  /** The native session ID chosen before the create call (Claude); absent when the runtime has none. */
+  preallocatedRef?: string;
+}
+
+/**
+ * Read-only check of a create call whose response was lost (C-08, CR2_DELIVERY_FIX §3). `sent`: the
+ * session exists. `unknown`: not found (not proof it was not created), unreadable, or the runtime cannot
+ * tell (Codex has no ID before `thread/start`).
+ */
+export type ReconcileProvisionResult =
+  | { state: 'sent'; nativeSessionRef: string }
+  | { state: 'unknown'; reason: 'not-found' | 'read-failed' | 'unsupported'; detail: string };
+
 /** One stored history entry, already mapped to contract types. */
 export type HistoryEntry = { kind: 'turn'; turn: Turn } | { kind: 'message'; message: Message } | { kind: 'item'; item: SessionItem };
 
@@ -162,7 +195,8 @@ export interface HistoryRequest {
 
 /**
  * Read-only, oldest first; never resumes a session or starts a turn. `complete: false` means some of the
- * history could not be read (paging failed, summarised turns), so callers must not treat gaps as absence.
+ * history could not be read (paging failed, summarised turns, a sub-agent without proof that it ended),
+ * so callers must not treat gaps as absence nor a `running` native task as proof that it still runs (C-09).
  */
 export interface HistoryResult {
   entries: HistoryEntry[];
@@ -180,6 +214,12 @@ export interface RuntimeAdapter {
   close(timeoutMs?: number): Promise<{ forced: boolean }>;
   startSession(options: StartSessionOptions): Promise<NativeSessionInfo>;
   resumeSession(options: ResumeSessionOptions): Promise<NativeSessionInfo>;
+  /**
+   * Releases one session's runtime resources (R-14: interrupt first, then close) without touching other
+   * sessions, e.g. when an idle session is closed (SP-05); `resumeSession` brings it back (C-07).
+   */
+  closeSession(nativeSessionRef: string, timeoutMs?: number): Promise<{ forced: boolean }>;
+  reconcileProvision(request: ReconcileProvisionRequest): Promise<ReconcileProvisionResult>;
   /** Every payload enters a session through here exactly once (CR2_DELIVERY_FIX §1 step 4). */
   dispatchOnce(request: DispatchRequest): Promise<DispatchResult>;
   reconcile(request: ReconcileRequest): Promise<ReconcileResult>;

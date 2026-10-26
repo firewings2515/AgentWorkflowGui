@@ -2,6 +2,7 @@
 // CR2_DELIVERY_FIX). The schema rejects records that contradict the dispatch rules.
 import { z } from 'zod';
 import { AttemptId, ClientMessageId, OperationId, SessionId, Timestamp } from './common';
+import { addRuleIssue, ruleIssue, type ContractRule } from './rules';
 
 /** Minimal delivery states (CR-2). `unknown` is never auto-resent; it is reconciled or shown to the user. */
 export const DeliveryState = z.enum(['pending', 'sent', 'unknown']);
@@ -67,15 +68,23 @@ export const DeliveryRecord = z
   })
   .superRefine((d, ctx) => {
     const last = d.attempts.at(-1);
-    const fail = (message: string) => ctx.addIssue({ code: 'custom', message });
-    if (!unique(d.attempts.map((a) => a.attemptId))) fail('attemptId must be unique');
-    if (!unique(d.attempts.map((a) => a.clientMessageId))) fail('clientMessageId must be unique per attempt');
-    if (d.attempts.slice(0, -1).some((a) => a.resolution?.decision !== 'retry')) fail('an earlier attempt must be unknown and abandoned by a user retry');
-    if (d.state === 'pending' && last && last.resolution?.decision !== 'retry') fail('pending cannot have a live attempt');
-    if (d.state === 'unknown' && (last?.state !== 'unknown' || last.resolution?.decision === 'retry')) fail('unknown needs a live unknown attempt');
-    if (d.state === 'sent' && last?.state !== 'sent') fail('sent needs a last attempt with nativeRef and evidence');
+    const fail = (rule: ContractRule) => addRuleIssue(ctx, rule);
+    if (!unique(d.attempts.map((a) => a.attemptId))) fail('delivery.attempt-id-unique');
+    if (!unique(d.attempts.map((a) => a.clientMessageId))) fail('delivery.client-message-id-unique');
+    if (d.attempts.slice(0, -1).some((a) => a.resolution?.decision !== 'retry')) fail('delivery.earlier-attempt-retried');
+    if (d.state === 'pending' && last && last.resolution?.decision !== 'retry') fail('delivery.pending-no-live-attempt');
+    if (d.state === 'unknown' && (last?.state !== 'unknown' || last.resolution?.decision === 'retry')) fail('delivery.unknown-needs-live-attempt');
+    if (d.state === 'sent' && last?.state !== 'sent') fail('delivery.sent-needs-evidence');
   });
 export type DeliveryRecord = z.infer<typeof DeliveryRecord>;
+
+/**
+ * How a logical operation ended apart from delivery (C-05): cancelled by the user, rejected by a check, or
+ * failed while executing. Never a delivery state; a delivery reconciled as sent afterwards is still
+ * recorded next to it (CR2 §2).
+ */
+export const OperationOutcome = z.strictObject({ kind: z.enum(['cancelled', 'rejected', 'failed']), detail: z.string(), at: Timestamp });
+export type OperationOutcome = z.infer<typeof OperationOutcome>;
 
 /**
  * Creating a target session is its own operation, recorded before the runtime call (CR2_DELIVERY_FIX §3).
@@ -90,8 +99,8 @@ export const ProvisionRecord = z
     nativeSessionRef: z.string().min(1).optional(),
     preallocated: z.boolean(),
   })
-  .refine((p) => p.state !== 'sent' || p.nativeSessionRef !== undefined, { message: 'a created target has a nativeSessionRef' })
-  .refine((p) => !p.preallocated || p.nativeSessionRef !== undefined, { message: 'a pre-allocated target has a nativeSessionRef' });
+  .refine((p) => p.state !== 'sent' || p.nativeSessionRef !== undefined, ruleIssue('provision.sent-needs-ref'))
+  .refine((p) => !p.preallocated || p.nativeSessionRef !== undefined, ruleIssue('provision.preallocated-needs-ref'));
 export type ProvisionRecord = z.infer<typeof ProvisionRecord>;
 
 /**
@@ -107,22 +116,21 @@ export type DeliveryTarget = z.infer<typeof DeliveryTarget>;
 
 /**
  * Cross-checks a delivery against its target: the payload must not leave the GUI before the target is
- * bound, and every runtime reference must point at that same target (CR2_DELIVERY_FIX §2).
+ * bound, and every runtime reference must point at that same target (CR2_DELIVERY_FIX §2). Returns the
+ * rules that fail; empty when consistent.
  */
-export const deliveryTargetIssues = (delivery: DeliveryRecord | undefined, target: DeliveryTarget): string[] => {
-  const issues: string[] = [];
+export const deliveryTargetIssues = (delivery: DeliveryRecord | undefined, target: DeliveryTarget): ContractRule[] => {
+  const issues: ContractRule[] = [];
   const { provision, nativeSessionRef } = target;
   if (provision?.nativeSessionRef !== undefined && nativeSessionRef !== undefined && provision.nativeSessionRef !== nativeSessionRef) {
-    issues.push('the target binding differs from the provisioned session');
+    issues.push('target.binding-mismatch');
   }
   // A pending record that keeps user-abandoned attempts has crossed the boundary before, so it still needs
   // its original target for reconciliation; only a never-dispatched record may lack one.
   if (delivery === undefined || delivery.attempts.length === 0) return issues;
-  if (target.sessionId === undefined || nativeSessionRef === undefined) issues.push('a dispatched payload has a bound target');
-  if (provision !== undefined && provision.state !== 'sent') issues.push('payload cannot be dispatched before the target is created');
-  for (const a of delivery.attempts) {
-    if (a.state === 'sent' && a.nativeRef.sessionRef !== nativeSessionRef) issues.push(`attempt ${a.attemptId} points at another target`);
-  }
+  if (target.sessionId === undefined || nativeSessionRef === undefined) issues.push('target.dispatched-needs-binding');
+  if (provision !== undefined && provision.state !== 'sent') issues.push('target.provision-not-created');
+  if (delivery.attempts.some((a) => a.state === 'sent' && a.nativeRef.sessionRef !== nativeSessionRef)) issues.push('target.attempt-other-target');
   return issues;
 };
 

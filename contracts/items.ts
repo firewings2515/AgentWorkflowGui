@@ -2,6 +2,7 @@
 // inside the adapters; these are the GUI-side forms.
 import { z } from 'zod';
 import { EscalationId, ItemId, NativeTaskId, PermissionRequestId, SessionId, Timestamp, TurnId } from './common';
+import { ruleIssue } from './rules';
 
 const itemShape = {
   id: ItemId,
@@ -14,7 +15,6 @@ const itemShape = {
 };
 
 const ended = (open: readonly string[]) => (i: { state: string; endedAt?: string | undefined }) => open.includes(i.state) === (i.endedAt === undefined);
-const endedMessage = { message: 'endedAt is set exactly when the item is finished' };
 
 /** A shell command the agent ran (Codex commandExecution, Claude Bash). */
 export const CommandItem = z
@@ -30,11 +30,17 @@ export const CommandItem = z
      * command without touching other sessions on the same host (CR-7). Not an OS PID.
      */
     nativeProcessRef: z.string().min(1).optional(),
+    /**
+     * Runs in the background (Claude `run_in_background`, Codex background terminal): it can outlive its
+     * turn, so file locks wait for it (R-07). Adapters send `item.updated` when it starts and when it ends;
+     * a background command whose end the runtime cannot report stays `running` until the session closes.
+     */
+    background: z.boolean().optional(),
     /** Aggregated output; may be cut to the tail, see `outputTruncated`. */
     output: z.string().default(''),
     outputTruncated: z.boolean().default(false),
   })
-  .refine(ended(['running']), endedMessage);
+  .refine(ended(['running']), ruleIssue('item.ended-at'));
 
 /** A file edit (Codex fileChange, Claude Edit/Write). `proposed` waits for a permission answer (R-07). */
 export const FileChangeItem = z
@@ -47,7 +53,7 @@ export const FileChangeItem = z
     state: z.enum(['proposed', 'applied', 'declined', 'failed']),
     diff: z.string().optional(),
   })
-  .refine(ended(['proposed']), endedMessage);
+  .refine(ended(['proposed']), ruleIssue('item.ended-at'));
 
 /** Any other tool call (MCP tools including the GUI's own, web search, ...). */
 export const ToolCallItem = z
@@ -59,7 +65,7 @@ export const ToolCallItem = z
     summary: z.string(),
     state: z.enum(['running', 'completed', 'failed', 'declined']),
   })
-  .refine(ended(['running']), endedMessage);
+  .refine(ended(['running']), ruleIssue('item.ended-at'));
 
 export const SessionItem = z.discriminatedUnion('kind', [CommandItem, FileChangeItem, ToolCallItem]);
 export type SessionItem = z.infer<typeof SessionItem>;
@@ -77,8 +83,8 @@ export const PermissionHold = z
     lockPath: z.string().min(1).optional(),
     escalationId: EscalationId.optional(),
   })
-  .refine((h) => h.reason !== 'file-lock' || (h.until !== undefined && h.lockPath !== undefined), { message: 'a lock hold needs a deadline and a path' })
-  .refine((h) => h.reason !== 'awaiting-user' || h.escalationId !== undefined, { message: 'a user hold points at its escalation' });
+  .refine((h) => h.reason !== 'file-lock' || (h.until !== undefined && h.lockPath !== undefined), ruleIssue('hold.lock-needs-deadline'))
+  .refine((h) => h.reason !== 'awaiting-user' || h.escalationId !== undefined, ruleIssue('hold.user-needs-escalation'));
 
 /** Who answered: the auto-approve policy, or the user on the root screen. An agent can never approve (R-05). */
 export const PermissionDecision = z
@@ -91,8 +97,8 @@ export const PermissionDecision = z
     content: z.json().optional(),
     at: Timestamp,
   })
-  .refine((d) => (d.decidedBy === 'user') === (d.escalationId !== undefined), { message: 'user decisions come from an escalation' })
-  .refine((d) => d.content === undefined || d.outcome === 'approve', { message: 'only an accepted elicitation carries content' });
+  .refine((d) => (d.decidedBy === 'user') === (d.escalationId !== undefined), ruleIssue('decision.user-needs-escalation'))
+  .refine((d) => d.content === undefined || d.outcome === 'approve', ruleIssue('decision.content-only-on-approve'));
 
 /**
  * What an MCP server asks the user for (MCP elicitation). `form`: fields described by a JSON schema
@@ -128,11 +134,11 @@ export const PermissionRequest = z
     decision: PermissionDecision.optional(),
     createdAt: Timestamp,
   })
-  .refine((p) => (p.state === 'held') === (p.hold !== undefined), { message: 'hold is set exactly when held' })
-  .refine((p) => (p.state === 'answered') === (p.decision !== undefined), { message: 'decision is set exactly when answered' })
-  .refine((p) => (p.kind === 'mcpElicitation') === (p.elicitation !== undefined), { message: 'elicitation is set exactly for MCP elicitations' })
-  .refine((p) => p.decision?.content === undefined || p.kind === 'mcpElicitation', { message: 'only elicitation answers carry content' })
-  .refine((p) => p.decision?.outcome !== 'approve-for-session' || p.kind !== 'mcpElicitation', { message: 'an elicitation is answered once' });
+  .refine((p) => (p.state === 'held') === (p.hold !== undefined), ruleIssue('permission.hold-when-held'))
+  .refine((p) => (p.state === 'answered') === (p.decision !== undefined), ruleIssue('permission.decision-when-answered'))
+  .refine((p) => (p.kind === 'mcpElicitation') === (p.elicitation !== undefined), ruleIssue('permission.elicitation-kind'))
+  .refine((p) => p.decision?.content === undefined || p.kind === 'mcpElicitation', ruleIssue('permission.content-only-elicitation'))
+  .refine((p) => p.decision?.outcome !== 'approve-for-session' || p.kind !== 'mcpElicitation', ruleIssue('permission.elicitation-once'));
 export type PermissionRequest = z.infer<typeof PermissionRequest>;
 
 // Inferred types for schemas that are not typed next to their definition.

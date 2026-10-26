@@ -1,3 +1,6 @@
-// Ports between core and the adapters (T005). Contract changes go through the main session.
+// Ports between core and the adapters (T005, T012). Contract changes go through the main session.
 export * from './runtime';
 export * from './delivery';
+export * from './process';
+export * from './policy';
+export * from './repository';

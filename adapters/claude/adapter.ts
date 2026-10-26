@@ -37,6 +37,8 @@ import type {
   NativeSessionInfo,
   PermissionHandle,
   ReconcileMatch,
+  ReconcileProvisionRequest,
+  ReconcileProvisionResult,
   ReconcileRequest,
   ReconcileResult,
   ResumeSessionOptions,
@@ -231,11 +233,31 @@ export class ClaudeAdapter implements RuntimeAdapter {
 
   /**
    * Releases one session's CLI (interrupt, then close; R-14), e.g. when the supervisor closes an idle
-   * session (SP-05). Not part of the port; resumeSession brings it back.
+   * session (SP-05); resumeSession brings it back.
    */
   async closeSession(nativeSessionRef: string, timeoutMs = 5000): Promise<{ forced: boolean }> {
     const s = this.sessions.get(nativeSessionRef);
     return s ? this.closeLive(s, timeoutMs) : { forced: false };
+  }
+
+  /**
+   * A pre-allocated session counts as created once its transcript exists under the cwd it was created in
+   * (C-08). Read-only; not found is not proof that it was not created (CR-2).
+   */
+  async reconcileProvision(request: ReconcileProvisionRequest): Promise<ReconcileProvisionResult> {
+    const ref = request.preallocatedRef;
+    if (ref === undefined || !isWireUuid(ref)) return { state: 'unknown', reason: 'unsupported', detail: 'only a pre-allocated Claude session UUID can be looked up' };
+    let lines: WireTranscriptEntry[];
+    try {
+      ({ lines } = await this.options.sdk.readTranscript(ref, { dir: request.cwd }));
+    } catch {
+      // Fixed text: the SDK's error may quote paths or transcript content, and this result can end up in an escalation.
+      return { state: 'unknown', reason: 'read-failed', detail: 'the stored transcript could not be read' };
+    }
+    if (lines.length === 0) return { state: 'unknown', reason: 'not-found', detail: 'no stored transcript for the pre-allocated session' };
+    const recorded = recordedCwd(lines);
+    if (recorded !== undefined && !sameFolder(recorded, request.cwd)) return { state: 'unknown', reason: 'read-failed', detail: 'the stored session ran in another folder' };
+    return { state: 'sent', nativeSessionRef: ref };
   }
 
   async startSession(options: StartSessionOptions): Promise<NativeSessionInfo> {
