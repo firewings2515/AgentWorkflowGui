@@ -8,11 +8,12 @@
 // requests, and the request does not say which shell runs them, so both readings must be safe.
 import type { PermissionRequest } from '../../contracts';
 import type { PermissionPolicy, PolicyContext, PolicyDecision, PolicyRule } from '../ports';
-import { type Effects, handlerFor } from './commands';
+import { type Effects, handlerFor, takesPipedTarget } from './commands';
 import { type Shell, type Word, lex } from './lexer';
 import {
   type AbsPath,
   type PathStyle,
+  fileKey,
   hasWildcard,
   isSecretPath,
   isWithinAny,
@@ -26,62 +27,105 @@ import { type Finding, REASONS, type ReasonKey, finding } from './reasons';
 interface Scope {
   writable: AbsPath[];
   readable: AbsPath[];
-  written: Set<AbsPath>;
-  /** A recorded written path could not be normalised, so no script can be shown not to be one. */
-  writtenUnclear: boolean;
 }
 
-const scopeOf = ({ folderScope, writtenPaths }: PolicyContext): Scope => {
+const scopeOf = ({ folderScope }: PolicyContext): Scope => {
   const roots = (paths: readonly string[]) => paths.flatMap((p) => normaliseAbsolute(p) ?? []);
   const workspace = normaliseAbsolute(folderScope.workspaceRoot);
   const writable = roots(folderScope.writableRoots);
-  const written = new Set<AbsPath>();
-  let writtenUnclear = false;
-  for (const p of writtenPaths) {
-    const abs = resolvePath(p, workspace, 'win');
-    if (abs === undefined) writtenUnclear = true;
-    else written.add(abs);
-  }
-  return { writable, readable: [...(workspace ? [workspace] : []), ...writable, ...roots(folderScope.readableRoots)], written, writtenUnclear };
+  return { writable, readable: [...(workspace ? [workspace] : []), ...writable, ...roots(folderScope.readableRoots)] };
 };
 
-type Access = 'read' | 'write' | 'run';
+// `run`: executed (scope, secret and written checks); `load`: code or settings taken from it (written check only).
+type Access = 'read' | 'write' | 'run' | 'load';
 
-/** Collects findings for one request. `cwds` are the folders a relative path may be relative to (`undefined`: unknown). */
+/**
+ * Collects findings for one request. `cwds` are the folders a relative path may be relative to
+ * (`undefined`: unknown). Every path is checked as written and again after links are resolved.
+ */
 class Checker {
   readonly findings: Finding[] = [];
-  constructor(private readonly scope: Scope) {}
+  /** Files and folders written by the session, or earlier in this request (CR-1), as `fileKey`s. */
+  private readonly written: string[] = [];
+  /** A written path could not be placed, so no script can be shown not to be one. */
+  private writtenUnclear = false;
+
+  constructor(
+    private readonly scope: Scope,
+    private readonly context: PolicyContext,
+  ) {
+    const workspace = normaliseAbsolute(context.folderScope.workspaceRoot);
+    for (const p of context.writtenPaths) {
+      const abs = resolvePath(p, workspace, 'win');
+      if (abs === undefined) this.writtenUnclear = true;
+      else this.recordWritten(abs);
+    }
+  }
 
   add(rule: PolicyRule, why: ReasonKey) {
     this.findings.push(finding(rule, why));
   }
 
+  /** The path with junctions and symbolic links resolved, or `undefined` when that cannot be confirmed. */
+  private real(path: AbsPath): AbsPath | undefined {
+    const resolved = this.context.resolveRealPath(path);
+    return resolved === null ? undefined : normaliseAbsolute(resolved);
+  }
+
+  private recordWritten(path: AbsPath) {
+    const real = this.real(path);
+    if (real === undefined) this.writtenUnclear = true;
+    for (const p of real === undefined ? [path] : [path, real]) this.written.push(fileKey(p));
+  }
+
+  /**
+   * Whether running `path` may run something written: the file itself, a file inside a written folder,
+   * a written file inside it (`index.js`), or a written file it names without its extension (`node x`).
+   */
+  private isWritten(path: AbsPath) {
+    if (this.writtenUnclear) return true;
+    const key = fileKey(path);
+    return this.written.some(
+      (w) => w === key || key.startsWith(`${w}/`) || w.startsWith(`${key}/`) || (w.startsWith(`${key}.`) && !w.slice(key.length).includes('/')),
+    );
+  }
+
   private inScope(path: AbsPath, access: Access) {
+    if (access === 'load') return;
     if (access === 'write') {
       if (!isWithinAny(path, this.scope.writable)) this.add('write-outside-scope', 'outside-write');
     } else if (!isWithinAny(path, this.scope.readable)) this.add('secret-read', 'outside-read');
   }
 
+  /** Checks one resolved path, as written and with its links resolved. */
+  private check(path: AbsPath, access: Access) {
+    const real = this.real(path);
+    if (real === undefined) return this.add('unrecognised', 'unknown-target');
+    for (const p of real === path ? [path] : [path, real]) {
+      if (access !== 'load' && isSecretPath(p)) this.add('secret-read', 'secret');
+      this.inScope(p, access);
+      if ((access === 'run' || access === 'load') && this.isWritten(p)) this.add('unrecognised', 'written-script');
+    }
+    // Later commands in this request may run it. For a wildcard this is its folder, which covers anything in it.
+    if (access === 'write') this.recordWritten(path);
+  }
+
   target(w: Word, access: Access, cwds: readonly (AbsPath | undefined)[], style: PathStyle) {
     for (const cwd of cwds) {
       if (w.wild || hasWildcard(w.text)) {
-        const glob = access === 'run' ? undefined : resolveGlob(w.text, cwd, style);
+        const glob = access === 'run' || access === 'load' ? undefined : resolveGlob(w.text, cwd, style);
         if (glob === undefined) {
           this.add('unrecognised', 'unknown-target');
           continue;
         }
-        if (isSecretPath(glob.folder) || glob.patterns.some(patternMayMatchSecret)) this.add('secret-read', 'secret');
-        this.inScope(glob.folder, access);
+        const last = glob.patterns.length - 1;
+        if (glob.patterns.some((p, i) => patternMayMatchSecret(p, i === last))) this.add('secret-read', 'secret');
+        this.check(glob.folder, access);
         continue;
       }
       const path = resolvePath(w.text, cwd, style);
-      if (path === undefined) {
-        this.add('unrecognised', 'unknown-target');
-        continue;
-      }
-      if (isSecretPath(path)) this.add('secret-read', 'secret');
-      this.inScope(path, access);
-      if (access === 'run' && (this.scope.writtenUnclear || this.scope.written.has(path))) this.add('unrecognised', 'written-script');
+      if (path === undefined) this.add('unrecognised', 'unknown-target');
+      else this.check(path, access);
     }
   }
 
@@ -89,15 +133,29 @@ class Checker {
     for (const cwd of cwds) {
       const base = at === undefined ? cwd : resolvePath(at.text, cwd, style);
       if (base === undefined) this.add('unrecognised', 'unknown-target');
-      else this.inScope(base, access);
+      else {
+        const real = this.real(base);
+        if (real === undefined) this.add('unrecognised', 'unknown-target');
+        else for (const p of real === base ? [base] : [base, real]) this.inScope(p, access);
+      }
     }
+  }
+
+  /** A program named by its path: never auto-approved, and called out when this session wrote it. */
+  program(w: Word, cwds: readonly (AbsPath | undefined)[], style: PathStyle) {
+    const path = w.wild ? undefined : resolvePath(w.text, cwds[0], style);
+    const real = path === undefined ? undefined : this.real(path);
+    const written = path !== undefined && (this.isWritten(path) || real === undefined || this.isWritten(real));
+    this.add('unrecognised', written ? 'written-script' : 'unknown-program');
   }
 
   effects(fx: Effects, cwds: readonly (AbsPath | undefined)[], style: PathStyle) {
     this.findings.push(...fx.findings);
     for (const w of fx.reads) this.target(w, 'read', cwds, style);
-    for (const w of fx.writes) this.target(w, 'write', cwds, style);
     for (const w of fx.runs) this.target(w, 'run', cwds, style);
+    for (const w of fx.loads) this.target(w, 'load', cwds, style);
+    // After the runs: what a command writes counts as written for the commands after it.
+    for (const w of fx.writes) this.target(w, 'write', cwds, style);
     if (fx.folder) this.folder(fx.folder.access, fx.folder.at, cwds, style);
   }
 
@@ -108,28 +166,30 @@ class Checker {
     const style: PathStyle = shell === 'ps' ? 'win' : 'sh';
     // A failed `cd` leaves the folder as it was, so every folder it may be in stays possible.
     let cwds: (AbsPath | undefined)[] = [cwd];
-    for (const { words, writes } of segments) {
-      for (const w of writes) this.target(w, 'write', cwds, style);
+    for (const { words, writes, piped } of segments) {
       const [head, ...args] = words;
-      if (head === undefined) continue;
-      if (head.wild || /[\\/:]/.test(head.text)) {
-        // A shell named by its full path is still a shell (`C:\...\powershell.exe -EncodedCommand`).
-        const base = head.text.split(/[\\/]/).pop()!;
-        if (!head.wild && /^(powershell|pwsh|cmd)(\.exe)?$/i.test(base)) {
-          this.effects(handlerFor(base, shell)!(args), cwds, style);
-          continue;
-        }
-        // Any other program named by path: never auto-approved, and called out when this session wrote it.
-        const path = head.wild ? undefined : resolvePath(head.text, cwds[0], style);
-        this.add('unrecognised', path !== undefined && (this.scope.writtenUnclear || this.scope.written.has(path)) ? 'written-script' : 'unknown-program');
+      if (head === undefined) {
+        for (const w of writes) this.target(w, 'write', cwds, style);
         continue;
       }
+      if (head.wild || /[\\/:]/.test(head.text)) {
+        for (const w of writes) this.target(w, 'write', cwds, style);
+        // A shell named by its full path is still a shell (`C:\...\powershell.exe -EncodedCommand`).
+        const base = head.text.split(/[\\/]/).pop()!;
+        if (!head.wild && /^(powershell|pwsh|cmd)(\.exe)?$/i.test(base)) this.effects(handlerFor(base, shell)!(args), cwds, style);
+        else this.program(head, cwds, style);
+        continue;
+      }
+      // The upstream objects' `Path` may become this cmdlet's target, which cannot be known here.
+      if (shell === 'ps' && piped && takesPipedTarget(head.text, args)) this.add('unrecognised', 'unknown-target');
       const handler = handlerFor(head.text, shell);
       if (handler === undefined) {
+        for (const w of writes) this.target(w, 'write', cwds, style);
         this.add('unrecognised', 'unknown-program');
         continue;
       }
       const fx = handler(args);
+      fx.writes.push(...writes);
       this.effects(fx, cwds, style);
       if (fx.cd) {
         const moved = cwds.map((c) => resolvePath(fx.cd!.text, c, style));
@@ -147,14 +207,17 @@ const WRAPPER = /^\s*(?:"([^"]+)"|(\S+))\s+((?:-(?:NoProfile|NoLogo|NonInteracti
  * Codex reports each command inside its shell call: `"C:\...\powershell.exe" -Command "<script>"`. Only
  * that exact form, with the system PowerShell, is opened (once); the script inside is then read as
  * PowerShell. `undefined` when the command is not in this form.
+ *
+ * The same text may also come from Claude's Bash tool, where Bash first expands `$...` and backticks
+ * inside the double quotes (even within the script's single quotes) and reads `\\` as one backslash.
+ * So the wrapper is opened only when Bash would pass the script through unchanged.
  */
 export const unwrapPowerShell = (command: string): string | undefined => {
   const m = WRAPPER.exec(command);
   if (!m) return undefined;
   const exe = normaliseAbsolute(m[1] ?? m[2]!);
   const script = m[4]!;
-  // A doubled backslash would be read differently if Bash, not Windows, split this command line.
-  if (exe === undefined || !POWERSHELL_EXE.test(exe) || script.includes('\\\\')) return undefined;
+  if (exe === undefined || !POWERSHELL_EXE.test(exe) || /[$`]|\\\\/.test(script)) return undefined;
   return script;
 };
 
@@ -193,7 +256,7 @@ const decide = (findings: readonly Finding[], request: PermissionRequest): Polic
 };
 
 export const evaluatePermission = (request: PermissionRequest, context: PolicyContext): PolicyDecision => {
-  const c = new Checker(scopeOf(context));
+  const c = new Checker(scopeOf(context), context);
   const cwd = request.cwd === undefined ? undefined : normaliseAbsolute(request.cwd);
   switch (request.kind) {
     case 'mcpElicitation':

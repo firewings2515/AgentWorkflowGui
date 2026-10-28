@@ -269,7 +269,7 @@ describe('request kinds', () => {
       'rg -n "useState" app',
       'cd sub && npm test',
       'echo done',
-      'git log --oneline -5 2>/dev/null',
+      'git log --oneline -5 2>$null',
       'Get-ChildItem 2>$null',
       "sed -n '1,40p' src/a.ts",
       'git diff --stat; git status --short',

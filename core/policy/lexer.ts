@@ -14,23 +14,26 @@ export interface Word {
 /** One simple command: its words, and the files its output redirections write. */
 export interface Segment {
   words: Word[];
-  /** Redirection targets that are written; discarded output (`$null`, `nul`, `/dev/null`) is left out. */
+  /** Redirection targets that are written; discarded output (`$null`, Bash's `/dev/null`) is left out. */
   writes: Word[];
+  /** Fed by `|`: PowerShell may bind the upstream objects' `Path` to a parameter. */
+  piped: boolean;
 }
 
 const SMART_QUOTES = /[‘’‚‛“”„‟]/;
 // PowerShell reads these dashes as `-`, so `–Recurse` is a parameter there.
 const PS_DASHES = /[–—―]/;
-const DISCARD = /^(nul|\/dev\/null)$/i;
 
 class Builder {
   readonly segments: Segment[] = [];
-  private current: Segment = { words: [], writes: [] };
+  private current: Segment = { words: [], writes: [], piped: false };
   private text: string | undefined;
   private wild = false;
   private quoted = false;
   /** The next word is a redirection target. */
   redirect = false;
+
+  constructor(private readonly shell: Shell) {}
 
   get inWord() {
     return this.text !== undefined;
@@ -59,17 +62,21 @@ class Builder {
     this.dropWord();
     if (this.redirect) {
       this.redirect = false;
-      if (!DISCARD.test(word.text)) this.current.writes.push(word);
+      // Only Bash has /dev/null; PowerShell writes `\dev\null` on the current drive.
+      if (this.shell === 'ps' || word.text !== '/dev/null') this.current.writes.push(word);
     } else this.current.words.push(word);
   }
 
-  /** Ends the command. `soft` separators (`;`, newline) may follow an empty command; `|`, `&&`, `||` may not. */
-  endSegment(soft: boolean): boolean {
+  /**
+   * Ends the command. `soft` separators (`;`, newline) may follow an empty command; `|`, `&&`, `||` may
+   * not. `pipe`: the next command reads this one's output.
+   */
+  endSegment(soft: boolean, pipe = false): boolean {
     this.endWord();
     if (this.redirect) return false;
     if (this.current.words.length === 0 && this.current.writes.length === 0) return soft;
     this.segments.push(this.current);
-    this.current = { words: [], writes: [] };
+    this.current = { words: [], writes: [], piped: pipe };
     return true;
   }
 }
@@ -101,7 +108,7 @@ const redirection = (s: string, i: number, b: Builder, shell: Shell): number => 
 };
 
 const lexPs = (s: string): Segment[] | undefined => {
-  const b = new Builder();
+  const b = new Builder('ps');
   let i = 0;
   while (i < s.length) {
     const c = s[i]!;
@@ -118,7 +125,7 @@ const lexPs = (s: string): Segment[] | undefined => {
       return undefined;
     } else if (c === '|' || c === '&') {
       if (c === '&' && s[i + 1] !== '&') return undefined;
-      if (!b.endSegment(false)) return undefined;
+      if (!b.endSegment(false, c === '|' && s[i + 1] !== '|')) return undefined;
       i += s[i + 1] === c ? 2 : 1;
     } else if (c === '>') {
       i = redirection(s, i, b, 'ps');
@@ -157,7 +164,7 @@ const lexPs = (s: string): Segment[] | undefined => {
 };
 
 const lexSh = (s: string): Segment[] | undefined => {
-  const b = new Builder();
+  const b = new Builder('sh');
   let i = 0;
   while (i < s.length) {
     const c = s[i]!;
@@ -171,7 +178,7 @@ const lexSh = (s: string): Segment[] | undefined => {
       i++;
     } else if (c === '|') {
       if (s[i + 1] === '&') return undefined;
-      if (!b.endSegment(false)) return undefined;
+      if (!b.endSegment(false, s[i + 1] !== '|')) return undefined;
       i += s[i + 1] === '|' ? 2 : 1;
     } else if (c === '&') {
       if (s[i + 1] === '&') {

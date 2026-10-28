@@ -15,6 +15,8 @@ export interface Effects {
   writes: Word[];
   /** Files it executes: refused when this session wrote them (CR-1). */
   runs: Word[];
+  /** Files or folders it takes code or settings from (`.npmrc`, `.husky`): refused only when this session wrote them. */
+  loads: Word[];
   /** Works in its folder without naming it (`git status`, `npm test`); `at` moves it first (`git -C`). */
   folder?: { access: 'read' | 'write'; at?: Word };
   /** Moves the working folder for the commands after it (`cd`). */
@@ -23,7 +25,7 @@ export interface Effects {
 
 export type Handler = (args: readonly Word[]) => Effects;
 
-const none = (): Effects => ({ findings: [], reads: [], writes: [], runs: [] });
+const none = (): Effects => ({ findings: [], reads: [], writes: [], runs: [], loads: [] });
 const flagged = (...findings: Finding[]): Effects => ({ ...none(), findings });
 const unrecognised = (why: ReasonKey = 'unknown-program') => flagged(finding('unrecognised', why));
 const word = (text: string): Word => ({ text, wild: false });
@@ -70,6 +72,89 @@ const reader =
     const reads = targetsOf(a);
     return { ...none(), reads, ...(reads.length === 0 && { folder: { access: 'read' as const } }) };
   };
+
+/**
+ * A reader whose options are all listed: `short` letters may be clustered (`-in`), `shortValue` letters
+ * take a number attached (`-C3`) or the next word (read as a target, which is harmless), and `long`
+ * names are exact. Used for tools with options that run programs (`rg --pre`, `--hostname-bin`).
+ */
+const listedReader =
+  (short: string, shortValue: string, long: readonly string[]): Handler =>
+  (args) => {
+    const a = splitArgs(args);
+    const known = (f: string) =>
+      f.startsWith('--')
+        ? long.includes(f.slice(2))
+        : [...f.slice(1)].every((c) => short.includes(c)) || (shortValue.includes(f[1]!) && /^\d*$/.test(f.slice(2)));
+    if (a.malformed || !a.flags.every(known)) return unrecognised('option');
+    const reads = targetsOf(a);
+    return { ...none(), reads, ...(reads.length === 0 && { folder: { access: 'read' as const } }) };
+  };
+
+// ripgrep without `--pre`, `--pre-glob`, `--hostname-bin`, `--search-zip` and other options that start programs.
+const rg = listedReader('nNiSswxFlcvoHILuaqUP0h', 'ABCmdgtTejMEfr', [
+  'line-number',
+  'no-line-number',
+  'ignore-case',
+  'smart-case',
+  'case-sensitive',
+  'word-regexp',
+  'line-regexp',
+  'fixed-strings',
+  'files-with-matches',
+  'files-without-match',
+  'files',
+  'count',
+  'count-matches',
+  'context',
+  'after-context',
+  'before-context',
+  'glob',
+  'iglob',
+  'type',
+  'type-not',
+  'hidden',
+  'no-ignore',
+  'no-ignore-vcs',
+  'follow',
+  'invert-match',
+  'only-matching',
+  'json',
+  'heading',
+  'no-heading',
+  'with-filename',
+  'no-filename',
+  'color',
+  'max-count',
+  'max-depth',
+  'sort',
+  'sortr',
+  'multiline',
+  'multiline-dotall',
+  'pcre2',
+  'trim',
+  'vimgrep',
+  'null',
+  'column',
+  'stats',
+  'quiet',
+  'max-filesize',
+  'text',
+  'regexp',
+  'file',
+  'threads',
+  'max-columns',
+  'max-columns-preview',
+  'encoding',
+  'no-messages',
+  'type-list',
+  'unrestricted',
+  'binary',
+  'passthru',
+  'replace',
+  'help',
+  'version',
+]);
 
 const LINK_TYPE = /^(symboliclink|junction|hardlink)$/i;
 
@@ -160,12 +245,71 @@ const GIT_RISKY_OPTION = /^(--output|--no-index|--open-files-in-pager|-O|--exec|
 const GIT_BRANCH_LIST = /^(-a|-r|-v|-vv|-l|--list|--all|--remotes|--verbose|--show-current|--no-color|--color|--sort=.*|--format=.*)$/;
 const REMOTE_KEY = /^(remote\.|url\.|branch\..+\.(remote|pushremote|merge)$)/i;
 
+// Options whose value is a file git reads (`-F msg.txt`, `--file=msg.txt`). `git config --file` writes it
+// when setting a value.
+const GIT_FILE_OPTIONS: Readonly<Record<string, readonly string[]>> = {
+  config: ['-f', '--file'],
+  commit: ['-F', '--file', '-t', '--template', '--pathspec-from-file'],
+  add: ['--pathspec-from-file'],
+  blame: ['--contents', '--ignore-revs-file', '-S'],
+  annotate: ['--contents', '--ignore-revs-file', '-S'],
+  grep: ['-f'],
+  'ls-files': ['-X', '--exclude-from'],
+};
+// Folders git commit runs hooks from when the repository points `core.hooksPath` into the worktree (husky).
+const GIT_HOOK_FOLDERS = ['.husky', '.githooks', '.git/hooks'];
+
+const looksLikePath = (v: string) => /[\\/]/.test(v) || /^(\.\.?|~)($|[\\/])/.test(v) || /^[a-z]:/i.test(v);
+
+interface GitArgs {
+  texts: string[];
+  positionals: string[];
+  /** Files named by file options, and option values or pathspecs that look like paths outside the repository. */
+  files: Word[];
+  malformed: boolean;
+}
+
+/** Reads git's arguments after the subcommand, picking out every file they name. */
+const gitArgs = (sub: string, rest: readonly Word[]): GitArgs => {
+  const fileOptions = GIT_FILE_OPTIONS[sub] ?? [];
+  const out: GitArgs = { texts: rest.map((w) => w.text), positionals: [], files: [], malformed: false };
+  let options = true;
+  for (let i = 0; i < rest.length; i++) {
+    const w = rest[i]!;
+    const t = w.text;
+    if (!options || !t.startsWith('-') || t === '-') {
+      out.positionals.push(t);
+      // `rev:path` is not a file here; an absolute or climbing pathspec is checked as one.
+      if ((!t.includes(':') || /^[a-z]:[\\/]/i.test(t)) && /^([a-z]:|[\\/]|\.\.|~)/i.test(t)) out.files.push(w);
+      continue;
+    }
+    if (t === '--') {
+      options = false;
+      continue;
+    }
+    const m = FLAG_VALUE.exec(t);
+    if (m) {
+      if (fileOptions.includes(m[1]!) || looksLikePath(m[2]!)) out.files.push({ text: m[2]!, wild: w.wild });
+      continue;
+    }
+    if (!FLAG.test(t)) out.malformed = true;
+    else if (fileOptions.includes(t)) {
+      const value = rest[++i];
+      if (value === undefined) out.malformed = true;
+      else out.files.push(value);
+    } else if (!t.startsWith('--') && t.length > 2 && fileOptions.some((o) => !o.startsWith('--') && t.includes(o[1]!))) {
+      // A short cluster or attached value with a file option in it (`-Fmsg`, `-aF`).
+      out.malformed = true;
+    }
+  }
+  return out;
+};
+
 /** `git config`: reading is allowed; remote keys are git-remote, global and system settings destructive. */
-const gitConfig = (rest: readonly Word[], at: Word | undefined): Effects => {
-  const texts = rest.map((w) => w.text);
-  const positionals = texts.filter((t) => !t.startsWith('-'));
-  const read = { ...none(), folder: { access: 'read' as const, ...(at && { at }) } };
+const gitConfig = (a: GitArgs, at: Word | undefined): Effects => {
+  const { texts, positionals, files } = a;
   const sub = positionals[0]?.toLowerCase();
+  const read = { ...none(), reads: files, folder: { access: 'read' as const, ...(at && { at }) } };
   if (sub === 'get' || sub === 'list' || texts.some((t) => /^(--get(-all|-regexp|-urlmatch)?|--list|-l)$/.test(t))) return read;
   const mutating = texts.some((t) => /^(--unset|--add|--replace-all|--rename-section|--remove-section|--edit|-e$)/.test(t));
   const newSyntax = sub !== undefined && ['set', 'unset', 'rename-section', 'remove-section', 'edit'].includes(sub);
@@ -190,18 +334,24 @@ const git: Handler = (args) => {
   if (subWord === undefined) return none();
   const sub = subWord.text.toLowerCase();
   const rest = args.slice(i + 1);
-  const texts = rest.map((w) => w.text);
-  const inFolder = (access: 'read' | 'write'): Effects => ({ ...none(), folder: { access, ...(at && { at }) } });
+  const parsed = gitArgs(sub, rest);
+  const { texts } = parsed;
+  const inFolder = (access: 'read' | 'write'): Effects => ({
+    ...none(),
+    reads: parsed.files,
+    folder: { access, ...(at && { at }) },
+    ...(sub === 'commit' && { loads: GIT_HOOK_FOLDERS.map((f) => word(at ? `${at.text}/${f}` : f)) }),
+  });
 
   if (sub === 'push') return flagged(finding('git-remote', 'git-remote'));
   if (sub === 'remote') {
     const op = texts.find((t) => !t.startsWith('-'))?.toLowerCase();
     return op === undefined || op === 'show' || op === 'get-url' ? inFolder('read') : flagged(finding('git-remote', 'git-remote'));
   }
-  if (sub === 'config') return gitConfig(rest, at);
   // Revisions and pathspecs are not resolved as paths (`HEAD~1`, `main..HEAD`), but secret names in them are caught.
   if (texts.some(mentionsSecret)) return flagged(finding('secret-read', 'secret'));
-  if (texts.some((t) => t.startsWith('-') && t !== '--' && !FLAG.test(t) && !FLAG_VALUE.test(t))) return unrecognised('option');
+  if (parsed.malformed) return unrecognised('option');
+  if (sub === 'config') return gitConfig(parsed, at);
   if (texts.some((t) => GIT_RISKY_OPTION.test(t))) return unrecognised('option');
   if (sub === 'clean') return flagged(finding('destructive', 'git-discard'));
   if (sub === 'reset' && texts.some((t) => ['--hard', '--merge', '--keep'].includes(t))) return flagged(finding('destructive', 'git-discard'));
@@ -220,13 +370,20 @@ const git: Handler = (args) => {
 const INSTALL_SUBS = new Set(['install', 'i', 'in', 'ci', 'add', 'uninstall', 'remove', 'rm', 'un', 'r', 'link', 'ln', 'update', 'up', 'upgrade']);
 const SCRIPT_SUBS = new Set(['test', 't', 'tst', 'start', 'stop', 'restart']);
 const LOCAL_INSTALL_SUBS = new Set(['install', 'i', 'in', 'ci']);
-const INFO_SUBS = new Set(['ls', 'list', 'outdated', 'view', 'info', 'why', 'explain', 'help', '-v', '--version', '-h', '--help']);
-// Options that move npm elsewhere or change how it runs scripts.
-const PM_RISKY_OPTION = /^(--prefix|-C$|--dir|--cwd|--location|--global-dir|--userconfig|--globalconfig|--script-shell|--node-options|-w$|--workspace|--filter|-r$|--recursive)/i;
+const INFO_SUBS = new Set(['ls', 'list', 'outdated', 'view', 'info', 'why', 'explain', 'help']);
+// The only options accepted, by kind of subcommand. npm expands abbreviations and aliases (`--g`,
+// `--C=...`, `--script-she=...`), so anything not listed exactly is refused.
+const PM_OPTIONS = {
+  scripts: new Set(['--silent', '-s', '--if-present']),
+  install: new Set(['--frozen-lockfile', '--prefer-offline', '--offline', '--no-audit', '--no-fund', '--ignore-scripts', '--legacy-peer-deps', '--silent', '-s']),
+  info: new Set(['--json', '--all', '--long']),
+};
+// Settings files a package manager loads code or a script shell from, besides package.json.
+const PM_SETTINGS = ['.npmrc', '.yarnrc', '.yarnrc.yml', '.pnpmfile.cjs'];
 
 /**
  * npm, pnpm, yarn. Running package scripts or installing runs whatever package.json says, so a
- * package.json this session wrote counts as running a written script (CR-1).
+ * package.json or settings file this session wrote counts as running a written script (CR-1).
  */
 const packageManager =
   (name: 'npm' | 'pnpm' | 'yarn'): Handler =>
@@ -234,19 +391,29 @@ const packageManager =
     const texts = args.map((w) => w.text);
     // On Windows these are .cmd shims, and cmd.exe reads their arguments again.
     if (texts.some((t) => /[&|<>^%!"]/.test(t))) return unrecognised('syntax');
-    const global = texts.some((t) => t === '-g' || /^--global/i.test(t) || /^--location=global$/i.test(t)) || (name === 'yarn' && texts[0] === 'global');
-    const sub = (name === 'yarn' && texts[0] === 'global' ? texts[1] : texts[0])?.toLowerCase();
-    if (global) return sub !== undefined && INSTALL_SUBS.has(sub) ? flagged(finding('destructive', 'global-install')) : unrecognised();
-    if (texts.some((t) => PM_RISKY_OPTION.test(t))) return unrecognised('option');
-    const runsScripts: Effects = { ...none(), folder: { access: 'write' }, runs: [word('package.json')] };
-    if (sub === undefined) return name === 'yarn' ? runsScripts : unrecognised();
+    const yarnGlobal = name === 'yarn' && texts[0] === 'global';
+    const sub = (yarnGlobal ? texts[1] : texts[0])?.toLowerCase();
+    if (yarnGlobal || texts.some((t) => t === '-g' || t === '--global')) {
+      return sub !== undefined && INSTALL_SUBS.has(sub) ? flagged(finding('destructive', 'global-install')) : unrecognised();
+    }
+    const runsScripts: Effects = { ...none(), folder: { access: 'write' }, runs: [word('package.json')], loads: PM_SETTINGS.map(word) };
     const rest = args.slice(1);
-    if (SCRIPT_SUBS.has(sub)) return runsScripts;
-    if (sub === 'run' || sub === 'run-script') return rest[0] !== undefined && !rest[0].text.startsWith('-') ? runsScripts : unrecognised();
+    const end = rest.findIndex((w) => w.text === '--');
+    const options = (end < 0 ? rest : rest.slice(0, end)).filter((w) => w.text.startsWith('-'));
+    const allowed = (kind: keyof typeof PM_OPTIONS) => options.every((w) => PM_OPTIONS[kind].has(w.text));
+    if (sub === undefined) return name === 'yarn' ? runsScripts : unrecognised();
+    if (SCRIPT_SUBS.has(sub)) return allowed('scripts') ? runsScripts : unrecognised('option');
+    if (sub === 'run' || sub === 'run-script') {
+      if (rest[0] === undefined || rest[0].text.startsWith('-')) return unrecognised();
+      return allowed('scripts') ? runsScripts : unrecognised('option');
+    }
     // Installing what the lockfile already names; adding packages brings new code, so it is left to the user.
-    if (LOCAL_INSTALL_SUBS.has(sub)) return rest.every((w) => w.text.startsWith('-')) ? runsScripts : unrecognised();
-    if (INFO_SUBS.has(sub)) return { ...none(), folder: { access: 'read' } };
-    return unrecognised();
+    if (LOCAL_INSTALL_SUBS.has(sub)) {
+      if (!rest.every((w) => w.text.startsWith('-'))) return unrecognised();
+      return allowed('install') ? runsScripts : unrecognised('option');
+    }
+    if (INFO_SUBS.has(sub)) return allowed('info') ? { ...none(), folder: { access: 'read' } } : unrecognised('option');
+    return texts.length === 1 && /^(-v|--version|-h|--help)$/.test(texts[0]!) ? none() : unrecognised();
   };
 
 const pip: Handler = (args) => {
@@ -387,7 +554,7 @@ const COMMON = table(
     grep: reader(),
     egrep: reader(),
     fgrep: reader(),
-    rg: reader(/^--pre/),
+    rg,
     diff: reader(),
     cmp: reader(),
     file: reader(),
@@ -400,7 +567,7 @@ const COMMON = table(
     nl: reader(),
     md5sum: reader(),
     sha256sum: reader(),
-    sort: reader(/^(-[a-zA-Z]*o|--output)/),
+    sort: reader(/^(-[a-zA-Z]*o|--output|--compress-program)/),
     uniq: reader(undefined, 1),
     find,
     sed,
@@ -531,4 +698,57 @@ export const handlerFor = (name: string, shell: Shell): Handler | undefined => {
   const known = SH_ONLY.get(n) ?? COMMON.get(n);
   if (known) return known;
   return PS_ONLY.has(n) && (n.includes('-') || CMD_BUILTINS.has(n)) ? inert : undefined;
+};
+
+// PowerShell cmdlets that bind a path from upstream objects (`... | Set-Content`): their `Path` or
+// `LiteralPath` comes from the pipeline unless given here. The second group also binds a destination,
+// a new name or a value that way, so piping into them is never understood.
+const PS_PIPED_PATH = new Set([
+  'get-childitem',
+  'gci',
+  'ls',
+  'dir',
+  'get-content',
+  'gc',
+  'cat',
+  'type',
+  'select-string',
+  'sls',
+  'test-path',
+  'resolve-path',
+  'get-item',
+  'gi',
+  'get-filehash',
+  'import-csv',
+  'split-path',
+  'join-path',
+  'set-location',
+  'sl',
+  'cd',
+  'chdir',
+  'remove-item',
+  'ri',
+  'del',
+  'erase',
+  'rd',
+  'rm',
+  'rmdir',
+  'set-content',
+  'add-content',
+  'ac',
+  'out-file',
+  'clear-content',
+  'clc',
+  'tee-object',
+  'tee',
+  'export-csv',
+  'export-clixml',
+]);
+const PS_PIPED_ANY = new Set(['new-item', 'ni', 'md', 'mkdir', 'copy', 'copy-item', 'cpi', 'cp', 'move', 'move-item', 'mi', 'mv', 'ren', 'rename-item', 'rni']);
+const EXPLICIT_PATH = /^-(path|literalpath|filepath|pspath|lp)([=:]|$)/i;
+
+/** In PowerShell, whether a command fed by `|` may take its target from the upstream objects. */
+export const takesPipedTarget = (name: string, args: readonly Word[]): boolean => {
+  const n = name.toLowerCase().replace(/\.exe$/, '');
+  return PS_PIPED_ANY.has(n) || (PS_PIPED_PATH.has(n) && !args.some((w) => EXPLICIT_PATH.test(w.text)));
 };
