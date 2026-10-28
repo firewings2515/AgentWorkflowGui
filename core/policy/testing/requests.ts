@@ -10,6 +10,7 @@ export const REFS = String.raw`E:\work\refs`;
 export const contextFor = (root = ROOT, extra: Partial<PolicyContext> = {}, readOnly = false): PolicyContext => ({
   folderScope: { source: 'task-worktree', workspaceRoot: root, writableRoots: readOnly ? [] : [root], readableRoots: [REFS] },
   writtenPaths: [],
+  resolveRealPath: (path) => path,
   ...extra,
 });
 
