@@ -9,6 +9,8 @@ export interface Word {
   text: string;
   /** Contains `*`, `?` or `[`. PowerShell expands these in `-Path` even when quoted, so quoting is ignored. */
   wild: boolean;
+  /** Quoted in whole or part. PowerShell reads an unquoted `-x` as a parameter name, a quoted one as a value. */
+  quoted?: boolean;
 }
 
 /** One simple command: its words, and the files its output redirections write. */
@@ -58,7 +60,7 @@ class Builder {
 
   endWord() {
     if (this.text === undefined) return;
-    const word = { text: this.text, wild: this.wild };
+    const word = { text: this.text, wild: this.wild, quoted: this.quoted };
     this.dropWord();
     if (this.redirect) {
       this.redirect = false;

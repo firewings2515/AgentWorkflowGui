@@ -19,6 +19,8 @@ export const REASONS = {
   syntax: 'Uses shell syntax the policy cannot analyse, such as variables, subexpressions or unusual quoting.',
   option: 'Uses an option the policy cannot analyse.',
   'unknown-target': 'Cannot determine the target path.',
+  wildcard: 'Names its targets with a wildcard, so the files it reaches are not known.',
+  'written-unclear': 'A file this session wrote cannot be located, so its scripts cannot be told apart.',
   link: 'Creates a symbolic link or junction.',
   'unknown-program': 'Runs a program or subcommand the policy does not recognise.',
   'unknown-tool': 'Uses a tool the policy does not recognise.',

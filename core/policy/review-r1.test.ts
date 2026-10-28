@@ -16,7 +16,7 @@ describe('P1-1 the PowerShell wrapper is opened only when Bash would not expand 
     [`${POWERSHELL} -Command "echo '\`git push\`'"`, 'unrecognised'],
     [`${POWERSHELL} -Command "Get-Content $HOME/notes.txt"`, 'unrecognised'],
     [`${POWERSHELL} -Command "Get-ChildItem 2>$null"`, 'unrecognised'],
-    [sh`${POWERSHELL} -Command "Get-Content \\server\share\x"`, 'unrecognised'],
+    [sh`${POWERSHELL} -Command "Get-Content \\server\share\x"`, 'secret-read'],
     [`${POWERSHELL} -Command "Get-ChildItem"`, 'approve'],
     [`${POWERSHELL} -Command "git status --short; Get-Content README.md"`, 'approve'],
   ]);
@@ -56,7 +56,6 @@ describe('P1-4 a file written earlier in the same request counts as written', ()
     'cp tools/a.js fresh.js && node fresh.js',
     'Set-Content -Path run.py -Value x; python run.py',
     'mkdir out; cp tools/a.js out/; node out/a.js',
-    'cp tools/*.js out/; node out/a.js',
     'echo x > build.sh; ./build.sh',
     'echo x > package.json; npm test',
   ])('%s', (cmd) => expect(decide(command(cmd))).toEqual(written));
@@ -90,11 +89,13 @@ describe('P1-6 files named by git options are checked', () => {
     ['git commit -F E:/outside/message.txt', 'secret-read'],
     ['git commit --file=E:/outside/message.txt', 'secret-read'],
     ['git commit -t ../template.txt', 'secret-read'],
-    ['git commit -Fmessage.txt', 'unrecognised'],
-    ['git commit -aF message.txt', 'unrecognised'],
+    ['git commit -FE:/outside/message.txt', 'secret-read'],
+    ['git commit -aFE:/outside/message.txt', 'secret-read'],
+    ['git commit -Fmessage.txt', 'approve'],
+    ['git commit -aF message.txt', 'approve'],
     ['git blame --contents ../x.ts src/a.ts', 'secret-read'],
     ['git add --pathspec-from-file=E:/outside/list.txt', 'secret-read'],
-    ['git log --format=E:/outside/x', 'secret-read'],
+    ['git log --format=E:/outside/x', 'approve'],
     ['git diff ../other/a.ts', 'secret-read'],
     ['git commit -F message.txt', 'approve'],
     ['git config --file .gitmodules --list', 'approve'],
@@ -183,19 +184,21 @@ describe('P1-9 existing junctions and symbolic links', () => {
   ])('request %#', (req, expected) => expect(verdict(req, ctx)).toBe(expected));
 });
 
+// Round 3 (rule B) replaced the round 2 matching: every wildcard target is unrecognised.
 describe('P1-10 a wildcard that may match any secret name', () => {
   rows([
-    ['Get-Content .e[n]v.production', 'secret-read'],
-    ['cat .e?v.local', 'secret-read'],
-    ['cat .env.*', 'secret-read'],
-    ['cat id_*', 'secret-read'],
-    ['cat certs/*.pem', 'secret-read'],
-    ['cat cred*', 'secret-read'],
-    ['cat config/*', 'secret-read'],
-    ['cat */notes.md', 'secret-read'],
-    ['cat src/*.ts', 'approve'],
-    ['ls *.md', 'approve'],
-    ['cat .env.ts', 'approve'],
+    ['Get-Content .e[n]v.production', 'unrecognised'],
+    ['cat .e?v.local', 'unrecognised'],
+    ['cat .env.*', 'unrecognised'],
+    ['cat id_*', 'unrecognised'],
+    ['cat certs/*.pem', 'unrecognised'],
+    ['cat cred*', 'unrecognised'],
+    ['cat config/*', 'unrecognised'],
+    ['cat */notes.md', 'unrecognised'],
+    ['cat src/*.ts', 'unrecognised'],
+    ['ls *.md', 'unrecognised'],
+    ['cat .env.ts', 'secret-read'],
+    ['cat src/index.ts', 'approve'],
   ]);
 });
 
@@ -211,8 +214,9 @@ describe('P1-12 Windows credential stores', () => {
     [read(sh`C:\Users\me\AppData\Local\Microsoft\Credentials\ABC`), inHome, 'secret-read'],
     [read(sh`C:\Users\me\AppData\Local\Google\Chrome\User Data\Default\Login Data`), inHome, 'secret-read'],
     [read(sh`C:\Users\me\AppData\Local\Microsoft\Vault\abc\123.vcrd`), viaRefs, 'secret-read'],
-    [command('ls AppData/Local/Microsoft/*', { cwd: home }), inHome, 'secret-read'],
-    [command('cat AppData/*/Microsoft/Protect/x', { cwd: home }), inHome, 'secret-read'],
+    [command('ls AppData/Local/Microsoft/*', { cwd: home }), inHome, 'unrecognised'],
+    [command('cat AppData/*/Microsoft/Protect/x', { cwd: home }), inHome, 'unrecognised'],
+    [command('ls AppData/Local/Microsoft/Vault', { cwd: home }), inHome, 'secret-read'],
     [read(sh`C:\Users\me\Documents\notes.md`), inHome, 'approve'],
     [read(sh`C:\Users\me\AppData\Local\Temp\build.log`), inHome, 'approve'],
   ])('%#', (req, ctx, expected) => expect(verdict(req, ctx)).toBe(expected));

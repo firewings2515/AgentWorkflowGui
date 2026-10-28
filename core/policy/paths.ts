@@ -111,23 +111,14 @@ export const isWithinAny = (path: AbsPath, roots: readonly AbsPath[]): boolean =
 /** True when `raw` contains a wildcard that a shell or PowerShell `-Path` would expand. */
 export const hasWildcard = (raw: string): boolean => WILD.test(raw);
 
-/**
- * Splits a wildcard path into the folder before the first wildcard segment and the pattern segments
- * after it. `undefined` when the pattern climbs (`..`) or the folder part cannot be resolved.
- */
-export const resolveGlob = (raw: string, cwd: AbsPath | undefined, style: PathStyle): { folder: AbsPath; patterns: string[] } | undefined => {
-  const parts = raw.replaceAll('\\', '/').split('/');
-  const first = parts.findIndex((part) => WILD.test(part));
-  if (first < 0) return undefined;
-  const patterns = parts.slice(first).filter((part) => part !== '' && part !== '.');
-  if (patterns.some((part) => part === '..' || /^\.{3,}$/.test(part))) return undefined;
-  const folder = resolvePath(first === 0 ? '.' : `${parts.slice(0, first).join('/')}/`, cwd, style);
-  if (folder === undefined || patterns.some((part) => CONTROL.test(part) || part.includes('$') || /~\d/.test(part))) return undefined;
-  return { folder, patterns: patterns.map(foldAscii) };
-};
-
-// Credentials and secret files (R-08). Checked on every segment, so folders such as `.ssh` count too.
-const SECRET_NAMES = new Set([
+// Credentials and secret files (R-08). Every segment is checked, folders included, and a family counts
+// whatever follows its stem: an extension never proves a name safe (`.env.production.txt`, `id_rsa.bak`).
+const SECRET_STEMS = [
+  '.env',
+  'id_rsa',
+  'id_dsa',
+  'id_ecdsa',
+  'id_ed25519',
   '.ssh',
   '.gnupg',
   '.aws',
@@ -136,7 +127,6 @@ const SECRET_NAMES = new Set([
   '.docker',
   '.password-store',
   'credentials',
-  'credentials.json',
   '.git-credentials',
   '.netrc',
   '_netrc',
@@ -150,55 +140,19 @@ const SECRET_NAMES = new Set([
   'secrets.yaml',
   'authorized_keys',
   'known_hosts',
-]);
-// Endings of source and document files. A `.env.*` name with one of them (`.env.ts`) is code, and a
-// wildcard that must end with one (`*.ts`) cannot reach any secret name.
-const PLAIN_EXT =
-  /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|md|mdx|txt|log|css|scss|less|html|htm|vue|svelte|go|rs|java|kt|cs|c|h|cc|cpp|hpp|rb|php|sh|ps1|psm1|bat|cmd|toml|lock|xml|svg|png|jpg|jpeg|gif|ico|csv|sql|graphql|proto|snap|map)$/;
-const SECRET_PATTERNS = [/^\.env(rc)?$/, /^\.env\./, /^id_[a-z0-9_-]+(\.pub)?$/, /\.(pem|key|pfx|p12|keystore|jks|ppk|kdbx|vcrd)$/];
+];
+const SECRET_PATTERNS = [/^id_[a-z0-9_-]+(\.pub)?$/, /\.(pem|key|pfx|p12|keystore|jks|ppk|kdbx|vcrd)(\.|$)/];
 // Windows credential stores (DPAPI keys, Credential Manager, the vault), browser profiles and the SAM hive.
 const WINDOWS_SECRET =
   /\/appdata\/(local|roaming)\/microsoft\/(vault|protect|credentials|crypto|systemcertificates)(\/|$)|\/appdata\/local\/(google\/chrome|microsoft\/edge)\/user data(\/|$)|\/appdata\/roaming\/mozilla\/firefox(\/|$)|^[a-z]:\/windows\/system32\/config(\/|$)/;
-// Folder names on the way to those stores: a wildcard folder that may match one may reach a secret.
-const SECRET_FOLDERS = ['appdata', 'local', 'roaming', 'microsoft', 'vault', 'protect', 'crypto', 'systemcertificates', 'user data', 'firefox', 'config'];
 
 /** A segment that names a secret. An alternate stream (`.env:x`) counts as its file. */
 export const isSecretName = (segment: string): boolean => {
   const name = foldAscii(segment).split(':')[0]!;
-  return SECRET_NAMES.has(name) || (SECRET_PATTERNS.some((pattern) => pattern.test(name)) && !PLAIN_EXT.test(name));
+  return SECRET_STEMS.some((stem) => name.startsWith(stem)) || SECRET_PATTERNS.some((pattern) => pattern.test(name));
 };
 
 export const isSecretPath = (path: AbsPath): boolean => splitAbs(path).segments.some(isSecretName) || WINDOWS_SECRET.test(path);
-
-/** Glob segment → regex. Character classes are widened to any character, which only adds matches. */
-const globRegex = (pattern: string) => {
-  let source = '';
-  for (let i = 0; i < pattern.length; i++) {
-    const c = pattern[i]!;
-    if (c === '*') source += '.*';
-    else if (c === '?' || c === '[') {
-      source += '.';
-      const end = c === '[' ? pattern.indexOf(']', i + 1) : -1;
-      if (end > 0) i = end;
-    } else source += c.replace(/[\\^$.|+(){}\]]/g, '\\$&');
-  }
-  return new RegExp(`^${source}$`, 'i');
-};
-
-/**
- * Whether a wildcard segment may match a secret. Named secrets are tested directly. The open-ended
- * families (`.env.*`, `id_*`, `*.pem` ...) are ruled out only when every match must end with a plain
- * source or document extension (`*.ts`). A folder segment (`last` false) may also lead to a Windows store.
- */
-export const patternMayMatchSecret = (pattern: string, last = true): boolean => {
-  if (pattern.includes(':')) return true;
-  const regex = globRegex(pattern);
-  if ([...SECRET_NAMES, ...(last ? [] : SECRET_FOLDERS)].some((name) => regex.test(name))) return true;
-  if (!last) return false;
-  // The text after the last wildcard is fixed, and every match ends with it.
-  const tail = pattern.slice(Math.max(pattern.lastIndexOf('*'), pattern.lastIndexOf('?'), pattern.lastIndexOf(']')) + 1);
-  return !PLAIN_EXT.test(foldAscii(tail));
-};
 
 /**
  * Key for "is this the same file" when matching written scripts: Unicode case folding after NFC. It may
