@@ -19,6 +19,7 @@ import {
   CommitUncertainError,
   type DispatchResult,
   type ReconcileResult,
+  type SessionSettings,
   type StartSessionOptions,
   type StoredDelivery,
 } from '../ports';
@@ -73,6 +74,31 @@ const startOptions = (spec: ProvisionDelivery['spec']): StartSessionOptions => (
   ...(spec.preallocatedRef !== undefined && { preallocatedRef: spec.preallocatedRef }),
 });
 
+const settingsOf = (s: SessionSettings): SessionSettings => ({
+  model: s.model,
+  readOnly: s.readOnly,
+  ...(s.instructions !== undefined && { instructions: s.instructions }),
+});
+
+/**
+ * What the store gets: the spec and the session settings rebuilt from the fields the port allows, so
+ * nothing else that rode along on the caller's object (an MCP token above all, C-07) is written.
+ */
+const storable = (input: AcceptInput): AcceptInput => {
+  if (input.kind !== 'provision') return { ...input, context: { ...input.context, session: settingsOf(input.context.session) } };
+  const { spec } = input;
+  return {
+    ...input,
+    spec: {
+      runtime: spec.runtime,
+      sessionId: spec.sessionId,
+      cwd: spec.cwd,
+      ...settingsOf(spec),
+      ...(spec.preallocatedRef !== undefined && { preallocatedRef: spec.preallocatedRef }),
+    },
+  };
+};
+
 export class DeliveryService {
   /** Operations whose single runtime call is running in this process. */
   private readonly inFlight = new Set<OperationId>();
@@ -89,7 +115,7 @@ export class DeliveryService {
     const issues = await this.acceptIssues(input);
     if (issues.length > 0) return { status: 'invalid', issues };
     try {
-      return await this.options.store.accept(input);
+      return await this.options.store.accept(storable(input));
     } catch (error) {
       if (error instanceof CommitUncertainError) return { status: 'commit-uncertain', detail: error.message };
       throw error;
@@ -173,6 +199,9 @@ export class DeliveryService {
   }
 
   private async acceptIssues(input: AcceptInput): Promise<string[]> {
+    // The types forbid it, but a spread through `SessionSettings` or a cast still compiles (C-07).
+    const settings: object = input.kind === 'provision' ? input.spec : input.context.session;
+    if ('mcp' in settings) return [`${input.kind === 'provision' ? 'spec' : 'context.session'} carries an MCP mount, which is never stored`];
     const parsed = DeliveryTargetSchema.safeParse(input.target);
     if (!parsed.success) return parsed.error.issues.map((i) => `target: ${i.message}`);
     const issues: string[] = deliveryTargetIssues(undefined, input.target);
@@ -216,6 +245,7 @@ export class DeliveryService {
         // The persisted payload, never a caller's copy.
         text: record.payload,
         entry: options.entry ?? record.context.entry,
+        ...(options.origin !== undefined && { origin: options.origin }),
         ...(timeoutMs !== undefined && { timeoutMs }),
       });
     } catch (error) {

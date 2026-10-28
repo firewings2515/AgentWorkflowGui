@@ -1,0 +1,337 @@
+// The main process's backend (T017): storage, process host, GUI MCP server, both runtimes, the policy
+// and the CR-2 delivery service, put together behind the facade the IPC layer serves. Electron-free, so
+// the integration tests run it on a real SQLite file with fake adapters.
+//
+// Start order: database → snapshot read (damaged data stops here, fail closed) → orphan cleanup → MCP
+// server → session service → recovery → model lists in the background. Exit order (R-14): new commands
+// refused → MCP server closed → every session closed (interrupt / close stdin) and its Job ended →
+// adapters closed → database closed.
+import { createHash, randomUUID } from 'node:crypto';
+import type { DatabaseSync } from 'node:sqlite';
+import {
+  CONTRACTS_VERSION,
+  type Command,
+  type CommandResult,
+  type ModelOption,
+  type OwnedProcess,
+  type PayloadHash,
+  type Runtime,
+  type SessionId,
+  type Snapshot,
+} from '../../contracts';
+import { ClaudeAdapter, claudeAgentSdk } from '../../adapters/claude';
+import { CodexAdapter } from '../../adapters/codex';
+import { GuiMcpServer, type McpToolHandlers } from '../../adapters/mcp-server';
+import { claudeProcessSpawn, codexAppServerSpawn, type JobSpawner } from '../../adapters/process';
+import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../adapters/storage';
+import { permissionPolicy } from '../../core/policy';
+import type { AppRepositories, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter } from '../../core/ports';
+import { SessionService } from '../../core/sessions';
+import type { EventBus } from './event-bus';
+import { type AppFacade, failure } from './facade';
+import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
+
+/** What the main process needs from its process host: the port plus the spawn the adapters use (T013). */
+export type BackendProcessHost = ProcessHost & JobSpawner;
+
+/** Builds the adapter that serves one session; `onPermissionRequest` must be passed to it. */
+export type AdapterFactory = (runtime: Runtime, sessionId: SessionId, hooks: { onPermissionRequest(handle: PermissionHandle): unknown }) => RuntimeAdapter;
+
+export interface BackendOptions {
+  dbPath: string;
+  bus: Pick<EventBus, 'seq' | 'publish'>;
+  /** The process host, recording into the backend's own OwnedProcess repository (T013). */
+  createHost(processes: OwnedProcessRepository): BackendProcessHost;
+  /** The Codex executable (codex-exe.ts); Codex is unavailable without one. */
+  codexExecutable?: string | undefined;
+  /** Replaces the real adapters (tests). */
+  createAdapter?: AdapterFactory;
+  /** Replaces the runtimes' model lists (tests). */
+  listModels?: (runtime: Runtime) => Promise<ModelOption[]>;
+  policy?: PermissionPolicy;
+  resolveRealPath(absolutePath: string): string | null;
+  /** Replaces fs.watch (tests). */
+  watch?: WatchFn;
+  now?: () => Date;
+  uuid?: () => string;
+  /** Diagnostics: fixed text, IDs and error names only. */
+  log: (message: string) => void;
+  closeTimeoutMs?: number;
+}
+
+export interface Backend {
+  status: 'ready';
+  facade: AppFacade;
+  service: SessionService;
+  repositories: AppRepositories;
+  mcp: GuiMcpServer;
+  /** What exiting now would cut off (R-14). */
+  unfinishedWork(): Promise<{ runningSessions: number; heldRequests: number; runningNativeTasks: number; commands: number }>;
+  shutdown(): Promise<void>;
+}
+
+/** The database cannot be opened or holds damaged records: nothing runs, the user is told (fail closed). */
+export interface DamagedBackend {
+  status: 'damaged';
+  facade: AppFacade;
+  dbPath: string;
+  /** Error name, and for StoredDataError the table and rule codes; never record content. */
+  reason: string;
+  shutdown(): Promise<void>;
+}
+
+/** The fixed text a renderer gets instead of a Snapshot when the stored data is damaged. */
+export const STORAGE_DAMAGED = 'The stored data is damaged; nothing was loaded';
+
+const describe = (error: unknown): string => {
+  if (!(error instanceof Error)) return 'non-error thrown';
+  const { table, problems } = error as Error & { table?: unknown; problems?: unknown };
+  if (error.name === 'StoredDataError' && typeof table === 'string' && Array.isArray(problems)) return `${error.name}: ${table} (${problems.join(', ')})`;
+  return error.name;
+};
+
+export const damagedFacade = (): AppFacade => ({
+  snapshot: () => {
+    throw new Error(STORAGE_DAMAGED);
+  },
+  execute: (command: Command) => failure(command.requestId, 'storage_failed', STORAGE_DAMAGED),
+});
+
+const sha256 = (text: string): PayloadHash => `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`;
+
+const notInWorkflow = { status: 'rejected', rejection: { reason: 'not-in-workflow', detail: 'this tool works in workflow sessions only' } } as const;
+
+/** Runs `run` with a deadline; past it, resolves undefined and leaves the work behind. */
+const within = async <T>(run: Promise<T>, ms: number): Promise<T | undefined> => {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([run, new Promise<undefined>((resolve) => (timer = setTimeout(() => resolve(undefined), ms)))]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+export async function startBackend(options: BackendOptions): Promise<Backend | DamagedBackend> {
+  const { bus, log } = options;
+  const now = () => (options.now?.() ?? new Date()).toISOString();
+  const uuid = () => options.uuid?.() ?? randomUUID();
+  const closeTimeoutMs = options.closeTimeoutMs ?? 5000;
+
+  // 1-2. Storage, read once in full: a damaged record stops everything here (T015 fails closed).
+  let db: DatabaseSync | undefined;
+  let repositories: AppRepositories;
+  try {
+    db = openDatabase(options.dbPath);
+    repositories = createRepositories(db);
+    await repositories.readSnapshotData();
+  } catch (error) {
+    const reason = describe(error);
+    log(`[backend] the database cannot be used (${reason}); nothing is started`);
+    try {
+      db?.close();
+    } catch {
+      // Already unusable.
+    }
+    return { status: 'damaged', facade: damagedFacade(), dbPath: options.dbPath, reason, shutdown: () => Promise.resolve() };
+  }
+  const store = new SqliteDeliveryStore(db);
+  const host = options.createHost(repositories.processes);
+
+  // 3. A crashed run's processes: only those whose PID and creation time both still match are ended.
+  try {
+    const live = await repositories.processes.listLive();
+    const cleaned = await host.cleanupOrphans(live);
+    for (const p of [...cleaned.ended, ...cleaned.gone]) await repositories.processes.markEnded(p.pid, p.startedAt, now());
+    if (cleaned.ended.length > 0) log(`[backend] ended ${String(cleaned.ended.length)} process(es) left by an earlier run`);
+  } catch (error) {
+    log(`[backend] cleaning up earlier processes failed (${describe(error)})`);
+  }
+
+  // 4-5. MCP server, adapters, the session service. Handlers and hooks reach the service once it exists.
+  const ref: { service?: SessionService } = {};
+  const handlers: McpToolHandlers = {
+    handoff: () => Promise.resolve(notInWorkflow),
+    create_tasks: () => Promise.resolve(notInWorkflow),
+    report_to_root: () => Promise.resolve(notInWorkflow),
+    wait_for_file: () => Promise.resolve(notInWorkflow),
+    send_message: (input, ctx) => {
+      if (ref.service === undefined) return Promise.resolve({ status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is starting' } });
+      return ref.service.sendMessage(input, ctx);
+    },
+  };
+  const mcp = await GuiMcpServer.start({ handlers, log: (message) => log(`[mcp] ${message}`) });
+  const watchers = new WorkspaceWatchers(
+    { changed: (sessionId, root, path) => ref.service?.workspaceChanged(sessionId, root, path), failed: (sessionId, root) => ref.service?.workspaceWatchFailed(sessionId, root) },
+    log,
+    options.watch,
+  );
+  const adapterLog = (runtime: Runtime) => (level: 'debug' | 'warn', message: string) => {
+    // The detail argument is left out: it can hold transcript text or protocol lines.
+    if (level === 'warn') log(`[${runtime}] ${message}`);
+  };
+  let claude: RuntimeAdapter | undefined;
+  const createAdapter: AdapterFactory =
+    options.createAdapter ??
+    ((runtime, sessionId, hooks) => {
+      if (runtime === 'claude') {
+        claude ??= new ClaudeAdapter({
+          sdk: claudeAgentSdk,
+          onPermissionRequest: (handle) => hooks.onPermissionRequest(handle),
+          spawnProcess: ({ sessionId: id }) => claudeProcessSpawn(host, id),
+          log: adapterLog('claude'),
+        });
+        return claude;
+      }
+      const command = options.codexExecutable;
+      if (command === undefined) throw new Error('Codex is not available');
+      return new CodexAdapter({
+        spawn: codexAppServerSpawn(host, sessionId, { command }),
+        endJob: () => host.closeJob(sessionId),
+        onPermissionRequest: (handle) => hooks.onPermissionRequest(handle),
+        log: adapterLog('codex'),
+      });
+    });
+  const hooks = { onPermissionRequest: (handle: PermissionHandle) => (ref.service === undefined ? Promise.reject(new Error('not ready')) : ref.service.onPermissionRequest(handle)) };
+  const listModels =
+    options.listModels ??
+    (async (runtime: Runtime): Promise<ModelOption[]> => {
+      // Listed outside any session: Codex in a Job of its own, ended right after.
+      const probeId = `models-${runtime}` as SessionId;
+      // Claude's adapter is the one all sessions share, so it keeps the service's hooks; the Codex probe
+      // has an app-server of its own, where nothing can be allowed.
+      const probeHooks = runtime === 'claude' ? hooks : { onPermissionRequest: (h: PermissionHandle) => h.answer({ outcome: 'decline', decidedBy: 'policy', at: now() }) };
+      const adapter = createAdapter(runtime, probeId, probeHooks);
+      try {
+        if (runtime === 'codex') await adapter.start();
+        return await adapter.listModels();
+      } finally {
+        if (runtime === 'codex') {
+          await adapter.close(2000).catch(() => undefined);
+          await host.closeJob(probeId).catch(() => undefined);
+        }
+      }
+    });
+
+  const service = new SessionService({
+    repositories,
+    store,
+    policy: options.policy ?? permissionPolicy,
+    publish: (event) => void bus.publish(event),
+    now,
+    uuid,
+    hashPayload: sha256,
+    resolveRealPath: (path) => options.resolveRealPath(path),
+    createAdapter: (runtime, sessionId) => createAdapter(runtime, sessionId, hooks),
+    mountMcp: (sessionId) => mcp.mount(sessionId),
+    listModels,
+    isRuntimeAvailable: (runtime) => runtime === 'claude' || options.codexExecutable !== undefined || options.createAdapter !== undefined,
+    onSessionOpened: (sessionId) => {
+      void repositories.sessions.get(sessionId).then((s) => s && watchers.start(sessionId, s.folderScope.workspaceRoot));
+    },
+    onSessionClosed: async (sessionId) => {
+      watchers.stop(sessionId);
+      try {
+        mcp.revoke(sessionId);
+      } catch {
+        // Closed already.
+      }
+      // The graceful close had its chance; whatever is left in the session's Job ends now (R-14, CR-7).
+      await host.closeJob(sessionId).catch((error: unknown) => log(`[backend] ending the Job of ${sessionId} failed (${describe(error)})`));
+    },
+    log,
+  });
+  ref.service = service;
+
+  // 6. Restart recovery (CR-2): unknown only reconciled, pending through the one dispatch entry.
+  try {
+    const report = await service.start();
+    if (report.failed.length > 0) log(`[backend] ${String(report.failed.length)} delivery(ies) could not be recovered`);
+  } catch (error) {
+    log(`[backend] recovery failed (${describe(error)})`);
+  }
+
+  // 7. Model lists, in the background: the window does not wait for them (R-12).
+  let modelOptions: ModelOption[] = [];
+  for (const runtime of ['claude', 'codex'] as const) {
+    if (runtime === 'codex' && options.codexExecutable === undefined && options.createAdapter === undefined) continue;
+    void listModels(runtime)
+      .then((list) => {
+        modelOptions = [...modelOptions.filter((m) => m.runtime !== runtime), ...list];
+        bus.publish({ type: 'modelOptions.updated', runtime, options: list, at: now() });
+      })
+      .catch((error: unknown) => log(`[backend] listing ${runtime} models failed (${describe(error)})`));
+  }
+
+  let closing: Promise<void> | undefined;
+  const facade: AppFacade = {
+    async snapshot(): Promise<Snapshot> {
+      // The seq first: anything published after it is applied again by the renderer, never skipped.
+      const seq = bus.seq;
+      const data = await repositories.readSnapshotData();
+      return {
+        schemaVersion: CONTRACTS_VERSION,
+        seq,
+        agents: data.agents,
+        workflows: data.workflows,
+        modelOptions,
+        sessions: data.sessions,
+        messages: data.conversations.messages,
+        turns: data.conversations.turns,
+        items: data.conversations.items,
+        permissionRequests: data.conversations.permissionRequests,
+        nativeTasks: data.conversations.nativeTasks,
+        artifacts: data.conversations.artifacts,
+        instances: [],
+        handoffs: [],
+        peerMessages: [],
+        escalations: data.escalations,
+        transfers: [],
+        preferences: data.preferences,
+      };
+    },
+    async execute(command: Command): Promise<CommandResult> {
+      if (closing !== undefined) return failure(command.requestId, 'runtime_unavailable', 'The application is closing');
+      try {
+        return await service.execute(command);
+      } catch (error) {
+        log(`[backend] ${command.type} failed (${describe(error)})`);
+        const storage = error instanceof Error && (error.name === 'StoredDataError' || error.name === 'InvalidRecordError');
+        return failure(command.requestId, storage ? 'storage_failed' : 'internal_error', storage ? 'The stored data could not be read or written' : 'The command failed', {
+          mayHaveSideEffects: true,
+        });
+      }
+    },
+  };
+
+  const shutdown = (): Promise<void> => {
+    closing ??= (async () => {
+      // R-14: no new tool calls, then every session closed gracefully, then whatever is left in a Job.
+      await mcp.close().catch(() => undefined);
+      await within(service.shutdown(closeTimeoutMs), closeTimeoutMs * 2);
+      const left: OwnedProcess[] = await host.listOwned().catch(() => []);
+      for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
+      watchers.stopAll();
+      db.close();
+    })();
+    return closing;
+  };
+
+  return {
+    status: 'ready',
+    facade,
+    service,
+    repositories,
+    mcp,
+    async unfinishedWork() {
+      const work = await service.unfinishedWork();
+      const owned = await host.listOwned().catch(() => []);
+      return {
+        runningSessions: work.runningSessions.length,
+        heldRequests: work.heldRequests,
+        runningNativeTasks: work.runningNativeTasks,
+        commands: owned.filter((p) => p.kind === 'command' && p.endedAt === undefined).length,
+      };
+    },
+    shutdown,
+  };
+}

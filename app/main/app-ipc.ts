@@ -40,11 +40,11 @@ export const SNAPSHOT_UNAVAILABLE = 'The state snapshot is not available';
  * The Snapshot, checked against the contract before it leaves the main process. Electron hands a handler's
  * thrown message to the renderer, so a failure is logged here (field paths only) and rethrown as fixed text.
  */
-export function readSnapshot(facade: AppFacade, log: (message: string) => void = console.error): Snapshot {
+export async function readSnapshot(facade: AppFacade, log: (message: string) => void = console.error): Promise<Snapshot> {
   let raw: unknown;
   let failed = false;
   try {
-    raw = facade.snapshot();
+    raw = await facade.snapshot();
   } catch (error) {
     log(`[ipc] the backend failed to produce a snapshot (${error instanceof Error ? error.name : 'non-error thrown'})`);
     failed = true;

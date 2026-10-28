@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { CommandResult, Snapshot, type Command, type EventEnvelope } from '../../contracts';
-import { fixtureSnapshot } from '../../contracts/fixtures/snapshot';
-import { EventBus } from './event-bus';
-import { createFakeFacade } from './facade';
+import { CommandResult, Snapshot, type Command, type EventEnvelope } from '../../../contracts';
+import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
+import { EventBus } from '../event-bus';
+import { createFakeFacade } from './fake-facade';
 
 const setup = () => {
   const bus = new EventBus({ seq: fixtureSnapshot.seq });
