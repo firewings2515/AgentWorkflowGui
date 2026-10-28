@@ -89,6 +89,23 @@ describe('r3-P1-2 git positionals are paths unless they read as revisions', () =
     ['git blame src/a.ts', 'approve'],
     ['git grep foo', 'approve'],
   ])('r3-P1-2 everyday git: %s → %s', (cmd, expected) => expect(verdict(command(cmd))).toBe(expected));
+  // Main session check: an absolute path holds a `:` but is not a revision; `git diff <outside> <file>` diffs the
+  // outside file without --no-index.
+  const viaLink = withLinks({ 'e:/work/proj/lnk': sh`E:\outside` });
+  it.each([
+    ['git diff E:/outside/a.txt src/a.ts', 'secret-read', undefined],
+    ['git diff E:/outside/a.txt', 'secret-read', undefined],
+    ['git blame E:/outside/a.ts', 'secret-read', undefined],
+    ['git show E:/outside/a.ts', 'secret-read', undefined],
+    ['git grep foo E:/outside', 'secret-read', undefined],
+    ['git rev-parse ../x', 'secret-read', undefined],
+    ['git diff E:/work/proj/lnk/a.ts', 'secret-read', viaLink],
+    ['git blame E:/work/proj/lnk/a.ts', 'secret-read', viaLink],
+    ['git diff E:/work/proj/src/a.ts', 'approve', undefined],
+    ['git log ..origin/main', 'approve', undefined],
+  ] as const)('r3-P1-2 main session check (absolute paths): %s → %s', (cmd, expected, context) =>
+    expect(verdict(command(cmd), context)).toBe(expected),
+  );
 });
 
 describe('r3-P1-3 NTFS alternate data streams', () => {

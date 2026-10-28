@@ -527,7 +527,9 @@ const GIT_REMOTE_GET_URL = posix('', 'push all');
 // A word git reads as a revision: `HEAD~1`, `main^`, `a..b`, `HEAD:path`, `@{u}`, a hash or a special head.
 // A `..` next to a slash (`../x`) is a path, not a range.
 const REVISION = /[~^:]|[^./\\]\.\.|\.\.[^./\\]|@\{|^@$|^(HEAD|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD)$|^[0-9a-f]{7,40}$/i;
-const REMOTE_KEY = /^(remote\.|url\.|branch\..+\.(remote|pushremote|merge)$)/i;
+// `..` alone or before a slash climbs; `..main` is a range.
+const ON_DISK = /^([a-z]:|[\\/]|\.\.([\\/]|$)|~)/i;
+const REMOTE_KEY =/^(remote\.|url\.|branch\..+\.(remote|pushremote|merge)$)/i;
 
 const git: Handler = (args) => {
   let i = 0;
@@ -559,7 +561,8 @@ const git: Handler = (args) => {
     positionals.forEach((p, k) => {
       const afterDashDash = k + offset >= end;
       // Before `--` a word that reads as a revision (`HEAD~1`, `a..b`, `HEAD:path`, a hash) is one; any other is checked as a path.
-      if (afterDashDash || mode === 'paths' || (mode === 'mixed' && !REVISION.test(p.text))) fx.reads.push(inRepo(p));
+      // A drive, rooted, climbing or home path always names one on disk, whatever the mode: `git diff E:/x a.ts` reads E:/x.
+      if (afterDashDash || mode === 'paths' || ON_DISK.test(p.text) || (mode === 'mixed' && !REVISION.test(p.text))) fx.reads.push(inRepo(p));
     });
     return fx;
   };
