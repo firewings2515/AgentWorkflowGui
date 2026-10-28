@@ -25,6 +25,21 @@ describe('runtime spawn functions', () => {
     expect(calls).toEqual([[S, 'codex', { command: 'C:\\codex\\codex.exe', args: ['-c', 'features.apps=false', 'app-server'], cwd: 'E:\\w', env: undefined }]]);
   });
 
+  it.runIf(process.platform === 'win32')('reads claude.exe’s stderr, so a chatty process never blocks on it', async () => {
+    const host = new WindowsProcessHost();
+    try {
+      let stderr = 0;
+      // 4 MiB of stderr, far beyond any pipe buffer, then one line on stdout.
+      const script = "const b=Buffer.alloc(65536,120);let n=0;const w=()=>{while(n<64){n++;if(!process.stderr.write(b))return process.stderr.once('drain',w)}process.stdout.write('done')};w();setInterval(()=>{},1000)";
+      const child = claudeProcessSpawn(host, S, (text) => (stderr += text.length))({ command: process.execPath, args: ['-e', script], env: { ...process.env } });
+      const [line] = (await once(child.stdout, 'data')) as [Buffer];
+      expect(line.toString()).toBe('done');
+      expect(stderr).toBe(64 * 65536);
+    } finally {
+      await host.dispose();
+    }
+  });
+
   it.runIf(process.platform === 'win32')('ends claude.exe when the SDK aborts', async () => {
     const host = new WindowsProcessHost();
     try {

@@ -34,11 +34,17 @@ export interface ClaudeProcessSpawnOptions {
   signal?: AbortSignal;
 }
 
-/** For the SDK's `spawnClaudeCodeProcess`: claude.exe of this session, inside its Job. */
+/**
+ * For the SDK's `spawnClaudeCodeProcess`: claude.exe of this session, inside its Job. The SDK reads only
+ * stdout of a custom spawn, so stderr is read here (to `onStderr`, or dropped); left unread, a full
+ * pipe would block claude.exe.
+ */
 export const claudeProcessSpawn =
-  (host: JobSpawner, sessionId: SessionId) =>
+  (host: JobSpawner, sessionId: SessionId, onStderr?: (text: string) => void) =>
   (options: ClaudeProcessSpawnOptions): JobChild => {
     const child = host.spawn(sessionId, 'claude', { command: options.command, args: options.args, cwd: options.cwd, env: options.env });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (text: string) => onStderr?.(text));
     const { signal } = options;
     if (signal) {
       const onAbort = () => child.kill('SIGTERM');

@@ -3,7 +3,7 @@
 // cleanup ends only records whose PID and creation time both still match. The tests end only processes
 // they started, through their own handles.
 import { type ChildProcess, spawn } from 'node:child_process';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +11,7 @@ import { build } from 'vite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { OwnedProcess, SessionId } from '../../contracts';
 import type { OwnedProcessRepository } from '../../core/ports/repository';
-import { WindowsProcessHost } from './host';
+import { type HostNative, WindowsProcessHost } from './host';
 import type { JobChild } from './launch';
 import { RUNTIME_WITH_DETACHED_WORKER, isAlive, waitUntil } from './testing/workers';
 import { closeHandle, creationTime, openProcess } from './win32';
@@ -152,5 +152,34 @@ describe.runIf(windows)('WindowsProcessHost', () => {
     } finally {
       for (const p of spawned) p.kill();
     }
+  });
+});
+
+describe('WindowsProcessHost Job scan (simulated kernel32)', () => {
+  it('skips a listed PID that another process took over before it was opened', async () => {
+    const opened: bigint[] = [];
+    const closed: bigint[] = [];
+    // PID 100 is the runtime host. PID 200 was in the Job when the list was read, then exited, and an
+    // outside process got the PID before it was opened: its handle is not in the Job.
+    const native: HostNative = {
+      createKillOnCloseJob: () => 1n,
+      terminateJob: () => undefined,
+      jobProcessIds: () => [100, 200],
+      openProcess: (pid) => (opened.push(BigInt(pid)), BigInt(pid)),
+      isProcessInJob: (handle, job) => job === 1n && handle === 100n,
+      creationTime: (handle) => Number(handle) * 1000,
+      imagePath: () => 'C:\tools\node.exe',
+      exitCodeOf: () => undefined,
+      terminateProcess: () => true,
+      closeHandle: (handle) => void closed.push(handle),
+    };
+    const launch = () => Object.assign(new EventEmitter(), { pid: 100, startedAt: 100_000 }) as unknown as JobChild;
+    const { rows, repository } = memoryRepository();
+    const host = new WindowsProcessHost({ repository, native, launch });
+    host.spawn(A, 'codex', { command: 'codex.exe' });
+
+    expect((await host.listOwned(A)).map((p) => p.pid)).toEqual([100]);
+    expect(rows.map((r) => [r.pid, r.kind])).toEqual([[100, 'runtime-host']]);
+    expect(opened.sort()).toEqual(closed.filter((h) => h !== 1n).sort());
   });
 });

@@ -39,6 +39,7 @@ interface Kernel32 {
   SetInformationJobObject(job: Handle, infoClass: number, info: Buffer, length: number): number;
   QueryInformationJobObject(job: Handle, infoClass: number, info: Buffer, length: number, returned: null): number;
   AssignProcessToJobObject(job: Handle, process: Handle): number;
+  IsProcessInJob(process: Handle, job: Handle, result: Buffer): number;
   TerminateJobObject(job: Handle, exitCode: number): number;
   CreateFileW(name: Buffer, access: number, share: number, security: Buffer, disposition: number, flags: number, template: null): Handle;
   InitializeProcThreadAttributeList(list: Handle | null, count: number, flags: number, size: Buffer): number;
@@ -77,6 +78,7 @@ const native = () => {
     'int __stdcall SetInformationJobObject(void *job, int infoClass, void *info, uint32_t length)',
     'int __stdcall QueryInformationJobObject(void *job, int infoClass, void *info, uint32_t length, void *returned)',
     'int __stdcall AssignProcessToJobObject(void *job, void *process)',
+    'int __stdcall IsProcessInJob(void *process, void *job, void *result)',
     'int __stdcall TerminateJobObject(void *job, uint32_t exitCode)',
     'void * __stdcall CreateFileW(void *name, uint32_t access, uint32_t share, void *security, uint32_t disposition, uint32_t flags, void *template)',
     'int __stdcall InitializeProcThreadAttributeList(void *list, uint32_t count, uint32_t flags, void *size)',
@@ -244,6 +246,13 @@ export const createSuspended = (options: CreateSuspendedOptions): Created => {
 
 export const assignToJob = (job: Handle, process: Handle) => {
   if (!native().k32.AssignProcessToJobObject(job, process)) fail('AssignProcessToJobObject');
+};
+
+/** Whether the process behind this handle is in the Job; the handle pins the process, so a PID cannot be reused under it. */
+export const isProcessInJob = (process: Handle, job: Handle): boolean => {
+  const result = Buffer.alloc(4);
+  if (!native().k32.IsProcessInJob(process, job, result)) fail('IsProcessInJob');
+  return result.readInt32LE(0) !== 0;
 };
 
 export const resumeThread = (thread: Handle) => {

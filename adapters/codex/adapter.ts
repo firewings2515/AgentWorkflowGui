@@ -244,6 +244,8 @@ export class CodexAdapter implements RuntimeAdapter {
   readonly runtime = 'codex' as const;
   private conn: RpcConnection | undefined;
   private closing = false;
+  /** The one GUI session this app-server serves (CR-7); set by its first thread. */
+  private owner: SessionId | undefined;
   private info: ServerInfo | undefined;
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   private readonly threads = new Map<string, ThreadBinding>();
@@ -335,6 +337,8 @@ export class CodexAdapter implements RuntimeAdapter {
    * first turn/start.
    */
   async startSession(options: StartSessionOptions): Promise<NativeSessionInfo> {
+    this.claim(options.sessionId);
+    if (!this.conn) await this.start();
     const model = this.codexSelection(options.model);
     const info = await this.startThread({ sessionId: options.sessionId, cwd: options.cwd, ...this.settingsOf(options, model) });
     this.keepEffort(info.threadId, model);
@@ -342,6 +346,9 @@ export class CodexAdapter implements RuntimeAdapter {
   }
 
   async resumeSession(options: ResumeSessionOptions): Promise<NativeSessionInfo> {
+    this.claim(options.sessionId);
+    // After closeSession the app-server is gone; resuming starts a new one in the session's Job.
+    if (!this.conn) await this.start();
     const model = this.codexSelection(options.model);
     const info = await this.resumeThread({ sessionId: options.sessionId, threadId: options.nativeSessionRef, cwd: options.cwd, ...this.settingsOf(options, model) });
     this.keepEffort(info.threadId, model);
@@ -357,6 +364,10 @@ export class CodexAdapter implements RuntimeAdapter {
     const binding = this.binding(nativeSessionRef);
     if (binding.nativeTaskId !== undefined) throw new Error(`thread ${nativeSessionRef} is a native task; close its session's thread instead`);
     const { forced } = await this.close(timeoutMs);
+    // Forget the exited process and what it had loaded, so resumeSession can start a fresh one.
+    this.conn = undefined;
+    this.closing = false;
+    this.threads.clear();
     return { forced };
   }
 
@@ -407,12 +418,16 @@ export class CodexAdapter implements RuntimeAdapter {
    * closed connection the thread may exist anyway; the caller must not blindly start another.
    */
   async startThread(options: StartThreadOptions): Promise<CodexThreadInfo> {
+    this.claim(options.sessionId);
     const response = await this.request('thread/start', { cwd: options.cwd, ...this.threadParams(options) });
-    return this.bindFromResponse(options.sessionId, response, 'thread/start');
+    const info = this.bindFromResponse(options.sessionId, response, 'thread/start');
+    this.owner = options.sessionId;
+    return info;
   }
 
   /** `thread/resume` without loading the full history (read its history with readHistory). */
   async resumeThread(options: ResumeThreadOptions): Promise<CodexThreadInfo> {
+    this.claim(options.sessionId);
     const existing = this.threads.get(options.threadId);
     if (existing && existing.sessionId !== options.sessionId) throw new Error(`thread/resume: thread ${options.threadId} is already bound to another session`);
     // Bound before the request: a running thread's events and approvals can arrive right behind the response.
@@ -424,7 +439,9 @@ export class CodexAdapter implements RuntimeAdapter {
         ...this.threadParams(options),
         excludeTurns: true,
       });
-      return this.bindFromResponse(options.sessionId, response, 'thread/resume');
+      const info = this.bindFromResponse(options.sessionId, response, 'thread/resume');
+      this.owner = options.sessionId;
+      return info;
     } catch (error) {
       if (!existing) this.threads.delete(options.threadId);
       throw error;
@@ -1413,6 +1430,16 @@ export class CodexAdapter implements RuntimeAdapter {
   }
 
   // ---- helpers ------------------------------------------------------------------------------------
+
+  /**
+   * One adapter, one app-server, one GUI session (CR-7): closing the session closes the app-server and
+   * its Job, so a second session here would be ended with it.
+   */
+  private claim(sessionId: SessionId): void {
+    if (this.owner !== undefined && this.owner !== sessionId) {
+      throw new Error(`this Codex app-server serves session ${this.owner}; session ${sessionId} needs its own adapter (CR-7)`);
+    }
+  }
 
   private binding(threadId: string): ThreadBinding {
     const binding = this.threads.get(threadId);

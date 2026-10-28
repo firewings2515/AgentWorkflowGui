@@ -1,8 +1,12 @@
 // The launcher against the real kernel32: a suspended start inside a KILL_ON_JOB_CLOSE Job, stdio through
-// named pipes, the exit code, and that only the three pipe handles are inherited.
+// named pipes, the exit code, and that only the three pipe handles are inherited. Failure paths run on a
+// simulated kernel32.
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
-import { launchInJob } from './launch';
+import { type LaunchNative, launchInJob } from './launch';
 import { closeHandle, createKillOnCloseJob, jobProcessIds, terminateJob } from './win32';
 
 const windows = process.platform === 'win32';
@@ -80,5 +84,86 @@ describe.runIf(windows)('launchInJob', () => {
     } finally {
       closeHandle(job);
     }
+  });
+});
+
+describe.runIf(windows)('launchInJob handle inheritance', () => {
+  // A named, inheritable event stands for any inheritable handle the GUI happens to hold. The child opens
+  // the event by name and asks the kernel whether the handle value it was told about is that same object.
+  const koffiPath = createRequire(import.meta.url).resolve('koffi');
+  const probe = (handle: bigint, name: string) =>
+    `const k=require(${JSON.stringify(koffiPath)}).load('kernel32.dll');` +
+    "const open=k.func('void * __stdcall OpenEventW(uint32_t a,int i,const char16_t *n)');" +
+    `const same=require(${JSON.stringify(koffiPath)}).load('kernelbase.dll').func('int __stdcall CompareObjectHandles(void *a,void *b)');` +
+    `const mine=open(0x100000,0,${JSON.stringify(name)});` +
+    `process.stdout.write(String(same(${handle}n,mine)!==0))`;
+
+  it('gives the child none of the GUI’s other inheritable handles (Node’s own spawn does)', async () => {
+    const koffi = createRequire(import.meta.url)('koffi') as { load(p: string): { func(s: string): (...a: unknown[]) => unknown } };
+    const k32 = koffi.load('kernel32.dll');
+    const createEvent = k32.func('void * __stdcall CreateEventW(void *sa, int manual, int initial, const char16_t *name)');
+    const security = Buffer.alloc(24);
+    security.writeUInt32LE(24, 0);
+    security.writeInt32LE(1, 16);
+    const name = `awg-t013-${randomUUID()}`;
+    const event = createEvent(security, 1, 0, name) as bigint;
+    const job = createKillOnCloseJob();
+    try {
+      const run = async (child: { stdout: NodeJS.ReadableStream | null }) => {
+        let out = '';
+        child.stdout!.setEncoding('utf8');
+        child.stdout!.on('data', (d: string) => (out += d));
+        await once(child.stdout!, 'end');
+        return out;
+      };
+      const viaNode = spawn(process.execPath, ['-e', probe(event, name)], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      expect(await run(viaNode)).toBe('true');
+      const inJob = launchInJob(job, { command: process.execPath, args: ['-e', probe(event, name)] });
+      inJob.stdin.end();
+      expect(await run(inJob)).toBe('false');
+    } finally {
+      closeHandle(event);
+      closeHandle(job);
+    }
+  });
+});
+
+describe.runIf(windows)('launchInJob failure paths (simulated kernel32)', () => {
+  const fake = (fail: 'create' | 'assign' | 'resume') => {
+    const calls: string[] = [];
+    const closed: bigint[] = [];
+    let next = 10n;
+    const native: LaunchNative = {
+      openInheritablePipe: () => next++,
+      createSuspended: () => {
+        if (fail === 'create') throw new Error('CreateProcessW failed');
+        calls.push('create');
+        return { process: 20n, thread: 21n, pid: 5 };
+      },
+      assignToJob: () => {
+        if (fail === 'assign') throw new Error('AssignProcessToJobObject failed');
+        calls.push('assign');
+      },
+      creationTime: () => 0,
+      resumeThread: () => {
+        if (fail === 'resume') throw new Error('ResumeThread failed');
+        calls.push('resume');
+      },
+      exitCodeOf: () => undefined,
+      terminateProcess: (handle) => (calls.push(`terminate ${handle}`), true),
+      closeHandle: (handle) => void closed.push(handle),
+    };
+    return { native, calls, closed };
+  };
+
+  it.each([
+    ['create', [], [10n, 11n, 12n]],
+    ['assign', ['create', 'terminate 20'], [10n, 11n, 12n, 20n, 21n]],
+    ['resume', ['create', 'assign', 'terminate 20'], [10n, 11n, 12n, 20n, 21n]],
+  ] as const)('a failed %s never resumes, ends the suspended process and closes every handle', (fail, calls, closed) => {
+    const f = fake(fail);
+    expect(() => launchInJob(1n, { command: process.execPath }, f.native)).toThrow(/failed/);
+    expect(f.calls).toEqual(calls);
+    expect(f.closed.sort()).toEqual([...closed]);
   });
 });

@@ -8,7 +8,13 @@ import type { OwnedProcess, Runtime, SessionId, Timestamp } from '../../contract
 import type { ProcessHost, SessionJob } from '../../core/ports/process';
 import type { OwnedProcessRepository } from '../../core/ports/repository';
 import { type JobChild, type LaunchOptions, launchInJob } from './launch';
-import * as win32 from './win32';
+import * as kernel32 from './win32';
+
+/** The kernel32 calls the host makes, swappable in tests. */
+export type HostNative = Pick<
+  typeof kernel32,
+  'createKillOnCloseJob' | 'terminateJob' | 'jobProcessIds' | 'openProcess' | 'isProcessInJob' | 'creationTime' | 'imagePath' | 'exitCodeOf' | 'terminateProcess' | 'closeHandle'
+>;
 
 export interface WindowsProcessHostOptions {
   /** Where every started process is recorded, so the next start can clean up after a crash. */
@@ -17,10 +23,13 @@ export interface WindowsProcessHostOptions {
   /** How long closeJob waits for the Job to empty (default 5 s). */
   closeTimeoutMs?: number;
   log?: (level: 'debug' | 'warn', message: string, detail?: unknown) => void;
+  /** Tests only: replaces kernel32 and the launcher. */
+  native?: HostNative;
+  launch?: (job: kernel32.Handle, options: LaunchOptions) => JobChild;
 }
 
 interface OpenJob extends SessionJob {
-  handle: win32.Handle;
+  handle: kernel32.Handle;
   runtime?: Runtime;
   hosts: Set<JobChild>;
   /** Every process seen in the Job, by PID, with its creation time. */
@@ -32,25 +41,13 @@ const sameProcess = (a: Pick<OwnedProcess, 'pid' | 'startedAt'>, b: Pick<OwnedPr
   a.pid === b.pid && Date.parse(a.startedAt) === Date.parse(b.startedAt);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Opens a process, runs `fn` on its handle, and always closes it; undefined when it is gone. */
-const withProcess = <T>(pid: number, fn: (handle: win32.Handle) => T): T | undefined => {
-  const handle = win32.openProcess(pid);
-  if (handle === undefined) return undefined;
-  try {
-    return fn(handle);
-  } finally {
-    win32.closeHandle(handle);
-  }
-};
-
-/** Whether this very process (PID and creation time) has not exited yet. */
-const running = (p: Pick<OwnedProcess, 'pid' | 'startedAt'>) =>
-  withProcess(p.pid, (handle) => win32.creationTime(handle) === Date.parse(p.startedAt) && win32.exitCodeOf(handle) === undefined) ?? false;
-
 export class WindowsProcessHost implements ProcessHost {
   private readonly jobs = new Map<SessionId, OpenJob>();
+  private readonly win32: HostNative;
 
-  constructor(private readonly options: WindowsProcessHostOptions = {}) {}
+  constructor(private readonly options: WindowsProcessHostOptions = {}) {
+    this.win32 = options.native ?? kernel32;
+  }
 
   openJob(sessionId: SessionId): Promise<SessionJob> {
     const { sessionId: id, jobRef } = this.job(sessionId);
@@ -65,7 +62,7 @@ export class WindowsProcessHost implements ProcessHost {
     const job = this.job(sessionId);
     if (job.runtime !== undefined && job.runtime !== runtime) throw new Error(`session ${sessionId} already runs ${job.runtime}`);
     job.runtime = runtime;
-    const child = launchInJob(job.handle, options);
+    const child = (this.options.launch ?? launchInJob)(job.handle, options);
     job.hosts.add(child);
     child.once('exit', () => job.hosts.delete(child));
     this.remember(job, runtime, { pid: child.pid, startedAt: iso(child.startedAt), kind: 'runtime-host' });
@@ -91,10 +88,10 @@ export class WindowsProcessHost implements ProcessHost {
     for (const record of records) {
       if (record.endedAt !== undefined || ours.some((p) => sameProcess(p, record))) continue;
       // Compare and terminate through one handle: the PID cannot change owner in between.
-      const outcome = withProcess(record.pid, (handle) => {
+      const outcome = this.withProcess(record.pid, (handle) => {
         // An exited process stays openable while someone holds a handle to it.
-        if (win32.creationTime(handle) !== Date.parse(record.startedAt) || win32.exitCodeOf(handle) !== undefined) return 'gone';
-        return win32.terminateProcess(handle, 1) ? 'ended' : 'failed';
+        if (this.win32.creationTime(handle) !== Date.parse(record.startedAt) || this.win32.exitCodeOf(handle) !== undefined) return 'gone';
+        return this.win32.terminateProcess(handle, 1) ? 'ended' : 'failed';
       });
       if (outcome === 'ended') ended.push({ ...record, endedAt: this.now() });
       else if (outcome === 'failed') this.log('warn', 'could not end an orphan', record);
@@ -113,7 +110,7 @@ export class WindowsProcessHost implements ProcessHost {
   private job(sessionId: SessionId): OpenJob {
     let job = this.jobs.get(sessionId);
     if (!job) {
-      job = { sessionId, jobRef: `job-${randomUUID()}`, handle: win32.createKillOnCloseJob(), hosts: new Set(), seen: new Map() };
+      job = { sessionId, jobRef: `job-${randomUUID()}`, handle: this.win32.createKillOnCloseJob(), hosts: new Set(), seen: new Map() };
       this.jobs.set(sessionId, job);
     }
     return job;
@@ -125,10 +122,14 @@ export class WindowsProcessHost implements ProcessHost {
     // Nothing was started in the Job yet, so it is empty.
     if (runtime === undefined) return [];
     const live: OwnedProcess[] = [];
-    for (const pid of win32.jobProcessIds(job.handle)) {
+    for (const pid of this.win32.jobProcessIds(job.handle)) {
       let info: { startedAt: Timestamp; image: string } | undefined;
       try {
-        info = withProcess(pid, (handle) => ({ startedAt: iso(win32.creationTime(handle)), image: win32.imagePath(handle) }));
+        // The PID may have been reused since the list was read: only a handle to a process that is in
+        // this Job identifies one of ours, and its identity is read through that same handle.
+        info = this.withProcess(pid, (handle) =>
+          this.win32.isProcessInJob(handle, job.handle) ? { startedAt: iso(this.win32.creationTime(handle)), image: this.win32.imagePath(handle) } : undefined,
+        );
       } catch (error) {
         this.log('debug', `cannot read process ${pid} of ${job.jobRef}`, error);
       }
@@ -156,15 +157,15 @@ export class WindowsProcessHost implements ProcessHost {
     let before: OwnedProcess[] = [];
     try {
       before = this.scan(job);
-      win32.terminateJob(job.handle, 1);
+      this.win32.terminateJob(job.handle, 1);
       // TerminateJobObject returns, and the Job's member list empties, before the processes have exited.
       const deadline = Date.now() + (this.options.closeTimeoutMs ?? 5000);
-      while (before.some(running) && Date.now() < deadline) await sleep(20);
+      while (before.some((p) => this.running(p)) && Date.now() < deadline) await sleep(20);
     } catch (error) {
       this.log('warn', `ending ${job.jobRef} failed; closing its handle ends it`, error);
     } finally {
       // The last handle: KILL_ON_JOB_CLOSE ends whatever is still in the Job.
-      win32.closeHandle(job.handle);
+      this.win32.closeHandle(job.handle);
     }
     const at = this.now();
     const ended = before.map((p) => ({ ...p, endedAt: at }));
@@ -182,6 +183,22 @@ export class WindowsProcessHost implements ProcessHost {
         this.log('warn', 'could not mark an owned process ended', error);
       }
     }
+  }
+
+  /** Opens a process, runs `fn` on its handle, and always closes it; undefined when it is gone. */
+  private withProcess<T>(pid: number, fn: (handle: kernel32.Handle) => T): T | undefined {
+    const handle = this.win32.openProcess(pid);
+    if (handle === undefined) return undefined;
+    try {
+      return fn(handle);
+    } finally {
+      this.win32.closeHandle(handle);
+    }
+  }
+
+  /** Whether this very process (PID and creation time) has not exited yet. */
+  private running(p: Pick<OwnedProcess, 'pid' | 'startedAt'>): boolean {
+    return this.withProcess(p.pid, (handle) => this.win32.creationTime(handle) === Date.parse(p.startedAt) && this.win32.exitCodeOf(handle) === undefined) ?? false;
   }
 
   private now(): Timestamp {

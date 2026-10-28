@@ -1,7 +1,7 @@
 // The runtime port (T005/T006) on the Codex adapter: session start / resume, model changes, inserts,
 // interrupts, the native process reference and stored history. Scripts reuse the SP-01 handshake.
 import { describe, expect, it } from 'vitest';
-import { AttemptId, ClientMessageId, NativeTaskId } from '../../contracts';
+import { AttemptId, ClientMessageId, NativeTaskId, SessionId } from '../../contracts';
 import type { DispatchRequest, RuntimeAdapter } from '../../core/ports';
 import { CodexAdapter, type CodexAdapterOptions } from './adapter';
 import { ISOLATION_CONFIG } from './protocol';
@@ -293,6 +293,32 @@ describe('closeSession (R-14, one app-server per GUI session)', () => {
     expect(await adapter.closeSession(THREAD_ID, 20)).toEqual({ forced: true });
     expect(jobEnded).toBe(1);
     expect(adapter.running).toBe(false);
+  });
+
+  it('serves one GUI session only: a second one is refused, and closing reports only the first', async () => {
+    const h = await resumed([]);
+    const B = SessionId.parse('session-b');
+    await expect(h.adapter.startSession({ sessionId: B, cwd: CWD, model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false })).rejects.toThrow(/needs its own adapter/);
+    await expect(h.adapter.resumeSession({ sessionId: B, nativeSessionRef: 'thread-b', cwd: CWD, model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false })).rejects.toThrow(/needs its own adapter/);
+    expect(h.fake.received.filter((m) => m.method === 'thread/start')).toEqual([]);
+    await h.adapter.closeSession(THREAD_ID);
+    expect(h.of('runtime.exited').map((e) => e.sessionIds)).toEqual([[SESSION]]);
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
+  it('resumes the closed session in a fresh app-server', async () => {
+    const script = (): ReplayRecord[] => [...init(), out('thread/resume', 2), reply(2, recordedResult(sp01, 'thread/start'))];
+    const fakes = [new FakeAppServer(script()), new FakeAppServer(script())];
+    let spawned = 0;
+    const adapter = new CodexAdapter({ spawn: () => fakes[spawned++]!, onPermissionRequest: () => undefined });
+    await adapter.start();
+    await adapter.resumeSession({ sessionId: SESSION, nativeSessionRef: THREAD_ID, cwd: CWD, model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false });
+    expect(await adapter.closeSession(THREAD_ID)).toEqual({ forced: false });
+    expect(adapter.running).toBe(false);
+    expect(await adapter.resumeSession({ sessionId: SESSION, nativeSessionRef: THREAD_ID, cwd: CWD, model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false })).toMatchObject({ nativeSessionRef: THREAD_ID });
+    expect({ spawned, running: adapter.running }).toEqual({ spawned: 2, running: true });
+    expect(fakes.flatMap((f) => f.mismatches)).toEqual([]);
+    await adapter.close();
   });
 
   it('refuses a thread it does not host', async () => {
