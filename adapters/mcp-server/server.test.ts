@@ -71,7 +71,37 @@ interface RawResponse {
   text: string;
 }
 
-const raw = (url: string, options: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<RawResponse> =>
+/** A request left open: what has arrived so far is in `state`; `req.destroy()` drops the connection. */
+const rawOpen = (url: string, headers: Record<string, string>, body: string) => {
+  const target = new URL(url);
+  const state = { status: 0, text: '' };
+  const req = request({ host: '127.0.0.1', port: target.port, path: target.pathname, method: 'POST', headers }, (res) => {
+    state.status = res.statusCode ?? 0;
+    res.setEncoding('utf8');
+    res.on('data', (chunk: string) => (state.text += chunk));
+    res.on('error', () => {});
+  });
+  req.on('error', () => {});
+  req.end(body);
+  return { req, state };
+};
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Repeats `send` while it answers 409 (the ID still taken), up to about a second. */
+const untilNot409 = async (send: () => Promise<RawResponse>): Promise<RawResponse> => {
+  for (let i = 0; i < 50; i++) {
+    const res = await send();
+    if (res.status !== 409) return res;
+    await sleep(20);
+  }
+  throw new Error('the ID stayed taken');
+};
+
+const toolCall = (id: number, name: string, args: unknown, meta?: Record<string, unknown>) =>
+  JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args, ...(meta && { _meta: meta }) } });
+
+const raw = (url: string, options: { method?: string; headers?: Record<string, string>; body?: string | Buffer } = {}): Promise<RawResponse> =>
   new Promise((resolve, reject) => {
     const target = new URL(url);
     const req = request(
@@ -288,6 +318,103 @@ describe('GuiMcpServer', () => {
   });
 
   // Review r1 P1-4: an initialize whose body arrived after the token was replaced still opened a session.
+  // Review r2 P1 (a): the ID was freed when the connection dropped, and the old handler's answer then
+  // went to the new request with the same ID.
+  it('keeps an ID taken after its connection drops until the SDK has ended that request', async () => {
+    const oldGate = deferred<void>();
+    let finished = 0;
+    const handlers = makeHandlers({
+      handoff: vi.fn<McpToolHandlers['handoff']>(async (_input, ctx) => {
+        if (ctx.sourceCallRef.endsWith(':old')) await oldGate.promise;
+        finished++;
+        return { status: 'accepted', handoffId: `handoff-${ctx.operationId}` as HandoffId, operationId: ctx.operationId, delivery: 'pending' };
+      }),
+    });
+    const server = await startServer(handlers);
+    const mount = server.mount(A);
+    const session = await rawSession(mount);
+    const first = rawOpen(mount.url, session.headers(), toolCall(7, 'handoff', handoffArgs, { callId: 'old' }));
+    await vi.waitFor(() => expect(handlers.handoff).toHaveBeenCalledTimes(1));
+    first.req.destroy();
+    await sleep(50);
+    const newArgs = { ...handoffArgs, content: 'other work' };
+    const whileOldRuns = await session.call(7, 'handoff', newArgs, { callId: 'new' });
+    expect(whileOldRuns.status).toBe(409);
+    expect(handlers.handoff).toHaveBeenCalledTimes(1);
+    oldGate.resolve();
+    await vi.waitFor(() => expect(finished).toBe(1));
+    // Once the old request has ended, the ID is free and the new request gets its own answer.
+    const second = await untilNot409(() => session.call(7, 'handoff', newArgs, { callId: 'new' }));
+    expect(second.status).toBe(200);
+    expect(resultOf(messageOf(second).result)).toMatchObject({ status: 'accepted', operationId: 'op-2' });
+    expect(second.text).not.toContain('op-1');
+  });
+
+  // Review r2 P1 (b): after a cancel the handler had ended, but the ID stayed taken while the old
+  // connection stayed open.
+  it('frees an ID once a cancelled request has ended, even while its connection stays open', async () => {
+    const gate = deferred<void>();
+    let finished = 0;
+    const handlers = makeHandlers({
+      handoff: vi.fn<McpToolHandlers['handoff']>(async (_input, ctx) => {
+        await gate.promise;
+        finished++;
+        return { status: 'accepted', handoffId: `handoff-${ctx.operationId}` as HandoffId, operationId: ctx.operationId, delivery: 'pending' };
+      }),
+    });
+    const server = await startServer(handlers);
+    const mount = server.mount(A);
+    const session = await rawSession(mount);
+    const meta = { callId: 'c1' };
+    const first = rawOpen(mount.url, session.headers(), toolCall(7, 'handoff', handoffArgs, meta));
+    await vi.waitFor(() => expect(handlers.handoff).toHaveBeenCalledTimes(1));
+    const cancel = await raw(mount.url, {
+      headers: session.headers(),
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 7, reason: 'test' } }),
+    });
+    expect(cancel.status).toBe(202);
+    gate.resolve();
+    await vi.waitFor(() => expect(finished).toBe(1));
+    const resend = await untilNot409(() => session.call(7, 'handoff', handoffArgs, meta));
+    expect(resend.status).toBe(200);
+    expect(resultOf(messageOf(resend).result)).toMatchObject({ status: 'duplicate', operationId: 'op-1' });
+    expect(handlers.handoff).toHaveBeenCalledTimes(1);
+    // The cancelled request's stream got nothing, not even the resend's answer.
+    expect(first.state.text).not.toContain('operationId');
+    first.req.destroy();
+  });
+
+  // Review r2 P2: a refused batch without a session header used to leave a transport behind.
+  it('refuses a batch with a repeated ID before opening any transport', async () => {
+    const server = await startServer(makeHandlers());
+    const mount = server.mount(A);
+    await rawSession(mount);
+    expect(server.openMcpSessions).toBe(1);
+    const init = { jsonrpc: '2.0', method: 'initialize', params: { protocolVersion: PROTOCOL, capabilities: {}, clientInfo: { name: 'x', version: '0' } } };
+    for (let i = 0; i < 5; i++) {
+      const res = await raw(mount.url, { headers: jsonHeaders(mount.token), body: JSON.stringify([{ ...init, id: 1 }, { jsonrpc: '2.0', id: 1, method: 'ping' }]) });
+      expect(res.status).toBe(400);
+    }
+    expect(server.openMcpSessions).toBe(1);
+  });
+
+  // Review r2 P2: an invalid UTF-8 byte was replaced with U+FFFD and the tool ran on the changed text.
+  it('answers a body that is not valid UTF-8 with a parse error and runs nothing', async () => {
+    const handlers = makeHandlers();
+    const server = await startServer(handlers);
+    const mount = server.mount(A);
+    const session = await rawSession(mount);
+    const [head, tail] = toolCall(1, 'report_to_root', { content: 'a#b' }).split('#');
+    const body = Buffer.concat([Buffer.from(head!, 'utf8'), Buffer.from([0xff]), Buffer.from(tail!, 'utf8')]);
+    const res = await raw(mount.url, { headers: session.headers(), body });
+    expect(res.status).toBe(400);
+    expect(messageOf(res)).toMatchObject({ error: { code: -32700 } });
+    expect(handlers.report_to_root).not.toHaveBeenCalled();
+    // Valid multi-byte text still passes.
+    expect((await session.call(2, 'report_to_root', { content: '交接 ✓' })).status).toBe(200);
+    expect(handlers.report_to_root.mock.calls[0]?.[0].content).toBe('交接 ✓');
+  });
+
   it('does not open an MCP session for a token replaced while the initialize body was arriving', async () => {
     const server = await startServer(makeHandlers());
     const old = server.mount(A);

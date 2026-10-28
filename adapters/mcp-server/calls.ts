@@ -148,6 +148,11 @@ export class CallRunner {
   /**
    * Drops a caller's record, e.g. when its token is replaced or revoked: its waiters stop waiting and its
    * handlers see their signal abort.
+   *
+   * Known limit: after a resume (new token) or a GUI restart, a resend of a call made before it is taken
+   * for a new call and gets a new operationId. Only `retryOf` plus the store's deduplication by operationId
+   * keep it from being accepted twice, until `DeliveryStore` can look a delivery up by `sourceCallRef`
+   * (T017 / the next port version).
    */
   forget(caller: SessionId): void {
     const record = this.#callers.get(caller);
