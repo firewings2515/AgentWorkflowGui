@@ -82,8 +82,22 @@ import { type AppServerProcess, type ExitInfo, RpcClosedError, RpcConnection, Rp
 export type CodexAdapterEvent = RuntimeEvent;
 
 export interface CodexAdapterOptions extends RuntimeAdapterHooks {
-  /** Replaces the default spawn (tests plug in a fake app-server here). */
+  /**
+   * Replaces the default spawn: the GUI starts the app-server inside the session's Job (T013,
+   * adapters/process), tests plug in a fake app-server. One adapter, and so one app-server, serves one
+   * GUI session (CR-7).
+   */
   spawn?: () => AppServerProcess;
+  /**
+   * Ends the session's Job (ProcessHost.closeJob) when the app-server does not exit after its stdin
+   * closed; without it only the app-server process is killed (R-14).
+   */
+  endJob?: () => Promise<unknown>;
+  /**
+   * After an interrupt, end the thread's command processes with thread/backgroundTerminals/terminate
+   * (CR-7, default true). Off only for replays recorded before the call existed.
+   */
+  terminateCommandsOnInterrupt?: boolean;
   spawnOptions?: SpawnOptions;
   clientInfo?: { name: string; title: string; version: string };
   /**
@@ -230,6 +244,15 @@ export class CodexAdapter implements RuntimeAdapter {
   readonly runtime = 'codex' as const;
   private conn: RpcConnection | undefined;
   private closing = false;
+  /**
+   * The one GUI session this app-server serves (CR-7). Taken before the first request is sent, so a
+   * concurrent second session is refused while the first is still pending; confirmed once a thread of
+   * it is bound, released if every pending attempt failed before that.
+   */
+  private owner: SessionId | undefined;
+  private ownerConfirmed = false;
+  private pendingClaims = 0;
+  private starting: Promise<void> | undefined;
   private info: ServerInfo | undefined;
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   private readonly threads = new Map<string, ThreadBinding>();
@@ -280,7 +303,8 @@ export class CodexAdapter implements RuntimeAdapter {
     });
     const result = await this.request('initialize', {
       clientInfo: this.options.clientInfo ?? { name: 'agent-workflow-gui', title: 'AgentWorkflowGui', version: '0.1.0' },
-      capabilities: null,
+      // thread/backgroundTerminals/* is experimental (CR-7, spike review-followup §1).
+      capabilities: { experimentalApi: true },
     });
     this.conn.notify('initialized');
     const r = isObject(result) ? result : {};
@@ -304,7 +328,10 @@ export class CodexAdapter implements RuntimeAdapter {
     const timeout = <T>(ms: number, value: T) => new Promise<T>((resolve) => setTimeout(() => resolve(value), ms).unref());
     const exit = await Promise.race([conn.exited, timeout(timeoutMs, undefined)]);
     if (exit) return { ...exit, forced: false };
-    conn.kill();
+    if (this.options.endJob) {
+      await this.options.endJob().catch((error: unknown) => this.log('warn', 'ending the session Job failed; killing the app-server', error));
+      if (conn.running) conn.kill();
+    } else conn.kill();
     const killed = await Promise.race([conn.exited, timeout(2000, { code: null, signal: null, error: 'did not exit after kill' })]);
     return { ...killed, forced: true };
   }
@@ -316,26 +343,41 @@ export class CodexAdapter implements RuntimeAdapter {
    * itself (CR2_DELIVERY_FIX §3). The model's effort cannot be set on the thread, so it rides on the
    * first turn/start.
    */
-  async startSession(options: StartSessionOptions): Promise<NativeSessionInfo> {
-    const model = this.codexSelection(options.model);
-    const info = await this.startThread({ sessionId: options.sessionId, cwd: options.cwd, ...this.settingsOf(options, model) });
-    this.keepEffort(info.threadId, model);
-    return { sessionId: options.sessionId, nativeSessionRef: info.threadId, cwd: info.cwd, model: info.configuredModel };
+  startSession(options: StartSessionOptions): Promise<NativeSessionInfo> {
+    return this.asOwner(options.sessionId, async () => {
+      await this.ensureStarted();
+      const model = this.codexSelection(options.model);
+      const info = await this.startThread({ sessionId: options.sessionId, cwd: options.cwd, ...this.settingsOf(options, model) });
+      this.keepEffort(info.threadId, model);
+      return { sessionId: options.sessionId, nativeSessionRef: info.threadId, cwd: info.cwd, model: info.configuredModel };
+    });
   }
 
-  async resumeSession(options: ResumeSessionOptions): Promise<NativeSessionInfo> {
-    const model = this.codexSelection(options.model);
-    const info = await this.resumeThread({ sessionId: options.sessionId, threadId: options.nativeSessionRef, cwd: options.cwd, ...this.settingsOf(options, model) });
-    this.keepEffort(info.threadId, model);
-    return { sessionId: options.sessionId, nativeSessionRef: info.threadId, cwd: info.cwd, model: info.configuredModel };
+  resumeSession(options: ResumeSessionOptions): Promise<NativeSessionInfo> {
+    return this.asOwner(options.sessionId, async () => {
+      // After closeSession the app-server is gone; resuming starts a new one in the session's Job.
+      await this.ensureStarted();
+      const model = this.codexSelection(options.model);
+      const info = await this.resumeThread({ sessionId: options.sessionId, threadId: options.nativeSessionRef, cwd: options.cwd, ...this.settingsOf(options, model) });
+      this.keepEffort(info.threadId, model);
+      return { sessionId: options.sessionId, nativeSessionRef: info.threadId, cwd: info.cwd, model: info.configuredModel };
+    });
   }
 
   /**
-   * Not supported yet (C-07): closing one thread without touching the others on this app-server needs the
-   * per-session app-server and Job of T013, which then closes the whole host for the session.
+   * R-14: this adapter's app-server serves exactly this GUI session (CR-7), so closing the session closes
+   * the app-server: stdin first, and when it does not exit within `timeoutMs` the session's Job ends
+   * (`endJob`). Other sessions run their own app-servers and are not touched.
    */
-  closeSession(nativeSessionRef: string): Promise<{ forced: boolean }> {
-    return Promise.reject(new Error(`closeSession: not supported by the Codex adapter yet (T013), thread ${nativeSessionRef}`));
+  async closeSession(nativeSessionRef: string, timeoutMs = 5000): Promise<{ forced: boolean }> {
+    const binding = this.binding(nativeSessionRef);
+    if (binding.nativeTaskId !== undefined) throw new Error(`thread ${nativeSessionRef} is a native task; close its session's thread instead`);
+    const { forced } = await this.close(timeoutMs);
+    // Forget the exited process and what it had loaded, so resumeSession can start a fresh one.
+    this.conn = undefined;
+    this.closing = false;
+    this.threads.clear();
+    return { forced };
   }
 
   /** Codex picks the thread ID only in the thread/start response, so a lost create cannot be looked up (C-08). */
@@ -353,9 +395,13 @@ export class CodexAdapter implements RuntimeAdapter {
     }
   }
 
-  /** Interrupts the thread's running turn; nothing to do when it has none. Command processes are CR-7. */
+  /**
+   * Interrupts the thread's running turn (nothing to do when it has none), then ends the thread's command
+   * processes, which turn/interrupt leaves running (SP-08, CR-7).
+   */
   async interrupt(nativeSessionRef: string): Promise<void> {
     await this.interruptRunning(nativeSessionRef);
+    if (this.options.terminateCommandsOnInterrupt !== false) await this.terminateCommands(nativeSessionRef);
   }
 
   /** `nativeTaskRef` is the child thread ID (`NativeTask.nativeRef`); only children of this session's thread qualify (R-13). */
@@ -380,13 +426,19 @@ export class CodexAdapter implements RuntimeAdapter {
    * and delivering to it are separate operations (CR2_DELIVERY_FIX §3). If this rejects with a timeout or
    * closed connection the thread may exist anyway; the caller must not blindly start another.
    */
-  async startThread(options: StartThreadOptions): Promise<CodexThreadInfo> {
-    const response = await this.request('thread/start', { cwd: options.cwd, ...this.threadParams(options) });
-    return this.bindFromResponse(options.sessionId, response, 'thread/start');
+  startThread(options: StartThreadOptions): Promise<CodexThreadInfo> {
+    return this.asOwner(options.sessionId, async () => {
+      const response = await this.request('thread/start', { cwd: options.cwd, ...this.threadParams(options) });
+      return this.bindFromResponse(options.sessionId, response, 'thread/start');
+    });
   }
 
   /** `thread/resume` without loading the full history (read its history with readHistory). */
-  async resumeThread(options: ResumeThreadOptions): Promise<CodexThreadInfo> {
+  resumeThread(options: ResumeThreadOptions): Promise<CodexThreadInfo> {
+    return this.asOwner(options.sessionId, () => this.resumeOwnThread(options));
+  }
+
+  private async resumeOwnThread(options: ResumeThreadOptions): Promise<CodexThreadInfo> {
     const existing = this.threads.get(options.threadId);
     if (existing && existing.sessionId !== options.sessionId) throw new Error(`thread/resume: thread ${options.threadId} is already bound to another session`);
     // Bound before the request: a running thread's events and approvals can arrive right behind the response.
@@ -876,6 +928,39 @@ export class CodexAdapter implements RuntimeAdapter {
     if (turnId !== undefined) await this.interruptTurn(threadId, turnId);
   }
 
+  /**
+   * Ends the thread's background terminals one by one with its own thread ID and the terminal's process
+   * ID: a wrong thread ID cannot end another session's process, even with the same command and cwd (CR-7
+   * live checks). A detached `Start-Process` child is not listed; the session's Job ends it on close.
+   * Failures are logged, not thrown: the turn is already interrupted and closing the session still ends
+   * everything.
+   */
+  private async terminateCommands(threadId: string): Promise<void> {
+    const processIds: string[] = [];
+    try {
+      const seen = new Set<string>();
+      let cursor: string | null = null;
+      do {
+        const page = (await this.request('thread/backgroundTerminals/list', { threadId, limit: 100, cursor })) as WirePage<{ processId?: unknown }> | undefined;
+        for (const t of page?.data ?? []) if (isNonEmptyString(t.processId)) processIds.push(t.processId);
+        cursor = page?.nextCursor ?? null;
+        if (cursor !== null && seen.has(cursor)) break;
+        if (cursor !== null) seen.add(cursor);
+      } while (cursor !== null);
+    } catch (error) {
+      this.log('warn', `listing the background terminals of ${threadId} failed`, error);
+      return;
+    }
+    for (const processId of processIds) {
+      try {
+        const result = await this.request('thread/backgroundTerminals/terminate', { threadId, processId });
+        if (!isObject(result) || result.terminated !== true) this.log('debug', `terminal ${processId} of ${threadId} was not terminated`, result);
+      } catch (error) {
+        this.log('warn', `terminating terminal ${processId} of ${threadId} failed`, error);
+      }
+    }
+  }
+
   /** For a turn we did not see start (e.g. it began before this adapter resumed the thread). */
   private async findRunningTurn(threadId: string): Promise<string | undefined> {
     const page = (await this.request('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc' })) as WirePage<WireTurn> | undefined;
@@ -1354,6 +1439,36 @@ export class CodexAdapter implements RuntimeAdapter {
   }
 
   // ---- helpers ------------------------------------------------------------------------------------
+
+  /**
+   * One adapter, one app-server, one GUI session (CR-7): closing the session closes the app-server and
+   * its Job, so a second session here would be ended with it.
+   */
+  private async asOwner<T>(sessionId: SessionId, run: () => Promise<T>): Promise<T> {
+    if (this.owner !== undefined && this.owner !== sessionId) {
+      throw new Error(`this Codex app-server serves session ${this.owner}; session ${sessionId} needs its own adapter (CR-7)`);
+    }
+    this.owner = sessionId;
+    this.pendingClaims++;
+    let bound = false;
+    try {
+      const result = await run();
+      bound = true;
+      return result;
+    } finally {
+      this.pendingClaims--;
+      if (bound) this.ownerConfirmed = true;
+      else if (!this.ownerConfirmed && this.pendingClaims === 0) this.owner = undefined;
+    }
+  }
+
+  /** Starts the app-server unless it runs or is starting; concurrent callers share one start. */
+  private async ensureStarted(): Promise<void> {
+    if (this.starting) return this.starting;
+    if (this.conn) return;
+    this.starting = this.start().finally(() => (this.starting = undefined));
+    return this.starting;
+  }
 
   private binding(threadId: string): ThreadBinding {
     const binding = this.threads.get(threadId);

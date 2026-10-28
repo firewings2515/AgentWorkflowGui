@@ -181,7 +181,8 @@ describe('file changes (SP-06)', () => {
 describe('interrupt (SP-08)', () => {
   it('reports the interrupted turn and closes the command Codex left open', async () => {
     const rec = loadFixture('sp08-interrupt.jsonl');
-    const h = setup(rec);
+    // Recorded before the adapter ended commands with thread/backgroundTerminals/terminate (CR-7).
+    const h = setup(rec, { terminateCommandsOnInterrupt: false });
     await h.adapter.start();
     const { threadId } = await h.adapter.startThread({ sessionId: SESSION, cwd: 'E:\\work\\task' });
     await h.adapter.startTurn({ threadId, text: recordedText(rec, 'turn/start', 0) });

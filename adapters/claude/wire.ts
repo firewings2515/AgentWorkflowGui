@@ -2,6 +2,7 @@
 // adapter depends on this interface, not on the package, so tests can plug in a fake SDK and recorded
 // SDK messages; `sdk.ts` binds the real package to it. SDK messages are read as untrusted data and
 // narrowed field by field (see mapping.ts), so only the fields the adapter relies on are listed.
+import type { Readable, Writable } from 'node:stream';
 
 /** `SDKMessageOrigin` subset the adapter may stamp on a dispatched user message (R-03, SP-05). */
 export type WireOrigin = { kind: 'human' } | { kind: 'peer'; from: string; fromMode?: 'bypass' | 'prompting'; name?: string };
@@ -66,6 +67,34 @@ export interface WireQueryOptions {
   /** Reliable recovery needs the transcript (CR2_DELIVERY_FIX §4). */
   persistSession: true;
   stderr?: (data: string) => void;
+  /** Starts claude.exe; the GUI puts it in the session's Job (T013, R-14). */
+  spawnClaudeCodeProcess?: (options: WireSpawnOptions) => WireSpawnedProcess;
+}
+
+/** What the SDK hands `spawnClaudeCodeProcess` (its `SpawnOptions`). */
+export interface WireSpawnOptions {
+  command: string;
+  args: string[];
+  cwd?: string;
+  env: Record<string, string | undefined>;
+  /** Aborts only after the SDK's stdin-EOF grace period. */
+  signal: AbortSignal;
+}
+
+/** The process the SDK talks to (its `SpawnedProcess`). */
+export interface WireSpawnedProcess {
+  stdin: Writable;
+  stdout: Readable;
+  readonly killed: boolean;
+  readonly exitCode: number | null;
+  readonly signalCode?: NodeJS.Signals | null;
+  kill(signal: NodeJS.Signals): boolean;
+  on(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): void;
+  on(event: 'error', listener: (error: Error) => void): void;
+  once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): void;
+  once(event: 'error', listener: (error: Error) => void): void;
+  off(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): void;
+  off(event: 'error', listener: (error: Error) => void): void;
 }
 
 export interface WireModelInfo {

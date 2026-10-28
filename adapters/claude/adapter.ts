@@ -90,6 +90,11 @@ export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
   dispatchOrigin?: (request: DispatchRequest) => WireOrigin | undefined;
   /** Origin of a user message shown in events and history (defaults to `user`). */
   userOrigin?: (info: { sessionId: SessionId; clientMessageId: string }) => MessageOrigin;
+  /**
+   * Starts a session's claude.exe; the GUI passes one that starts it inside the session's Job (T013,
+   * R-14), so its commands cannot outlive the session or the GUI. The SDK's own spawn when absent.
+   */
+  spawnProcess?: (info: { sessionId: SessionId }) => WireQueryOptions['spawnClaudeCodeProcess'];
   /** Per-session MCP servers, e.g. the GUI MCP server with the session's own token (R-03). */
   mcpServers?: (info: { sessionId: SessionId; cwd: string }) => Record<string, WireMcpServer>;
   now?: () => Date;
@@ -566,6 +571,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
   ): WireQueryOptions {
     const effort = toEffort(settings.model?.effort);
     const mcpServers = sessionId === undefined ? undefined : this.options.mcpServers?.({ sessionId, cwd });
+    const spawn = sessionId === undefined ? undefined : this.options.spawnProcess?.({ sessionId });
     return {
       cwd,
       ...opt('sessionId', how.sessionId),
@@ -585,6 +591,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
       includePartialMessages: true,
       persistSession: true,
       stderr: (data) => this.log('debug', 'claude stderr', data),
+      ...opt('spawnClaudeCodeProcess', spawn),
     };
   }
 
