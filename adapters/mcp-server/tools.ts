@@ -28,7 +28,10 @@ export interface McpCallContext {
    * sends one in `_meta`, otherwise the MCP session and JSON-RPC request ID. A resend carries the same one.
    */
   sourceCallRef: string;
-  /** Aborted when the client cancels the call or the server shuts down; the answer is then discarded. */
+  /**
+   * Aborted when the server shuts down or the caller's token is replaced or revoked; the answer is then
+   * not sent. A client cancelling its request does not abort it: a resend may still wait for the answer.
+   */
   signal: AbortSignal;
 }
 
@@ -44,8 +47,10 @@ export interface DeliveryCallContext extends McpCallContext {
 /**
  * The business side of each tool, injected by the layer above (e.g. built on core's delivery service).
  * The server validates the input before calling and the result after; a handler that throws or returns
- * something that does not fit the result schema gives the agent a generic error, and its message is
- * never sent to the agent. A handler is called at most once per source call while its result is kept.
+ * something that does not fit the result schema gives the agent a generic error; nothing of the error
+ * is sent or logged. A handler is called at most once per source call for as long as the caller's token
+ * is valid: a resend gets the same answer, a failure included, so a real retry is a new tool call (with
+ * `retryOf` where the tool has it).
  */
 export interface McpToolHandlers {
   handoff(input: HandoffToolInput, ctx: DeliveryCallContext): Promise<HandoffToolResult>;

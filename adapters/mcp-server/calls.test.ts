@@ -123,19 +123,38 @@ describe('CallRunner', () => {
     expect(handlers.create_tasks).not.toHaveBeenCalled();
   });
 
-  it('does not keep a failed or invalid answer, so a resend runs again with the same operationId', async () => {
-    const log = vi.fn();
-    const handoff = vi
-      .fn<McpToolHandlers['handoff']>()
-      .mockRejectedValueOnce(new Error('store down: token=abc'))
-      .mockResolvedValueOnce({ status: 'bogus' } as unknown as HandoffToolResult)
-      .mockImplementationOnce((_input, ctx) => Promise.resolve(accepted(ctx)));
-    const calls = runner(makeHandlers({ handoff }), log);
-    expect(await calls.run(A, 'handoff', handoffArgs, 'meta:x:1', live())).toEqual({ kind: 'failed' });
-    expect(await calls.run(A, 'handoff', handoffArgs, 'meta:x:1', live())).toEqual({ kind: 'failed' });
-    expect(await calls.run(A, 'handoff', handoffArgs, 'meta:x:1', live())).toMatchObject({ result: { status: 'accepted', operationId: 'op-1' } });
-    expect(handoff.mock.calls.map((c) => c[1].operationId)).toEqual(['op-1', 'op-1', 'op-1']);
-    expect(log.mock.calls.join('\n')).not.toContain('token=abc');
+
+  // Review r1 P1-5: a handler that did its work and then failed must not run again on a resend.
+  it('keeps a failure on record, so a resend gets the same failure without running the handler again', async () => {
+    let created = 0;
+    const create_tasks = vi.fn<McpToolHandlers['create_tasks']>(() => {
+      created++;
+      return Promise.reject(new Error('created, then the answer failed'));
+    });
+    const handoff = vi.fn<McpToolHandlers['handoff']>(() => Promise.resolve({ status: 'bogus' } as unknown as HandoffToolResult));
+    const calls = runner(makeHandlers({ create_tasks, handoff }));
+    const tasks = { tasks: [{ key: 'a', title: 'A' }] };
+    expect(await calls.run(A, 'create_tasks', tasks, 'meta:x:1', live())).toEqual({ kind: 'failed' });
+    expect(await calls.run(A, 'create_tasks', tasks, 'meta:x:1', live())).toEqual({ kind: 'failed' });
+    expect(created).toBe(1);
+    expect(await calls.run(A, 'handoff', handoffArgs, 'meta:x:2', live())).toEqual({ kind: 'failed' });
+    expect(await calls.run(A, 'handoff', handoffArgs, 'meta:x:2', live())).toEqual({ kind: 'failed' });
+    expect(handoff).toHaveBeenCalledTimes(1);
+    // A real retry is a new tool call; for a delivery it names the operation it retries.
+    await calls.run(A, 'handoff', { ...handoffArgs, retryOf: 'op-1' }, 'meta:x:3', live());
+    expect(handoff.mock.calls.map((c) => c[1].operationId)).toEqual(['op-1', 'op-1']);
+  });
+
+  // Review r1 P1-7: the error's name and message are the handler's strings; neither reaches the log.
+  it('logs only a fixed category and the tool name for a failing handler', async () => {
+    const log = vi.fn<(m: string) => void>();
+    const error = Object.assign(new Error('MESSAGE-MARKER token=abc'), { name: 'NAME-MARKER' });
+    const handoff = vi.fn<McpToolHandlers['handoff']>(() => Promise.reject(error));
+    const send_message = vi.fn<McpToolHandlers['send_message']>(() => Promise.resolve({ status: 'RESULT-MARKER' } as never));
+    const calls = runner(makeHandlers({ handoff, send_message }), log);
+    await calls.run(A, 'handoff', handoffArgs, 'meta:x:1', live());
+    await calls.run(A, 'send_message', { to: 'session-b', content: 'hi' }, 'meta:x:2', live());
+    expect(log.mock.calls.map((c) => c[0])).toEqual(['[mcp] handoff: handler-threw', '[mcp] send_message: invalid-result']);
   });
 
   it('answers waiting calls with shutting-down, aborts handlers and refuses new calls after shutdown', async () => {
@@ -158,37 +177,92 @@ describe('CallRunner', () => {
     });
   });
 
-  it('aborts the handler once every request waiting for it is cancelled', async () => {
+  // Review r1 P1-6: cancelling the only waiter must not leave a later resend without an answer at shutdown.
+  it('does not abort the handler when a waiter cancels, and answers a later resend at shutdown', async () => {
     let seen: AbortSignal | undefined;
-    const calls = runner(
-      makeHandlers({
-        wait_for_file: vi.fn<McpToolHandlers['wait_for_file']>((_input, ctx) => {
-          seen = ctx.signal;
-          return new Promise<never>(() => {});
-        }),
-      }),
-    );
-    const one = new AbortController();
-    const two = new AbortController();
-    const first = calls.run(A, 'wait_for_file', { path: 'a.txt' }, 'meta:x:1', one.signal);
-    const resend = calls.run(A, 'wait_for_file', { path: 'a.txt' }, 'meta:x:1', two.signal);
-    await Promise.resolve();
-    one.abort();
+    const wait_for_file = vi.fn<McpToolHandlers['wait_for_file']>((_input, ctx) => {
+      seen = ctx.signal;
+      return new Promise<never>(() => {});
+    });
+    const calls = runner(makeHandlers({ wait_for_file }));
+    const cancelled = new AbortController();
+    const first = calls.run(A, 'wait_for_file', { path: 'a.txt' }, 'meta:x:1', cancelled.signal);
+    cancelled.abort();
     expect(await first).toEqual({ kind: 'failed' });
     expect(seen?.aborted).toBe(false);
-    two.abort();
-    expect(await resend).toEqual({ kind: 'failed' });
+    const resend = calls.run(A, 'wait_for_file', { path: 'a.txt' }, 'meta:x:1', live());
+    calls.shutdown();
+    expect(await resend).toMatchObject({ result: { status: 'rejected', rejection: { reason: 'shutting-down' } } });
     expect(seen?.aborted).toBe(true);
+    expect(wait_for_file).toHaveBeenCalledTimes(1);
   });
 
-  it('forgets the oldest finished calls beyond its limit', async () => {
+  it('lets a resend receive the answer after the first waiter cancelled', async () => {
+    const gate = deferred<void>();
+    const handoff = vi.fn<McpToolHandlers['handoff']>(async (_input, ctx) => {
+      await gate.promise;
+      return accepted(ctx);
+    });
+    const calls = runner(makeHandlers({ handoff }));
+    const cancelled = new AbortController();
+    const first = calls.run(A, 'handoff', handoffArgs, 'meta:x:1', cancelled.signal);
+    cancelled.abort();
+    await first;
+    const resend = calls.run(A, 'handoff', handoffArgs, 'meta:x:1', live());
+    gate.resolve();
+    expect(await resend).toMatchObject({ result: { status: 'duplicate', operationId: 'op-1' } });
+    expect(handoff).toHaveBeenCalledTimes(1);
+  });
+
+  // Review r1 P1-1: finished calls beyond the capacity were forgotten and accepted again.
+  it('never forgets a call on record: past the capacity, new calls are refused instead', async () => {
     const handlers = makeHandlers();
-    const calls = new CallRunner({ handlers, uuid: (() => { let n = 0; return () => `op-${++n}`; })(), maxEntries: 2 });
-    for (const ref of ['r1', 'r2', 'r3']) await calls.run(A, 'report_to_root', { content: ref }, ref, live());
-    await calls.run(A, 'report_to_root', { content: 'r3' }, 'r3', live());
-    expect(handlers.report_to_root).toHaveBeenCalledTimes(3);
-    await calls.run(A, 'report_to_root', { content: 'r1' }, 'r1', live());
-    expect(handlers.report_to_root).toHaveBeenCalledTimes(4);
+    const calls = new CallRunner({ handlers, uuid: (() => { let n = 0; return () => `op-${++n}`; })(), maxCallsPerCaller: 2 });
+    expect(await calls.run(A, 'handoff', handoffArgs, 'r1', live())).toMatchObject({ result: { status: 'accepted', operationId: 'op-1' } });
+    await calls.run(A, 'handoff', handoffArgs, 'r2', live());
+    expect(await calls.run(A, 'handoff', handoffArgs, 'r3', live())).toEqual({ kind: 'refused' });
+    expect(await calls.run(A, 'handoff', handoffArgs, 'r1', live())).toMatchObject({ result: { status: 'duplicate', operationId: 'op-1' } });
+    expect(handlers.handoff).toHaveBeenCalledTimes(2);
+    // The capacity is per caller.
+    expect(await calls.run(B, 'handoff', handoffArgs, 'r3', live())).toMatchObject({ result: { status: 'accepted' } });
+  });
+
+  // Review r1 P1-2: with the capacity taken by calls in progress, a new call ran untracked, twice.
+  it('refuses new calls while the capacity is taken by calls in progress, and shutdown covers those', async () => {
+    const signals: AbortSignal[] = [];
+    const handoff = vi.fn<McpToolHandlers['handoff']>((_input, ctx) => {
+      signals.push(ctx.signal);
+      return new Promise<never>(() => {});
+    });
+    const calls = new CallRunner({ handlers: makeHandlers({ handoff }), uuid: (() => { let n = 0; return () => `op-${++n}`; })(), maxCallsPerCaller: 2 });
+    const one = calls.run(A, 'handoff', handoffArgs, 'r1', live());
+    const two = calls.run(A, 'handoff', handoffArgs, 'r2', live());
+    expect(await calls.run(A, 'handoff', handoffArgs, 'r3', live())).toEqual({ kind: 'refused' });
+    expect(await calls.run(A, 'handoff', handoffArgs, 'r3', live())).toEqual({ kind: 'refused' });
+    expect(handoff).toHaveBeenCalledTimes(2);
+    expect(calls.inFlight).toBe(2);
+    calls.shutdown();
+    expect(await one).toMatchObject({ result: { rejection: { reason: 'shutting-down' } } });
+    expect(await two).toMatchObject({ result: { rejection: { reason: 'shutting-down' } } });
+    expect(signals.every((s) => s.aborted)).toBe(true);
+  });
+
+  it('drops a forgotten caller: its waiters stop, its handlers are aborted, other callers are untouched', async () => {
+    const signals: AbortSignal[] = [];
+    const wait_for_file = vi.fn<McpToolHandlers['wait_for_file']>((_input, ctx) => {
+      signals.push(ctx.signal);
+      return new Promise<never>(() => {});
+    });
+    const handlers = makeHandlers({ wait_for_file });
+    const calls = runner(handlers);
+    await calls.run(A, 'handoff', handoffArgs, 'r1', live());
+    const waitingA = calls.run(A, 'wait_for_file', { path: 'a' }, 'r2', live());
+    const waitingB = calls.run(B, 'wait_for_file', { path: 'a' }, 'r2', live());
+    calls.forget(A);
+    expect(await waitingA).toEqual({ kind: 'failed' });
+    expect(signals.map((s) => s.aborted)).toEqual([true, false]);
+    calls.shutdown();
+    expect(await waitingB).toMatchObject({ result: { rejection: { reason: 'shutting-down' } } });
   });
 });
 
@@ -208,16 +282,23 @@ describe('SessionTokens', () => {
     const b = tokens.issue(B);
     expect(a).not.toBe(b);
     expect(a.length).toBeGreaterThanOrEqual(43);
-    expect(tokens.resolve(a)).toBe(A);
-    expect(tokens.resolve(b)).toBe(B);
+    const grantA = tokens.resolve(a);
+    expect(grantA?.sessionId).toBe(A);
+    expect(tokens.resolve(b)?.sessionId).toBe(B);
     expect(tokens.resolve(`${a}x`)).toBeUndefined();
     expect(tokens.resolve(undefined)).toBeUndefined();
     expect(tokens.resolve('x'.repeat(10_000))).toBeUndefined();
     const a2 = tokens.issue(A);
     expect(tokens.resolve(a)).toBeUndefined();
-    expect(tokens.resolve(a2)).toBe(A);
+    const grantA2 = tokens.resolve(a2);
+    expect(grantA2?.sessionId).toBe(A);
+    // The same session's later token is another generation: what was bound to the first is not current.
+    expect(grantA2?.generation).not.toBe(grantA?.generation);
+    expect(tokens.isCurrent(grantA!)).toBe(false);
+    expect(tokens.isCurrent(grantA2!)).toBe(true);
     expect(tokens.revoke(A)).toBe(true);
     expect(tokens.resolve(a2)).toBeUndefined();
+    expect(tokens.isCurrent(grantA2!)).toBe(false);
     expect(tokens.revoke(A)).toBe(false);
   });
 

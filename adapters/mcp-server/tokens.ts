@@ -9,9 +9,19 @@ const MAX_TOKEN_LENGTH = 256;
 
 const digestOf = (token: string): Buffer => createHash('sha256').update(token, 'utf8').digest();
 
+/**
+ * Who a token belongs to. `generation` is unique per issued token, so anything bound to a token (an MCP
+ * session) can tell that token from the same session's later one.
+ */
+export interface TokenGrant {
+  sessionId: SessionId;
+  generation: number;
+}
+
 export class SessionTokens {
-  readonly #byDigest = new Map<string, { sessionId: SessionId; digest: Buffer }>();
+  readonly #byDigest = new Map<string, TokenGrant & { digest: Buffer }>();
   readonly #bySession = new Map<SessionId, string>();
+  #generation = 0;
 
   /** A fresh token for `sessionId`; the session's earlier token stops working. */
   issue(sessionId: SessionId): string {
@@ -19,7 +29,7 @@ export class SessionTokens {
     const token = randomBytes(32).toString('base64url');
     const digest = digestOf(token);
     const key = digest.toString('hex');
-    this.#byDigest.set(key, { sessionId, digest });
+    this.#byDigest.set(key, { sessionId, generation: ++this.#generation, digest });
     this.#bySession.set(sessionId, key);
     return token;
   }
@@ -33,16 +43,18 @@ export class SessionTokens {
     return true;
   }
 
-  /** The session a presented token belongs to; undefined for a missing, unknown or revoked token. */
-  resolve(token: string | undefined): SessionId | undefined {
+  /** The grant of a presented token; undefined for a missing, unknown or revoked token. */
+  resolve(token: string | undefined): TokenGrant | undefined {
     if (!token || token.length > MAX_TOKEN_LENGTH) return undefined;
     const digest = digestOf(token);
     const entry = this.#byDigest.get(digest.toString('hex'));
-    return entry && timingSafeEqual(entry.digest, digest) ? entry.sessionId : undefined;
+    return entry && timingSafeEqual(entry.digest, digest) ? { sessionId: entry.sessionId, generation: entry.generation } : undefined;
   }
 
-  has(sessionId: SessionId): boolean {
-    return this.#bySession.has(sessionId);
+  /** Whether `grant` is still the session's current token. */
+  isCurrent(grant: TokenGrant): boolean {
+    const key = this.#bySession.get(grant.sessionId);
+    return key !== undefined && this.#byDigest.get(key)?.generation === grant.generation;
   }
 
   clear(): void {

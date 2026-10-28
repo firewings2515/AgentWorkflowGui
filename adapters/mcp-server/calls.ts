@@ -46,180 +46,204 @@ const canonicalJson = (value: unknown): string =>
 const digestOf = (tool: McpToolName, args: unknown): string =>
   createHash('sha256').update(`${tool}\n${canonicalJson(args)}`, 'utf8').digest('hex');
 
-/** `result`: send it to the agent. `failed`: the handler threw or broke its contract; say nothing more. */
-export type CallOutcome = { kind: 'result'; result: McpToolResult } | { kind: 'failed' };
+/**
+ * `result`: send it to the agent. `failed`: the handler threw or broke its contract; nothing more is said,
+ * and every resend of the same source call gets the same answer. `refused`: the caller has too many calls
+ * on record, so this one was not run.
+ */
+export type CallOutcome = { kind: 'result'; result: McpToolResult } | { kind: 'failed' } | { kind: 'refused' };
+
+/** Why a handler's answer was not used; the only thing logged about it. */
+type FailureCategory = 'handler-threw' | 'invalid-result';
 
 interface Entry {
-  caller: SessionId;
   digest: string;
   operationId?: OperationId;
-  /** The handler's run while it is in progress. */
-  running?: Running;
-  /** Kept once the handler answered validly, for later resends. */
-  result?: McpToolResult;
+  /** Settles once with the handler's outcome. The entry is on record before the handler starts. */
+  done: Promise<CallOutcome>;
+  /** The settled outcome, for resends; failures are kept too, so a resend never runs the handler again. */
+  outcome?: CallOutcome;
+  /** The handler's signal: aborted on shutdown or when the caller is forgotten, never by one waiter. */
+  controller: AbortController;
 }
 
-interface Running {
-  done: Promise<CallOutcome>;
-  controller: AbortController;
-  waiters: number;
+/** One caller's calls. Kept for as long as the caller's token is valid; never evicted entry by entry. */
+interface CallerRecord {
+  calls: Map<string, Entry>;
+  /** Operations this caller created, so a `retryOf` from another caller is refused. */
+  operations: Set<OperationId>;
+  /** Aborted when the caller is forgotten, so its waiters stop waiting. */
+  forgotten: AbortController;
 }
 
 export interface CallRunnerOptions {
   handlers: McpToolHandlers;
   /** A fresh UUID per new operation. */
-  uuid(): string;
-  /** Diagnostics for the GUI's own log; never sent to the agent. Gets no tokens and no tool input. */
-  log?(message: string): void;
-  /** How many source calls and operations to remember; the oldest finished ones go first. */
-  maxEntries?: number;
+  uuid: () => string;
+  /** Diagnostics for the GUI's own log; never sent to the agent. Gets fixed categories and tool names only. */
+  log?: (message: string) => void;
+  /** Calls kept on record per caller; past this, new calls are refused rather than older ones forgotten. */
+  maxCallsPerCaller?: number;
 }
+
+const shuttingDown = (): CallOutcome => ({ kind: 'result', result: rejection('shutting-down', 'the GUI is shutting down') });
 
 export class CallRunner {
   readonly #options: CallRunnerOptions;
   readonly #max: number;
-  readonly #calls = new Map<string, Entry>();
-  /** Which session created each operation, so a `retryOf` from another session is refused. */
-  readonly #owners = new Map<OperationId, SessionId>();
-  #closing = false;
+  readonly #callers = new Map<SessionId, CallerRecord>();
+  readonly #shutdown = new AbortController();
 
   constructor(options: CallRunnerOptions) {
     this.#options = options;
-    this.#max = options.maxEntries ?? 10_000;
+    this.#max = options.maxCallsPerCaller ?? 10_000;
   }
 
   get closing(): boolean {
-    return this.#closing;
+    return this.#shutdown.signal.aborted;
   }
 
-  /** Calls in progress, counting each source call once. */
+  /** Calls whose handler has not answered yet, counting each source call once. */
   get inFlight(): number {
     let n = 0;
-    for (const entry of this.#calls.values()) if (entry.running) n++;
+    for (const record of this.#callers.values()) for (const entry of record.calls.values()) if (!entry.outcome) n++;
     return n;
   }
 
   /**
-   * Runs `tool` for `caller`. `signal` is this request's own: when it aborts the request no longer waits,
-   * and the handler is aborted once no request waits for it.
+   * Runs `tool` for `caller`, or joins the run of the same source call. `signal` is this request's own:
+   * when it aborts, this request stops waiting; the handler keeps running for the other waiters and for
+   * later resends.
    */
   async run(caller: SessionId, tool: McpToolName, args: unknown, sourceCallRef: string, signal: AbortSignal): Promise<CallOutcome> {
-    if (this.#closing) return { kind: 'result', result: rejection('shutting-down', 'the GUI is shutting down') };
+    if (this.closing) return shuttingDown();
     const spec = toolSpecs[tool];
     const parsed = spec.input.safeParse(args ?? {});
     if (!parsed.success) return { kind: 'result', result: rejection('invalid-input', describeInputIssues(parsed.error)) };
     const input = parsed.data as { retryOf?: OperationId };
 
-    const key = `${caller}\u0000${sourceCallRef}`;
+    const record = this.#recordOf(caller);
     const digest = digestOf(tool, args ?? {});
-    let entry = this.#calls.get(key);
-    let first = false;
-    if (entry) {
-      if (entry.digest !== digest) {
+    const known = record.calls.get(sourceCallRef);
+    if (known) {
+      if (known.digest !== digest) {
         return { kind: 'result', result: rejection('invalid-input', 'this tool call ID was already used with another tool or input') };
       }
-      if (entry.result) return { kind: 'result', result: asResend(tool, entry.result) };
-    } else {
-      if (input.retryOf !== undefined) {
-        const owner = this.#owners.get(input.retryOf);
-        // Unknown here (e.g. after a restart) is for the handler to check against the store.
-        if (owner !== undefined && owner !== caller) {
-          return { kind: 'result', result: rejection('unknown-target', 'retryOf does not name an operation of this session') };
-        }
-      }
-      entry = { caller, digest };
-      if (spec.delivers) {
-        entry.operationId = input.retryOf ?? (this.#options.uuid() as OperationId);
-        this.#remember(this.#owners, entry.operationId, caller);
-      }
-      this.#remember(this.#calls, key, entry);
-      first = true;
+      return asResend(tool, await this.#wait(known, record, signal));
     }
 
-    if (!entry.running) {
-      first = true;
-      entry.running = this.#start(tool, input, entry, sourceCallRef);
+    if (input.retryOf !== undefined) {
+      const owner = this.#ownerOf(input.retryOf);
+      // Unknown here (e.g. after a restart) is for the handler to check against the store.
+      if (owner !== undefined && owner !== caller) {
+        return { kind: 'result', result: rejection('unknown-target', 'retryOf does not name an operation of this session') };
+      }
     }
-    const outcome = await this.#wait(entry.running, signal);
-    if (outcome.kind === 'result' && !first) return { kind: 'result', result: asResend(tool, outcome.result) };
-    return outcome;
+    if (record.calls.size >= this.#max) return { kind: 'refused' };
+    const operationId = spec.delivers ? (input.retryOf ?? (this.#options.uuid() as OperationId)) : undefined;
+    const entry = this.#start(tool, input, caller, sourceCallRef, record, digest, operationId);
+    return this.#wait(entry, record, signal);
+  }
+
+  /**
+   * Drops a caller's record, e.g. when its token is replaced or revoked: its waiters stop waiting and its
+   * handlers see their signal abort.
+   */
+  forget(caller: SessionId): void {
+    const record = this.#callers.get(caller);
+    if (!record) return;
+    this.#callers.delete(caller);
+    record.forgotten.abort();
+    for (const entry of record.calls.values()) if (!entry.outcome) entry.controller.abort();
   }
 
   /** Refuses new calls and answers every waiting one with `shutting-down`; handlers see their signal abort. */
   shutdown(): void {
-    this.#closing = true;
-    for (const entry of this.#calls.values()) entry.running?.controller.abort(new ShuttingDown());
+    this.#shutdown.abort();
+    for (const record of this.#callers.values()) for (const entry of record.calls.values()) if (!entry.outcome) entry.controller.abort();
   }
 
-  #start(tool: McpToolName, input: unknown, entry: Entry, sourceCallRef: string): Running {
+  #recordOf(caller: SessionId): CallerRecord {
+    let record = this.#callers.get(caller);
+    if (!record) {
+      record = { calls: new Map(), operations: new Set(), forgotten: new AbortController() };
+      this.#callers.set(caller, record);
+    }
+    return record;
+  }
+
+  #ownerOf(operationId: OperationId): SessionId | undefined {
+    for (const [caller, record] of this.#callers) if (record.operations.has(operationId)) return caller;
+    return undefined;
+  }
+
+  /** Puts the call on record, then starts its handler. */
+  #start(
+    tool: McpToolName,
+    input: unknown,
+    caller: SessionId,
+    sourceCallRef: string,
+    record: CallerRecord,
+    digest: string,
+    operationId: OperationId | undefined,
+  ): Entry {
     const controller = new AbortController();
-    const ctx: McpCallContext & { operationId?: OperationId } = { caller: entry.caller, sourceCallRef, signal: controller.signal };
-    if (entry.operationId !== undefined) ctx.operationId = entry.operationId;
+    let settle!: (outcome: CallOutcome) => void;
+    const entry: Entry = { digest, controller, done: new Promise<CallOutcome>((resolve) => (settle = resolve)) };
+    if (operationId !== undefined) {
+      entry.operationId = operationId;
+      record.operations.add(operationId);
+    }
+    record.calls.set(sourceCallRef, entry);
+
+    const ctx: McpCallContext & { operationId?: OperationId } = { caller, sourceCallRef, signal: controller.signal };
+    if (operationId !== undefined) ctx.operationId = operationId;
     const handlers = this.#options.handlers as unknown as Record<McpToolName, (input: unknown, ctx: unknown) => Promise<unknown>>;
-    const running: Running = { controller, waiters: 0, done: Promise.resolve({ kind: 'failed' }) };
-    running.done = (async (): Promise<CallOutcome> => {
+    const fail = (category: FailureCategory): CallOutcome => {
+      this.#options.log?.(`[mcp] ${tool}: ${category}`);
+      return { kind: 'failed' };
+    };
+    void (async () => {
+      let outcome: CallOutcome;
       try {
         const answer = await handlers[tool](input, ctx);
         const checked = toolSpecs[tool].result.safeParse(answer);
-        if (!checked.success) {
-          this.#options.log?.(`[mcp] ${tool} handler returned an invalid result: ${describeInputIssues(checked.error)}`);
-          return { kind: 'failed' };
-        }
-        const result = checked.data as McpToolResult;
-        if (!controller.signal.aborted) entry.result = result;
-        return { kind: 'result', result };
-      } catch (error) {
-        this.#options.log?.(`[mcp] ${tool} handler failed: ${error instanceof Error ? error.name : 'non-error thrown'}`);
-        return { kind: 'failed' };
-      } finally {
-        if (entry.running === running) delete entry.running;
+        outcome = checked.success ? { kind: 'result', result: checked.data as McpToolResult } : fail('invalid-result');
+      } catch {
+        outcome = fail('handler-threw');
       }
+      entry.outcome = outcome;
+      settle(outcome);
     })();
-    return running;
+    return entry;
   }
 
-  /** Waits for the run, or stops waiting when this request is cancelled or the server shuts down. */
-  async #wait(running: Running, signal: AbortSignal): Promise<CallOutcome> {
-    running.waiters++;
-    const shutdown = running.controller.signal;
-    let release = (): void => {};
+  /** Waits for the run; stops early with `shutting-down` on shutdown, or when this request or caller ends. */
+  async #wait(entry: Entry, record: CallerRecord, signal: AbortSignal): Promise<CallOutcome> {
+    if (entry.outcome) return entry.outcome;
+    if (this.closing) return shuttingDown();
+    const listeners: [AbortSignal, () => void][] = [];
     const stopped = new Promise<CallOutcome>((resolve) => {
-      const onShutdown = (): void => resolve({ kind: 'result', result: rejection('shutting-down', 'the GUI is shutting down') });
-      const onCancel = (): void => {
-        if (--running.waiters === 0) running.controller.abort(new Cancelled());
-        resolve({ kind: 'failed' });
+      const on = (s: AbortSignal, outcome: () => CallOutcome) => {
+        const listener = () => resolve(outcome());
+        s.addEventListener('abort', listener, { once: true });
+        listeners.push([s, listener]);
       };
-      if (shutdown.aborted && shutdown.reason instanceof ShuttingDown) return onShutdown();
-      if (signal.aborted) return onCancel();
-      shutdown.addEventListener('abort', () => shutdown.reason instanceof ShuttingDown && onShutdown(), { once: true });
-      signal.addEventListener('abort', onCancel, { once: true });
-      release = () => signal.removeEventListener('abort', onCancel);
+      on(this.#shutdown.signal, shuttingDown);
+      on(record.forgotten.signal, () => ({ kind: 'failed' }));
+      on(signal, () => ({ kind: 'failed' }));
+      if (record.forgotten.signal.aborted || signal.aborted) resolve({ kind: 'failed' });
     });
     try {
-      return await Promise.race([running.done, stopped]);
+      return await Promise.race([entry.done, stopped]);
     } finally {
-      release();
+      for (const [s, listener] of listeners) s.removeEventListener('abort', listener);
     }
   }
-
-  #remember<K, V>(map: Map<K, V>, key: K, value: V): void {
-    map.set(key, value);
-    if (map.size <= this.#max) return;
-    for (const [k, v] of map) {
-      if (map.size <= this.#max) break;
-      if (!(v as Partial<Entry>).running) map.delete(k);
-    }
-  }
-}
-
-class ShuttingDown extends Error {
-  override name = 'ShuttingDown';
-}
-
-class Cancelled extends Error {
-  override name = 'Cancelled';
 }
 
 /** What a resend of a call gets: the same answer, with an acceptance reported as a duplicate. */
-const asResend = (tool: McpToolName, result: McpToolResult): McpToolResult =>
-  toolSpecs[tool].delivers && result.status === 'accepted' ? { ...result, status: 'duplicate' } : result;
+const asResend = (tool: McpToolName, outcome: CallOutcome): CallOutcome =>
+  outcome.kind === 'result' && toolSpecs[tool].delivers && outcome.result.status === 'accepted'
+    ? { kind: 'result', result: { ...outcome.result, status: 'duplicate' } }
+    : outcome;

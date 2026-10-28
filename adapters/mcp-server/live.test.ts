@@ -39,6 +39,19 @@ const tokenOnDisk = (root: string | null | undefined, nameIncludes: string, toke
   const name = readdirSync(root, { recursive: true, encoding: 'utf8' }).find((f) => f.includes(nameIncludes) && f.endsWith('.jsonl'));
   return name === undefined ? { found: false } : { found: true, containsToken: readFileSync(join(root, name), 'utf8').includes(token) };
 };
+/** Runs every cleanup step even when an earlier one throws, then throws the first error. */
+const cleanUp = async (...steps: (() => unknown)[]): Promise<void> => {
+  const errors: unknown[] = [];
+  for (const step of steps) {
+    try {
+      await step();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length > 0) throw errors[0];
+};
+
 const decide = (outcome: PermissionDecision['outcome']): PermissionDecision => ({ outcome, decidedBy: 'policy', at: new Date().toISOString() });
 
 /** A server whose only working tool is report_to_root; it records who called and what `_meta` keys came. */
@@ -57,10 +70,12 @@ const startRecordingServer = async (label: string) => {
     },
   };
   const server = await GuiMcpServer.start({ handlers, onCallMeta: (info) => meta.push(info.metaKeys) });
-  const close = async (extra: Record<string, unknown>) => {
-    findings[label] = { ...extra, calls, metaKeys: meta };
-    await server.close();
-  };
+  /** `extra` is read inside the cleanup, so a failure in it cannot keep the server open. */
+  const close = (extra: () => Record<string, unknown>) =>
+    cleanUp(
+      () => (findings[label] = { ...extra(), calls, metaKeys: meta }),
+      () => server.close(),
+    );
   return { server, calls, close };
 };
 
@@ -74,12 +89,16 @@ afterAll(() => {
 
 describe.skipIf(!claudeLive)('GUI MCP server with a real Claude session (live)', () => {
   const cwd = claudeLive ? mkdtempSync(join(tmpdir(), 'awg-t016-claude-')) : '';
-  afterAll(() => {
+  afterAll(async () => {
     if (!cwd) return;
-    rmSync(cwd, { recursive: true, force: true });
-    // The CLI keeps scratch files under %TEMP%\claude\<encoded cwd>; the transcript under ~/.claude stays.
     const scratch = join(tmpdir(), 'claude');
-    if (existsSync(scratch)) for (const d of readdirSync(scratch)) if (d.endsWith(basename(cwd))) rmSync(join(scratch, d), { recursive: true, force: true });
+    await cleanUp(
+      () => rmSync(cwd, { recursive: true, force: true }),
+      // The CLI keeps scratch files under %TEMP%\claude\<encoded cwd>; the transcript under ~/.claude stays.
+      () => {
+        if (existsSync(scratch)) for (const d of readdirSync(scratch)) if (d.endsWith(basename(cwd))) rmSync(join(scratch, d), { recursive: true, force: true });
+      },
+    );
   });
 
   it('a Claude session calls report_to_root and is identified by its token', { timeout: 240_000 }, async () => {
@@ -104,9 +123,9 @@ describe.skipIf(!claudeLive)('GUI MCP server with a real Claude session (live)',
     });
     const events: RuntimeEvent[] = [];
     adapter.subscribe((e) => events.push(e));
-    await adapter.start();
     const ref = randomUUID();
     try {
+      await adapter.start();
       await adapter.startSession({ sessionId, cwd, model: { runtime: 'claude', model: process.env.AWG_CLAUDE_MODEL ?? 'haiku' }, readOnly: true, preallocatedRef: ref });
       const marker = `AWG-T016-${randomUUID().slice(0, 8)}`;
       const clientMessageId = randomUUID();
@@ -121,8 +140,10 @@ describe.skipIf(!claudeLive)('GUI MCP server with a real Claude session (live)',
       await waitFor('the turn to end', () => events.some((e) => e.type === 'turn.updated' && e.turn.state !== 'running'), 180_000);
       expect(calls).toEqual([expect.objectContaining({ caller: sessionId, content: marker })]);
     } finally {
-      await adapter.close();
-      await close({ asked, transcript: tokenOnDisk(join(homedir(), '.claude', 'projects'), ref, token) });
+      await cleanUp(
+        () => adapter.close(),
+        () => close(() => ({ asked, transcript: tokenOnDisk(join(homedir(), '.claude', 'projects'), ref, token) })),
+      );
     }
   });
 });
@@ -150,10 +171,10 @@ describe.skipIf(!codexLive)('GUI MCP server with a real Codex thread (live)', ()
     });
     const events: CodexAdapterEvent[] = [];
     adapter.subscribe((e) => events.push(e));
-    await adapter.start();
     const mount = server.mount(sessionId);
     let threadId = '';
     try {
+      await adapter.start();
       const thread = await adapter.startThread({
         sessionId,
         cwd,
@@ -176,8 +197,10 @@ describe.skipIf(!codexLive)('GUI MCP server with a real Codex thread (live)', ()
       expect(calls).toEqual([expect.objectContaining({ caller: sessionId, content: marker })]);
     } finally {
       const codexHome = adapter.serverInfo?.codexHome;
-      await adapter.close();
-      await close({ asked, rollout: threadId ? tokenOnDisk(codexHome && join(codexHome, 'sessions'), threadId, mount.token) : { found: false } });
+      await cleanUp(
+        () => adapter.close(),
+        () => close(() => ({ asked, rollout: threadId ? tokenOnDisk(codexHome && join(codexHome, 'sessions'), threadId, mount.token) : { found: false } })),
+      );
     }
   });
 });

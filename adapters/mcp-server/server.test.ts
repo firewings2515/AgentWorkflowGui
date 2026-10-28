@@ -30,6 +30,12 @@ const makeHandlers = (overrides: Partial<Fakes> = {}): Fakes => ({
   ...overrides,
 });
 
+const deferred = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => (resolve = r));
+  return { promise, resolve };
+};
+
 const open: { servers: GuiMcpServer[]; clients: Client[] } = { servers: [], clients: [] };
 
 afterEach(async () => {
@@ -236,16 +242,81 @@ describe('GuiMcpServer', () => {
   });
 
   it('gives a generic error when a handler fails, with nothing of the failure in it', async () => {
-    const handlers = makeHandlers({ report_to_root: vi.fn<McpToolHandlers['report_to_root']>(() => Promise.reject(new Error('db at C:/secret token=abc'))) });
+    const error = Object.assign(new Error('db at C:/secret token=abc'), { name: 'NAME-MARKER' });
+    const handlers = makeHandlers({ report_to_root: vi.fn<McpToolHandlers['report_to_root']>(() => Promise.reject(error)) });
     const log = vi.fn<(m: string) => void>();
     const server = await startServer(handlers, { log });
     const mount = server.mount(A);
     const { client } = await connect(mount);
     const answer = await client.callTool({ name: 'report_to_root', arguments: { content: 'x' } });
     expect(answer.isError).toBe(true);
-    expect(JSON.stringify(answer)).not.toMatch(/secret|token=abc/);
-    expect(log.mock.calls.join('\n')).not.toMatch(/secret|token=abc/);
-    expect(log.mock.calls.join('\n')).not.toContain(mount.token);
+    expect(JSON.stringify(answer)).not.toMatch(/secret|token=abc|NAME-MARKER/);
+    expect(log.mock.calls.map((c) => c[0])).toEqual(['[mcp] report_to_root: handler-threw']);
+    // The same source call again: the same failure, and the handler does not run twice (review r1 P1-5).
+    const session = await rawSession(mount);
+    const meta = { 'claudecode/toolUseId': 'toolu_9' };
+    const one = messageOf(await session.call(1, 'report_to_root', { content: 'y' }, meta));
+    const two = messageOf(await session.call(2, 'report_to_root', { content: 'y' }, meta));
+    expect(two).toEqual({ ...one, id: 2 });
+    expect(handlers.report_to_root).toHaveBeenCalledTimes(2);
+  });
+
+  // Review r1 P1-3: two requests with one JSON-RPC ID at once used to leave the first without an answer.
+  it('answers both of two concurrent requests with the same JSON-RPC ID', async () => {
+    const gate = deferred<void>();
+    const handlers = makeHandlers({
+      handoff: vi.fn<McpToolHandlers['handoff']>(async (_input, ctx) => {
+        await gate.promise;
+        return { status: 'accepted', handoffId: `handoff-${ctx.operationId}` as HandoffId, operationId: ctx.operationId, delivery: 'pending' };
+      }),
+    });
+    const server = await startServer(handlers);
+    const session = await rawSession(server.mount(A));
+    const first = session.call(7, 'handoff', handoffArgs);
+    await vi.waitFor(() => expect(handlers.handoff).toHaveBeenCalled());
+    const second = await session.call(7, 'handoff', handoffArgs);
+    expect(second.status).toBe(409);
+    expect(messageOf(second)).toMatchObject({ id: 7, error: { code: -32600 } });
+    gate.resolve();
+    const answer = await first;
+    expect(answer.status).toBe(200);
+    expect(resultOf(messageOf(answer).result)).toMatchObject({ status: 'accepted', operationId: 'op-1' });
+    // Once answered, the same ID is a resend of a finished call.
+    expect(resultOf(messageOf(await session.call(7, 'handoff', handoffArgs)).result)).toMatchObject({ status: 'duplicate', operationId: 'op-1' });
+    expect(handlers.handoff).toHaveBeenCalledTimes(1);
+    expect((await session.call(8, 'handoff', handoffArgs)).status).toBe(200);
+  });
+
+  // Review r1 P1-4: an initialize whose body arrived after the token was replaced still opened a session.
+  it('does not open an MCP session for a token replaced while the initialize body was arriving', async () => {
+    const server = await startServer(makeHandlers());
+    const old = server.mount(A);
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: PROTOCOL, capabilities: {}, clientInfo: { name: 'slow', version: '0' } } });
+    const target = new URL(old.url);
+    const pending = new Promise<RawResponse>((resolve, reject) => {
+      const req = request(
+        { host: '127.0.0.1', port: target.port, path: target.pathname, method: 'POST', headers: { ...jsonHeaders(old.token), 'content-length': String(Buffer.byteLength(body)) } },
+        (res) => {
+          let text = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk: string) => (text += chunk));
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, text }));
+        },
+      );
+      req.on('error', reject);
+      req.flushHeaders();
+      req.write(body.slice(0, 10));
+      setTimeout(() => {
+        current = server.mount(A);
+        req.end(body.slice(10));
+      }, 100);
+    });
+    let current: McpMount | undefined;
+    const answer = await pending;
+    expect(answer.status).toBe(401);
+    expect(answer.headers['mcp-session-id']).toBeUndefined();
+    // The new token opens its own session as usual.
+    await rawSession(current!);
   });
 
   it('answers calls in progress with shutting-down when it closes, then refuses connections', async () => {
