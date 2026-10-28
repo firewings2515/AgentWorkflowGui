@@ -12,9 +12,16 @@ export type PolicyRule =
   | 'unrecognised'; // interpreter one-liners, encoded commands, a script the session just wrote, unknown targets
 
 export interface PolicyContext {
+  /** Roots are already real paths (links resolved) when the session service builds the context. */
   folderScope: FolderScope;
   /** Files this session wrote, so running a script it just wrote is recognised (CR-1). */
   writtenPaths: readonly string[];
+  /**
+   * Resolves junctions and symbolic links in the existing part of an absolute path; a tail that does not
+   * exist yet is kept as written. `null` means it cannot be confirmed, which the policy treats as
+   * `unrecognised`. Injected by the session service so the policy stays free of Node.
+   */
+  resolveRealPath(absolutePath: string): string | null;
 }
 
 /**
