@@ -12,6 +12,7 @@ import { CallToolRequestSchema, type CallToolResult, ListToolsRequestSchema } fr
 import { McpToolName, type SessionId } from '../../contracts';
 import type { McpMount } from '../../core/ports';
 import { CallRunner, sourceCallRefOf } from './calls';
+import { RequestIds, requestKeyOf } from './request-ids';
 import { SessionTokens, type TokenGrant, bearerToken } from './tokens';
 import { type McpToolHandlers, toolListings } from './tools';
 
@@ -34,6 +35,8 @@ export interface GuiMcpServerOptions {
   sourceCallRef?: SourceCallRefOf;
   /** Sees the `_meta` key names of every tool call (never the values), to learn what a client sends. */
   onCallMeta?: (info: { caller: SessionId; tool: string; metaKeys: string[] }) => void;
+  /** Once per MCP session: the protocol version the client uses after initialize (`MCP-Protocol-Version`). */
+  onProtocolVersion?: (info: { caller: SessionId; protocolVersion: string }) => void;
   /** Largest accepted POST body; larger ones get 413 and are never parsed. Default 1 MiB. */
   maxRequestBodyBytes?: number;
   /** MCP sessions kept per GUI session; the oldest is closed beyond this. Default 8. */
@@ -47,22 +50,13 @@ export interface GuiMcpServerOptions {
   closeGraceMs?: number;
 }
 
-/** One request whose JSON-RPC ID is taken in its MCP session. */
-interface TakenId {
-  /** The SDK has the request: from then on only the SDK ending it frees the ID, not the HTTP response. */
-  dispatched: boolean;
-}
-
 interface McpSession {
   grant: TokenGrant;
   transport: StreamableHTTPServerTransport;
   server: Server;
-  /**
-   * JSON-RPC IDs (as JSON text) of the requests this MCP session has not finished. The SDK maps a
-   * response to its HTTP stream by request ID, so a second request with a taken ID would receive the
-   * first one's answer, or take its answer away; it is refused until the first has ended.
-   */
-  ids: Map<string, TakenId>;
+  /** The request IDs this MCP session is still answering (see request-ids.ts). */
+  ids: RequestIds;
+  protocolReported?: boolean;
 }
 
 const DEFAULT_MAX_BODY = 1024 * 1024;
@@ -182,9 +176,10 @@ export class GuiMcpServer {
         if (this.#closing) return reply(res, 503, 'shutting down');
         if (!this.#tokens.isCurrent(grant)) return unauthorized(res);
       }
-      // Before any transport is opened, so a refused batch leaves nothing behind.
-      const ids = req.method === 'POST' ? requestIdsOf(body) : [];
-      if (ids === 'duplicate') return reply(res, 400, 'duplicate request ID in batch', -32600);
+      // JSON-RPC batches are not part of MCP since 2025-06-18 and neither client sends them. Refused before
+      // any transport is opened or any ID is taken, so a batch leaves nothing behind.
+      if (Array.isArray(body)) return reply(res, 400, 'batches are not supported', -32600);
+      const id = req.method === 'POST' ? requestKeyOf(body) : undefined;
 
       const sessionHeader = req.headers['mcp-session-id'];
       let session: McpSession | undefined;
@@ -192,6 +187,11 @@ export class GuiMcpServer {
         session = typeof sessionHeader === 'string' ? this.#sessions.get(sessionHeader) : undefined;
         // Another token's MCP session ID is answered exactly like an unknown one.
         if (!session || !sameGrant(session.grant, grant)) return reply(res, 404, 'session not found', -32001);
+        const version = req.headers['mcp-protocol-version'];
+        if (!session.protocolReported && typeof version === 'string' && version.length <= 32) {
+          session.protocolReported = true;
+          this.#options.onProtocolVersion?.({ caller: grant.sessionId, protocolVersion: version });
+        }
       } else if (req.method === 'POST') {
         session = await this.#open(grant);
       } else {
@@ -199,20 +199,16 @@ export class GuiMcpServer {
       }
 
       if (req.method === 'POST') {
-        // A taken ID stays taken until the SDK has ended that request, whatever happened to its HTTP
-        // response; the new request gets an error of its own instead of the old one's answer.
-        const busy = ids.find((id) => session.ids.has(id));
-        if (busy !== undefined) return reply(res, 409, 'a request with this ID is still being answered', -32600, JSON.parse(busy) as string | number);
-        const taken = ids.map((id) => {
-          const entry: TakenId = { dispatched: false };
-          session.ids.set(id, entry);
-          return [id, entry] as const;
-        });
+        // A taken ID stays taken until no answer for it can be written any more, whatever happened to its
+        // HTTP response; a new request with it gets an error of its own instead of the old one's answer.
+        if (id !== undefined && session.ids.has(id)) {
+          return reply(res, 409, 'a request with this ID is still being answered', -32600, JSON.parse(id) as string | number);
+        }
+        const entry = id === undefined ? undefined : session.ids.take(id);
         this.#posts.add(res);
         res.once('close', () => {
           this.#posts.delete(res);
-          // Never reached the SDK (refused or failed before dispatch): nothing else will free the ID.
-          for (const [id, entry] of taken) if (!entry.dispatched) release(session, id, entry);
+          if (id !== undefined && entry) session.ids.closed(id, entry);
         });
       }
       await session.transport.handleRequest(req, res, body);
@@ -246,13 +242,8 @@ export class GuiMcpServer {
         this.#sessions.delete(id);
       },
     });
-    const ids = new Map<string, TakenId>();
-    const server = this.#buildServer(grant.sessionId, (requestId) => {
-      const key = JSON.stringify(requestId);
-      const entry = ids.get(key);
-      // After the SDK's own handling of the cancelled request, which sends nothing.
-      if (entry) setImmediate(() => release(session, key, entry));
-    });
+    const ids = new RequestIds();
+    const server = this.#buildServer(grant.sessionId);
     const session: McpSession = { grant, transport, server, ids };
     this.#opening.add(session);
     transport.onclose = () => {
@@ -261,47 +252,40 @@ export class GuiMcpServer {
     };
     await server.connect(transport);
 
-    // Follow each request through the SDK: dispatched when the SDK receives it, ended when its response
-    // has been sent (to its own stream, or to none when that stream is gone).
+    // Follow every request through the SDK, whatever its method: received (and cancelled) through
+    // `onmessage`, answered through `send`, whether its stream is still there or not. Relies on SDK 1.32.2
+    // behaviour listed in request-ids.ts.
     const deliver = transport.onmessage;
     transport.onmessage = (message, extra) => {
-      const key = requestKeyOf(message);
-      const entry = key === undefined ? undefined : ids.get(key);
-      if (entry) entry.dispatched = true;
+      ids.received(message);
       deliver?.(message, extra);
     };
     const send = transport.send.bind(transport);
     transport.send = async (message, options) => {
-      const key = responseKeyOf(message);
-      const entry = key === undefined ? undefined : ids.get(key);
+      const taken = ids.sending(message);
       try {
         await send(message, options);
       } finally {
-        if (key !== undefined && entry) release(session, key, entry);
+        if (taken) ids.sent(taken);
       }
     };
     return session;
   }
 
-  /** `onCancelledEnd`: a call's handler ended after the client cancelled it, so the SDK will not answer it. */
-  #buildServer(caller: SessionId, onCancelledEnd: (requestId: string | number) => void): Server {
+  #buildServer(caller: SessionId): Server {
     const server = new Server(SERVER_INFO, { capabilities: { tools: {} } });
     server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [...toolListings] }));
     server.setRequestHandler(CallToolRequestSchema, async (request, extra): Promise<CallToolResult> => {
-      try {
-        const { name, arguments: args, _meta: meta } = request.params;
-        this.#options.onCallMeta?.({ caller, tool: name, metaKeys: Object.keys(meta ?? {}) });
-        const tool = McpToolName.safeParse(name);
-        if (!tool.success) return errorResult(`Unknown tool. The GUI tools are: ${McpToolName.options.join(', ')}.`);
-        const sourceCallRefFn = this.#options.sourceCallRef ?? sourceCallRefOf;
-        const sourceCallRef = sourceCallRefFn(meta, { mcpSessionId: extra.sessionId ?? '', requestId: extra.requestId });
-        const outcome = await this.#runner.run(caller, tool.data, args, sourceCallRef, extra.signal);
-        if (outcome.kind === 'failed') return errorResult('The GUI could not complete this call. Nothing more is known; do not resend it.');
-        if (outcome.kind === 'refused') return errorResult('The GUI is keeping too many calls from this session and did not run this one.');
-        return { content: [{ type: 'text', text: JSON.stringify(outcome.result) }], isError: outcome.result.status === 'rejected' };
-      } finally {
-        if (extra.signal.aborted) onCancelledEnd(extra.requestId);
-      }
+      const { name, arguments: args, _meta: meta } = request.params;
+      this.#options.onCallMeta?.({ caller, tool: name, metaKeys: Object.keys(meta ?? {}) });
+      const tool = McpToolName.safeParse(name);
+      if (!tool.success) return errorResult(`Unknown tool. The GUI tools are: ${McpToolName.options.join(', ')}.`);
+      const sourceCallRefFn = this.#options.sourceCallRef ?? sourceCallRefOf;
+      const sourceCallRef = sourceCallRefFn(meta, { mcpSessionId: extra.sessionId ?? '', requestId: extra.requestId });
+      const outcome = await this.#runner.run(caller, tool.data, args, sourceCallRef, extra.signal);
+      if (outcome.kind === 'failed') return errorResult('The GUI could not complete this call. Nothing more is known; do not resend it.');
+      if (outcome.kind === 'refused') return errorResult('The GUI is keeping too many calls from this session and did not run this one.');
+      return { content: [{ type: 'text', text: JSON.stringify(outcome.result) }], isError: outcome.result.status === 'rejected' };
     });
     return server;
   }
@@ -329,23 +313,6 @@ export class GuiMcpServer {
 }
 
 const sameGrant = (a: TokenGrant, b: TokenGrant): boolean => a.sessionId === b.sessionId && a.generation === b.generation;
-
-/** Frees an ID only for the request that took it, never for a later one with the same ID. */
-const release = (session: McpSession, key: string, entry: TakenId): void => {
-  if (session.ids.get(key) === entry) session.ids.delete(key);
-};
-
-const idKey = (id: unknown): string | undefined => (typeof id === 'string' || typeof id === 'number' ? JSON.stringify(id) : undefined);
-
-/** The ID of a JSON-RPC request (not a notification or a response). */
-const requestKeyOf = (message: unknown): string | undefined =>
-  message !== null && typeof message === 'object' && 'method' in message && 'id' in message ? idKey(message.id) : undefined;
-
-/** The ID of a JSON-RPC response or error response (not a request the server sends). */
-const responseKeyOf = (message: unknown): string | undefined =>
-  message !== null && typeof message === 'object' && !('method' in message) && 'id' in message && ('result' in message || 'error' in message)
-    ? idKey(message.id)
-    : undefined;
 
 type BodyRead = { kind: 'ok'; value: unknown } | { kind: 'too-large' } | { kind: 'invalid' };
 
@@ -381,13 +348,6 @@ const readJsonBody = (req: IncomingMessage, max: number): Promise<BodyRead> =>
       }
     });
   });
-
-/** JSON text of the IDs of the requests in a message or batch; `duplicate` when a batch repeats one. */
-const requestIdsOf = (body: unknown): string[] | 'duplicate' => {
-  const messages = Array.isArray(body) ? (body as unknown[]) : [body];
-  const ids = messages.map(requestKeyOf).filter((key) => key !== undefined);
-  return new Set(ids).size === ids.length ? ids : 'duplicate';
-};
 
 const strictUtf8 = new TextDecoder('utf-8', { fatal: true });
 

@@ -217,7 +217,8 @@ describe('GuiMcpServer', () => {
   it('maps a resend with the same native call ID to the same operationId and accepts it once', async () => {
     const handlers = makeHandlers();
     const metaKeys: string[][] = [];
-    const server = await startServer(handlers, { onCallMeta: (info) => metaKeys.push(info.metaKeys) });
+    const versions: string[] = [];
+    const server = await startServer(handlers, { onCallMeta: (info) => metaKeys.push(info.metaKeys), onProtocolVersion: (info) => versions.push(`${info.caller} ${info.protocolVersion}`) });
     const session = await rawSession(server.mount(A));
     const meta = { 'claudecode/toolUseId': 'toolu_01' };
     const first = messageOf(await session.call(1, 'handoff', handoffArgs, meta));
@@ -229,6 +230,8 @@ describe('GuiMcpServer', () => {
     expect(handlers.handoff).toHaveBeenCalledTimes(2);
     expect(handlers.handoff.mock.calls[0]?.[1].sourceCallRef).toBe('meta:claudecode/toolUseId:toolu_01');
     expect(metaKeys[0]).toEqual(['claudecode/toolUseId']);
+    // Reported once for the MCP session, from the version header the client sends after initialize.
+    expect(versions).toEqual([`${A} ${PROTOCOL}`]);
   });
 
   it('without a native call ID, recognises a resend by its JSON-RPC ID within the MCP session', async () => {
@@ -385,17 +388,80 @@ describe('GuiMcpServer', () => {
   });
 
   // Review r2 P2: a refused batch without a session header used to leave a transport behind.
-  it('refuses a batch with a repeated ID before opening any transport', async () => {
-    const server = await startServer(makeHandlers());
+  // Review r3 P1-1: a batch freed an answered ID before the SDK had finished the batch, and a new batch
+  // reusing it lost its answer. Batches are refused outright now (not part of MCP since 2025-06-18).
+  it('refuses every batch before opening a transport or taking an ID', async () => {
+    const handlers = makeHandlers();
+    const server = await startServer(handlers);
     const mount = server.mount(A);
-    await rawSession(mount);
+    const session = await rawSession(mount);
     expect(server.openMcpSessions).toBe(1);
     const init = { jsonrpc: '2.0', method: 'initialize', params: { protocolVersion: PROTOCOL, capabilities: {}, clientInfo: { name: 'x', version: '0' } } };
     for (let i = 0; i < 5; i++) {
       const res = await raw(mount.url, { headers: jsonHeaders(mount.token), body: JSON.stringify([{ ...init, id: 1 }, { jsonrpc: '2.0', id: 1, method: 'ping' }]) });
       expect(res.status).toBe(400);
+      expect(messageOf(res)).toMatchObject({ error: { code: -32600 } });
     }
     expect(server.openMcpSessions).toBe(1);
+    // The r3 sequence inside a session: [7, 8], then [7, 9]. Neither reaches the SDK or takes 7.
+    const batch = (ids: number[], callId: string) =>
+      raw(mount.url, {
+        headers: session.headers(),
+        body: JSON.stringify(ids.map((id) => ({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'handoff', arguments: handoffArgs, _meta: { callId: `${callId}-${id}` } } }))),
+      });
+    for (const res of [await batch([7, 8], 'a'), await batch([7, 9], 'b')]) {
+      expect(res.status).toBe(400);
+      expect(messageOf(res)).toMatchObject({ error: { code: -32600 } });
+    }
+    expect(handlers.handoff).not.toHaveBeenCalled();
+    const single = await session.call(7, 'handoff', handoffArgs, { callId: 'c' });
+    expect(single.status).toBe(200);
+    expect(resultOf(messageOf(single).result)).toMatchObject({ status: 'accepted', operationId: 'op-1' });
+  });
+
+  // Review r3 P1-2: only cancelled calls that reached our tool handler freed their ID; a cancelled ping,
+  // tools/list or invalid tools/call kept it taken for good, even after the connection dropped.
+  describe('frees the ID of a cancelled or dropped request, whatever its method', () => {
+    const requests: Record<string, Record<string, unknown>> = {
+      ping: { method: 'ping' },
+      'tools/list': { method: 'tools/list' },
+      'invalid tools/call': { method: 'tools/call', params: { name: 42 } },
+      'pending tools/call': { method: 'tools/call', params: { name: 'wait_for_file', arguments: { path: 'src/a.ts' } } },
+    };
+    const endings = ['cancel', 'drop then cancel', 'drop'] as const;
+    for (const [label, message] of Object.entries(requests)) {
+      for (const ending of endings) {
+        // A pending call whose connection only drops keeps its ID until its handler ends (tested above).
+        if (label === 'pending tools/call' && ending === 'drop') continue;
+        it(`${label}, ${ending}`, async () => {
+          const handlers = makeHandlers({ wait_for_file: vi.fn<McpToolHandlers['wait_for_file']>(() => new Promise<never>(() => {})) });
+          const server = await startServer(handlers);
+          const mount = server.mount(A);
+          const session = await rawSession(mount);
+          const first = rawOpen(mount.url, session.headers(), JSON.stringify({ jsonrpc: '2.0', id: 7, ...message }));
+          if (label === 'pending tools/call') await vi.waitFor(() => expect(handlers.wait_for_file).toHaveBeenCalled());
+          else await sleep(30);
+          if (ending !== 'cancel') {
+            first.req.destroy();
+            await sleep(30);
+          }
+          if (ending !== 'drop') {
+            const cancelled = await raw(mount.url, {
+              headers: session.headers(),
+              body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 7 } }),
+            });
+            expect(cancelled.status).toBe(202);
+          }
+          // A new tool call with its own native ID (without one, the same JSON-RPC ID would be the same call).
+          const next = await untilNot409(() => session.call(7, 'report_to_root', { content: 'next' }, { callId: 'next' }));
+          expect(next.status).toBe(200);
+          // The new request's own answer, not the old request's.
+          expect(resultOf(messageOf(next).result)).toEqual({ status: 'reported' });
+          expect(first.state.text).not.toContain('reported');
+          first.req.destroy();
+        });
+      }
+    }
   });
 
   // Review r2 P2: an invalid UTF-8 byte was replaced with U+FFFD and the tool ran on the changed text.

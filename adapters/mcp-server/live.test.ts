@@ -58,6 +58,7 @@ const decide = (outcome: PermissionDecision['outcome']): PermissionDecision => (
 const startRecordingServer = async (label: string) => {
   const calls: { caller: string; content: string; sourceCallRefKind: string }[] = [];
   const meta: string[][] = [];
+  const protocolVersions: string[] = [];
   const refuse = () => Promise.reject(new Error('not used in the live check'));
   const handlers: McpToolHandlers = {
     handoff: refuse,
@@ -69,11 +70,15 @@ const startRecordingServer = async (label: string) => {
       return Promise.resolve({ status: 'reported' });
     },
   };
-  const server = await GuiMcpServer.start({ handlers, onCallMeta: (info) => meta.push(info.metaKeys) });
+  const server = await GuiMcpServer.start({
+    handlers,
+    onCallMeta: (info) => meta.push(info.metaKeys),
+    onProtocolVersion: (info) => protocolVersions.push(info.protocolVersion),
+  });
   /** `extra` is read inside the cleanup, so a failure in it cannot keep the server open. */
   const close = (extra: () => Record<string, unknown>) =>
     cleanUp(
-      () => (findings[label] = { ...extra(), calls, metaKeys: meta }),
+      () => (findings[label] = { ...extra(), calls, metaKeys: meta, protocolVersions }),
       () => server.close(),
     );
   return { server, calls, close };
