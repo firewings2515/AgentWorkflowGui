@@ -7,7 +7,7 @@ import {
   type EscalationId,
 } from '../../contracts';
 import type { EscalationRepository, OwnedProcessRepository, PreferencesRepository } from '../../core/ports';
-import { checkRecord, epochMs, readRecord, run, type StorageContext } from './codec';
+import { checkRecord, epochMs, instantKey, readRecord, run, type StorageContext } from './codec';
 import { committed, unchanged, writeTransaction } from './transaction';
 
 interface BodyRow {
@@ -85,10 +85,10 @@ export class SqliteOwnedProcessRepository implements OwnedProcessRepository {
         // Recording the same process again refreshes its details but never revives one already ended.
         this.ctx.db
           .prepare(
-            `INSERT INTO owned_process (pid, started_ms, recorded_ms, ended_at, body) VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT (pid, started_ms) DO UPDATE SET body = excluded.body, ended_at = coalesce(owned_process.ended_at, excluded.ended_at)`,
+            `INSERT INTO owned_process (pid, started_key, recorded_ms, ended_at, body) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (pid, started_key) DO UPDATE SET body = excluded.body, ended_at = coalesce(owned_process.ended_at, excluded.ended_at)`,
           )
-          .run(rest.pid, epochMs(rest.startedAt), epochMs(rest.recordedAt), endedAt ?? null, JSON.stringify(rest));
+          .run(rest.pid, instantKey(rest.startedAt), epochMs(rest.recordedAt), endedAt ?? null, JSON.stringify(rest));
         return committed(undefined);
       });
     });
@@ -101,8 +101,8 @@ export class SqliteOwnedProcessRepository implements OwnedProcessRepository {
       writeTransaction(this.ctx.db, () => {
         // The first end is kept; an unknown process is nothing to end.
         const result = this.ctx.db
-          .prepare('UPDATE owned_process SET ended_at = ? WHERE pid = ? AND started_ms = ? AND ended_at IS NULL')
-          .run(ended, pid, epochMs(started));
+          .prepare('UPDATE owned_process SET ended_at = ? WHERE pid = ? AND started_key = ? AND ended_at IS NULL')
+          .run(ended, pid, instantKey(started));
         return Number(result.changes) === 0 ? unchanged(undefined) : committed(undefined);
       });
     });

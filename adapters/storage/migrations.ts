@@ -70,7 +70,8 @@ CREATE INDEX receive_admission_by_key ON receive_admission (count_key);
  * v2: the records the GUI shows (T015, core/ports/repository.ts). `body` is the contract-shaped record as
  * JSON, validated with its schema when read. Columns beside it exist only to find, order and guard rows:
  * `revision` for compare-and-set, `*_ms` (UTC epoch ms) so timestamps with different offsets sort right.
- * Text over the blob threshold moves to `blob`, keyed by its owner so replacing a record replaces its blobs.
+ * Text over the blob threshold moves to `blob` (stored JSON-encoded, see codec.ts), keyed by its owner so
+ * replacing a record replaces its blobs.
  */
 const repositoriesV2 = `
 CREATE TABLE agent (
@@ -155,6 +156,7 @@ CREATE TABLE blob (
   owner_id TEXT NOT NULL,
   field TEXT NOT NULL,
   size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+  -- sha256 of content; content is the JSON encoding of the text, so NUL and lone surrogates survive.
   sha256 TEXT NOT NULL,
   content TEXT NOT NULL,
   PRIMARY KEY (kind, owner_id, field)
@@ -174,14 +176,15 @@ CREATE TABLE preference (
   body TEXT NOT NULL
 ) STRICT;
 
--- A process is its PID and creation time (PIDs are reused, R-14). body omits endedAt, kept in its column.
+-- A process is its PID and creation time (PIDs are reused, R-14); started_key is that instant at full
+-- precision (codec.ts instantKey). body omits endedAt, kept in its column.
 CREATE TABLE owned_process (
   pid INTEGER NOT NULL,
-  started_ms INTEGER NOT NULL,
+  started_key TEXT NOT NULL,
   recorded_ms INTEGER NOT NULL,
   ended_at TEXT,
   body TEXT NOT NULL,
-  PRIMARY KEY (pid, started_ms)
+  PRIMARY KEY (pid, started_key)
 ) STRICT;
 CREATE INDEX owned_process_live ON owned_process (recorded_ms) WHERE ended_at IS NULL;
 `;

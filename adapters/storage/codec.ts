@@ -57,8 +57,26 @@ export const readRecord = <S extends z.ZodType>(schema: S, table: string, text: 
   return result.data;
 };
 
-/** The ms since epoch of a contract timestamp, for ordering across UTC offsets. */
+/** The ms since epoch of a contract timestamp, for ordering across UTC offsets (sub-millisecond digits are dropped). */
 export const epochMs = (timestamp: string): number => Date.parse(timestamp);
+
+const INSTANT = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}(?::?\d{2})?)$/i;
+
+/**
+ * An identity for the instant a timestamp names, at full precision: equal for the same instant written
+ * with another offset or trailing zeros, different for instants less than a millisecond apart. Used where
+ * a timestamp is part of a key (a process is its PID and creation time), not just for ordering.
+ */
+export const instantKey = (timestamp: string): string => {
+  const match = INSTANT.exec(timestamp);
+  const [, whole, fraction = '', zone] = match ?? [];
+  if (whole === undefined || zone === undefined) throw new InvalidRecordError('timestamp', ['$:format']);
+  // Offsets are applied to the whole seconds, so the fraction needs no arithmetic.
+  const offset = /^z$/i.test(zone) ? '+00:00' : zone.length === 3 ? `${zone}:00` : zone.length === 5 ? `${zone.slice(0, 3)}:${zone.slice(3)}` : zone;
+  const seconds = Date.parse(`${whole}${offset}`) / 1000;
+  if (!Number.isFinite(seconds)) throw new InvalidRecordError('timestamp', ['$:format']);
+  return `${String(seconds)}.${fraction.replace(/0+$/, '')}`;
+};
 
 /** What the repositories share: the connection and where large text goes. */
 export interface StorageContext {
@@ -71,6 +89,19 @@ export interface StorageContext {
 export const DEFAULT_BLOB_THRESHOLD_BYTES = 64 * 1024;
 
 const sha256 = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
+
+// A blob's `content` is the JSON encoding of its text, not the raw text: node:sqlite hands a TEXT value
+// back cut at its first NUL, and raw text cannot hold a lone surrogate. JSON escapes both, so what is read
+// is exactly what was written; `sha256` covers the stored encoding, `size_bytes` the text itself.
+const encodeBlob = (text: string): string => JSON.stringify(text);
+const decodeBlob = (stored: string): string | undefined => {
+  try {
+    const value: unknown = JSON.parse(stored);
+    return typeof value === 'string' ? value : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 /**
  * Splits `fields` of `record` that exceed the threshold out of it. Returns the record without them and
@@ -93,7 +124,10 @@ export const splitBlobs = (ctx: StorageContext, record: object, fields: readonly
 export const writeBlobs = (ctx: StorageContext, kind: string, ownerId: string, blobs: Record<string, string>): void => {
   ctx.db.prepare('DELETE FROM blob WHERE kind = ? AND owner_id = ?').run(kind, ownerId);
   const insert = ctx.db.prepare('INSERT INTO blob (kind, owner_id, field, size_bytes, sha256, content) VALUES (?, ?, ?, ?, ?, ?)');
-  for (const [field, content] of Object.entries(blobs)) insert.run(kind, ownerId, field, Buffer.byteLength(content, 'utf8'), sha256(content), content);
+  for (const [field, text] of Object.entries(blobs)) {
+    const stored = encodeBlob(text);
+    insert.run(kind, ownerId, field, Buffer.byteLength(text, 'utf8'), sha256(stored), stored);
+  }
 };
 
 /** Puts the stored blobs of a record back into its body text, checking each against its hash. */
@@ -114,8 +148,10 @@ export const joinBlobs = (ctx: StorageContext, table: string, kind: string, owne
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new StoredDataError(table, ['$:json']);
   const record = value as Record<string, unknown>;
   for (const row of rows) {
-    if (Buffer.byteLength(row.content, 'utf8') !== row.size_bytes || sha256(row.content) !== row.sha256) throw new StoredDataError(table, ['blob:hash']);
-    record[row.field] = row.content;
+    if (sha256(row.content) !== row.sha256) throw new StoredDataError(table, ['blob:hash']);
+    const text = decodeBlob(row.content);
+    if (text === undefined || Buffer.byteLength(text, 'utf8') !== row.size_bytes) throw new StoredDataError(table, ['blob:content']);
+    record[row.field] = text;
   }
   return JSON.stringify(record);
 };

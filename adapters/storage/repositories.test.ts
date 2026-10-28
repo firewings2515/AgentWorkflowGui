@@ -1,7 +1,8 @@
 // The repositories against a real SQLite file (core/ports/repository.ts): compare-and-set on revision,
 // records surviving a reopen, large text kept apart, damaged data reported without its content, and an
 // upgrade from the T007 schema.
-import { mkdtempSync, rmSync } from 'node:fs';
+import { fork } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -104,20 +105,49 @@ describe('agents and workflows (compare-and-set)', () => {
     expect(await repos.agents.list()).toEqual([]);
   });
 
-  it('lets only one of two connections win the same revision', async () => {
+  it('waits for another process that holds the write lock, then answers stale instead of overwriting', async () => {
     await repos.agents.save(agent, null);
-    const other = openDatabase(path);
-    try {
-      const otherRepos = createRepositories(other);
-      const [a, b] = await Promise.all([repos.agents.save({ ...agent, name: 'from-a' }, 0), otherRepos.agents.save({ ...agent, name: 'from-b' }, 0)]);
-      expect([a.status, b.status].sort()).toEqual(['saved', 'stale']);
-      const winner = a.status === 'saved' ? a.record : b.status === 'saved' ? b.record : undefined;
-      expect(await repos.agents.get(agent.id)).toEqual(winner);
-      expect(winner?.revision).toBe(1);
-    } finally {
-      other.close();
-    }
-  });
+    // A second process opens its write transaction first, reads revision 0, and commits revision 1 only
+    // after 400 ms. The save below starts while that transaction is open, so it must wait for the lock
+    // and then see the new revision. (The wait blocks this process; the other one keeps running.)
+    const script = join(dir, 'competitor.mjs');
+    writeFileSync(
+      script,
+      `import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync(process.argv[2]);
+db.exec('PRAGMA busy_timeout = 10000');
+db.exec('BEGIN IMMEDIATE');
+const row = db.prepare('SELECT revision FROM agent').get();
+if (row.revision !== 0) throw new Error('unexpected revision');
+process.send({ locked: true });
+setTimeout(() => {
+  db.prepare("UPDATE agent SET revision = 1, body = json_set(body, '$.revision', 1, '$.name', 'from-other-process')").run();
+  db.exec('COMMIT');
+  db.close();
+  process.send({ committed: true }, () => process.exit(0));
+}, 400);`,
+    );
+    const child = fork(script, [path], { execArgv: ['--disable-warning=ExperimentalWarning'], stdio: ['ignore', 'ignore', 'pipe', 'ipc'], windowsHide: true });
+    let stderr = '';
+    child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
+    const exited = new Promise<void>((resolve, reject) => {
+      child.on('error', reject);
+      child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`competitor failed: ${stderr}`))));
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once('message', () => resolve());
+      child.once('exit', () => reject(new Error(`competitor did not take the lock: ${stderr}`)));
+    });
+
+    const started = Date.now();
+    const result = await repos.agents.save({ ...agent, name: 'from-this-process' }, 0);
+    const waited = Date.now() - started;
+    await exited;
+
+    expect(result).toEqual({ status: 'stale', current: { ...agent, name: 'from-other-process', revision: 1 } });
+    expect(waited).toBeGreaterThanOrEqual(250); // it really waited behind the other transaction
+    expect(await repos.agents.get(agent.id)).toEqual({ ...agent, name: 'from-other-process', revision: 1 });
+  }, 30_000);
 });
 
 describe('sessions', () => {
@@ -294,6 +324,29 @@ describe('large text', () => {
     expect(blobs()).toEqual([{ kind: 'message', owner_id: message.id, field: 'text', size_bytes: 600 }]);
   });
 
+  it('round-trips text with NUL and lone surrogates, through a Snapshot read and a reopen', async () => {
+    await seedConversations();
+    const texts = ['prefix\0' + 'x'.repeat(65_536), '\0'.repeat(300), `ok${String.fromCharCode(0xd800)}${'y'.repeat(200)}`];
+    const message = { ...(fx.messages[0] as Message), id: 'm-nul' as Message['id'], text: texts[0] as string };
+    const command = { ...(fx.items.find((i) => i.kind === 'command') as Extract<SessionItem, { kind: 'command' }>), id: 'it-nul' as SessionItem['id'], output: texts[1] as string };
+    const diff = { ...(fx.items.find((i) => i.kind === 'fileChange') as Extract<SessionItem, { kind: 'fileChange' }>), id: 'it-lone' as SessionItem['id'], diff: texts[2] as string };
+    await repos.conversations.appendMessage(message);
+    await repos.conversations.upsertItem(command);
+    await repos.conversations.upsertItem(diff);
+
+    const check = async () => {
+      const { conversations } = await repos.readSnapshotData();
+      expect(conversations.messages).toContainEqual(message);
+      expect(conversations.items).toContainEqual(command);
+      expect(conversations.items).toContainEqual(diff);
+    };
+    await check();
+    db.close();
+    db = openDatabase(path);
+    repos = createRepositories(db, { blobThresholdBytes: 100 });
+    await check();
+  });
+
   it('reports a blob that was changed or lost without quoting it', async () => {
     await repos.sessions.create(fx.sessions[0] as LogicalSession);
     const message = { ...(fx.messages[0] as Message), text: big };
@@ -371,6 +424,26 @@ describe('owned processes', () => {
     await repos.processes.markEnded(300, ts('2026-10-24T01:00:00+00:00'), ts('2026-10-24T02:00:00+00:00'));
     expect(await repos.processes.listLive()).toEqual([]);
     await repos.processes.record(original);
+    expect(await repos.processes.listLive()).toEqual([]);
+  });
+
+  it('tells apart processes created less than a millisecond apart, and ends only the one named', async () => {
+    await repos.processes.record(process(500, '2026-10-24T00:00:00.123100Z'));
+    await repos.processes.record(process(500, '2026-10-24T00:00:00.123900Z'));
+    expect((await repos.processes.listLive()).map((p) => p.startedAt)).toEqual(['2026-10-24T00:00:00.123100Z', '2026-10-24T00:00:00.123900Z']);
+    await repos.processes.markEnded(500, ts('2026-10-24T00:00:00.123100Z'), ts('2026-10-24T01:00:00Z'));
+    expect((await repos.processes.listLive()).map((p) => p.startedAt)).toEqual(['2026-10-24T00:00:00.123900Z']);
+  });
+
+  it('treats the same instant as one process however it is written', async () => {
+    await repos.processes.record(process(600, '2026-10-24T08:00:00.1231+08:00'));
+    await repos.processes.record(process(600, '2026-10-24T00:00:00.123100Z'));
+    expect(await repos.processes.listLive()).toHaveLength(1);
+    await repos.processes.markEnded(600, ts('2026-10-24T00:00:00.12310Z'), ts('2026-10-24T01:00:00Z'));
+    expect(await repos.processes.listLive()).toEqual([]);
+    // Whole seconds with and without a zero fraction, and an offset without a colon, are the same instant too.
+    await repos.processes.record(process(601, '2026-10-24T09:00:00.000+09:00'));
+    await repos.processes.markEnded(601, ts('2026-10-24T00:00:00Z'), ts('2026-10-24T01:00:00Z'));
     expect(await repos.processes.listLive()).toEqual([]);
   });
 
