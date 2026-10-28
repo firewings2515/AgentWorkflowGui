@@ -297,12 +297,47 @@ describe('closeSession (R-14, one app-server per GUI session)', () => {
 
   it('serves one GUI session only: a second one is refused, and closing reports only the first', async () => {
     const h = await resumed([]);
-    const B = SessionId.parse('session-b');
     await expect(h.adapter.startSession({ sessionId: B, cwd: CWD, model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false })).rejects.toThrow(/needs its own adapter/);
     await expect(h.adapter.resumeSession({ sessionId: B, nativeSessionRef: 'thread-b', cwd: CWD, model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false })).rejects.toThrow(/needs its own adapter/);
     expect(h.fake.received.filter((m) => m.method === 'thread/start')).toEqual([]);
     await h.adapter.closeSession(THREAD_ID);
     expect(h.of('runtime.exited').map((e) => e.sessionIds)).toEqual([[SESSION]]);
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
+  const B = SessionId.parse('session-b');
+  const codexModel = { runtime: 'codex', model: 'gpt-6-luna' } as const;
+  const startA = () => ({ sessionId: SESSION, cwd: CWD, model: codexModel, readOnly: false });
+  const settled = (results: PromiseSettledResult<unknown>[]) => results.map((r) => r.status);
+
+  it('takes the session before the first request: of A and B started together only A gets the app-server', async () => {
+    const h = setup([...init(), out('thread/start', 2), reply(2, recordedResult(sp01, 'thread/start'))]);
+    await h.adapter.start();
+    const results = await Promise.allSettled([h.adapter.startSession(startA()), h.adapter.startSession({ ...startA(), sessionId: B })]);
+    expect(settled(results)).toEqual(['fulfilled', 'rejected']);
+    expect(String((results[1] as PromiseRejectedResult).reason)).toMatch(/needs its own adapter/);
+    await h.adapter.closeSession(THREAD_ID);
+    expect(h.of('runtime.exited').map((e) => e.sessionIds)).toEqual([[SESSION]]);
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
+  it('the same for A and B resumed together, before the app-server even started', async () => {
+    const h = setup([...init(), out('thread/resume', 2), reply(2, recordedResult(sp01, 'thread/start'))]);
+    const resume = (sessionId: SessionId) => h.adapter.resumeSession({ sessionId, nativeSessionRef: THREAD_ID, cwd: CWD, model: codexModel, readOnly: false });
+    expect(settled(await Promise.allSettled([resume(SESSION), resume(B)]))).toEqual(['fulfilled', 'rejected']);
+    await h.adapter.closeSession(THREAD_ID);
+    expect(h.of('runtime.exited').map((e) => e.sessionIds)).toEqual([[SESSION]]);
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
+  it('releases a pending claim whose first request failed, so another session can take the app-server', async () => {
+    const h = setup([...init(), out('thread/start', 2), replyError(2, -32000, 'thread/start failed'), out('thread/start', 3), reply(3, recordedResult(sp01, 'thread/start'))]);
+    await h.adapter.start();
+    await expect(h.adapter.startSession(startA())).rejects.toThrow('thread/start failed');
+    expect(await h.adapter.startSession({ ...startA(), sessionId: B })).toMatchObject({ sessionId: B, nativeSessionRef: THREAD_ID });
+    await expect(h.adapter.startSession(startA())).rejects.toThrow(/needs its own adapter/);
+    await h.adapter.closeSession(THREAD_ID);
+    expect(h.of('runtime.exited').map((e) => e.sessionIds)).toEqual([[B]]);
     expect(h.fake.mismatches).toEqual([]);
   });
 
