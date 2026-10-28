@@ -10,7 +10,7 @@ import type { PermissionRequest } from '../../contracts';
 import type { PermissionPolicy, PolicyContext, PolicyDecision, PolicyRule } from '../ports';
 import { type Effects, type Target, handlerFor } from './commands';
 import { type Shell, type Word, lex } from './lexer';
-import { type AbsPath, type PathStyle, fileKey, hasWildcard, isSecretPath, isWithinAny, normaliseAbsolute, resolvePath } from './paths';
+import { type AbsPath, type PathStyle, fileKey, hasWildcard, isSecretPath, isWithinAny, mentionsSecret, normaliseAbsolute, resolvePath } from './paths';
 import { type Finding, REASONS, type ReasonKey, finding } from './reasons';
 
 interface Scope {
@@ -94,6 +94,11 @@ class Checker {
   target(t: Target, access: Access, cwds: readonly (AbsPath | undefined)[], style: PathStyle) {
     // Rule B: a wildcard target reaches files that cannot be listed or resolved here.
     if (t.wild || hasWildcard(t.text)) return this.add('unrecognised', 'wildcard');
+    // An NTFS alternate data stream (`file:stream`) is not followed; one on a secret file is a secret read.
+    if (/^([a-z]:)?[^:]*:/i.test(t.text) && t.text.replace(/^[a-z]:/i, '').includes(':')) {
+      if (mentionsSecret(t.text)) return this.add('secret-read', 'secret');
+      return this.add('unrecognised', 'unknown-target');
+    }
     for (const cwd of cwds) {
       const base = t.base === undefined ? cwd : resolvePath(t.base, cwd, style);
       // Without a base folder only an absolute path resolves.
@@ -142,6 +147,8 @@ class Checker {
     const style: PathStyle = shell === 'ps' ? 'win' : 'sh';
     // A failed `cd` leaves the folder as it was, so every folder it may be in stays possible.
     let cwds: (AbsPath | undefined)[] = [cwd];
+    // The working folder, and every folder `cd` moves to, must resolve through links.
+    if (cwd !== undefined && this.real(cwd) === undefined) this.add('unrecognised', 'unknown-target');
     for (const { words, writes, piped } of segments) {
       const [head, ...args] = words;
       if (head === undefined) {
@@ -169,7 +176,7 @@ class Checker {
       this.effects(fx, cwds, style);
       if (fx.cd) {
         const moved = cwds.map((c) => resolvePath(fx.cd!.text, c, style));
-        if (fx.cd.wild || moved.some((c) => c === undefined)) this.add('unrecognised', 'unknown-target');
+        if (fx.cd.wild || moved.some((c) => c === undefined || this.real(c) === undefined)) this.add('unrecognised', 'unknown-target');
         else cwds = [...new Set([...cwds, ...moved])];
       }
     }

@@ -121,6 +121,8 @@ const posix = (short: string, long: string, legacyNumber = false): Posix => ({
 interface Parsed {
   bound: Bound[];
   positionals: Word[];
+  /** How many positionals came before `--`, when there was one. */
+  dashDash?: number;
 }
 
 /** getopt-style parsing against a table; `undefined` for anything the table does not allow. */
@@ -136,6 +138,7 @@ const parsePosix = (args: readonly Word[], spec: Posix): Parsed | undefined => {
     }
     if (t === '--') {
       options = false;
+      out.dashDash = out.positionals.length;
       continue;
     }
     if (t.startsWith('--')) {
@@ -221,9 +224,24 @@ const folderOf = (text: string) => {
 
 const LINK_TYPE = /^(symboliclink|junction|hardlink)$/i;
 
+/**
+ * Where copying or moving one `source` may land. With a destination it is not known whether that is an
+ * existing folder, so both `dest` and `dest/<name>` count; without one (PowerShell's default) it is
+ * `<name>` in the working folder. Several sources, or a source whose name is unclear, are unrecognised.
+ */
+const landings = (sources: readonly Target[], dest: Target | undefined): Target[] | Effects => {
+  if (sources.length !== 1) return unrecognised(sources.length === 0 ? 'unknown-target' : 'wildcard');
+  const source = sources[0]!;
+  if (source.wild) return unrecognised('wildcard');
+  const name = source.text.replaceAll('\\', '/').replace(/\/+$/, '').split('/').pop() ?? '';
+  if (name === '' || name === '.' || name === '..' || /^[a-z]:$/i.test(name)) return unrecognised('unknown-target');
+  if (dest === undefined) return [word(name)];
+  return [dest, { ...dest, text: `${dest.text.replace(/[\\/]+$/, '')}/${name}` }];
+};
+
 interface CmdletOptions {
-  /** What it does with its targets; `remove` makes recursion and filters destructive. */
-  mode: 'read' | 'list' | 'write' | 'remove' | 'cd' | 'new';
+  /** What it does with its targets; `remove` makes recursion and filters destructive, `copy` lands the source. */
+  mode: 'read' | 'list' | 'write' | 'remove' | 'cd' | 'new' | 'copy';
   /** Destination, new name or value may also come from the pipeline, so piping into it is never understood. */
   pipedAny?: boolean;
 }
@@ -238,14 +256,18 @@ const cmdlet = (spec: string, { mode, pipedAny = false }: CmdletOptions): Handle
     if (mode === 'remove' && args.some((w) => /^\/s$/i.test(w.text))) return flagged(finding('destructive', 'wide-delete'));
     const bound = parsePs(args, table);
     if (bound === undefined) return unrecognised('option');
+    // NTFS alternate data streams are not followed.
+    if (bound.has('stream')) return unrecognised('unknown-target');
     const fx = none();
     const source = PATH_PARAMS.map((p) => bound.get(p)?.[0]).find((w) => w !== undefined);
     let filtered = false;
+    let dest: Word | undefined;
     for (const [name, values] of bound) {
       const kind = table.options.get(name)!.kind;
       for (const value of values) {
         if (kind === 'read') fx.reads.push(value);
-        else if (kind === 'write' || kind === 'dest') fx.writes.push(value);
+        else if (kind === 'write') fx.writes.push(value);
+        else if (kind === 'dest') dest = value;
         else if (kind === 'filter') filtered = true;
         else if (kind === 'cd') fx.cd = value;
         else if (kind === 'child') fx.writes.push({ ...value, base: source?.text ?? '.' });
@@ -257,6 +279,11 @@ const cmdlet = (spec: string, { mode, pipedAny = false }: CmdletOptions): Handle
       }
     }
     fx.pipedTarget = pipedAny || source === undefined;
+    if (mode === 'copy' && source !== undefined) {
+      const landed = landings([source], dest);
+      if (!Array.isArray(landed)) return landed;
+      fx.writes.push(...landed);
+    }
     if (mode === 'remove' && (filtered || bound.has('recurse') || fx.writes.some((w) => w.wild))) return flagged(finding('destructive', 'wide-delete'));
     if (filtered && mode !== 'list') return unrecognised('wildcard');
     if (mode === 'new' && bound.get('itemtype')?.some((w) => LINK_TYPE.test(w.text))) return unrecognised('link');
@@ -267,7 +294,7 @@ const cmdlet = (spec: string, { mode, pipedAny = false }: CmdletOptions): Handle
 
 interface ToolOptions {
   /** What its positional arguments are. `pattern`: the first is a search pattern unless one is given by option. */
-  positionals: 'read' | 'write' | 'pattern' | 'none';
+  positionals: 'read' | 'write' | 'pattern' | 'copy' | 'none';
   /** Reads its folder when it names no file (`ls`, `rg pattern`). */
   folderWhenEmpty?: boolean;
   /** Options that give the pattern, so every positional is a path. */
@@ -282,16 +309,25 @@ const tool = (spec: Posix, o: ToolOptions): Handler => (args) => {
   const parsed = parsePosix(args, spec);
   if (parsed === undefined) return unrecognised('option');
   const fx = none();
+  let dest: Word | undefined;
   for (const { opt, value } of parsed.bound) {
     if (value === undefined) continue;
     if (opt.kind === 'read') fx.reads.push(value);
-    else if (opt.kind === 'write' || opt.kind === 'dest') fx.writes.push(value);
+    else if (opt.kind === 'write') fx.writes.push(value);
+    else if (opt.kind === 'dest') dest = value;
   }
   let positionals = parsed.positionals;
   if (o.maxPositionals !== undefined && positionals.length > o.maxPositionals) return unrecognised('option');
   if (o.positionals === 'pattern' && !parsed.bound.some((b) => o.patternOptions?.includes(b.opt.name))) positionals = positionals.slice(1);
   if (o.positionals === 'read' || o.positionals === 'pattern') fx.reads.push(...positionals);
-  if (o.positionals === 'write') fx.writes.push(...positionals);
+  if (o.positionals === 'write' || o.positionals === 'copy') fx.writes.push(...positionals);
+  if (o.positionals === 'copy') {
+    // cp/mv: the folder given by -t, or else the last argument, receives the sources.
+    const sources = dest === undefined ? positionals.slice(0, -1) : positionals;
+    const landed = landings(sources, dest ?? positionals.at(-1));
+    if (!Array.isArray(landed)) return landed;
+    fx.writes.push(...landed);
+  }
   if (parsed.bound.some((b) => o.destructive?.includes(b.opt.name)) || (o.destructive && fx.writes.some((w) => w.wild))) {
     return flagged(finding('destructive', 'wide-delete'));
   }
@@ -353,9 +389,9 @@ const cp = tool(
     'r R a f i n p v u L P H T t/',
     'recursive archive force interactive no-clobber preserve? no-preserve= verbose update? target-directory/ no-target-directory parents dereference no-dereference',
   ),
-  { positionals: 'write' },
+  { positionals: 'copy' },
 );
-const mv = tool(posix('f i n v u T t/', 'force interactive no-clobber verbose update? target-directory/ no-target-directory'), { positionals: 'write' });
+const mv = tool(posix('f i n v u T t/', 'force interactive no-clobber verbose update? target-directory/ no-target-directory'), { positionals: 'copy' });
 
 const cdTool = (spec: Posix | undefined): Handler => (args) => {
   const parsed = spec ? parsePosix(args, spec) : { bound: [], positionals: [...args] };
@@ -403,13 +439,19 @@ const DIFF_LONG =
 interface GitSub {
   spec: Posix;
   access: 'read' | 'write';
-  /** Its positionals are files it writes (`git mv`, `git rm`), relative to the repository folder. */
+  /**
+   * What its positionals are. `paths`: all paths; `mixed`: revisions or paths, so anything that does not
+   * look like a revision is checked as a path; `refs`: revisions only. Everything after `--` is a path.
+   */
+  positionals: 'paths' | 'mixed' | 'refs';
+  /** Its positionals are files it writes (`git rm`); `git mv` also lands its source in the last one. */
   writesPositionals?: boolean;
   destructive?: readonly string[];
 }
 
-const sub = (short: string, long: string, access: 'read' | 'write' = 'read', extra: Partial<GitSub> = {}, legacyNumber = false): GitSub => ({
+const sub = (short: string, long: string, positionals: GitSub['positionals'], access: 'read' | 'write' = 'read', extra: Partial<GitSub> = {}, legacyNumber = false): GitSub => ({
   spec: posix(short, long, legacyNumber),
+  positionals,
   access,
   ...extra,
 });
@@ -418,49 +460,55 @@ const GIT_SUBS: Readonly<Record<string, GitSub>> = {
   status: sub(
     's b u? z v',
     'short branch porcelain? long untracked-files? ignored? ignore-submodules? column? no-column ahead-behind no-ahead-behind renames no-renames find-renames? show-stash verbose null',
+    'paths',
   ),
-  log: sub(LOG_SHORT, LOG_LONG, 'read', {}, true),
-  whatchanged: sub(LOG_SHORT, LOG_LONG, 'read', {}, true),
-  shortlog: sub('s n e c', 'summary numbered email committer all since= until= group= format='),
-  diff: sub(DIFF_SHORT, DIFF_LONG),
-  show: sub(`${LOG_SHORT} w b R a`, `${LOG_LONG} ${DIFF_LONG}`, 'read', {}, true),
-  add: sub('A u n v f N', 'all no-all update dry-run verbose force intent-to-add ignore-errors pathspec-from-file@ pathspec-file-nul renormalize ignore-removal chmod= sparse', 'write'),
+  log: sub(LOG_SHORT, LOG_LONG, 'mixed', 'read', {}, true),
+  whatchanged: sub(LOG_SHORT, LOG_LONG, 'mixed', 'read', {}, true),
+  shortlog: sub('s n e c', 'summary numbered email committer all since= until= group= format=', 'mixed'),
+  diff: sub(DIFF_SHORT, DIFF_LONG, 'mixed'),
+  show: sub(`${LOG_SHORT} w b R a`, `${LOG_LONG} ${DIFF_LONG}`, 'mixed', 'read', {}, true),
+  add: sub('A u n v f N', 'all no-all update dry-run verbose force intent-to-add ignore-errors pathspec-from-file@ pathspec-file-nul renormalize ignore-removal chmod= sparse', 'paths', 'write'),
   commit: sub(
     'm= a F@ t@ q v n s e C= c=',
     'message= all file@ template@ quiet verbose no-verify verify signoff no-signoff amend no-edit edit allow-empty allow-empty-message author= date= only include pathspec-from-file@ pathspec-file-nul fixup= squash= reuse-message= reedit-message= cleanup= dry-run short branch porcelain long status no-status untracked-files? reset-author trailer= no-gpg-sign',
+    'paths',
     'write',
   ),
-  mv: sub('f k n v', 'force dry-run verbose', 'write', { writesPositionals: true }),
-  rm: sub('r f n q', 'cached recursive force dry-run quiet ignore-unmatch sparse pathspec-from-file@', 'write', { writesPositionals: true, destructive: ['r', 'recursive'] }),
+  mv: sub('f k n v', 'force dry-run verbose', 'paths', 'write', { writesPositionals: true }),
+  rm: sub('r f n q', 'cached recursive force dry-run quiet ignore-unmatch sparse pathspec-from-file@', 'paths', 'write', { writesPositionals: true, destructive: ['r', 'recursive'] }),
   blame: sub(
     'L= w e s l t b c p n f S@',
     'contents@ ignore-revs-file@ ignore-rev= porcelain line-porcelain incremental date= show-name show-number root reverse= first-parent color-lines color-by-age abbrev? show-stats encoding=',
+    'mixed',
   ),
-  annotate: sub('L= w e s l t b c p n f S@', 'contents@ ignore-revs-file@ ignore-rev= porcelain date= root abbrev? encoding='),
+  annotate: sub('L= w e s l t b c p n f S@', 'contents@ ignore-revs-file@ ignore-rev= porcelain date= root abbrev? encoding=', 'mixed'),
   'ls-files': sub(
     'c d o i s u k m t v f z X@ x=',
     'cached deleted others ignored stage unmerged killed modified exclude= exclude-from@ exclude-per-directory= exclude-standard full-name error-unmatch directory no-empty-directory eol deduplicate format= recurse-submodules abbrev? sparse',
+    'paths',
   ),
-  'ls-tree': sub('d r t l z', 'name-only name-status object-only full-name full-tree abbrev? format= long'),
+  'ls-tree': sub('d r t l z', 'name-only name-status object-only full-name full-tree abbrev? format= long', 'mixed'),
   'rev-parse': sub(
     'q',
     'abbrev-ref? short? verify quiet show-toplevel git-dir git-common-dir absolute-git-dir is-inside-work-tree is-inside-git-dir is-bare-repository is-shallow-repository show-prefix show-cdup symbolic-full-name symbolic all branches? tags? remotes? since= until= default=',
+    'refs',
   ),
-  'rev-list': sub('n#', 'count max-count# all reverse left-right first-parent no-merges merges since= until= after= before= topo-order date-order', 'read', {}, true),
-  describe: sub('', 'tags always abbrev? dirty? broken? long exact-match contains all match= exclude= first-parent candidates#'),
-  'cat-file': sub('p t s e', 'batch? batch-check? batch-all-objects allow-unknown-type'),
+  'rev-list': sub('n#', 'count max-count# all reverse left-right first-parent no-merges merges since= until= after= before= topo-order date-order', 'mixed', 'read', {}, true),
+  describe: sub('', 'tags always abbrev? dirty? broken? long exact-match contains all match= exclude= first-parent candidates#', 'refs'),
+  'cat-file': sub('p t s e', 'batch? batch-check? batch-all-objects allow-unknown-type', 'refs'),
   grep: sub(
     'n i l L c w v E F P G h H e= f@ A# B# C# I q a z o',
     'line-number ignore-case files-with-matches files-without-match name-only count word-regexp invert-match extended-regexp fixed-strings perl-regexp basic-regexp untracked cached recurse-submodules all-match max-depth# heading break show-function function-context color? no-color and or not text full-name only-matching quiet threads# exclude-standard no-exclude-standard',
+    'mixed',
   ),
-  'merge-base': sub('', 'all is-ancestor fork-point independent octopus'),
-  'name-rev': sub('', 'name-only tags refs= exclude= all no-undefined always'),
-  'for-each-ref': sub('', 'format= sort= count# shell python perl tcl contains= no-contains= merged? no-merged? points-at= ignore-case'),
-  'show-ref': sub('d q s', 'heads tags head verify hash? abbrev? quiet dereference exists'),
-  'check-ignore': sub('q v n z', 'quiet verbose non-matching stdin'),
-  'count-objects': sub('v H', 'verbose human-readable'),
-  help: sub('a g', 'all guides'),
-  version: sub('', 'build-options'),
+  'merge-base': sub('', 'all is-ancestor fork-point independent octopus', 'refs'),
+  'name-rev': sub('', 'name-only tags refs= exclude= all no-undefined always', 'refs'),
+  'for-each-ref': sub('', 'format= sort= count# shell python perl tcl contains= no-contains= merged? no-merged? points-at= ignore-case', 'refs'),
+  'show-ref': sub('d q s', 'heads tags head verify hash? abbrev? quiet dereference exists', 'refs'),
+  'check-ignore': sub('q v n z', 'quiet verbose non-matching stdin', 'paths'),
+  'count-objects': sub('v H', 'verbose human-readable', 'refs'),
+  help: sub('a g', 'all guides', 'refs'),
+  version: sub('', 'build-options', 'refs'),
 };
 // Folders git commit runs hooks from when the repository points `core.hooksPath` into the worktree (husky).
 const GIT_HOOK_FOLDERS = ['.husky', '.githooks', '.git/hooks'];
@@ -474,6 +522,11 @@ const GIT_STASH_LIST = posix(LOG_SHORT, LOG_LONG);
 const GIT_STASH_SHOW = posix(DIFF_SHORT, DIFF_LONG);
 const GIT_WORKTREE_LIST = posix('v z', 'porcelain verbose expire=');
 const GIT_REMOTE = posix('v', 'verbose');
+const GIT_REMOTE_SHOW = posix('n', '');
+const GIT_REMOTE_GET_URL = posix('', 'push all');
+// A word git reads as a revision: `HEAD~1`, `main^`, `a..b`, `HEAD:path`, `@{u}`, a hash or a special head.
+// A `..` next to a slash (`../x`) is a path, not a range.
+const REVISION = /[~^:]|[^./\\]\.\.|\.\.[^./\\]|@\{|^@$|^(HEAD|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD)$|^[0-9a-f]{7,40}$/i;
 const REMOTE_KEY = /^(remote\.|url\.|branch\..+\.(remote|pushremote|merge)$)/i;
 
 const git: Handler = (args) => {
@@ -493,16 +546,21 @@ const git: Handler = (args) => {
   const texts = rest.map((w) => w.text);
   // Files named in git's arguments are relative to the folder `-C` moved to.
   const inRepo = (w: Word): Target => (at === undefined ? w : { ...w, base: at.text });
-  const parse = (spec: Posix, access: 'read' | 'write', writesPositionals = false): Effects => {
-    const parsed = parsePosix(rest, spec);
+  const parse = (spec: Posix, access: 'read' | 'write', mode: GitSub['positionals'], args: readonly Word[] = rest): Effects => {
+    const parsed = parsePosix(args, spec);
     if (parsed === undefined) return unrecognised('option');
     const fx: Effects = { ...none(), folder: { access, ...(at && { at }) } };
     for (const { opt, value } of parsed.bound) if (value !== undefined && opt.kind === 'read') fx.reads.push(inRepo(value));
-    for (const p of parsed.positionals) {
-      if (writesPositionals) fx.writes.push(inRepo(p));
-      // `rev:path` names a file in history; an absolute or climbing pathspec names one on disk.
-      else if ((!p.text.includes(':') || /^[a-z]:[\\/]/i.test(p.text)) && /^([a-z]:|[\\/]|\.\.|~)/i.test(p.text)) fx.reads.push(inRepo(p));
-    }
+    const end = parsed.dashDash ?? parsed.positionals.length;
+    let positionals = parsed.positionals;
+    // `git grep`: the first positional is the pattern unless -e or -f gives it.
+    if (name === 'grep' && !parsed.bound.some((b) => ['e', 'f'].includes(b.opt.name))) positionals = positionals.slice(1);
+    const offset = parsed.positionals.length - positionals.length;
+    positionals.forEach((p, k) => {
+      const afterDashDash = k + offset >= end;
+      // Before `--` a word that reads as a revision (`HEAD~1`, `a..b`, `HEAD:path`, a hash) is one; any other is checked as a path.
+      if (afterDashDash || mode === 'paths' || (mode === 'mixed' && !REVISION.test(p.text))) fx.reads.push(inRepo(p));
+    });
     return fx;
   };
 
@@ -512,13 +570,16 @@ const git: Handler = (args) => {
   if (name === 'remote') {
     const op = texts.find((t) => !t.startsWith('-'))?.toLowerCase();
     if (op !== undefined && op !== 'show' && op !== 'get-url') return flagged(finding('git-remote', 'git-remote'));
-    return op === undefined ? parse(GIT_REMOTE, 'read') : { ...none(), folder: { access: 'read', ...(at && { at }) } };
+    if (op === undefined) return parse(GIT_REMOTE, 'read', 'refs');
+    // `git remote show|get-url [options] <name>`; options before the operation are not accepted.
+    if (texts[0]?.toLowerCase() !== op) return unrecognised('option');
+    return parse(op === 'show' ? GIT_REMOTE_SHOW : GIT_REMOTE_GET_URL, 'read', 'refs', rest.slice(1));
   }
   if (name === 'clean') return flagged(finding('destructive', 'git-discard'));
   if (name === 'reset') return texts.some((t) => ['--hard', '--merge', '--keep'].includes(t)) ? flagged(finding('destructive', 'git-discard')) : unrecognised();
   if (name === 'branch' || name === 'tag') {
     if (texts.some((t) => ['--delete'].includes(t) || /^-[a-zA-Z]*[dD]/.test(t))) return flagged(finding('destructive', 'git-discard'));
-    const fx = parse(name === 'branch' ? GIT_BRANCH : GIT_TAG, 'read');
+    const fx = parse(name === 'branch' ? GIT_BRANCH : GIT_TAG, 'read', 'refs');
     // A positional creates a branch or tag, except `git tag -l <pattern>`.
     const listing = name === 'tag' && texts.some((t) => t === '-l' || t === '--list');
     return texts.some((t) => !t.startsWith('-')) && !listing ? unrecognised() : fx;
@@ -552,7 +613,17 @@ const git: Handler = (args) => {
   const parsed = parsePosix(rest, known.spec);
   if (parsed?.bound.some((b) => known.destructive?.includes(b.opt.name))) return flagged(finding('destructive', 'wide-delete'));
   if (known.writesPositionals && parsed?.positionals.some((w) => w.wild)) return flagged(finding('destructive', 'wide-delete'));
-  const fx = parse(known.spec, known.access, known.writesPositionals);
+  const fx = parse(known.spec, known.access, known.positionals);
+  if (known.writesPositionals && fx.findings.length === 0) {
+    // Its paths are written (removed or moved); `git mv` also lands the source in its last argument.
+    fx.writes.push(...parsed!.positionals.map(inRepo));
+    if (name === 'mv') {
+      const paths = parsed!.positionals.map(inRepo);
+      const landed = landings(paths.slice(0, -1), paths.at(-1));
+      if (!Array.isArray(landed)) return landed;
+      fx.writes.push(...landed);
+    }
+  }
   if (name === 'commit' && fx.findings.length === 0) fx.loads.push(...GIT_HOOK_FOLDERS.map((f) => inRepo(word(f))));
   return fx;
 };
@@ -670,7 +741,7 @@ const resolvePathCmdlet = cmdlet(`Path@0 LiteralPath@ ${LITERAL} Relative Relati
 const getItem = cmdlet(`Path@0 LiteralPath@ ${LITERAL} Force Credential= Stream= Filter% Include% Exclude%`, { mode: 'read' });
 const removeItem = cmdlet(`Path>0 LiteralPath> ${LITERAL} Recurse Force Credential= Filter% Include% Exclude% Stream=`, { mode: 'remove' });
 const newItem = cmdlet('Path>0 Name^ ItemType= Type:ItemType Value= Target:Value Force Credential=', { mode: 'new', pipedAny: true });
-const copyItem = cmdlet(`Path>0 LiteralPath> ${LITERAL} Destination/1 Recurse Force Container PassThru Credential= Filter% Include% Exclude%`, { mode: 'write', pipedAny: true });
+const copyItem = cmdlet(`Path>0 LiteralPath> ${LITERAL} Destination/1 Recurse Force Container PassThru Credential= Filter% Include% Exclude%`, { mode: 'copy', pipedAny: true });
 const renameItem = cmdlet(`Path>0 LiteralPath> ${LITERAL} NewName~1 Force PassThru Credential=`, { mode: 'write', pipedAny: true });
 const setLocation = cmdlet(`Path!0 LiteralPath! ${LITERAL} PassThru StackName=`, { mode: 'cd' });
 
@@ -804,7 +875,7 @@ const NATIVE = table(
 
 /** Git Bash built-ins and GNU tools whose names PowerShell gives to its own cmdlets. */
 const SH_ONLY = table(
-  { ls, dir: ls, cat, sort, diff, mkdir, tee, rm, rmdir, unlink, cp, mv, cd: cdTool(posix('L P', '')), type: inert },
+  { ls, dir: ls, cat, sort, diff, mkdir, tee, rm, rmdir, unlink, cp, mv, cd: cdTool(posix('L P', '')), pushd: cdTool(undefined), type: inert },
   [['echo', 'printf', 'pwd', 'true', 'false', 'sleep', 'basename', 'dirname', 'realpath'], inert],
 );
 
@@ -825,7 +896,7 @@ const PS_ONLY = table(
   [['new-item', 'ni', 'md', 'mkdir'], newItem],
   [['copy-item', 'cpi', 'cp', 'copy', 'move-item', 'mi', 'mv', 'move'], copyItem],
   [['rename-item', 'rni', 'ren'], renameItem],
-  [['set-location', 'sl', 'cd', 'chdir'], setLocation],
+  [['set-location', 'sl', 'cd', 'chdir', 'push-location', 'pushd'], setLocation],
   [
     [
       'get-location',
