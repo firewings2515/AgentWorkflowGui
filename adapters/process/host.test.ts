@@ -183,3 +183,54 @@ describe('WindowsProcessHost Job scan (simulated kernel32)', () => {
     expect(opened.sort()).toEqual(closed.filter((h) => h !== 1n).sort());
   });
 });
+
+describe('T021 Job members on the real machine (simulated kernel32)', () => {
+  /** A Job with the runtime host (PID 100) and whatever `members` lists; `images` names each PID's file. */
+  const simulated = (members: number[], images: Record<number, string>) => {
+    const native: HostNative = {
+      createKillOnCloseJob: () => 1n,
+      terminateJob: () => undefined,
+      jobProcessIds: () => members,
+      openProcess: (pid) => (members.includes(pid) ? BigInt(pid) : undefined),
+      isProcessInJob: (handle, job) => job === 1n && members.includes(Number(handle)),
+      creationTime: (handle) => Number(handle) * 1000,
+      imagePath: (handle) => images[Number(handle)] ?? 'C:/tools/node.exe',
+      exitCodeOf: (handle) => (members.includes(Number(handle)) ? undefined : 0),
+      terminateProcess: () => true,
+      closeHandle: () => undefined,
+    };
+    const launch = () => Object.assign(new EventEmitter(), { pid: 100, startedAt: 100_000 }) as unknown as JobChild;
+    const { rows, repository } = memoryRepository();
+    const host = new WindowsProcessHost({ repository, native, launch });
+    host.spawn(A, 'codex', { command: 'codex.exe' });
+    return { host, rows };
+  };
+  const images = {
+    // Forward slashes, so the file names are found on any CI platform's path module.
+    100: 'C:/Users/u/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe',
+    200: 'C:/Windows/System32/conhost.exe',
+    300: 'C:/Users/u/.codex/packages/standalone/releases/0.160.0-x86_64-pc-windows-msvc/bin/codex-code-mode-host.exe',
+    400: 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
+  };
+
+  it("T021 Codex's resident codex-code-mode-host is a helper, not a command, so exiting does not warn of it", async () => {
+    const { host } = simulated([100, 200, 300, 400], images);
+    const kinds = Object.fromEntries((await host.listOwned(A)).map((p) => [p.pid, p.kind]));
+    expect(kinds).toEqual({ 100: 'runtime-host', 200: 'helper', 300: 'helper', 400: 'command' });
+  });
+
+  it('T021 processes that exited before their Job was ended (a graceful close) are recorded as ended too', async () => {
+    const members = [100, 200, 300, 400];
+    const { host, rows } = simulated(members, images);
+    expect((await host.listOwned(A)).length).toBe(4);
+    // Closing stdin let the app-server end itself and everything it ran.
+    members.splice(0, members.length);
+    expect(await host.closeJob(A)).toEqual({ ended: [] });
+    expect(rows.map((r) => [r.pid, r.endedAt !== undefined])).toEqual([
+      [100, true],
+      [200, true],
+      [300, true],
+      [400, true],
+    ]);
+  });
+});

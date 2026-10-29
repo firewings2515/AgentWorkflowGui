@@ -22,10 +22,12 @@ import {
   type PayloadHash,
   type PeerMessage,
   PeerMessageId,
+  type PermissionRequest,
   type Runtime,
   type SendMessageToolInput,
   type SendMessageToolResult,
   type SessionId,
+  type SessionItem,
   type Timestamp,
   AttemptId,
 } from '../../contracts';
@@ -101,6 +103,21 @@ const fail = (
 });
 
 const errorName = (error: unknown) => (error instanceof Error ? error.name : 'non-error thrown');
+
+/** A turn is running: also while it waits for the user (R-05) or a file lock (R-07). */
+const inTurn = (s: Pick<LogicalSession, 'activity'>) => s.activity === 'running' || s.activity === 'waiting-user' || s.activity === 'waiting-lock';
+
+/** An item the last run left open, as ended by that run's exit (T021); undefined when it had ended. */
+const endedByExit = (item: SessionItem, endedAt: Timestamp): SessionItem | undefined => {
+  if (item.endedAt !== undefined) return undefined;
+  switch (item.kind) {
+    case 'command':
+      return { ...item, state: 'interrupted', endedAt };
+    case 'fileChange':
+    case 'toolCall':
+      return { ...item, state: 'failed', endedAt };
+  }
+};
 
 /** Stable operation IDs: one runtime session per GUI session, one delivery per renderer message ID. */
 const provisionOp = (sessionId: SessionId): OperationId => OperationIdSchema.parse(`provision:${sessionId}`);
@@ -259,6 +276,15 @@ export class SessionService {
             item.changes.flatMap((c) => [c.path, ...(c.movePath ? [c.movePath] : [])]),
             session.cwd,
           );
+      // The last run's processes are gone (its Job ended them, D-03), so nothing of it is still running:
+      // turns, items and sub-agents it left open were cut off by its exit (T021: a GUI killed mid-turn).
+      const at = this.options.now();
+      for (const turn of conversation.turns) if (turn.state === 'running') await repositories.conversations.upsertTurn({ ...turn, state: 'interrupted', endedAt: at });
+      for (const item of conversation.items) {
+        const ended = endedByExit(item, at);
+        if (ended !== undefined) await repositories.conversations.upsertItem(ended);
+      }
+      for (const task of conversation.nativeTasks) if (task.state === 'running') await repositories.conversations.upsertNativeTask({ ...task, state: 'stopped', endedAt: at });
       for (const request of conversation.permissionRequests) {
         if ((request.kind === 'command' || request.kind === 'fileChange') && request.decision?.outcome === 'approve')
           this.written.add(session.id, request.paths, request.cwd ?? session.cwd);
@@ -358,7 +384,7 @@ export class SessionService {
     for (const s of sessions)
       runningNativeTasks += (await this.repos.conversations.get(s.id)).nativeTasks.filter((t) => t.state === 'running').length;
     return {
-      runningSessions: sessions.filter((s) => s.activity === 'running' || s.activity === 'waiting-user' || s.activity === 'waiting-lock').map((s) => s.id),
+      runningSessions: sessions.filter(inTurn).map((s) => s.id),
       heldRequests: sessions.reduce((n, s) => n + this.gate.heldFor(s.id).length, 0),
       runningNativeTasks,
     };
@@ -501,7 +527,7 @@ export class SessionService {
       const provisioned = await this.ensureProvisioned(session);
       if (this.closing) return closingFailure(requestId);
       if (!provisioned.ok) return fail(requestId, provisioned.code, provisioned.message, provisioned);
-      const entry: DispatchEntry = session.activity === 'running' ? { kind: 'insert' } : { kind: 'new-turn' };
+      const entry: DispatchEntry = inTurn(session) ? { kind: 'insert' } : { kind: 'new-turn' };
       const accepted = await this.delivery.accept({
         kind: 'user-message',
         operationId,
@@ -912,7 +938,7 @@ export class SessionService {
       // A busy target gets the message inside its running turn (SP-05).
       await this.dispatchPending(p.operationId, {
         origin,
-        entry: target.activity === 'running' ? { kind: 'insert' } : { kind: 'new-turn' },
+        entry: inTurn(target) ? { kind: 'insert' } : { kind: 'new-turn' },
       });
       record = (await this.store.get(p.operationId)) ?? record;
     }
@@ -1224,6 +1250,7 @@ export class SessionService {
       case 'permission.updated':
         await conversations.upsertPermissionRequest(event.request);
         if (event.request.state === 'withdrawn') await this.gate.withdrawn(event.request);
+        await this.followHold(event.request);
         break;
       case 'nativeTask.updated':
         await conversations.upsertNativeTask(event.task);
@@ -1310,6 +1337,23 @@ export class SessionService {
   }
 
   // ---- session records ------------------------------------------------------------------------------
+
+  /**
+   * R-05: a session whose request is held for the user shows `waiting-user`, which no adapter reports; once
+   * nothing of it waits any more it is back to running, or idle when its turn ended meanwhile (T021).
+   */
+  private async followHold(request: PermissionRequest): Promise<void> {
+    const waits = (r: PermissionRequest) => r.state === 'held' && r.hold?.reason === 'awaiting-user';
+    const { sessionId } = request;
+    if (waits(request)) {
+      await this.updateSession(sessionId, (s) => (s.activity === 'running' || s.activity === 'idle' ? { ...s, activity: 'waiting-user' } : undefined));
+      return;
+    }
+    if ((await this.repos.sessions.get(sessionId))?.activity !== 'waiting-user') return;
+    const conversation = await this.repos.conversations.get(sessionId);
+    if (conversation.permissionRequests.some(waits)) return;
+    await this.setActivity(sessionId, conversation.turns.some((t) => t.state === 'running' && t.nativeTaskId === undefined) ? 'running' : 'idle');
+  }
 
   private async setActivity(sessionId: SessionId, activity: LogicalSession['activity']): Promise<void> {
     await this.updateSession(sessionId, (s) => {

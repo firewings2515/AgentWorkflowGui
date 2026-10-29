@@ -39,6 +39,8 @@ interface OpenJob extends SessionJob {
 const iso = (ms: number) => new Date(ms).toISOString();
 const sameProcess = (a: Pick<OwnedProcess, 'pid' | 'startedAt'>, b: Pick<OwnedProcess, 'pid' | 'startedAt'>) =>
   a.pid === b.pid && Date.parse(a.startedAt) === Date.parse(b.startedAt);
+/** Image names (lower case) of Job members that are never the agent's commands. */
+const HELPER_IMAGES = new Set(['conhost.exe', 'codex-code-mode-host.exe']);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class WindowsProcessHost implements ProcessHost {
@@ -139,8 +141,9 @@ export class WindowsProcessHost implements ProcessHost {
         live.push(known);
         continue;
       }
-      // The console host Windows adds for CREATE_NO_WINDOW is not the runtime's work.
-      const kind = basename(info.image).toLowerCase() === 'conhost.exe' ? 'helper' : 'command';
+      // The console host Windows adds for CREATE_NO_WINDOW, and the runtimes' own resident helpers, are not
+      // the agent's commands: counted as commands they made exiting warn of work that is not there (T021).
+      const kind = HELPER_IMAGES.has(basename(info.image).toLowerCase()) ? 'helper' : 'command';
       live.push(this.remember(job, runtime, { pid, startedAt: info.startedAt, kind }));
     }
     return live;
@@ -169,7 +172,10 @@ export class WindowsProcessHost implements ProcessHost {
     }
     const at = this.now();
     const ended = before.map((p) => ({ ...p, endedAt: at }));
-    await this.markEnded(ended);
+    // What exited before the Job was ended (a graceful close lets the runtime end its own processes) is
+    // recorded as ended too, by now at the latest; otherwise its record stays open until the next start (T021).
+    const exited = [...job.seen.values()].filter((p) => !before.some((b) => sameProcess(b, p))).map((p) => ({ ...p, endedAt: at }));
+    await this.markEnded([...ended, ...exited]);
     return { ended };
   }
 

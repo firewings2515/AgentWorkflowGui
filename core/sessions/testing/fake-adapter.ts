@@ -1,6 +1,6 @@
 // A fake runtime adapter for the session service's tests: records every call (with the MCP mount it got),
 // lets a test emit runtime events and approval requests, and answers dispatches as told.
-import type { ModelOption, ModelSelection, PermissionDecision, PermissionHold, PermissionRequest, Runtime, SessionId } from '../../../contracts';
+import type { ModelOption, ModelSelection, ObservedModel, PermissionDecision, PermissionHold, PermissionRequest, Runtime, SessionId } from '../../../contracts';
 import type {
   DispatchRequest,
   DispatchResult,
@@ -36,6 +36,8 @@ export class FakeAdapter implements RuntimeAdapter {
   startModes: ('ok' | 'fail' | 'lost' | 'held')[] = [];
   /** The message a failed start rejects with (e.g. one quoting the MCP mount). */
   startError = 'could not start';
+  /** What start and resume report as the observed model (Codex: the configured one). */
+  openedModel: ObservedModel = { source: 'unknown' };
   /** When set, setModel waits for it; `setModelError` makes it fail. */
   setModelGate: Promise<void> | undefined;
   setModelError: Error | undefined;
@@ -71,7 +73,7 @@ export class FakeAdapter implements RuntimeAdapter {
     if (mode === 'fail') return Promise.reject(new Error(this.startError));
     if (mode === 'lost') return Promise.reject(new Error('the create response was lost'));
     const ref = options.preallocatedRef ?? `thread-${++this.next}`;
-    const info: NativeSessionInfo = { sessionId: options.sessionId, nativeSessionRef: ref, cwd: options.cwd, model: { source: 'unknown' } };
+    const info: NativeSessionInfo = { sessionId: options.sessionId, nativeSessionRef: ref, cwd: options.cwd, model: this.openedModel };
     if (mode === 'held') return new Promise((resolve) => this.held.push(() => resolve(info)));
     return Promise.resolve(info);
   }
@@ -85,7 +87,7 @@ export class FakeAdapter implements RuntimeAdapter {
     this.calls.push('resumeSession');
     this.resumed.push(options);
     await this.resumeGate;
-    return { sessionId: options.sessionId, nativeSessionRef: options.nativeSessionRef, cwd: options.cwd, model: { source: 'unknown' } };
+    return { sessionId: options.sessionId, nativeSessionRef: options.nativeSessionRef, cwd: options.cwd, model: this.openedModel };
   }
 
   closeSession(ref: string): Promise<{ forced: boolean }> {
