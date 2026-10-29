@@ -2,5 +2,14 @@
 export { isGuiToolRequest, PermissionGate, type PermissionGateOptions } from './permissions';
 export { REDACTED, Redactor, tokenForms } from './redact';
 export { SessionRuntimes, type SessionRuntimesOptions } from './runtimes';
-export { type CommandOf, SessionService, type SessionServiceOptions, type WorkflowEntry, type WorkflowHooks, type WorkflowSession } from './service';
+export {
+  type CommandOf,
+  SessionService,
+  type SessionServiceOptions,
+  type TransferCommand,
+  type TransferHooks,
+  type WorkflowEntry,
+  type WorkflowHooks,
+  type WorkflowSession,
+} from './service';
 export { absolutePath, isAbsolutePath, WrittenPaths, type WrittenPathsOptions } from './written-paths';

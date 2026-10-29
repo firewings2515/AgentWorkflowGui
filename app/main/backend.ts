@@ -27,6 +27,7 @@ import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../ada
 import { permissionPolicy } from '../../core/policy';
 import type { AppRepositories, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter } from '../../core/ports';
 import { Redactor, SessionService } from '../../core/sessions';
+import { TransferService } from '../../core/transfer';
 import { WorkflowEngine } from '../../core/workflow';
 import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
@@ -66,6 +67,8 @@ export interface Backend {
   service: SessionService;
   /** The workflow engine (T024) behind `workflow.start` and the workflow MCP tools. */
   workflow: WorkflowEngine;
+  /** Cross-tool transfer (T023) behind `transfer.*`. */
+  transfer: TransferService;
   repositories: AppRepositories;
   mcp: GuiMcpServer;
   /** What exiting now would cut off (R-14). */
@@ -279,6 +282,9 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   const workflow = new WorkflowEngine({ sessions: service, publish: (event) => void bus.publish(event), now, uuid, hashPayload: sha256, log });
   service.attachWorkflow(workflow);
   ref.workflow = workflow;
+  // T023: transfer.prepare / confirm / cancel; it reaches storage and runtimes through the service too.
+  const transfer = new TransferService({ sessions: service, publish: (event) => void bus.publish(event), now, hashPayload: sha256, log });
+  service.attachTransfer(transfer);
 
   // 6. Restart recovery (CR-2): unknown only reconciled, pending through the one dispatch entry. Stored data
   // it cannot read stops the start like damaged data does (r1-P1-6): no model probe, no runtime.
@@ -287,6 +293,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     if (report.failed.length > 0) log(`[backend] ${String(report.failed.length)} delivery(ies) could not be recovered`);
     // Each run's tasks rebuilt from its handoffs, the record of what was counted (T024).
     await workflow.recover();
+    // Each confirmed transfer goes on from the step it stopped at; a cancelled one sends nothing (T023).
+    await transfer.recover();
   } catch (error) {
     await service.shutdown(closeTimeoutMs).catch(() => undefined);
     await mcp.close().catch(() => undefined);
@@ -371,6 +379,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     facade,
     service,
     workflow,
+    transfer,
     repositories,
     mcp,
     async unfinishedWork() {

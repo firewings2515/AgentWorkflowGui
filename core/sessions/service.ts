@@ -1,7 +1,8 @@
 // Ordinary sessions over the ports (T017): the commands of the renderer, the runtime events that become the
 // stored conversation, the GUI MCP server's `send_message`, and restart / exit. Workflow execution belongs
 // to the workflow engine (T024), attached with `attachWorkflow`; this service only gives it workflow
-// sessions, their deliveries and their escalations. Cross-tool transfer still answers `unsupported`.
+// sessions, their deliveries and their escalations. Cross-tool transfer (T023) belongs to the transfer
+// service, attached with `attachTransfer` the same way.
 //
 // Every payload reaches a runtime through the CR-2 delivery service (T008); a session's runtime session is
 // itself created as a provision delivery, so a lost create response is never followed by a second create.
@@ -85,6 +86,29 @@ export interface WorkflowHooks {
    * to anything else. Every other user message is `deliver`.
    */
   userMessageFate(record: StoredDelivery): Promise<'deliver' | 'wait' | 'cancel'>;
+}
+
+export type TransferCommand = CommandOf<'transfer.prepare' | 'transfer.confirm' | 'transfer.cancel'>;
+
+/**
+ * What the transfer service (T023, R-02) takes over from the session service. Every `transfer` delivery (a
+ * proposal's payload, or the request for the source agent's note) is dispatched by it, in its own order
+ * with the proposal's state, so a cancelled proposal never sends anything.
+ */
+export interface TransferHooks {
+  execute(command: TransferCommand): Promise<CommandResult>;
+  /** A session's own turn ended: a draft waiting for its source's turn boundary may finish now. */
+  turnEnded(turn: Turn): void;
+  /** Whether a `transfer` delivery may still go (the gate in `dispatchOne`). */
+  mayDispatch(record: PayloadDelivery): Promise<boolean>;
+  /** A session a transfer created: its provision is left to the transfer service at a restart. */
+  isTarget(session: LogicalSession): boolean;
+  /** Re-dispatches a `transfer` delivery the user retried, in the transfer's own order. */
+  redeliver(operationId: OperationId): Promise<void>;
+  /** Where an unknown transfer delivery, or a transfer target's provision, is shown: the source session. */
+  escalationFor(item: DeliveryEscalation): Promise<{ ref: NonNullable<Escalation['ref']>; rootSessionId: SessionId } | undefined>;
+  /** The user decided on an unknown delivery with `delivery.resolve` (already recorded). */
+  deliveryResolved(operationId: OperationId, decision: 'wait' | 'cancel' | 'retry'): Promise<void>;
 }
 
 /** How a workflow payload enters its target: a formal handoff waits for the target's turn to end (SP-05). */
@@ -260,6 +284,7 @@ export class SessionService {
   /** Set when shutdown finished: nothing is stored any more (the database closes next). */
   private closed = false;
   private workflow: WorkflowHooks | undefined;
+  private transfer: TransferHooks | undefined;
   /**
    * A formal handoff dispatched to a session whose turn has not been seen to end yet (SP-05, T024 r1-P1-2/3):
    * the main turns the session had before the dispatch, and the new one once it started. A replayed old turn
@@ -313,6 +338,11 @@ export class SessionService {
   /** The workflow engine (T024); without one, `workflow.start` answers `unsupported`. */
   attachWorkflow(hooks: WorkflowHooks): void {
     this.workflow = hooks;
+  }
+
+  /** The transfer service (T023); without one, `transfer.*` answers `unsupported`. */
+  attachTransfer(hooks: TransferHooks): void {
+    this.transfer = hooks;
   }
 
   // ---- lifecycle ------------------------------------------------------------------------------------
@@ -371,12 +401,19 @@ export class SessionService {
     // A workflow node's session is created for the work sent to it: a provision with none (a crash between
     // the two acceptances) waits for the first handoff instead of starting a runtime now (T024 r1-P2-1).
     const workflowSessions = new Set((await repositories.sessions.list()).filter((s) => s.kind === 'workflow').map((s) => s.id));
+    // A transfer's payloads and its target's provision go in the transfer's own order, after this (T023).
+    const transfer = this.transfer;
+    const transferTargets = new Set(transfer === undefined ? [] : (await repositories.sessions.list()).filter((s) => transfer.isTarget(s)).map((s) => s.id));
     const withWork = new Set<string>();
     for (const state of ['pending', 'unknown', 'sent'] as const)
       for (const record of await this.store.listByState(state)) if (record.kind !== 'provision' && record.target.sessionId !== undefined) withWork.add(record.target.sessionId);
     const report = await this.delivery.recover({
       select: (record) => {
-        if (record.kind === 'provision') return workflowSessions.has(record.spec.sessionId) && !withWork.has(record.spec.sessionId) ? 'skip' : {};
+        if (record.kind === 'provision') {
+          if (transferTargets.has(record.spec.sessionId)) return 'skip';
+          return workflowSessions.has(record.spec.sessionId) && !withWork.has(record.spec.sessionId) ? 'skip' : {};
+        }
+        if (record.kind === 'transfer' && transfer !== undefined) return 'skip';
         // A formal handoff goes through the one queue of its target (T024 r1-P1-2), below.
         if (record.kind === 'handoff' && record.target.sessionId !== undefined) {
           handoffs.push({ operationId: record.operationId, sessionId: record.target.sessionId });
@@ -540,6 +577,7 @@ export class SessionService {
       case 'transfer.prepare':
       case 'transfer.confirm':
       case 'transfer.cancel':
+        if (this.transfer !== undefined) return this.transfer.execute(command);
         return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
     }
   }
@@ -822,12 +860,19 @@ export class SessionService {
       await this.retryPending(attempt.operationId);
       if (escalation.ref?.kind === 'provision') for (const blocked of escalation.ref.blocked) await this.retryPending(blocked);
     }
+    // A transfer follows the user's decision on its target or payload (T023).
+    if (decision === 'cancel') await this.transfer?.deliveryResolved(attempt.operationId, decision);
     return ok(requestId);
   }
 
   /** A pending delivery the user retried: a formal handoff waits in its target's queue like any other (r1-P1-2). */
   private async retryPending(operationId: OperationId): Promise<void> {
     const record = await this.store.get(operationId);
+    // A transfer delivery goes in its transfer's order, which a cancel also takes (T023).
+    if (record?.kind === 'transfer' && this.transfer !== undefined) {
+      await this.transfer.redeliver(operationId);
+      return;
+    }
     if (record?.kind === 'handoff' && record.target.sessionId !== undefined) {
       await this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn');
       return;
@@ -1253,6 +1298,49 @@ export class SessionService {
     return { operationId: provisionOp(sessionId), bindingKey: `session:${sessionId}`, state: 'pending', preallocated: false };
   }
 
+  // ---- transfers (T023) -----------------------------------------------------------------------------
+
+  /** Whether the session's own turn runs, by the stored turns (an old event cannot undo them): its turn boundary. */
+  async mainTurnRunning(sessionId: SessionId): Promise<boolean> {
+    return runningMainTurn(await this.repos.conversations.get(sessionId)) !== undefined;
+  }
+
+  /** The native session a GUI session is bound to, once its provision was sent. */
+  nativeSessionOf(sessionId: SessionId): Promise<string | undefined> {
+    return this.binding(sessionId);
+  }
+
+  /**
+   * Dispatches a pending `transfer` delivery in its session's queue, as a new turn and only at the session's
+   * turn boundary (`queued` while its own turn runs); its provision first when needed (CR2 §3).
+   */
+  deliverTransfer(operationId: OperationId, sessionId: SessionId): Promise<DeliveryState | 'queued'> {
+    return this.serial(sessionKey(sessionId), async (): Promise<DeliveryState | 'queued'> => {
+      const record = await this.store.get(operationId);
+      if (record === undefined || record.delivery.state !== 'pending') return record?.delivery.state ?? 'pending';
+      const session = await this.repos.sessions.get(sessionId);
+      if (this.closing || session === undefined) return 'pending';
+      const provisioned = await this.ensureProvisioned(session);
+      if (!provisioned.ok || this.closing) return 'pending';
+      if (runningMainTurn(await this.repos.conversations.get(sessionId)) !== undefined) return 'queued';
+      return this.dispatchPending(operationId, { origin: await this.originOf(operationId), entry: { kind: 'new-turn' } });
+    });
+  }
+
+  /**
+   * The user cancelled what an unknown delivery was for (`transfer.cancel`): the live unknown attempt gets
+   * the user's cancel and its escalation is closed. It stays reconcilable (CR2 §2).
+   */
+  async cancelUnknownDelivery(operationId: OperationId): Promise<void> {
+    const record = await this.store.get(operationId);
+    const last = record?.delivery.attempts.at(-1);
+    if (record?.delivery.state !== 'unknown' || last?.state !== 'unknown' || last.resolution?.decision === 'cancel') return;
+    const resolved = await this.delivery.resolve({ operationId, attemptId: last.attemptId, decision: 'cancel', acceptDuplicateRisk: false });
+    if (resolved.status === 'commit-uncertain') throw new Error('the cancel of an unknown delivery could not be saved for certain');
+    const escalation = await this.repos.escalations.get(deliveryEscalationId(`${operationId}/${last.attemptId}`));
+    if (escalation?.state === 'open') await this.closeEscalation(escalation, 'resolved', 'user');
+  }
+
   /** Where a session's escalations go (R-05): a workflow session's to its instance's root. */
   private async rootOf(session: LogicalSession): Promise<{ rootSessionId: SessionId; instanceId?: InstanceId }> {
     if (session.kind !== 'workflow') return { rootSessionId: session.id };
@@ -1442,7 +1530,11 @@ export class SessionService {
   private async dispatchOne(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry }): Promise<DispatchOutcome | undefined> {
     if (this.closing) return undefined;
     // Every way a user message is dispatched (sent at once, recovered, retried) passes here (T024 r3-P1-2).
-    const record = this.workflow === undefined ? undefined : await this.store.get(operationId);
+    const record = this.workflow === undefined && this.transfer === undefined ? undefined : await this.store.get(operationId);
+    // Every transfer delivery passes here too: never once its proposal is cancelled or failed (T023).
+    if (record?.kind === 'transfer' && this.transfer !== undefined) {
+      if (record.outcome !== undefined || !(await this.transfer.mayDispatch(record))) return undefined;
+    }
     if (record?.kind === 'user-message' && this.workflow !== undefined) {
       if (record.outcome !== undefined) return undefined;
       const fate = await this.workflow.userMessageFate(record);
@@ -1471,8 +1563,11 @@ export class SessionService {
       await this.setActivity(sessionId, 'reconciling');
       return;
     }
-    const ref: Escalation['ref'] =
-      item.deliveryKind === 'provision'
+    // A transfer's own deliveries, and its target's creation, are shown at the source session (T023).
+    const transferred = await this.transfer?.escalationFor(item);
+    const ref: Escalation['ref'] = transferred
+      ? transferred.ref
+      : item.deliveryKind === 'provision'
         ? {
             kind: 'provision',
             operationId: item.operationId,
@@ -1488,7 +1583,7 @@ export class SessionService {
     if ((await this.repos.escalations.get(id)) !== undefined) return;
     // A workflow session's question goes to its instance's root (R-05).
     const target = await this.repos.sessions.get(sessionId);
-    const root = target === undefined ? { rootSessionId: sessionId } : await this.rootOf(target);
+    const root = transferred ? { rootSessionId: transferred.rootSessionId } : target === undefined ? { rootSessionId: sessionId } : await this.rootOf(target);
     const escalation: Escalation = {
       id,
       ...(root.instanceId !== undefined && { instanceId: root.instanceId }),
@@ -1496,7 +1591,13 @@ export class SessionService {
       fromSessionId: sessionId,
       kind: 'delivery-unknown',
       title:
-        item.deliveryKind === 'provision' ? 'Session start outcome unknown' : item.deliveryKind === 'handoff' ? 'Handoff delivery outcome unknown' : 'Message delivery outcome unknown',
+        item.deliveryKind === 'provision'
+          ? 'Session start outcome unknown'
+          : item.deliveryKind === 'handoff'
+            ? 'Handoff delivery outcome unknown'
+            : item.deliveryKind === 'transfer'
+              ? 'Transfer delivery outcome unknown'
+              : 'Message delivery outcome unknown',
       // Fixed words only: the adapter's detail may quote paths or content.
       detail: `reason: ${item.reason}; duplicate risk on retry: ${item.duplicateRisk}`,
       ref,
@@ -1589,6 +1690,11 @@ export class SessionService {
         if (turn.state !== 'running' && turn.nativeTaskId === undefined && this.workflow !== undefined) {
           const hooks = this.workflow;
           void Promise.resolve().then(() => hooks.turnEnded(turn.sessionId));
+        }
+        // A transfer waiting for its source's turn boundary (T023), outside this queue for the same reason.
+        if (turn.state !== 'running' && turn.nativeTaskId === undefined && this.transfer !== undefined) {
+          const hooks = this.transfer;
+          void Promise.resolve().then(() => hooks.turnEnded(turn));
         }
         break;
       }
