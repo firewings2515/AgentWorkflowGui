@@ -72,12 +72,14 @@ const emitTurn = (adapter: FakeAdapter, sessionId: SessionId, id: string, state:
 const withTurns = (adapter: FakeAdapter, codexSession?: SessionId): FakeAdapter => {
   const dispatch = adapter.dispatchOnce.bind(adapter);
   adapter.dispatchOnce = async (request) => {
-    const result = await dispatch(request);
+    let result = await dispatch(request);
     const sessionId =
       codexSession ??
       [...adapter.started.map((o) => [o.preallocatedRef, o.sessionId] as const), ...adapter.resumed.map((o) => [o.nativeSessionRef, o.sessionId] as const)].find(([ref]) => ref === request.nativeSessionRef)?.[1];
     if (result.state === 'sent' && request.entry.kind === 'new-turn' && sessionId !== undefined) {
       const id = `turn-${String(++turnIds)}`;
+      // The ack names the turn it started, as the real adapters' acks do (r2-P1-2).
+      result = { ...result, nativeRef: { ...result.nativeRef, turnRef: id } };
       void Promise.resolve().then(() => {
         emitTurn(adapter, sessionId, id, 'running');
         if (holding.has(sessionId)) open.set(sessionId, { adapter, turnId: id });

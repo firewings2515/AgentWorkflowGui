@@ -132,9 +132,12 @@ describe('T024 review r1', () => {
     w.emitTurn(impl, 'busy-1', 'completed');
     await settle();
     expect(handoffOps(w, impl)).toHaveLength(2);
-    // Its own turn, start missed, ends: the next one goes.
+    // A turn never recorded ends late: not the dispatched one, so still nothing (r2-P1-2).
     w.emitTurn(impl, 'late-turn', 'completed');
     await settle();
+    expect(handoffOps(w, impl)).toHaveLength(2);
+    // The turn the dispatch started ends (its start was never reported): the next one goes.
+    await w.finishTurn(impl);
     expect(handoffOps(w, impl)).toHaveLength(3);
     expect(review).toBeDefined();
   });

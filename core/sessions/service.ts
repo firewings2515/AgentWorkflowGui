@@ -45,6 +45,7 @@ import type {
   Conversation,
   DeliveryStore,
   DispatchEntry,
+  HandoffMeta,
   McpMount,
   PayloadContext,
   PermissionHandle,
@@ -76,6 +77,8 @@ export interface WorkflowHooks {
   turnEnded(sessionId: SessionId): void;
   /** The node's part of a workflow session's instructions (rules, task, rework limit; R-05). */
   briefing(session: WorkflowSession): Promise<string | undefined>;
+  /** Whether a formal handoff may still go: not when its task stopped at a limit (R-05, T024 r2-P1-1). */
+  mayDeliver(handoff: HandoffMeta): Promise<boolean>;
 }
 
 /** How a workflow payload enters its target: a formal handoff waits for the target's turn to end (SP-05). */
@@ -256,7 +259,7 @@ export class SessionService {
    * the main turns the session had before the dispatch, and the new one once it started. A replayed old turn
    * is in `known` and never ends the wait; until it ends, no other handoff goes to that session.
    */
-  private readonly handoffTurns = new Map<SessionId, { operationId: OperationId; known: Set<string>; started?: string }>();
+  private readonly handoffTurns = new Map<SessionId, { operationId: OperationId; known: Set<string>; started?: string; expected?: string }>();
 
   constructor(private readonly options: SessionServiceOptions) {
     // Storage only through the write gate: once shutdown returned, nothing reaches it (r2-P1-4).
@@ -1116,8 +1119,18 @@ export class SessionService {
     const { sessionId, instance, nodeId, taskId, cwd, parentId } = input;
     const node = instance.template.nodes.find((n) => n.id === nodeId);
     if (node?.kind !== 'agent') return 'taken';
+    // An existing session is this one only when everything the node gives it is the same (T024 r2-P1-4):
+    // a session made from another revision of the node must not stand in for it.
     const same = (s: LogicalSession | undefined) =>
-      s !== undefined && s.kind === 'workflow' && s.workflow.instanceId === instance.id && s.workflow.nodeId === nodeId && s.workflow.taskId === taskId;
+      s !== undefined &&
+      s.kind === 'workflow' &&
+      s.workflow.instanceId === instance.id &&
+      s.workflow.nodeId === nodeId &&
+      s.workflow.taskId === taskId &&
+      s.cwd === cwd &&
+      s.agent.id === node.agentId &&
+      JSON.stringify([s.requestedModel.runtime, s.requestedModel.model, s.requestedModel.effort]) === JSON.stringify([node.model.runtime, node.model.model, node.model.effort]) &&
+      (s.folderScope.writableRoots.length > 0) === (node.writePolicy === 'write');
     const existing = await this.repos.sessions.get(sessionId);
     if (existing !== undefined) return same(existing) ? 'exists' : 'taken';
     const root = this.options.resolveRealPath(cwd);
@@ -1204,11 +1217,20 @@ export class SessionService {
       .sort((a, b) => (a.acceptedAt < b.acceptedAt ? -1 : a.acceptedAt > b.acceptedAt ? 1 : a.operationId < b.operationId ? -1 : 1));
     const next = waiting[0];
     if (next === undefined) return 'queued';
+    // A task stopped at a limit sends nothing more, queued handoffs included (r2-P1-1).
+    if (next.kind === 'handoff' && next.handoff !== undefined && this.workflow !== undefined && !(await this.workflow.mayDeliver(next.handoff))) return 'queued';
     const known = new Set<string>(conversation.turns.filter((t) => t.nativeTaskId === undefined).map((t) => t.id));
-    this.handoffTurns.set(sessionId, { operationId: next.operationId, known });
+    const mark: { operationId: OperationId; known: Set<string>; started?: string; expected?: string } = { operationId: next.operationId, known };
+    this.handoffTurns.set(sessionId, mark);
     const state = await this.dispatchPending(next.operationId, { origin: await this.originOf(next.operationId), entry: { kind: 'new-turn' } });
     // Nothing crossed the boundary: no turn to wait for. Sent or unknown: its turn is waited for.
-    if (state === 'pending' && this.handoffTurns.get(sessionId)?.operationId === next.operationId) this.handoffTurns.delete(sessionId);
+    if (state === 'pending' && this.handoffTurns.get(sessionId) === mark) this.handoffTurns.delete(sessionId);
+    // The runtime's ack names the turn it started (Claude's frame, Codex's turn/start): only that turn's end
+    // ends the wait (r2-P1-2). Its events are applied after this, in this same queue.
+    if (state === 'sent') {
+      const sent = (await this.store.get(next.operationId))?.delivery.attempts.at(-1);
+      if (sent?.state === 'sent' && sent.nativeRef.turnRef !== undefined) mark.expected = sent.nativeRef.turnRef;
+    }
     return next.operationId === operationId ? state : 'queued';
   }
 
@@ -1217,14 +1239,12 @@ export class SessionService {
     return this.serial(sessionKey(sessionId), () => this.writeUserMessage(sessionId, messageId, text, this.options.now()));
   }
 
-  /** The user's own message, as `session.send` sends it but with no revision to match (a workflow's first message). */
-  sendAsUser(requestId: Success['requestId'], sessionId: SessionId, messageId: MessageId, text: string): Promise<CommandResult> {
-    return this.serial(sessionKey(sessionId), async () => {
-      if (this.closing) return closingFailure(requestId);
-      const session = await this.repos.sessions.get(sessionId);
-      if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
-      return this.sendUserMessage(requestId, session, messageId, text);
-    });
+  /**
+   * The provision a payload to this session waits for before the session is created (T024 r2-P1-4): the same
+   * operation and binding key the session's own provision is recorded under.
+   */
+  provisionFor(sessionId: SessionId): { operationId: OperationId; bindingKey: string; state: 'pending'; preallocated: false } {
+    return { operationId: provisionOp(sessionId), bindingKey: `session:${sessionId}`, state: 'pending', preallocated: false };
   }
 
   /** Where a session's escalations go (R-05): a workflow session's to its instance's root. */
@@ -1540,8 +1560,13 @@ export class SessionService {
         await this.setActivity(event.sessionId, event.activity);
         break;
       case 'turn.updated': {
-        await conversations.upsertTurn(event.turn);
         const { turn } = event;
+        // A turn that ended stays ended: a late `running` of it is dropped (T024 r2-P1-3).
+        if (turn.state === 'running') {
+          const stored = (await conversations.get(turn.sessionId)).turns.find((t) => t.id === turn.id);
+          if (stored !== undefined && stored.state !== 'running') return;
+        }
+        await conversations.upsertTurn(turn);
         if (turn.nativeTaskId === undefined) this.followHandoffTurn(turn);
         // Outside this queue: what the engine dispatches next runs in the same session's queue (T024).
         if (turn.state !== 'running' && turn.nativeTaskId === undefined && this.workflow !== undefined) {
@@ -1595,14 +1620,21 @@ export class SessionService {
   }
 
   /**
-   * The turn a dispatched handoff started (r1-P1-3): the first main turn not known at dispatch. Its end, or
-   * the end of a new turn whose start was missed, ends the wait; a replayed earlier turn changes nothing.
+   * The turn a dispatched handoff started (r1-P1-3, r2-P1-2): the turn the runtime's ack named, else the
+   * first main turn not known at dispatch that was seen running. Only that turn's end ends the wait: an
+   * end of any other turn, recorded or not, changes nothing. Without either, the wait ends with the user's
+   * decision on the delivery, the runtime's exit, or a restart.
    */
   private followHandoffTurn(turn: Turn): void {
     const mark = this.handoffTurns.get(turn.sessionId);
-    if (mark === undefined || mark.known.has(turn.id)) return;
+    if (mark === undefined) return;
+    if (mark.expected !== undefined) {
+      if (turn.id === mark.expected && turn.state !== 'running') this.handoffTurns.delete(turn.sessionId);
+      return;
+    }
+    if (mark.known.has(turn.id)) return;
     if (turn.state === 'running') mark.started ??= turn.id;
-    else if (mark.started === undefined || mark.started === turn.id) this.handoffTurns.delete(turn.sessionId);
+    else if (mark.started === turn.id) this.handoffTurns.delete(turn.sessionId);
   }
 
   /** Remembers a user message this process dispatched, so its runtime echo is recognised. */
@@ -1665,6 +1697,8 @@ export class SessionService {
   private async ensureUserMessage(record: PayloadDelivery): Promise<void> {
     const sessionId = record.target.sessionId;
     if (record.kind !== 'user-message' || sessionId === undefined) return;
+    // A workflow's first message is accepted before its root session exists (T024): written once it does.
+    if ((await this.repos.sessions.get(sessionId)) === undefined) return;
     const id = MessageId.parse(record.operationId.slice('user-message:'.length));
     if ((await this.writeUserMessage(sessionId, id, record.payload, record.acceptedAt)) === 'taken') this.log(`the message of ${record.operationId} has an ID another message holds`);
   }

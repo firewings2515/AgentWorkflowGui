@@ -24,7 +24,7 @@ import {
 } from '../../../contracts';
 import { hashOf } from '../../delivery/testing/fixtures';
 import { MemoryDeliveryStore } from '../../delivery/testing/memory-store';
-import type { McpMount, PermissionPolicy, PolicyDecision, StoredDelivery } from '../../ports';
+import type { AppRepositories, DeliveryStore, McpMount, PermissionPolicy, PolicyDecision, StoredDelivery } from '../../ports';
 import { SessionService } from '../../sessions';
 import { FakeAdapter } from '../../sessions/testing/fake-adapter';
 import { MemoryRepositories } from '../../sessions/testing/memory-repositories';
@@ -159,7 +159,7 @@ const peerOf = (r: StoredDelivery): PeerMessage | undefined => {
   };
 };
 
-const all = async (store: MemoryDeliveryStore) => [...(await store.listByState('pending')), ...(await store.listByState('unknown')), ...(await store.listByState('sent'))];
+const all = async (store: DeliveryStore) => [...(await store.listByState('pending')), ...(await store.listByState('unknown')), ...(await store.listByState('sent'))];
 
 /** Memory repositories whose handoffs and peer messages are the delivery store's records (C-12). */
 class WorkflowRepositories extends MemoryRepositories {
@@ -191,8 +191,8 @@ let ticks = 0;
 const now = () => new Date(Date.UTC(2026, 9, 29, 1, 0, 0, ++ticks)).toISOString();
 
 export interface World {
-  repositories: WorkflowRepositories;
-  store: MemoryDeliveryStore;
+  repositories: AppRepositories;
+  store: DeliveryStore;
   codex: Map<string, FakeAdapter>;
   claude: FakeAdapter;
   events: AppEvent[];
@@ -223,16 +223,22 @@ const adapterOf = (w: World, sessionId: SessionId) => w.codex.get(sessionId) ?? 
 const withTurns = (adapter: FakeAdapter, w: World, codexSession?: SessionId): FakeAdapter => {
   const dispatch = adapter.dispatchOnce.bind(adapter);
   adapter.dispatchOnce = async (request) => {
-    const result = await dispatch(request);
+    let result = await dispatch(request);
     const sessionId =
       codexSession ??
       [...adapter.started.map((o) => [o.preallocatedRef, o.sessionId] as const), ...adapter.resumed.map((o) => [o.nativeSessionRef, o.sessionId] as const)].find(
         ([ref]) => ref === request.nativeSessionRef,
       )?.[1];
-    if (result.state === 'sent' && request.entry.kind === 'new-turn' && sessionId !== undefined && !w.silent.has(sessionId)) {
+    if (result.state === 'sent' && request.entry.kind === 'new-turn' && sessionId !== undefined) {
+      // The ack names the turn the dispatch started, as both runtimes' acks do (r2-P1-2).
       const id = `turn-run-${String(++turns)}`;
-      // After the dispatch returned, as a runtime's notifications arrive.
+      result = { ...result, nativeRef: { ...result.nativeRef, turnRef: id } };
+      // After the dispatch returned, as a runtime's notifications arrive; a silent session reports none.
       void Promise.resolve().then(() => {
+        if (w.silent.has(sessionId)) {
+          w.open.set(sessionId, id);
+          return;
+        }
         w.emitTurn(sessionId, id, 'running');
         if (w.holding.has(sessionId)) w.open.set(sessionId, id);
         else w.emitTurn(sessionId, id, 'completed');
@@ -243,7 +249,7 @@ const withTurns = (adapter: FakeAdapter, w: World, codexSession?: SessionId): Fa
   return adapter;
 };
 
-const build = (repositories: WorkflowRepositories, store: MemoryDeliveryStore, previous?: World): World => {
+const build = (repositories: AppRepositories, store: DeliveryStore, previous?: World): World => {
   const world = {
     repositories,
     store,
@@ -312,7 +318,12 @@ const build = (repositories: WorkflowRepositories, store: MemoryDeliveryStore, p
 
 export const world = async (workflow: WorkflowTemplate = template()): Promise<World> => {
   const store = new MemoryDeliveryStore();
-  const w = build(new WorkflowRepositories(store), store);
+  return worldOn(new WorkflowRepositories(store), store, workflow);
+};
+
+/** The same world on other storage (the SQLite repositories and store in app/main's tests, r2). */
+export const worldOn = async (repositories: AppRepositories, store: DeliveryStore, workflow: WorkflowTemplate = template()): Promise<World> => {
+  const w = build(repositories, store);
   for (const a of agents()) await w.repositories.agents.save(a, null);
   await w.repositories.workflows.save(workflow, null);
   return w;
