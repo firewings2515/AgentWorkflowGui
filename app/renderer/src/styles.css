@@ -43,6 +43,35 @@
   --transparent: transparent;
 }
 * { box-sizing: border-box; }
+.workflow-start { height: 100%; overflow: auto; padding: 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.workflow-start form { max-width: 850px; }
+.workflow-start fieldset, .escalation-card fieldset { min-width: 0; border: 0; padding: 0; margin: 0; }
+.workflow-start legend { font-weight: 600; margin-bottom: 16px; }
+.workflow-start label, .escalation-card label { display: grid; gap: 7px; margin: 14px 0; }
+.workflow-start input, .workflow-start textarea, .escalation-card input, .escalation-card textarea { padding: 9px; min-width: 0; max-width: 100%; width: 100%; }
+.workflow-start textarea, .escalation-card textarea { resize: vertical; }
+.workflow-start .check-label, .escalation-card .check-label { display: flex; align-items: flex-start; gap: 10px; line-height: 1.6; }
+.check-label input[type='checkbox'] { width: auto; flex: 0 0 auto; margin-top: 5px; }
+.node-tools { overflow: auto; margin: 12px 0; }
+.node-tools table { width: 100%; border-collapse: collapse; }
+.node-tools th, .node-tools td { padding: 10px; text-align: left; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.escalation-panel { padding: 14px; margin-bottom: 20px; border: 1px solid var(--warning); border-radius: 9px; }
+.pending-badge { color: var(--warning); font-size: 12px; white-space: nowrap; }
+.session-link .pending-badge { display: block; }
+.pending-panel { margin-bottom: 16px; }
+.pending-panel > summary { cursor: pointer; padding: 8px 0; }
+.pending-panel-scroll { max-height: min(240px, 32vh); overflow: auto; }
+.approval-authority { color: var(--warning); font-weight: 600; }
+.escalation-card { padding: 14px; margin: 12px 0; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); overflow-wrap: anywhere; }
+.escalation-card h4 { margin: 0 0 12px; }
+.escalation-card pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; background: var(--panel); padding: 10px; }
+.escalation-card dd, .damaged-screen dd { margin: 4px 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.escalation-card dt, .damaged-screen dt { color: var(--muted); }
+.preserve-text { white-space: pre-wrap; }
+.escalation-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.damaged-screen { max-width: 850px; margin: auto; }
+.damaged-screen section { margin: 24px 0; padding: 20px; border: 1px solid var(--error); border-radius: 10px; }
+@media (max-width: 1100px) { .workflow-start { padding: 14px; } .escalation-panel, .escalation-card { padding: 10px; } }
 html, body, #root { margin: 0; min-width: 320px; height: 100%; }
 body { font-family: 'Segoe UI', 'Microsoft JhengHei', sans-serif; font-size: 14px; color: var(--text); background: var(--bg); }
 button, input, textarea, select { font: inherit; color: inherit; }

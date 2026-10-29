@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import type { LogicalSession, SessionId, Snapshot } from '../../../contracts';
 import { Status } from './ui';
+import { openEscalations } from './EscalationPanel';
 
 export function SessionTree({ snapshot, demo = true, selectedId, onOpen }: { snapshot: Snapshot; demo?: boolean; selectedId: SessionId | undefined; onOpen: (id: SessionId) => void }) {
   const [mode, setMode] = useState<'ordinary' | 'workflow'>('ordinary');
@@ -15,11 +16,13 @@ export function SessionTree({ snapshot, demo = true, selectedId, onOpen }: { sna
   const renderBranch = (session: LogicalSession) => {
     const children = sessions.filter(child => child.parentId === session.id);
     const expanded = !collapsed.has(session.id);
+    const pending = openEscalations(snapshot, session.id).length;
     return <li key={session.id} data-session-id={session.id}>
       <div className={`tree-row ${selectedId === session.id ? 'selected' : ''}`}>
         {children.length > 0 ? <button className="tree-toggle" aria-label={`${expanded ? '收合' : '展開'} ${session.title}`} aria-expanded={expanded} onClick={() => toggle(session.id)}>{expanded ? '▾' : '▸'}</button> : <span className="tree-spacer" />}
         <button className="session-link" aria-current={selectedId === session.id ? 'true' : undefined} onClick={() => onOpen(session.id)}>
           <span>{session.title}</span>{' '}<Status value={session.activity} />
+          {pending > 0 && <span className="pending-badge">待處理 {pending} 件</span>}
         </button>
       </div>
       {children.length > 0 && expanded && <ul>{children.map(renderBranch)}</ul>}

@@ -73,6 +73,8 @@ describe('layout stylesheet declarations', () => {
     ['.transcript-frame', 'flex', '1 0 160px'],
     ['.transcript', 'min-height', '0'],
     ['.transcript', 'overflow', 'auto'],
+    ['.pending-panel-scroll', 'max-height', 'min(240px, 32vh)'],
+    ['.pending-panel-scroll', 'overflow', 'auto'],
     ['.composer', 'flex-shrink', '0'],
     ['.app-shell', 'position', 'relative'],
     ['.agent-form-actions', 'position', 'sticky'],
