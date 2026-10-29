@@ -159,3 +159,39 @@ describe('r1-P1-1 every level is rebuilt from plain data', () => {
     expect(await stored(g, OP)).not.toContain(TOKEN);
   });
 });
+
+describe('r2-P1-1 every field is read once, through its descriptor', () => {
+  it('r2-P1-1 a Proxy that answers another value to a second read cannot slip the token in', async () => {
+    const g = gui();
+    const base = provisionInput();
+    const extra = { ...base.spec.model, mcp: { token: TOKEN } };
+    const model = new Proxy({ ...base.spec.model }, { get: (target, key) => (key === 'model' ? extra.mcp.token : (Reflect.get(target, key) as unknown)) });
+    const outcome = await g.service.accept({ ...base, spec: { ...base.spec, model } });
+    expect(outcome.status).toBe('accepted');
+    const stored = JSON.stringify(await g.store.get(base.operationId));
+    expect(stored).not.toContain(TOKEN);
+  });
+
+  it('r2-P1-1 a getter on the target (nativeSessionRef) is refused and never runs', async () => {
+    const g = gui();
+    const base = payloadInput();
+    let reads = 0;
+    const target = { sessionId: base.target.sessionId } as Record<string, unknown>;
+    Object.defineProperty(target, 'nativeSessionRef', {
+      enumerable: true,
+      get: () => {
+        reads++;
+        return TOKEN;
+      },
+    });
+    expect(await g.service.accept({ ...base, target: target })).toMatchObject({ status: 'invalid' });
+    expect(reads).toBe(0);
+    expect(await g.store.get(OP)).toBeUndefined();
+  });
+
+  it('r2-P1-1 a target with keys the contract does not have is refused', async () => {
+    const g = gui();
+    const base = payloadInput();
+    expect(await g.service.accept({ ...base, target: { ...base.target, token: TOKEN } as typeof base.target })).toMatchObject({ status: 'invalid' });
+  });
+});

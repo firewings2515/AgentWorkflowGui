@@ -45,6 +45,7 @@ import type {
 import { PermissionGate } from './permissions';
 import { SessionRuntimes } from './runtimes';
 import { WrittenPaths, type WrittenPathsOptions } from './written-paths';
+import { gated } from './write-gate';
 
 type Failure = Extract<CommandResult, { ok: false }>;
 type Success = Extract<CommandResult, { ok: true }>;
@@ -178,6 +179,8 @@ export class SessionService {
   readonly gate: PermissionGate;
   readonly runtimes: SessionRuntimes;
   readonly delivery: DeliveryService;
+  private readonly repos: AppRepositories;
+  private readonly store: DeliveryStore;
   private readonly queues = new Map<string, Promise<unknown>>();
   /** Latest session-level usage per session, written to the session when its turn ends. */
   private readonly usage = new Map<SessionId, LogicalSession['tokenUsage']>();
@@ -195,9 +198,12 @@ export class SessionService {
   private closed = false;
 
   constructor(private readonly options: SessionServiceOptions) {
+    // Storage only through the write gate: once shutdown returned, nothing reaches it (r2-P1-4).
+    this.repos = gated(options.repositories, () => this.closed);
+    this.store = gated(options.store, () => this.closed);
     this.written = new WrittenPaths(options.written);
     this.gate = new PermissionGate({
-      repositories: options.repositories,
+      repositories: this.repos,
       policy: options.policy,
       written: this.written,
       resolveRealPath: (path) => options.resolveRealPath(path),
@@ -213,9 +219,10 @@ export class SessionService {
       onOpened: (sessionId, cwd) => options.onSessionOpened?.(sessionId, cwd),
       onClosed: (sessionId) => options.onSessionClosed?.(sessionId),
       onEvent: (event) => this.record(event),
+      ...(options.sleep !== undefined && { sleep: (ms: number) => this.options.sleep!(ms) }),
     });
     this.delivery = new DeliveryService({
-      store: options.store,
+      store: this.store,
       runtimes: this.runtimes.adapters,
       now: () => options.now(),
       uuid: () => options.uuid(),
@@ -239,7 +246,7 @@ export class SessionService {
    * deliveries are recovered (CR-2: unknown only reconciled, pending through the one dispatch entry).
    */
   async start(): Promise<RecoveryReport> {
-    const { repositories } = this.options;
+    const repositories = this.repos;
     for (const session of await repositories.sessions.list()) {
       const binding = await this.binding(session.id);
       if (binding !== undefined) this.runtimes.bind(session.id, binding);
@@ -270,20 +277,33 @@ export class SessionService {
     }
     // A message accepted before a crash but never written is written now (r1-P1-8).
     for (const state of ['pending', 'unknown'] as const) {
-      for (const record of await this.options.store.listByState(state)) if (record.kind === 'user-message') await this.ensureUserMessage(record);
+      for (const record of await this.store.listByState(state)) if (record.kind === 'user-message') await this.ensureUserMessage(record);
     }
+    const userMessages: OperationId[] = [];
     const report = await this.delivery.recover({
       select: (record) => {
         if (record.kind === 'provision') return {};
-        this.expectEcho(record);
+        // Dispatched below, in the session's queue, so its echo is registered before its events (r2-P1-7).
+        if (record.kind === 'user-message') {
+          userMessages.push(record.operationId);
+          return 'skip';
+        }
         // PayloadContext keeps no origin (contracts gap): a restored non-user payload is marked as not the user's.
-        return {
-          origin: record.kind === 'user-message' ? { kind: 'user' } : { kind: 'system' },
-        };
+        return { origin: { kind: 'system' } };
       },
     });
+    for (const operationId of userMessages) {
+      const sessionId = (await this.store.get(operationId))?.target.sessionId;
+      if (sessionId === undefined) continue;
+      try {
+        const outcome = await this.serial(sessionKey(sessionId), () => this.dispatchOne(operationId, { origin: { kind: 'user' } }));
+        if (outcome !== undefined) report.dispatched.push({ operationId, outcome });
+      } catch (error) {
+        report.failed.push({ operationId, detail: errorName(error) });
+      }
+    }
     for (const { operationId, outcome } of [...report.reconciled, ...report.dispatched]) {
-      if (outcome.status === 'sent') await this.settled(operationId, outcome.attemptId);
+      if (outcome.status === 'sent' && !userMessages.includes(operationId)) await this.settled(operationId, outcome.attemptId);
     }
     return report;
   }
@@ -325,10 +345,10 @@ export class SessionService {
     runningNativeTasks: number;
   }> {
     const open = new Set(this.runtimes.openSessions().map((s) => s.sessionId));
-    const sessions = (await this.options.repositories.sessions.list()).filter((s) => open.has(s.id));
+    const sessions = (await this.repos.sessions.list()).filter((s) => open.has(s.id));
     let runningNativeTasks = 0;
     for (const s of sessions)
-      runningNativeTasks += (await this.options.repositories.conversations.get(s.id)).nativeTasks.filter((t) => t.state === 'running').length;
+      runningNativeTasks += (await this.repos.conversations.get(s.id)).nativeTasks.filter((t) => t.state === 'running').length;
     return {
       runningSessions: sessions.filter((s) => s.activity === 'running' || s.activity === 'waiting-user' || s.activity === 'waiting-lock').map((s) => s.id),
       heldRequests: sessions.reduce((n, s) => n + this.gate.heldFor(s.id).length, 0),
@@ -338,6 +358,11 @@ export class SessionService {
 
   /** `RuntimeAdapterHooks.onPermissionRequest` for every adapter. */
   onPermissionRequest(handle: PermissionHandle): Promise<void> {
+    // Once closing began nothing is approved, by the policy or anyone (r2-P1-6).
+    if (this.closing) {
+      handle.answer({ outcome: 'decline', decidedBy: 'policy', reason: 'the GUI is closing', at: this.options.now() });
+      return Promise.resolve();
+    }
     return this.gate.onPermissionRequest(handle);
   }
 
@@ -371,7 +396,7 @@ export class SessionService {
       case 'session.setAgent':
         return queued(command.sessionId, () => this.setAgent(command));
       case 'session.reparent':
-        return this.serial('tree', () => this.reparent(command));
+        return this.serial('tree', () => (this.closing ? Promise.resolve(closingFailure(command.requestId)) : this.reparent(command)));
       case 'nativeTask.stop':
         return this.stopNativeTask(command);
       case 'agent.save':
@@ -379,7 +404,7 @@ export class SessionService {
       case 'agent.delete':
         return this.deleteAgent(command);
       case 'workflow.save': {
-        const saved = await this.options.repositories.workflows.save(command.workflow, command.expectedRevision);
+        const saved = await this.repos.workflows.save(command.workflow, command.expectedRevision);
         if (saved.status === 'stale') return fail(command.requestId, 'stale_revision', 'The workflow has changed since it was loaded', { retryable: true });
         return ok(command.requestId, { revision: saved.record.revision });
       }
@@ -388,7 +413,7 @@ export class SessionService {
       case 'delivery.resolve':
         return this.resolveDelivery(command);
       case 'preferences.set': {
-        const preferences = await this.options.repositories.preferences.set(command.preferences);
+        const preferences = await this.repos.preferences.set(command.preferences);
         this.options.publish({
           type: 'preferences.updated',
           preferences,
@@ -406,7 +431,7 @@ export class SessionService {
 
   private async create(command: CommandOf<'session.create'>): Promise<CommandResult> {
     const { requestId, sessionId, agentId, model, cwd, parentId } = command;
-    const { repositories } = this.options;
+    const repositories = this.repos;
     const agent = await repositories.agents.get(agentId);
     if (agent === undefined) return fail(requestId, 'not_found', 'Unknown agent');
     if (!(this.options.isRuntimeAvailable?.(model.runtime) ?? true))
@@ -435,6 +460,7 @@ export class SessionService {
       createdAt: at,
       updatedAt: at,
     };
+    if (this.closing) return closingFailure(requestId);
     if ((await repositories.sessions.create(session)) === 'exists') return fail(requestId, 'already_exists', 'A session with this ID already exists');
     this.options.publish({ type: 'session.updated', session });
     // The runtime session is created in the background; a send waits for it.
@@ -449,14 +475,23 @@ export class SessionService {
 
   private async send(command: CommandOf<'session.send'>): Promise<CommandResult> {
     const { requestId, sessionId, messageId, expectedRevision, text, attachments } = command;
-    const session = await this.options.repositories.sessions.get(sessionId);
+    const session = await this.repos.sessions.get(sessionId);
     if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
     if (session.revision !== expectedRevision) return fail(requestId, 'stale_revision', 'The session has changed since it was loaded', { retryable: true });
     if (attachments.length > 0) return fail(requestId, 'unsupported', 'Attachments are not available yet');
     const operationId = userMessageOp(messageId);
-    const existing = await this.options.store.get(operationId);
+    const existing = await this.store.get(operationId);
+    if (existing !== undefined && (existing.kind !== 'user-message' || existing.target.sessionId !== sessionId || existing.payload !== text)) {
+      return fail(requestId, 'invalid_request', 'This message ID was already used for another message');
+    }
+    // The renderer's message under its ID comes first, and must really be in this session (r1-P1-8,
+    // r2-P1-8): a message ID taken elsewhere is refused before anything is accepted or sent.
+    const written = await this.writeUserMessage(sessionId, messageId, text, existing?.acceptedAt ?? this.options.now());
+    if (written === 'taken') return fail(requestId, 'invalid_request', 'This message ID was already used for another message');
+    if (this.closing) return closingFailure(requestId);
     if (existing === undefined) {
       const provisioned = await this.ensureProvisioned(session);
+      if (this.closing) return closingFailure(requestId);
       if (!provisioned.ok) return fail(requestId, provisioned.code, provisioned.message, provisioned);
       const entry: DispatchEntry = session.activity === 'running' ? { kind: 'insert' } : { kind: 'new-turn' };
       const accepted = await this.delivery.accept({
@@ -478,13 +513,8 @@ export class SessionService {
       if (accepted.status === 'commit-uncertain')
         return fail(requestId, 'storage_failed', 'Saving the message could not be confirmed', { retryable: true, mayHaveSideEffects: true });
       if (accepted.status !== 'accepted' && accepted.status !== 'duplicate') return fail(requestId, 'internal_error', 'The message could not be accepted');
-    } else if (existing.kind !== 'user-message' || existing.target.sessionId !== sessionId || existing.payload !== text) {
-      return fail(requestId, 'invalid_request', 'This message ID was already used for another message');
     }
-    // The renderer's message under its ID, whether this call accepted it or an earlier one did and failed
-    // before writing it (r1-P1-8); the runtime's echo of it is not stored again (see record()).
-    const record = await this.options.store.get(operationId);
-    if (record?.kind === 'user-message') await this.ensureUserMessage(record);
+    if (this.closing) return closingFailure(requestId);
     const outcome = await this.dispatchPending(operationId, {
       origin: { kind: 'user' },
     });
@@ -503,7 +533,7 @@ export class SessionService {
   }
 
   private async interrupt(command: CommandOf<'session.interrupt'>): Promise<CommandResult> {
-    const session = await this.options.repositories.sessions.get(command.sessionId);
+    const session = await this.repos.sessions.get(command.sessionId);
     if (session === undefined) return fail(command.requestId, 'not_found', 'Unknown session');
     const ref = await this.binding(session.id);
     // Nothing runs in a session that is not open.
@@ -519,7 +549,7 @@ export class SessionService {
 
   private async setModel(command: CommandOf<'session.setModel'>): Promise<CommandResult> {
     const { requestId, sessionId, expectedRevision, model } = command;
-    const session = await this.options.repositories.sessions.get(sessionId);
+    const session = await this.repos.sessions.get(sessionId);
     if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
     // Another runtime means another session: that is a transfer (R-02, R-12).
     if (model.runtime !== session.requestedModel.runtime) return fail(requestId, 'invalid_request', 'Changing to another tool goes through a transfer');
@@ -543,10 +573,10 @@ export class SessionService {
 
   private async setAgent(command: CommandOf<'session.setAgent'>): Promise<CommandResult> {
     const { requestId, sessionId, expectedRevision, agentId } = command;
-    const session = await this.options.repositories.sessions.get(sessionId);
+    const session = await this.repos.sessions.get(sessionId);
     if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
     if (session.kind !== 'ordinary') return fail(requestId, 'invalid_transition', 'A workflow session keeps its agent');
-    const agent = await this.options.repositories.agents.get(agentId);
+    const agent = await this.repos.agents.get(agentId);
     if (agent === undefined) return fail(requestId, 'not_found', 'Unknown agent');
     // The new instructions take effect when the runtime session is next started or resumed.
     return this.updateFromCommand(requestId, sessionId, expectedRevision, (s) => ({ ...s, agent: { id: agent.id, revision: agent.revision } }));
@@ -554,7 +584,7 @@ export class SessionService {
 
   private async reparent(command: CommandOf<'session.reparent'>): Promise<CommandResult> {
     const { requestId, sessionId, parentId, expectedRevision } = command;
-    const sessions = await this.options.repositories.sessions.list();
+    const sessions = await this.repos.sessions.list();
     const session = sessions.find((s) => s.id === sessionId);
     if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
     // A workflow session's parent is the session that created it; only the ordinary tree can be reorganised (WB-01).
@@ -579,9 +609,9 @@ export class SessionService {
 
   private async stopNativeTask(command: CommandOf<'nativeTask.stop'>): Promise<CommandResult> {
     const { requestId, sessionId, nativeTaskId } = command;
-    const session = await this.options.repositories.sessions.get(sessionId);
+    const session = await this.repos.sessions.get(sessionId);
     if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
-    const task = (await this.options.repositories.conversations.get(sessionId)).nativeTasks.find((t) => t.id === nativeTaskId);
+    const task = (await this.repos.conversations.get(sessionId)).nativeTasks.find((t) => t.id === nativeTaskId);
     if (task === undefined) return fail(requestId, 'not_found', 'Unknown sub-agent');
     if (task.state !== 'running') return fail(requestId, 'invalid_transition', 'The sub-agent is not running');
     const ref = await this.binding(sessionId);
@@ -596,14 +626,14 @@ export class SessionService {
   }
 
   private async saveAgent(command: CommandOf<'agent.save'>): Promise<CommandResult> {
-    const saved = await this.options.repositories.agents.save(command.agent, command.expectedRevision);
+    const saved = await this.repos.agents.save(command.agent, command.expectedRevision);
     if (saved.status === 'stale') return fail(command.requestId, 'stale_revision', 'The agent has changed since it was loaded', { retryable: true });
     return ok(command.requestId, { revision: saved.record.revision });
   }
 
   private async deleteAgent(command: CommandOf<'agent.delete'>): Promise<CommandResult> {
     const { requestId, agentId, expectedRevision } = command;
-    const { repositories } = this.options;
+    const repositories = this.repos;
     const inUse =
       (await repositories.sessions.list()).some((s) => s.agent.id === agentId) ||
       (await repositories.workflows.list()).some((w) => w.nodes.some((n) => n.kind === 'agent' && n.agentId === agentId));
@@ -617,10 +647,11 @@ export class SessionService {
 
   private async respond(command: CommandOf<'escalation.respond'>): Promise<CommandResult> {
     const { requestId, escalationId, decision, note, content } = command;
-    const escalation = await this.options.repositories.escalations.get(escalationId);
+    const escalation = await this.repos.escalations.get(escalationId);
     if (escalation === undefined) return fail(requestId, 'not_found', 'Unknown escalation');
     if (escalation.state !== 'open') return fail(requestId, 'invalid_transition', 'The escalation is already closed');
     if (escalation.kind === 'permission') {
+      if (this.closing) return closingFailure(requestId);
       const answered = await this.gate.respond(escalation, {
         decision,
         note,
@@ -636,7 +667,7 @@ export class SessionService {
   /** The user's decision on a delivery whose outcome stayed unknown (CR2_DELIVERY_FIX §2). */
   private async resolveDelivery(command: CommandOf<'delivery.resolve'>): Promise<CommandResult> {
     const { requestId, escalationId, decision, acceptDuplicateRisk } = command;
-    const escalation = await this.options.repositories.escalations.get(escalationId);
+    const escalation = await this.repos.escalations.get(escalationId);
     const attempt = parseDeliveryEscalationId(escalationId);
     if (escalation === undefined || attempt === undefined || escalation.kind !== 'delivery-unknown')
       return fail(requestId, 'not_found', 'Unknown delivery escalation');
@@ -688,7 +719,7 @@ export class SessionService {
       rejection: { reason, detail },
     });
     if (this.closing) return rejected('shutting-down', 'the GUI is closing');
-    const { sessions } = this.options.repositories;
+    const { sessions } = this.repos;
     const caller = await sessions.get(ctx.caller);
     const target = await sessions.get(input.to);
     if (caller === undefined || target === undefined) return rejected('unknown-target', 'no such session');
@@ -700,13 +731,23 @@ export class SessionService {
       operationId: ctx.operationId,
       sourceCallRef: ctx.sourceCallRef,
     };
+    // One call per operation at a time, so two calls racing for the same ID are checked against each other
+    // (r2-P1-3); the target's part then runs in the target's queue.
+    return this.serial(`op:${ctx.operationId}`, () => this.sendMessageNow(caller, target, pending));
+  }
+
+  private async sendMessageNow(caller: LogicalSession, target: LogicalSession, pending: PendingConfirmation): Promise<SendMessageToolResult> {
+    const rejected = (reason: 'invalid-input' | 'shutting-down', detail: string): SendMessageToolResult => ({ status: 'rejected', rejection: { reason, detail } });
+    if (this.closing) return rejected('shutting-down', 'the GUI is closing');
     // A resend or a `retryOf` names an operation that already exists: it must be the same message from the
     // same session to the same target (CR-2's fixed content), or it is refused (r1-P1-3).
     const mismatch = await this.resendMismatch(pending);
     if (mismatch !== undefined) return rejected('invalid-input', mismatch);
-    if (caller.requestedModel.runtime !== target.requestedModel.runtime && (await this.options.store.get(ctx.operationId)) === undefined) {
-      const id = EscalationId.parse(`confirm-${ctx.operationId}`);
-      const existing = await this.options.repositories.escalations.get(id);
+    if (caller.requestedModel.runtime !== target.requestedModel.runtime && (await this.store.get(pending.operationId)) === undefined) {
+      const id = EscalationId.parse(`confirm-${pending.operationId}`);
+      const existing = await this.repos.escalations.get(id);
+      // Re-checked after every wait, before anything is written (r2-P1-6).
+      if (this.closing) return rejected('shutting-down', 'the GUI is closing');
       if (existing === undefined) {
         const escalation: Escalation = {
           id,
@@ -717,14 +758,14 @@ export class SessionService {
           detail: `${caller.requestedModel.runtime} session "${caller.title}" asks to send a message to ${target.requestedModel.runtime} session "${target.title}"`,
           ref: {
             kind: 'peerMessage',
-            peerMessageId: peerIdOf(ctx.operationId),
+            peerMessageId: peerIdOf(pending.operationId),
           },
           state: 'open',
           createdAt: this.options.now(),
         };
-        await this.options.repositories.escalations.upsert(escalation);
         this.confirmations.set(id, pending);
-        this.owners.set(ctx.operationId, caller.id);
+        this.owners.set(pending.operationId, caller.id);
+        await this.repos.escalations.upsert(escalation);
         this.options.publish({ type: 'escalation.updated', escalation });
       } else if (existing.state !== 'open') {
         return rejected('invalid-input', 'the user already answered this message');
@@ -751,15 +792,21 @@ export class SessionService {
    * known only for operations this process accepted (contracts store none), so an unknown one is refused.
    */
   private async resendMismatch(p: PendingConfirmation): Promise<string | undefined> {
-    const record = await this.options.store.get(p.operationId);
+    const record = await this.store.get(p.operationId);
     const waiting = this.confirmations.get(EscalationId.parse(`confirm-${p.operationId}`));
     if (record === undefined && waiting === undefined) {
-      const escalation = await this.options.repositories.escalations.get(EscalationId.parse(`confirm-${p.operationId}`));
+      const escalation = await this.repos.escalations.get(EscalationId.parse(`confirm-${p.operationId}`));
       return escalation === undefined ? undefined : 'this operation is no longer waiting';
     }
     if (this.owners.get(p.operationId) !== p.from) return 'this operation belongs to another call';
     if (waiting !== undefined) return waiting.to === p.to && waiting.content === p.content ? undefined : 'this operation carries another message';
-    if (record?.kind !== 'peer-message') return 'this operation is not a message';
+    return record === undefined ? undefined : this.recordMismatch(record, p);
+  }
+
+  /** The stored operation must be this call's message: sender, target and payload (r1-P1-3, r2-P1-3). */
+  private async recordMismatch(record: StoredDelivery, p: PendingConfirmation): Promise<string | undefined> {
+    if (record.kind !== 'peer-message') return 'this operation is not a message';
+    if (this.owners.get(p.operationId) !== p.from) return 'this operation belongs to another call';
     if (record.target.sessionId !== p.to || record.payloadHash !== (await this.options.hashPayload(p.content))) return 'this operation carries another message';
     return undefined;
   }
@@ -772,7 +819,7 @@ export class SessionService {
   }
 
   private async deliverPeerNow(p: PendingConfirmation): Promise<SendMessageToolResult> {
-    const target = await this.options.repositories.sessions.get(p.to);
+    const target = await this.repos.sessions.get(p.to);
     if (target === undefined)
       return {
         status: 'rejected',
@@ -783,11 +830,13 @@ export class SessionService {
       fromSessionId: p.from,
       peerMessageId: peerIdOf(p.operationId),
     };
-    this.origins.set(p.operationId, origin);
-    let record = await this.options.store.get(p.operationId);
+    const shuttingDown: SendMessageToolResult = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } };
+    let record = await this.store.get(p.operationId);
     if (record === undefined) {
+      if (this.closing) return shuttingDown;
       const provisioned = await this.ensureProvisioned(target);
-      const provision = await this.options.store.get(provisionOp(target.id));
+      if (this.closing) return shuttingDown;
+      const provision = await this.store.get(provisionOp(target.id));
       // Not started yet: the message waits for the target's provision (CR2 §3) instead of being refused.
       const bound = provisioned.ok
         ? {
@@ -831,25 +880,23 @@ export class SessionService {
         };
       // Thrown, so the MCP server answers with a generic error and a resend tries the same operation again.
       if (accepted.status !== 'accepted' && accepted.status !== 'duplicate') throw new Error(`accepting the peer message ended ${accepted.status}`);
-      this.owners.set(p.operationId, p.from);
-      record = await this.options.store.get(p.operationId);
+      // Only the call that created the operation owns it; a duplicate is checked below like any resend.
+      if (accepted.status === 'accepted') this.owners.set(p.operationId, p.from);
+      record = await this.store.get(p.operationId);
     }
-    if (record?.kind !== 'peer-message')
-      return {
-        status: 'rejected',
-        rejection: {
-          reason: 'invalid-input',
-          detail: 'this operation is not a message',
-        },
-      };
+    // Checked again here, inside the target's queue, with the record this call will use (r2-P1-3).
+    const mismatch = record === undefined ? 'this operation is not a message' : await this.recordMismatch(record, p);
+    if (mismatch !== undefined || record?.kind !== 'peer-message') return { status: 'rejected', rejection: { reason: 'invalid-input', detail: mismatch ?? 'this operation is not a message' } };
+    this.origins.set(p.operationId, origin);
     const fresh = record.delivery.state === 'pending';
     if (fresh) {
+      if (this.closing) return shuttingDown;
       // A busy target gets the message inside its running turn (SP-05).
       await this.dispatchPending(p.operationId, {
         origin,
         entry: target.activity === 'running' ? { kind: 'insert' } : { kind: 'new-turn' },
       });
-      record = (await this.options.store.get(p.operationId)) ?? record;
+      record = (await this.store.get(p.operationId)) ?? record;
     }
     if (record.kind !== 'peer-message') throw new Error('the peer message record changed kind');
     this.publishPeer(record, p);
@@ -885,7 +932,7 @@ export class SessionService {
 
   /** The session's runtime settings: its model and its agent's instructions (no MCP mount, C-07). */
   private async settingsOf(session: LogicalSession): Promise<SessionSettings> {
-    const agent: AgentDefinition | undefined = await this.options.repositories.agents.get(session.agent.id);
+    const agent: AgentDefinition | undefined = await this.repos.agents.get(session.agent.id);
     return {
       model: session.requestedModel,
       readOnly: false,
@@ -895,7 +942,7 @@ export class SessionService {
 
   /** The native session bound to a GUI session: the one its provision created (contracts keep no binding). */
   private async binding(sessionId: SessionId): Promise<string | undefined> {
-    const record = await this.options.store.get(provisionOp(sessionId));
+    const record = await this.store.get(provisionOp(sessionId));
     if (record?.delivery.state !== 'sent') return undefined;
     const last = record.delivery.attempts.at(-1);
     return record.target.nativeSessionRef ?? (last?.state === 'sent' ? last.nativeRef.sessionRef : undefined);
@@ -906,8 +953,10 @@ export class SessionService {
    * leaves it unknown for the user, and it is never created a second time on its own.
    */
   private async ensureProvisioned(session: LogicalSession): Promise<Provisioned> {
+    const closing: Provisioned = { ok: false, code: 'runtime_unavailable', message: 'The application is closing', retryable: false, mayHaveSideEffects: false };
+    if (this.closing) return closing;
     const operationId = provisionOp(session.id);
-    let record = await this.options.store.get(operationId);
+    let record = await this.store.get(operationId);
     if (record === undefined) {
       const { runtime } = session.requestedModel;
       if (!(this.options.isRuntimeAvailable?.(runtime) ?? true))
@@ -955,12 +1004,13 @@ export class SessionService {
           mayHaveSideEffects: false,
         };
       }
-      record = await this.options.store.get(operationId);
+      record = await this.store.get(operationId);
     }
     if (record?.delivery.state === 'pending') {
+      if (this.closing) return closing;
       const outcome = await this.delivery.dispatch(operationId);
       if (outcome.status === 'sent') await this.setActivity(session.id, 'idle');
-      record = await this.options.store.get(operationId);
+      record = await this.store.get(operationId);
     }
     const ref = await this.binding(session.id);
     if (ref !== undefined) {
@@ -990,7 +1040,7 @@ export class SessionService {
     const ref = record.target.nativeSessionRef;
     const sessionId = record.target.sessionId;
     if (ref === undefined || sessionId === undefined || this.runtimes.isOpen(ref)) return;
-    const session = await this.options.repositories.sessions.get(sessionId);
+    const session = await this.repos.sessions.get(sessionId);
     const settings = session === undefined ? record.context.session : await this.settingsOf(session);
     await this.runtimes.resumeSession(record.context.runtime, {
       sessionId,
@@ -1003,18 +1053,25 @@ export class SessionService {
 
   /** Dispatches a delivery that is still pending; returns its state afterwards. */
   private async dispatchPending(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry }): Promise<'sent' | 'unknown' | 'pending'> {
-    const record = await this.options.store.get(operationId);
+    const record = await this.store.get(operationId);
     if (record === undefined) return 'pending';
     if (record.delivery.state !== 'pending') return record.delivery.state;
-    // Known before the call (by its text), and by its IDs once the call returned (r1-P1-9).
-    const before = this.expectEcho(record);
+    const outcome = await this.dispatchOne(operationId, options);
+    return outcome?.status === 'sent' ? 'sent' : outcome?.status === 'unknown' ? 'unknown' : 'pending';
+  }
+
+  /**
+   * One dispatch; undefined when closing began (nothing new reaches a runtime then, r2-P1-4). A user message
+   * that was sent is registered for its echo from the outcome (r1-P1-9, r2-P1-7).
+   */
+  private async dispatchOne(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry }): Promise<DispatchOutcome | undefined> {
+    if (this.closing) return undefined;
     const outcome: DispatchOutcome = await this.delivery.dispatch(operationId, options);
-    this.expectEcho(await this.options.store.get(operationId), before);
     if (outcome.status === 'sent') {
+      this.expectEcho(await this.store.get(operationId), outcome.attemptId);
       await this.settled(operationId, outcome.attemptId);
-      return 'sent';
     }
-    return outcome.status === 'unknown' ? 'unknown' : 'pending';
+    return outcome;
   }
 
   // ---- escalations ----------------------------------------------------------------------------------
@@ -1040,7 +1097,7 @@ export class SessionService {
           : undefined;
     if (ref === undefined) return;
     const id = deliveryEscalationId(item.key);
-    if ((await this.options.repositories.escalations.get(id)) !== undefined) return;
+    if ((await this.repos.escalations.get(id)) !== undefined) return;
     const escalation: Escalation = {
       id,
       rootSessionId: sessionId,
@@ -1053,18 +1110,18 @@ export class SessionService {
       state: 'open',
       createdAt: this.options.now(),
     };
-    await this.options.repositories.escalations.upsert(escalation);
+    await this.repos.escalations.upsert(escalation);
     this.options.publish({ type: 'escalation.updated', escalation });
   }
 
   /** An attempt turned out sent: its open delivery-unknown escalation, if any, is closed by the system. */
   private async settled(operationId: OperationId, attemptId: AttemptId): Promise<void> {
-    const escalation = await this.options.repositories.escalations.get(deliveryEscalationId(`${operationId}/${attemptId}`));
+    const escalation = await this.repos.escalations.get(deliveryEscalationId(`${operationId}/${attemptId}`));
     if (escalation?.state === 'open') await this.closeEscalation(escalation, 'resolved');
-    const record: StoredDelivery | undefined = await this.options.store.get(operationId);
+    const record: StoredDelivery | undefined = await this.store.get(operationId);
     const sessionId = record?.target.sessionId;
     if (record?.kind === 'user-message' && sessionId !== undefined) {
-      const session = await this.options.repositories.sessions.get(sessionId);
+      const session = await this.repos.sessions.get(sessionId);
       if (session?.activity === 'reconciling')
         await this.setActivity(sessionId, this.runtimes.isOpen(record.target.nativeSessionRef ?? '') ? 'idle' : 'closed');
     }
@@ -1081,7 +1138,7 @@ export class SessionService {
       resolvedBy: by,
       resolvedAt: this.options.now(),
     };
-    await this.options.repositories.escalations.upsert(closed);
+    await this.repos.escalations.upsert(closed);
     this.options.publish({ type: 'escalation.updated', escalation: closed });
   }
 
@@ -1119,7 +1176,7 @@ export class SessionService {
 
   private async apply(event: Exclude<RuntimeEvent, { type: 'runtime.exited' | 'message.delta' | 'item.outputDelta' }>): Promise<void> {
     if (this.closed) return;
-    const { conversations } = this.options.repositories;
+    const { conversations } = this.repos;
     switch (event.type) {
       case 'session.activity':
         await this.setActivity(event.sessionId, event.activity);
@@ -1137,7 +1194,7 @@ export class SessionService {
         const { item } = event;
         await conversations.upsertItem(item);
         if (item.kind === 'fileChange' && item.state !== 'declined') {
-          const session = await this.options.repositories.sessions.get(item.sessionId);
+          const session = await this.repos.sessions.get(item.sessionId);
           this.written.add(
             item.sessionId,
             item.changes.flatMap((c) => [c.path, ...(c.movePath ? [c.movePath] : [])]),
@@ -1171,34 +1228,36 @@ export class SessionService {
   }
 
   /** Remembers a user message this process dispatched, so its runtime echo is recognised. */
-  private expectEcho(record: StoredDelivery | undefined, replace?: Echo): Echo | undefined {
+  /** Registers the echo of a user message that the runtime accepted with attempt `attemptId`. */
+  private expectEcho(record: StoredDelivery | undefined, attemptId: AttemptId): void {
     const sessionId = record?.target.sessionId;
-    if (record?.kind !== 'user-message' || sessionId === undefined) return undefined;
-    const last = record.delivery.attempts.at(-1);
+    if (record?.kind !== 'user-message' || sessionId === undefined) return;
+    const attempt = record.delivery.attempts.find((a) => a.attemptId === attemptId);
+    if (attempt?.state !== 'sent') return;
     const echo: Echo = {
-      clientMessageIds: record.delivery.attempts.map((a) => a.clientMessageId),
-      ...(last?.state === 'sent' && last.nativeRef.turnRef !== undefined && { turnRef: last.nativeRef.turnRef }),
+      clientMessageIds: [attempt.clientMessageId],
+      ...(attempt.nativeRef.turnRef !== undefined && { turnRef: attempt.nativeRef.turnRef }),
       text: record.payload,
     };
-    const list = (this.echoes.get(sessionId) ?? []).filter((e) => e !== replace);
     // A few per session: an echo that never comes must not keep the list growing.
-    this.echoes.set(sessionId, [...list, echo].slice(-20));
-    return echo;
+    this.echoes.set(sessionId, [...(this.echoes.get(sessionId) ?? []), echo].slice(-20));
   }
 
   /**
    * The runtime's echo of a user message this process sent: a session-level (no native task) user message
-   * from the user, under the dispatch's clientMessageId (Claude) or in the turn it started (Codex), or with
-   * its text when the dispatch gave no turn. Consumed once.
+   * from the user with the same text, under the attempt's clientMessageId (Claude) or in the turn the
+   * dispatch started (Codex), and in that turn whenever both are known. Without that proof it is kept: a
+   * duplicate is better than a lost message (r2-P1-7). Consumed once.
    */
   private isEcho(message: Message): boolean {
     if (message.role !== 'user' || message.origin.kind !== 'user' || message.nativeTaskId !== undefined) return false;
     const list = this.echoes.get(message.sessionId) ?? [];
-    const index = list.findIndex(
-      (e) =>
-        e.clientMessageIds.includes(message.id) ||
-        (e.turnRef !== undefined ? message.turnId === e.turnRef && message.text === e.text : message.text === e.text),
-    );
+    const index = list.findIndex((e) => {
+      if (message.text !== e.text) return false;
+      const sameTurn = e.turnRef !== undefined && message.turnId === e.turnRef;
+      const turnAgrees = e.turnRef === undefined || message.turnId === undefined || sameTurn;
+      return (e.clientMessageIds.includes(message.id) && turnAgrees) || sameTurn;
+    });
     if (index < 0) return false;
     this.echoes.set(
       message.sessionId,
@@ -1207,15 +1266,29 @@ export class SessionService {
     return true;
   }
 
+  /**
+   * Writes the user's message once under its renderer ID and confirms it is this session's (r2-P1-8):
+   * message IDs are unique across sessions, and a write under an ID another session holds is ignored by
+   * the store, so `taken` means it is not here. The same message already here is `written`.
+   */
+  private async writeUserMessage(sessionId: SessionId, id: MessageId, text: string, createdAt: Timestamp): Promise<'written' | 'taken'> {
+    const same = (m: Message | undefined) => m !== undefined && m.role === 'user' && m.origin.kind === 'user' && m.text === text && m.nativeTaskId === undefined;
+    const before = (await this.repos.conversations.get(sessionId)).messages.find((m) => m.id === id);
+    if (before !== undefined) return same(before) ? 'written' : 'taken';
+    const message: Message = { id, sessionId, role: 'user', origin: { kind: 'user' }, text, attachments: [], createdAt };
+    await this.repos.conversations.appendMessage(message);
+    const after = (await this.repos.conversations.get(sessionId)).messages.find((m) => m.id === id);
+    if (!same(after)) return 'taken';
+    this.options.publish({ type: 'message.completed', message });
+    return 'written';
+  }
+
   /** The user message of a user-message operation, written once under its renderer ID (r1-P1-8). */
   private async ensureUserMessage(record: PayloadDelivery): Promise<void> {
     const sessionId = record.target.sessionId;
     if (record.kind !== 'user-message' || sessionId === undefined) return;
     const id = MessageId.parse(record.operationId.slice('user-message:'.length));
-    if ((await this.options.repositories.conversations.get(sessionId)).messages.some((m) => m.id === id)) return;
-    const message: Message = { id, sessionId, role: 'user', origin: { kind: 'user' }, text: record.payload, attachments: [], createdAt: record.acceptedAt };
-    await this.options.repositories.conversations.appendMessage(message);
-    this.options.publish({ type: 'message.completed', message });
+    if ((await this.writeUserMessage(sessionId, id, record.payload, record.acceptedAt)) === 'taken') this.log(`the message of ${record.operationId} has an ID another message holds`);
   }
 
   // ---- session records ------------------------------------------------------------------------------
@@ -1239,7 +1312,7 @@ export class SessionService {
     expectedRevision?: number,
   ): Promise<LogicalSession | 'stale' | undefined> {
     return this.serial(`row:${sessionId}`, async () => {
-      const { sessions } = this.options.repositories;
+      const { sessions } = this.repos;
       const current = await sessions.get(sessionId);
       if (current === undefined) return undefined;
       if (expectedRevision !== undefined && current.revision !== expectedRevision) return 'stale';

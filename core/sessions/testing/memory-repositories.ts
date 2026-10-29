@@ -86,7 +86,9 @@ export class MemoryRepositories implements AppRepositories {
     upsertTurn: (turn: Conversation['turns'][number]) => this.upsert('turns', turn),
     appendMessage: (message: Conversation['messages'][number]) => {
       const list = this.conversationOf(message.sessionId).messages;
-      if (!list.some((m) => m.id === message.id)) list.push(copy(message));
+      // As in SQLite, a message ID is unique across sessions and a repeat is ignored, wherever it is (T015).
+      const taken = [...this.conversationRecords.values()].some((c) => c.messages.some((m) => m.id === message.id));
+      if (!taken) list.push(copy(message));
       return Promise.resolve();
     },
     upsertItem: (item: Conversation['items'][number]) => this.upsert('items', item),

@@ -56,7 +56,7 @@ interface Started {
 let requests = 0;
 const rid = () => RequestId.parse(`r-${++requests}`);
 
-const start = async (options: { order?: string[]; realModels?: boolean; configure?: (adapter: FakeAdapter) => void } = {}): Promise<Started> => {
+const start = async (options: { order?: string[]; realModels?: boolean; configure?: (adapter: FakeAdapter) => void; closeTimeoutMs?: number } = {}): Promise<Started> => {
   const order = options.order ?? [];
   const logs: string[] = [];
   const adapters: FakeAdapter[] = [];
@@ -90,6 +90,7 @@ const start = async (options: { order?: string[]; realModels?: boolean; configur
       return watcher as unknown as ReturnType<NonNullable<Parameters<typeof startBackend>[0]['watch']>>;
     },
     log: (message) => logs.push(message),
+    ...(options.closeTimeoutMs !== undefined && { closeTimeoutMs: options.closeTimeoutMs }),
   });
   if (result.status !== 'ready') throw new Error(`backend not ready: ${result.reason}`);
   return { backend: result, bus, envelopes, adapters, order, logs, run: (command) => result.facade.execute(command) as Promise<CommandResult> };
@@ -346,5 +347,39 @@ describe('review round 1 (T017-r1-result.md)', () => {
     expect({ probes, adapters }).toEqual({ probes: 0, adapters: 0 });
     expect(() => result.facade.snapshot()).toThrow(STORAGE_DAMAGED);
     expect(logs.join('\n')).not.toContain('DATA_MARKER');
+  });
+});
+
+describe('review round 2 (T017-r2-result.md)', () => {
+  it('r2-P1-8 on SQLite, a message ID another session holds is refused before anything is accepted or sent', async () => {
+    const s = await start();
+    await createSession(s, 'session-a');
+    await createSession(s, 'session-b');
+    const [a, b] = s.adapters;
+    b!.emit({ type: 'message.completed', message: { id: MessageId.parse('collision'), sessionId: SessionId.parse('session-b'), role: 'assistant', origin: { kind: 'agent' }, text: 'mine', attachments: [], createdAt: '2026-10-29T01:00:00.000Z' } });
+    await settle();
+    const session = Snapshot.parse(await s.backend.facade.snapshot()).sessions.find((x) => x.id === 'session-a')!;
+    const result = await s.run({ type: 'session.send', requestId: rid(), sessionId: session.id, messageId: MessageId.parse('collision'), expectedRevision: session.revision, text: 'hello', attachments: [] });
+    expect(result).toMatchObject({ ok: false, code: 'invalid_request' });
+    expect(a!.dispatched).toEqual([]);
+    expect(s.envelopes.filter((e) => e.event.type === 'message.completed' && e.event.message.sessionId === 'session-a')).toEqual([]);
+    await s.backend.shutdown();
+    const db = openDatabase(join(dir, 'awg.sqlite'));
+    expect(await new SqliteDeliveryStore(db).get(OperationId.parse('user-message:collision'))).toBeUndefined();
+    db.close();
+  });
+
+  it('r2-P1-4 a start that answers after a timed-out exit writes nothing to the closed database', async () => {
+    const s = await start({ closeTimeoutMs: 10, configure: (adapter) => adapter.startModes.push('held') });
+    await createSession(s, 'slow');
+    const adapter = s.adapters.at(-1)!;
+    await s.backend.shutdown();
+    adapter.release();
+    await settle();
+    expect(adapter.closedSessions).toEqual(['thread-1']);
+    // The create call is recorded as crossed (unknown) and stays so: nothing was written after the exit.
+    const db = openDatabase(join(dir, 'awg.sqlite'));
+    expect((await new SqliteDeliveryStore(db).get(OperationId.parse('provision:slow')))?.delivery.state).toBe('unknown');
+    db.close();
   });
 });

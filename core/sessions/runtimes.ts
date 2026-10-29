@@ -24,6 +24,7 @@ import type {
   RuntimeEvent,
   StartSessionOptions,
 } from '../ports';
+import { Redactor } from './redact';
 
 export interface SessionRuntimesOptions {
   /**
@@ -41,14 +42,14 @@ export interface SessionRuntimesOptions {
   onClosed?(sessionId: SessionId): Promise<void> | void;
   /** Every event of every adapter, once. */
   onEvent(event: RuntimeEvent): void;
+  /** Resolves after `ms`: bounds the waits of closing (core has no timers). Without it they are unbounded. */
+  sleep?(ms: number): Promise<void>;
 }
 
 interface Entry {
   runtime: Runtime;
   adapter: Promise<RuntimeAdapter>;
 }
-
-export const REDACTED = '[redacted]';
 
 const notRunning = (detail: string): DispatchResult => ({
   state: 'unknown',
@@ -67,7 +68,7 @@ export class SessionRuntimes {
   private readonly subscribed = new WeakSet<RuntimeAdapter>();
   private readonly views: Record<Runtime, RuntimeAdapter>;
   /** Every MCP token handed out in this process, revoked ones included; never shown anywhere (C-07). */
-  private readonly tokens = new Set<string>();
+  readonly redactor = new Redactor();
   /** Starts and resumes still waiting for their adapter, so closing can wait for them. */
   private readonly inflight = new Set<Promise<unknown>>();
   private closing = false;
@@ -98,23 +99,9 @@ export class SessionRuntimes {
     });
   }
 
-  /** Replaces every MCP token this process handed out with `[redacted]`, in any string. */
+  /** Replaces every MCP token this process handed out (in the spellings redact.ts matches) with `[redacted]`. */
   redactText(text: string): string {
-    let out = text;
-    for (const token of this.tokens) if (out.includes(token)) out = out.split(token).join(REDACTED);
-    return out;
-  }
-
-  /** A copy of plain data with every token redacted from every string in it. */
-  redact<T>(value: T): T {
-    if (this.tokens.size === 0) return value;
-    const walk = (v: unknown): unknown => {
-      if (typeof v === 'string') return this.redactText(v);
-      if (Array.isArray(v)) return v.map(walk);
-      if (typeof v === 'object' && v !== null) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]));
-      return v;
-    };
-    return walk(value) as T;
+    return this.redactor.text(text);
   }
 
   /**
@@ -160,8 +147,13 @@ export class SessionRuntimes {
     if (this.closing) return Promise.reject(new Error('the GUI is closing'));
     const run = (async () => {
       const adapter = await this.adapterFor(runtime, sessionId);
+      // Closing began while the adapter came up: nothing is opened on it (r2-P1-5).
+      if (this.closing) {
+        await this.release(sessionId, adapter);
+        throw new Error('the GUI is closing');
+      }
       const mcp = await this.options.mountMcp(sessionId);
-      this.tokens.add(mcp.token);
+      this.redactor.add(mcp.token);
       let info: NativeSessionInfo;
       try {
         info = await call(adapter, mcp);
@@ -200,16 +192,27 @@ export class SessionRuntimes {
   }
 
   /** Closes every adapter this router created (R-14: after the sessions themselves were closed). */
-  async closeAll(timeoutMs?: number): Promise<void> {
+  async closeAll(timeoutMs = 5000): Promise<void> {
     const adapters = new Set<RuntimeAdapter>();
-    for (const entry of this.entries.values()) {
+    for (const [sessionId, entry] of [...this.entries]) {
+      // An adapter still coming up gets the deadline; past it, its session's Job is ended instead (r2-P1-5).
+      const wait: Promise<RuntimeAdapter | undefined> =
+        this.options.sleep === undefined ? entry.adapter : Promise.race([entry.adapter, this.options.sleep(timeoutMs).then(() => undefined)]);
       try {
-        adapters.add(await entry.adapter);
+        const adapter = await wait;
+        if (adapter === undefined) await this.options.onClosed?.(sessionId);
+        else adapters.add(adapter);
       } catch {
         // It never started; nothing to close.
       }
     }
     await Promise.allSettled([...adapters].map((a) => a.close(timeoutMs)));
+  }
+
+  /** An adapter that came up after closing began: closed again, and its session's Job ended. */
+  private async release(sessionId: SessionId, adapter: RuntimeAdapter): Promise<void> {
+    await adapter.close().catch(() => undefined);
+    await this.options.onClosed?.(sessionId);
   }
 
   /** The adapter of an open native ref, or undefined. */
@@ -227,6 +230,7 @@ export class SessionRuntimes {
 
   /** The session's adapter, created and started on first use; a failed start is forgotten so the next call tries again. */
   private adapterFor(runtime: Runtime, sessionId: SessionId): Promise<RuntimeAdapter> {
+    if (this.closing) return Promise.reject(new Error('the GUI is closing'));
     const existing = this.entries.get(sessionId);
     if (existing !== undefined) {
       if (existing.runtime !== runtime) return Promise.reject(new Error(`session ${sessionId} runs on ${existing.runtime}, not ${runtime}`));
@@ -237,11 +241,18 @@ export class SessionRuntimes {
       if (!this.subscribed.has(created)) {
         this.subscribed.add(created);
         // Runtime errors and output can quote the mount (e.g. a failed MCP connection): redacted here, before anything stores or shows it.
-        created.subscribe((event) => this.options.onEvent(this.redact(event)));
+        // Deltas are held back until no token can be split across them (r2-P1-2).
+        created.subscribe((event) => {
+          for (const out of this.redactor.events(event)) this.options.onEvent(out);
+        });
       }
       if (!this.started.has(created)) {
         await created.start();
         this.started.add(created);
+      }
+      if (this.closing) {
+        await this.release(sessionId, created);
+        throw new Error('the GUI is closing');
       }
       return created;
     })();

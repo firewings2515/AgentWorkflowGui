@@ -26,7 +26,7 @@ import { claudeProcessSpawn, codexAppServerSpawn, type JobSpawner } from '../../
 import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../adapters/storage';
 import { permissionPolicy } from '../../core/policy';
 import type { AppRepositories, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter } from '../../core/ports';
-import { SessionService } from '../../core/sessions';
+import { Redactor, SessionService } from '../../core/sessions';
 import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
@@ -105,10 +105,10 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 export async function startBackend(options: BackendOptions): Promise<Backend | DamagedBackend> {
   const { bus } = options;
-  // Every MCP token handed out, revoked ones included: no log line carries one (r1-P1-2).
-  const tokens = new Set<string>();
-  const redact = (text: string) => [...tokens].reduce((out, token) => out.split(token).join('[redacted]'), text);
-  const log = (message: string) => options.log(redact(message));
+  // Every MCP token handed out, revoked ones included, in every spelling the core matches: no log line
+  // carries one (r1-P1-2, r2-P1-2).
+  const tokens = new Redactor();
+  const log = (message: string) => options.log(tokens.text(message));
   const now = () => (options.now?.() ?? new Date()).toISOString();
   const uuid = () => options.uuid?.() ?? randomUUID();
   const closeTimeoutMs = options.closeTimeoutMs ?? 5000;

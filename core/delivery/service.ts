@@ -79,13 +79,25 @@ const startOptions = (spec: ProvisionDelivery['spec']): StartSessionOptions => (
   ...(spec.preallocatedRef !== undefined && { preallocatedRef: spec.preallocatedRef }),
 });
 
-/** Own data properties only, from Object.prototype or null, no symbols: what JSON would see, and nothing more. */
-const isPlain = (v: unknown): v is Record<string, unknown> => {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+/**
+ * A copy of a plain object's own data properties, read once through their descriptors (T017 r2-P1-1):
+ * nothing is read a second time, so a getter never runs and a Proxy cannot answer one value to the check
+ * and another to the copy. Undefined for anything that is not plain data: an array, an object of another
+ * prototype, a symbol key, or an accessor.
+ */
+const snapshot = (v: unknown): Record<string, unknown> | undefined => {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined;
   const proto: unknown = Object.getPrototypeOf(v);
-  if (proto !== Object.prototype && proto !== null) return false;
-  if (Object.getOwnPropertySymbols(v).length > 0) return false;
-  return Object.values(Object.getOwnPropertyDescriptors(v)).every((d) => 'value' in d);
+  if (proto !== Object.prototype && proto !== null) return undefined;
+  const descriptors = Object.getOwnPropertyDescriptors(v);
+  const out = Object.create(null) as Record<string, unknown>;
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key === 'symbol') return undefined;
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !('value' in descriptor)) return undefined;
+    out[key] = descriptor.value;
+  }
+  return out;
 };
 
 const hasKey = (v: unknown, key: string): boolean =>
@@ -100,8 +112,43 @@ class Rebuild {
   readonly issues: string[] = [];
 
   object(v: unknown, at: string): Record<string, unknown> {
-    if (isPlain(v)) return v;
+    const copy = snapshot(v);
+    if (copy !== undefined) return copy;
     this.issues.push(`${at} is not plain data`);
+    return Object.create(null) as Record<string, unknown>;
+  }
+
+  /** Keys other than `allowed` make the object invalid (the target is a strict contract shape). */
+  only(o: Record<string, unknown>, allowed: readonly string[], at: string): void {
+    for (const key of Object.keys(o)) if (!allowed.includes(key)) this.issues.push(`${at}.${key} is not allowed`);
+  }
+
+  target(v: unknown): DeliveryTarget {
+    const o = this.object(v, 'target');
+    this.only(o, ['sessionId', 'nativeSessionRef', 'provision'], 'target');
+    const sessionId = this.optionalString(o, 'sessionId', 'target');
+    const nativeSessionRef = this.optionalString(o, 'nativeSessionRef', 'target');
+    let provision: Record<string, unknown> | undefined;
+    if (o.provision !== undefined) {
+      const p = this.object(o.provision, 'target.provision');
+      this.only(p, ['operationId', 'bindingKey', 'state', 'nativeSessionRef', 'preallocated'], 'target.provision');
+      const ref = this.optionalString(p, 'nativeSessionRef', 'target.provision');
+      provision = {
+        operationId: this.string(p, 'operationId', 'target.provision'),
+        bindingKey: this.string(p, 'bindingKey', 'target.provision'),
+        state: this.string(p, 'state', 'target.provision'),
+        ...(ref !== undefined && { nativeSessionRef: ref }),
+        preallocated: p.preallocated,
+      };
+    }
+    // Plain data from here on, so the contract check reads nothing it did not copy.
+    const parsed = DeliveryTargetSchema.safeParse({
+      ...(sessionId !== undefined && { sessionId }),
+      ...(nativeSessionRef !== undefined && { nativeSessionRef }),
+      ...(provision !== undefined && { provision }),
+    });
+    if (parsed.success) return parsed.data;
+    for (const i of parsed.error.issues) this.issues.push(`target: ${i.message}`);
     return {};
   }
 
@@ -131,6 +178,8 @@ class Rebuild {
 
   settings(v: unknown, at: string): SessionSettings {
     const o = this.object(v, at);
+    // The types forbid it, but a spread through `SessionSettings` or a cast still compiles (C-07).
+    if ('mcp' in o) this.issues.push(`${at} carries an MCP mount, which is never stored`);
     if (typeof o.readOnly !== 'boolean') this.issues.push(`${at}.readOnly is not a boolean`);
     const instructions = this.optionalString(o, 'instructions', at);
     return { model: this.model(o.model, `${at}.model`), readOnly: o.readOnly === true, ...(instructions !== undefined && { instructions }) };
@@ -152,8 +201,7 @@ const PAYLOAD_KINDS: readonly PayloadKind[] = ['handoff', 'peer-message', 'trans
 const rebuild = (input: AcceptInput): { input: AcceptInput } | { issues: string[] } => {
   const r = new Rebuild();
   const top = r.object(input, 'input');
-  const target = DeliveryTargetSchema.safeParse(top.target);
-  if (!target.success) return { issues: target.error.issues.map((i) => `target: ${i.message}`) };
+  const target = r.target(top.target);
   const countIn = top.count === undefined ? undefined : r.object(top.count, 'count');
   const limit = countIn?.limit;
   if (limit !== undefined && typeof limit !== 'number') r.issues.push('count.limit is not a number');
@@ -164,7 +212,7 @@ const rebuild = (input: AcceptInput): { input: AcceptInput } | { issues: string[
     ...(sourceCallRef !== undefined && { sourceCallRef }),
     payloadHash: r.string(top, 'payloadHash', 'input'),
     proposalRevision: top.proposalRevision as number,
-    target: target.data,
+    target,
     at: r.string(top, 'at', 'input'),
     ...(countIn !== undefined && { count: { key: r.string(countIn, 'key', 'count'), ...(typeof limit === 'number' && { limit }) } }),
   };
@@ -220,7 +268,7 @@ export class DeliveryService {
     const rebuilt = rebuild(given);
     if ('issues' in rebuilt) return { status: 'invalid', issues: rebuilt.issues };
     const { input } = rebuilt;
-    const issues = await this.acceptIssues(given, input);
+    const issues = await this.acceptIssues(input);
     if (issues.length > 0) return { status: 'invalid', issues };
     try {
       return await this.options.store.accept(input);
@@ -306,10 +354,7 @@ export class DeliveryService {
     return report;
   }
 
-  private async acceptIssues(given: AcceptInput, input: AcceptInput): Promise<string[]> {
-    // The types forbid it, but a spread through `SessionSettings` or a cast still compiles (C-07).
-    const settings: object = given.kind === 'provision' ? given.spec : given.context.session;
-    if ('mcp' in settings) return [`${given.kind === 'provision' ? 'spec' : 'context.session'} carries an MCP mount, which is never stored`];
+  private async acceptIssues(input: AcceptInput): Promise<string[]> {
     const issues: string[] = deliveryTargetIssues(undefined, input.target);
     if (input.kind === 'provision') {
       if (input.target.provision?.operationId !== input.operationId) issues.push('a provision describes itself in target.provision');

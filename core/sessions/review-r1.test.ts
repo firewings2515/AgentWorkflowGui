@@ -189,14 +189,33 @@ describe('r1-P1-7 an event that cannot be stored is not pushed', () => {
 });
 
 describe('r1-P1-8 the user message survives a failure after acceptance', () => {
-  it('r1-P1-8 a write that failed after the delivery was accepted is made by the retry with the same messageId', async () => {
+  it('r1-P1-8 a failed message write accepts nothing; the retry with the same messageId writes and sends it once', async () => {
     const w = await world();
     const { sessionId } = await created(w);
     const append = w.repositories.conversations.appendMessage;
     w.repositories.conversations.appendMessage = () => Promise.reject(new Error('busy'));
     await expect(send(w, sessionId, 'hello', 'm-1', await latest(w, 'session-a'))).rejects.toThrow();
-    expect((await w.store.get(OperationId.parse('user-message:m-1')))?.delivery.state).toBe('pending');
+    // The message comes first now (r2-P1-8): nothing was accepted or sent without it.
+    expect(await w.store.get(OperationId.parse('user-message:m-1'))).toBeUndefined();
     w.repositories.conversations.appendMessage = append;
+    expect(await send(w, sessionId, 'hello', 'm-1', await latest(w, 'session-a'))).toMatchObject({ ok: true });
+    expect((await w.repositories.conversations.get(sessionId)).messages).toMatchObject([{ id: 'm-1', text: 'hello' }]);
+    expect(w.codex.get(sessionId)!.dispatched).toHaveLength(1);
+  });
+
+  it('r1-P1-8 an operation accepted earlier without its message gets the message from the retry', async () => {
+    const w = await world();
+    const { sessionId } = await created(w);
+    await w.service.delivery.accept({
+      kind: 'user-message',
+      operationId: OperationId.parse('user-message:m-1'),
+      payloadHash: hashOf('hello'),
+      payload: 'hello',
+      proposalRevision: await latest(w, 'session-a'),
+      target: { sessionId, nativeSessionRef: 'thread-1' },
+      at,
+      context: { runtime: 'codex', cwd: CWD, entry: { kind: 'new-turn' }, session: { model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false } },
+    });
     expect(await send(w, sessionId, 'hello', 'm-1', await latest(w, 'session-a'))).toMatchObject({ ok: true });
     expect((await w.repositories.conversations.get(sessionId)).messages).toMatchObject([{ id: 'm-1', text: 'hello' }]);
     expect(w.codex.get(sessionId)!.dispatched).toHaveLength(1);

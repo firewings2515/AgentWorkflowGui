@@ -50,9 +50,13 @@ export class FakeAdapter implements RuntimeAdapter {
     private readonly onPermission: (handle: PermissionHandle) => unknown = () => undefined,
   ) {}
 
-  start(): Promise<void> {
+  /** When set, start() and resumeSession() wait for it (an initialize or a resume that hangs). */
+  startGate: Promise<void> | undefined;
+  resumeGate: Promise<void> | undefined;
+
+  async start(): Promise<void> {
     this.calls.push('start');
-    return Promise.resolve();
+    await this.startGate;
   }
 
   close(): Promise<{ forced: boolean }> {
@@ -77,10 +81,11 @@ export class FakeAdapter implements RuntimeAdapter {
     this.held.shift()?.();
   }
 
-  resumeSession(options: ResumeSessionOptions): Promise<NativeSessionInfo> {
+  async resumeSession(options: ResumeSessionOptions): Promise<NativeSessionInfo> {
     this.calls.push('resumeSession');
     this.resumed.push(options);
-    return Promise.resolve({ sessionId: options.sessionId, nativeSessionRef: options.nativeSessionRef, cwd: options.cwd, model: { source: 'unknown' } });
+    await this.resumeGate;
+    return { sessionId: options.sessionId, nativeSessionRef: options.nativeSessionRef, cwd: options.cwd, model: { source: 'unknown' } };
   }
 
   closeSession(ref: string): Promise<{ forced: boolean }> {
