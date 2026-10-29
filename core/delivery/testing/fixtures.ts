@@ -1,7 +1,7 @@
 // Test inputs for the delivery service: a handoff to a bound Codex thread, a provision for a new Claude
 // session, and a GUI "process" (service + adapters) that can be restarted on the same store and history.
-import { OperationId, type PayloadHash, SessionId } from '../../../contracts';
-import type { AcceptInput, PayloadKind } from '../../ports';
+import { HandoffId, InstanceId, NodeId, OperationId, type PayloadHash, SessionId, TaskId } from '../../../contracts';
+import type { AcceptInput, HandoffMeta, PayloadKind } from '../../ports';
 import { DeliveryService } from '../service';
 import type { DeliveryEscalation, DeliveryServiceOptions } from '../types';
 import { FakeHistory, FakeRuntime } from './fake-runtime';
@@ -32,8 +32,25 @@ export const THREAD = 'thread-A';
 export const COUNT_KEY = 'instance-1/task-1/node-review';
 export const OP = op('op-1');
 
-export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadInput =>
-  defined({
+/** The handoff facts stored with a handoff (C-12); one handoff per operation. */
+export const handoffMeta = (operationId: string = OP): HandoffMeta => ({
+  handoffId: HandoffId.parse(`handoff-${operationId}`),
+  instanceId: InstanceId.parse('instance-1'),
+  taskId: TaskId.parse('task-1'),
+  fromNodeId: NodeId.parse('node-implement'),
+  toNodeId: NodeId.parse('node-review'),
+  fromSessionId: SessionId.parse('session-implement'),
+  ruleId: 'to-review',
+  rework: false,
+  round: 0,
+});
+
+export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadInput => {
+  const kind = 'kind' in overrides ? overrides.kind : 'handoff';
+  const operationId = overrides.operationId ?? OP;
+  const meta = handoffMeta(operationId);
+  return defined({
+    ...(kind === 'handoff' && { handoff: meta }),
     kind: 'handoff',
     operationId: OP,
     sourceCallRef: 'call-1',
@@ -47,10 +64,13 @@ export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadIn
       cwd: 'E:/work',
       entry: { kind: 'new-turn' },
       session: { model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false },
+      // A handoff names whose it is (C-01); other kinds set their own origin in the test.
+      ...(kind === 'handoff' && { origin: { kind: 'handoff', fromSessionId: meta.fromSessionId, handoffId: meta.handoffId } }),
     },
-    count: { key: COUNT_KEY, limit: 3 },
+    counts: [{ key: COUNT_KEY, limit: 3 }],
     ...overrides,
   });
+};
 
 /** A provision for target `name`: its own operationId, session, pre-allocated ref and binding key. */
 export const provisionInput = (name = '1', overrides: Partial<ProvisionInput> = {}): ProvisionInput => {
@@ -78,14 +98,23 @@ export const provisionInput = (name = '1', overrides: Partial<ProvisionInput> = 
   };
 };
 
+const originOf = (input: PayloadInput) => (input.context.origin === undefined ? {} : { origin: input.context.origin });
+
+/** The default payload's context without an origin (a user message, or a pre-0.5 record). */
+export const contextWithoutOrigin = (): PayloadInput['context'] => {
+  const context = { ...payloadInput().context };
+  delete context.origin;
+  return context;
+};
+
 /** A payload for the Claude session that provision `name` creates, accepted before it exists. */
 export const waitingPayload = (name = '1', overrides: Overrides<PayloadInput> = {}): PayloadInput => {
   const provision = provisionInput(name);
   return payloadInput({
     operationId: op(`payload-for-${name}`),
     target: { sessionId: provision.spec.sessionId, provision: provision.target.provision },
-    context: { runtime: 'claude', cwd: 'E:/work', entry: { kind: 'new-turn' }, session: { model: provision.spec.model, readOnly: true } },
-    count: { key: `instance-1/task-1/node-${name}` },
+    context: { runtime: 'claude', cwd: 'E:/work', entry: { kind: 'new-turn' }, session: { model: provision.spec.model, readOnly: true }, ...originOf(payloadInput()) },
+    counts: [{ key: `instance-1/task-1/node-${name}` }],
     ...overrides,
   });
 };

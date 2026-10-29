@@ -35,7 +35,7 @@ const recoverTwice = async (g: ReturnType<typeof gui>) => {
 describe('CR2_DELIVERY_FIX §6 scenarios', () => {
   it('1. accepts once with a fixed payload, hash and revision; a changed resend is rejected and never counted', async () => {
     const g = gui();
-    expect(await g.service.accept(payloadInput())).toMatchObject({ status: 'accepted', count: 1 });
+    expect(await g.service.accept(payloadInput())).toMatchObject({ status: 'accepted', counts: [{ key: COUNT_KEY, count: 1 }] });
     expect(await g.service.accept(payloadInput({ sourceCallRef: 'call-1-resent', at: at(5) }))).toMatchObject({ status: 'duplicate' });
     expect(await g.service.accept(payloadInput({ target: { ...payloadInput().target, nativeSessionRef: 'thread-B' } }))).toMatchObject({ status: 'conflict' });
     expect(await g.service.accept(payloadInput({ payload: 'changed' }))).toMatchObject({ status: 'conflict' });
@@ -235,7 +235,7 @@ describe('dispatch entry', () => {
     await flush();
     const [request] = g.codex.dispatched;
     const attempt = valid(await g.store.get(OP)).delivery.attempts[0];
-    expect(request).toEqual({ nativeSessionRef: THREAD, attempt, text: 'payload', entry: { kind: 'insert', expectedTurnRef: 'turn-7' }, timeoutMs: 5000 });
+    expect(request).toEqual({ nativeSessionRef: THREAD, attempt, text: 'payload', entry: { kind: 'insert', expectedTurnRef: 'turn-7' }, origin: payloadInput().context.origin, timeoutMs: 5000 });
     // A restarted GUI knows nothing but the store.
     const next = g.restart();
     await next.service.recover();

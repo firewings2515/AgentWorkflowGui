@@ -352,7 +352,7 @@ describe('review round 2 cases', () => {
     expect(ok(PermissionRequest, answered)).toBe(true);
     expect(ok(PermissionRequest, { ...answered, decision: { ...answered.decision, outcome: 'decline' } })).toBe(false);
     const url = { mode: 'url', serverName: 's', message: '登入', url: 'https://example.test/auth', elicitationId: 'el-1' };
-    expect(ok(PermissionRequest, { ...req, elicitation: url })).toBe(true);
+    expect(ok(PermissionRequest, { ...req, elicitation: url, server: 's' })).toBe(true);
     const command = pick(fixtureSnapshotInput.permissionRequests, 1);
     expect(ok(PermissionRequest, { ...command, decision: { outcome: 'approve', decidedBy: 'policy', content: { x: 1 }, at } })).toBe(false);
   });

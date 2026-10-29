@@ -208,14 +208,14 @@ const FOLDER_TOOLS = new Set(['Glob', 'Grep', 'LS']);
 const QUIET_TOOLS = new Set(['TodoWrite', 'Agent', 'Task', 'ToolSearch']);
 
 /**
- * `permissions` requests carry no tool name. Claude's adapter writes the summary as `<Tool> <target>`,
- * and Codex's as `Grant ...`, so the first word identifies a Claude tool. It is used only to approve
- * the read-only and quiet tools above; any other first word escalates.
+ * `permissions` requests name their tool in `tool` (C-04): Claude's tools do; Codex's sandbox grants have
+ * none. The tool is used only to approve the read-only and quiet tools above; any other tool escalates,
+ * and a request without a tool is a grant.
  */
 const checkPermissions = (c: Checker, request: PermissionRequest, cwd: AbsPath | undefined) => {
-  const tool = /^[A-Za-z_][\w-]*(?=\s|$)/.exec(request.summary)?.[0];
+  const { tool } = request;
   if (tool !== undefined && QUIET_TOOLS.has(tool) && request.paths.length === 0) return;
-  if (tool === undefined || !READ_TOOLS.has(tool)) return c.add('unrecognised', request.summary.startsWith('Grant ') ? 'grant' : 'unknown-tool');
+  if (tool === undefined || !READ_TOOLS.has(tool)) return c.add('unrecognised', tool === undefined ? 'grant' : 'unknown-tool');
   if (request.paths.length === 0) {
     if (FOLDER_TOOLS.has(tool)) c.folder('read', undefined, [cwd], 'win');
     else c.add('unrecognised', 'unknown-target');

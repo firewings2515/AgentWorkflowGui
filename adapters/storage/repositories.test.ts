@@ -490,6 +490,10 @@ describe('snapshot data and reopening', () => {
       conversations: { turns: [], messages: [], items: [], nativeTasks: [], permissionRequests: [], artifacts: [] },
       escalations: [],
       preferences: { theme: 'dark' },
+      instances: [],
+      handoffs: [],
+      peerMessages: [],
+      transfers: [],
     });
   });
 

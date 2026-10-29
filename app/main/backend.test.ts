@@ -11,7 +11,7 @@ import type { OwnedProcess } from '../../contracts';
 import type { PermissionHandle } from '../../core/ports';
 import { FakeAdapter, permissionRequest } from '../../core/sessions/testing/fake-adapter';
 import { agent } from '../../core/sessions/testing/harness';
-import { type Backend, type BackendProcessHost, type DamagedBackend, STORAGE_DAMAGED, startBackend } from './backend';
+import { type Backend, type BackendProcessHost, type DamagedBackend, startBackend } from './backend';
 import { EventBus } from './event-bus';
 import { ClaudeAdapter } from '../../adapters/claude';
 import { FakeSdk } from '../../adapters/claude/testing/fake-sdk';
@@ -219,7 +219,7 @@ describe('the assembled backend', () => {
     await settle();
     await createSession(s, 'c-1', 'claude');
     const claude = s.adapters.find((a) => a.runtime === 'claude')!;
-    const handle = claude.ask(permissionRequest(SessionId.parse('c-1'), { kind: 'permissions', summary: 'ToolSearch select:mcp__gui__send_message' }));
+    const handle = claude.ask(permissionRequest(SessionId.parse('c-1'), { kind: 'permissions', tool: 'ToolSearch', summary: 'ToolSearch select:mcp__gui__send_message' }));
     await settle();
     expect(handle.decision).toMatchObject({ outcome: 'approve', decidedBy: 'policy' });
     // The Codex probe ran in a Job of its own, ended right after.
@@ -250,7 +250,11 @@ describe('the assembled backend', () => {
     expect(result.status).toBe('damaged');
     expect(result.reason).toMatch(/^StoredDataError: agent/);
     expect(adapters).toBe(0);
-    expect(() => result.facade.snapshot()).toThrow(STORAGE_DAMAGED);
+    // C-06: a Snapshot that says the data is damaged, with nothing loaded and no stored content.
+    const damagedSnapshot = await result.facade.snapshot();
+    expect(damagedSnapshot.app).toMatchObject({ status: 'damaged', reason: expect.stringMatching(/^StoredDataError: agent/) as unknown });
+    expect(damagedSnapshot.sessions).toEqual([]);
+    expect(JSON.stringify(damagedSnapshot)).not.toContain('DATA_MARKER');
     expect(await result.facade.execute({ type: 'preferences.set', requestId: rid(), preferences: { theme: 'light' } })).toMatchObject({ ok: false, code: 'storage_failed' });
     expect(logs.join('\n')).not.toContain('DATA_MARKER');
     expect(result.reason).not.toContain('DATA_MARKER');
@@ -347,7 +351,11 @@ describe('review round 1 (T017-r1-result.md)', () => {
     });
     expect(result.status).toBe('damaged');
     expect({ probes, adapters }).toEqual({ probes: 0, adapters: 0 });
-    expect(() => result.facade.snapshot()).toThrow(STORAGE_DAMAGED);
+    // C-06: a Snapshot that says the data is damaged, with nothing loaded and no stored content.
+    const damagedSnapshot = await (result as DamagedBackend).facade.snapshot();
+    expect(damagedSnapshot.app.status).toBe('damaged');
+    expect(damagedSnapshot.sessions).toEqual([]);
+    expect(JSON.stringify(damagedSnapshot)).not.toContain('DATA_MARKER');
     expect(logs.join('\n')).not.toContain('DATA_MARKER');
   });
 });

@@ -19,14 +19,13 @@ const GUI_TOOLS = ['handoff', 'create_tasks', 'send_message', 'report_to_root', 
 
 /**
  * The GUI's own tools need no decision: Codex's elicitation for server `gui`, and Claude's ToolSearch (it
- * loads the deferred GUI tools first) and the GUI tools themselves. Claude's requests carry no tool name
- * (contracts gap), so the first word of the summary, which the adapter writes as the tool name, decides.
+ * loads the deferred GUI tools first) and the GUI tools themselves. Decided by the request's `tool` and
+ * `server` fields (C-04), never by its summary.
  */
 export const isGuiToolRequest = (request: PermissionRequest): boolean => {
-  if (request.kind === 'mcpElicitation') return request.elicitation?.serverName === 'gui';
+  if (request.kind === 'mcpElicitation') return request.server === 'gui' && request.elicitation?.serverName === 'gui';
   if (request.kind !== 'permissions') return false;
-  const tool = /^\S+/.exec(request.summary)?.[0];
-  return tool === 'ToolSearch' || (tool !== undefined && GUI_TOOLS.includes(tool));
+  return request.tool === 'ToolSearch' || (request.server === 'gui' && request.tool !== undefined && GUI_TOOLS.includes(request.tool));
 };
 
 /** Fixed titles; the detail is the policy's fixed reason, never request content (R-08). */

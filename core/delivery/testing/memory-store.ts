@@ -11,7 +11,9 @@ import type {
   DispatchAttempt,
   NativeRef,
   OperationId,
+  OperationOutcome,
   ProvisionRecord,
+  SessionId,
 } from '../../../contracts';
 import {
   type AcceptInput,
@@ -20,13 +22,15 @@ import {
   type ClaimResult,
   CommitUncertainError,
   type DeliveryStore,
+  type HandoffMeta,
   type PayloadContext,
+  type PeerMeta,
   type ProvisionSpec,
   type StoredDelivery,
   type WriteResult,
 } from '../../ports';
 
-type Method = 'accept' | 'updateTarget' | 'claim' | 'recordSent' | 'recordResolution' | 'get' | 'listByState';
+type Method = 'accept' | 'updateTarget' | 'claim' | 'recordSent' | 'recordResolution' | 'recordOutcome' | 'get' | 'findBySourceCallRef' | 'listByState';
 
 /**
  * `error`: the transaction fails before COMMIT, nothing is applied. `uncertain`: COMMIT fails and was in
@@ -39,6 +43,7 @@ interface Row {
   kind: StoredDelivery['kind'];
   operationId: OperationId;
   sourceCallRef?: string;
+  sender?: SessionId;
   payloadHash: string;
   proposalRevision: number;
   acceptedTarget: string;
@@ -47,8 +52,9 @@ interface Row {
   state: DeliveryRecord['state'];
   acceptedAt: string;
   attempts: { attempt: DispatchAttempt; abandoned: boolean }[];
-  countKey?: string;
+  countKeys: string[];
   bindingKey?: string;
+  outcome?: OperationOutcome;
 }
 
 /** JSON with object keys sorted and undefined dropped, so equal values are equal text. */
@@ -62,7 +68,11 @@ const canonicalJson = (value: unknown): string =>
 const parse = <T>(text: string): T => JSON.parse(text) as T;
 const copy = <T>(value: T): T => (value === undefined ? value : parse<T>(JSON.stringify(value)));
 
-const bodyOf = (input: AcceptInput) => (input.kind === 'provision' ? { spec: input.spec } : { payload: input.payload, context: input.context });
+/** The kind-specific facts (C-12, C-09) are part of the body, so a resend that changes them is a conflict. */
+const bodyOf = (input: AcceptInput) =>
+  input.kind === 'provision'
+    ? { spec: input.spec }
+    : { payload: input.payload, context: input.context, ...(input.handoff !== undefined && { handoff: input.handoff }), ...(input.peer !== undefined && { peer: input.peer }) };
 
 /** A provision's own target mirrors its delivery state and, once created, the new session (CR2 §3). */
 const provisionTarget = (target: DeliveryTarget, state: DeliveryRecord['state'], createdRef?: string): DeliveryTarget => {
@@ -85,11 +95,13 @@ export class MemoryDeliveryStore implements DeliveryStore {
 
   /** Receive admissions under `key`, i.e. what the receive counter shows (R-04). */
   admissions(key: string): number {
-    return [...this.rows.values()].filter((r) => r.countKey === key).length;
+    return [...this.rows.values()].filter((r) => r.countKeys.includes(key)).length;
   }
 
   accept(input: AcceptInput): Promise<AcceptResult> {
     return this.run<AcceptResult>('accept', () => {
+      if (input.kind === 'handoff' && input.handoff === undefined) return { value: { status: 'invalid', detail: 'a handoff needs its handoff facts' } };
+      if (input.kind === 'peer-message' && input.peer === undefined) return { value: { status: 'invalid', detail: 'a peer message needs its peer facts' } };
       const existing = this.rows.get(input.operationId);
       if (existing !== undefined) {
         return { value: this.sameAcceptance(existing, input) ? { status: 'duplicate', record: this.load(existing) } : { status: 'conflict', existing: this.load(existing) } };
@@ -106,18 +118,18 @@ export class MemoryDeliveryStore implements DeliveryStore {
         if (other !== undefined) return { value: { status: 'conflict', existing: this.load(other) } };
         target = provisionTarget(target, 'pending');
       }
-      let count: number | undefined;
-      if (input.count !== undefined) {
-        const counted = this.admissions(input.count.key);
-        if (input.count.limit !== undefined && counted >= input.count.limit) {
-          return { value: { status: 'limit-exceeded', count: counted, limit: input.count.limit } };
-        }
-        count = counted + 1;
+      // Every count is checked before any is advanced: one at its limit writes nothing (R-04 step 3).
+      const counts: { key: string; count: number }[] = [];
+      for (const c of input.counts ?? []) {
+        const counted = this.admissions(c.key);
+        if (c.limit !== undefined && counted >= c.limit) return { value: { status: 'limit-exceeded', key: c.key, count: counted, limit: c.limit } };
+        counts.push({ key: c.key, count: counted + 1 });
       }
       const row: Row = {
         kind: input.kind,
         operationId: input.operationId,
         ...(input.sourceCallRef !== undefined && { sourceCallRef: input.sourceCallRef }),
+        ...(input.sender !== undefined && { sender: input.sender }),
         payloadHash: input.payloadHash,
         proposalRevision: input.proposalRevision,
         acceptedTarget: canonicalJson(input.target),
@@ -126,11 +138,11 @@ export class MemoryDeliveryStore implements DeliveryStore {
         state: 'pending',
         acceptedAt: input.at,
         attempts: [],
-        ...(input.count !== undefined && { countKey: input.count.key }),
+        countKeys: counts.map((c) => c.key),
         ...(bindingKey !== undefined && { bindingKey }),
       };
       return {
-        value: count === undefined ? { status: 'accepted', record: this.load(row) } : { status: 'accepted', record: this.load(row), count },
+        value: counts.length === 0 ? { status: 'accepted', record: this.load(row) } : { status: 'accepted', record: this.load(row), counts },
         apply: () => this.rows.set(row.operationId, row),
       };
     });
@@ -225,6 +237,22 @@ export class MemoryDeliveryStore implements DeliveryStore {
     });
   }
 
+  recordOutcome(operationId: OperationId, outcome: OperationOutcome): Promise<WriteResult> {
+    return this.run<WriteResult>('recordOutcome', () => {
+      const row = this.rows.get(operationId);
+      if (row === undefined) return { value: 'stale' };
+      if (row.outcome !== undefined) return { value: canonicalJson(row.outcome) === canonicalJson(outcome) ? 'recorded' : 'stale' };
+      return { value: 'recorded', apply: () => (row.outcome = copy(outcome)) };
+    });
+  }
+
+  findBySourceCallRef(sourceCallRef: string): Promise<StoredDelivery | undefined> {
+    return this.run('findBySourceCallRef', () => {
+      const row = [...this.rows.values()].find((r) => r.sourceCallRef === sourceCallRef);
+      return { value: row === undefined ? undefined : this.load(row) };
+    });
+  }
+
   get(operationId: OperationId): Promise<StoredDelivery | undefined> {
     return this.run('get', () => {
       const row = this.rows.get(operationId);
@@ -263,6 +291,8 @@ export class MemoryDeliveryStore implements DeliveryStore {
     const base = {
       operationId: row.operationId,
       ...(row.sourceCallRef !== undefined && { sourceCallRef: row.sourceCallRef }),
+      ...(row.sender !== undefined && { sender: row.sender }),
+      ...(row.outcome !== undefined && { outcome: copy(row.outcome) }),
       payloadHash: row.payloadHash,
       proposalRevision: row.proposalRevision,
       target: parse<DeliveryTarget>(row.target),
@@ -270,8 +300,8 @@ export class MemoryDeliveryStore implements DeliveryStore {
       acceptedAt: row.acceptedAt,
     };
     if (row.kind === 'provision') return { ...base, kind: 'provision', spec: parse<{ spec: ProvisionSpec }>(row.body).spec };
-    const body = parse<{ payload: string; context: PayloadContext }>(row.body);
-    return { ...base, kind: row.kind, payload: body.payload, context: body.context };
+    const body = parse<{ payload: string; context: PayloadContext; handoff?: HandoffMeta; peer?: PeerMeta }>(row.body);
+    return { ...base, ...body, kind: row.kind };
   }
 
   private sameAcceptance(row: Row, input: AcceptInput): boolean {
@@ -281,7 +311,8 @@ export class MemoryDeliveryStore implements DeliveryStore {
       row.proposalRevision === input.proposalRevision &&
       row.acceptedTarget === canonicalJson(input.target) &&
       row.body === canonicalJson(bodyOf(input)) &&
-      row.countKey === input.count?.key
+      row.sender === input.sender &&
+      canonicalJson(row.countKeys) === canonicalJson((input.counts ?? []).map((c) => c.key))
     );
   }
 

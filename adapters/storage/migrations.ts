@@ -189,9 +189,23 @@ CREATE TABLE owned_process (
 CREATE INDEX owned_process_live ON owned_process (recorded_ms) WHERE ended_at IS NULL;
 `;
 
+/**
+ * v3: records written under contracts 0.4 read under 0.5 (T020 review r1 P1-5). Agents and workflow
+ * templates carry the contracts version; an MCP elicitation names its server in `server` too (C-04).
+ * Nothing else stored under 0.4 changed shape: the new fields are optional, and a payload stored without
+ * an origin is dispatched as not the user's (C-01).
+ */
+const contracts05V3 = `
+UPDATE agent SET body = json_set(body, '$.schemaVersion', '0.5.0') WHERE json_extract(body, '$.schemaVersion') = '0.4.0';
+UPDATE workflow SET body = json_set(body, '$.schemaVersion', '0.5.0') WHERE json_extract(body, '$.schemaVersion') = '0.4.0';
+UPDATE permission_request SET body = json_set(body, '$.server', json_extract(body, '$.elicitation.serverName'))
+  WHERE json_extract(body, '$.elicitation.serverName') IS NOT NULL AND json_extract(body, '$.server') IS NULL;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
+  { version: 3, name: 'contracts-0.5', sql: contracts05V3 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;

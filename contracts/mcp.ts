@@ -17,6 +17,10 @@ export const McpRejection = z.strictObject({
     'not-in-workflow', // a workflow tool called from an ordinary session
     'invalid-input',
     'shutting-down',
+    'not-owner', // the named operation (`retryOf`) was not created by the calling session (C-07)
+    'resend-mismatch', // a resend of a known call or operation changed its content or target (C-07)
+    'busy', // the GUI is at a capacity limit; the agent may call again later (C-07)
+    'unsupported', // the tool is not available in this version (e.g. `create_tasks` before task pipelining)
   ]),
   detail: z.string(),
 });

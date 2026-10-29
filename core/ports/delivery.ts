@@ -9,12 +9,19 @@ import type {
   DeliveryRecord,
   DeliveryTarget,
   DispatchAttempt,
+  HandoffId,
+  InstanceId,
+  MessageOrigin,
   NativeRef,
+  NodeId,
   OperationId,
+  OperationOutcome,
+  PeerMessageId,
   PayloadHash,
   Revision,
   Runtime,
   SessionId,
+  TaskId,
   Timestamp,
 } from '../../contracts';
 import type { DispatchEntry, SessionSettings } from './runtime';
@@ -37,6 +44,56 @@ export interface PayloadContext {
    * (`ResumeSessionOptions`) without any other store. Stored as is, so never the MCP mount (C-07).
    */
   session: SessionSettings & { mcp?: never };
+  /**
+   * Who the payload comes from (C-01), so a restarted GUI dispatches a pending peer or handoff payload with
+   * its original origin (R-03: never as the user). Absent means the user; only `user-message` may omit it.
+   */
+  origin?: MessageOrigin;
+}
+
+/**
+ * What a handoff is besides its payload (R-04 step 3, C-12): stored in the acceptance transaction, so the
+ * handoff, its receive count and its delivery record can never disagree. `HandoffRepository` reads it back
+ * as a `Handoff`.
+ */
+export interface HandoffMeta {
+  handoffId: HandoffId;
+  instanceId: InstanceId;
+  taskId: TaskId;
+  fromNodeId: NodeId;
+  toNodeId: NodeId;
+  fromSessionId: SessionId;
+  ruleId: string;
+  /**
+   * Whether this handoff is rework (R-05): its target node already received a handoff of this task in this
+   * instance. Every return counts: plan → implement → review → implement → review is two reworks (the
+   * second implement and the second review). Decided by the caller at acceptance, stored with the handoff
+   * and shown as `Handoff.rework`; the same acceptance advances the task's rework count key, so the limit,
+   * a restart (`WorkflowTask.reworkCount` is rebuilt from the handoffs) and the progress view agree.
+   */
+  rework: boolean;
+  /** Fan-out round and the upstream set expected in it (CR-4); batch 4 always uses round 0 and no set. */
+  round: number;
+  expectedUpstream?: readonly NodeId[];
+}
+
+/** What a `send_message` is besides its payload (C-09): read back by `PeerMessageRepository`. */
+export interface PeerMeta {
+  peerMessageId: PeerMessageId;
+  fromSessionId: SessionId;
+  toSessionId: SessionId;
+  /** Both sides in one workflow instance (start-time consent covers it, R-11). */
+  instanceId?: InstanceId;
+}
+
+/**
+ * One receive count checked and advanced in the acceptance transaction, once per operationId (R-04 step 3).
+ * A handoff counts the target node's receipts of the task and, when it goes back to an earlier node, the
+ * task's rework (R-05); `limit` absent means count only.
+ */
+export interface ReceiveCount {
+  key: string;
+  limit?: number;
 }
 
 /** Everything needed to create the target session again after a restart. */
@@ -57,43 +114,62 @@ interface StoredBase {
   operationId: OperationId;
   /** Native identity of the tool call that asked for it, to recognise a resend (CR2 §4). */
   sourceCallRef?: string;
+  /** The GUI session that asked for it (C-08): a later `retryOf` is accepted only from the same session. */
+  sender?: SessionId;
   payloadHash: PayloadHash;
   proposalRevision: Revision;
   target: DeliveryTarget;
   delivery: DeliveryRecord;
   acceptedAt: Timestamp;
+  /** How the operation ended apart from delivery (C-05 of 0.4), set once by `recordOutcome`. */
+  outcome?: OperationOutcome;
+}
+
+/** Kind-specific facts of a payload; `handoff` is set exactly for handoffs, `peer` for peer messages. */
+interface PayloadMeta {
+  handoff?: HandoffMeta;
+  peer?: PeerMeta;
 }
 
 export type StoredDelivery =
-  | (StoredBase & { kind: PayloadKind; payload: string; context: PayloadContext })
+  | (StoredBase & PayloadMeta & { kind: PayloadKind; payload: string; context: PayloadContext })
   /** For a provision, `delivery` tracks the create call; a sent attempt's nativeRef is the new session. */
   | (StoredBase & { kind: 'provision'; spec: ProvisionSpec });
 
 interface AcceptBase {
   operationId: OperationId;
   sourceCallRef?: string;
+  sender?: SessionId;
   payloadHash: PayloadHash;
   proposalRevision: Revision;
   target: DeliveryTarget;
   at: Timestamp;
   /**
-   * Receive counting for handoffs (R-04): the key (instance, task, target node) and its limit. Counted in
-   * the same transaction, once per operationId.
+   * Receive counting for handoffs (R-04, R-05): every count is checked first and all are advanced together
+   * in the same transaction, once per operationId; when any is at its limit nothing is written.
    */
-  count?: { key: string; limit?: number };
+  counts?: readonly ReceiveCount[];
 }
 
 export type AcceptInput =
-  | (AcceptBase & { kind: PayloadKind; payload: string; context: PayloadContext })
+  /**
+   * `handoff` is required for kind `handoff` and `peer` for `peer-message` (the store answers `invalid`
+   * without them); a resend must repeat them unchanged, or it is a conflict.
+   */
+  | (AcceptBase & PayloadMeta & { kind: PayloadKind; payload: string; context: PayloadContext })
   | (AcceptBase & { kind: 'provision'; spec: ProvisionSpec });
 
 export type AcceptResult =
-  | { status: 'accepted'; record: StoredDelivery; count?: number }
+  /** `counts`: each key's count after this acceptance, in the order given. */
+  | { status: 'accepted'; record: StoredDelivery; counts?: { key: string; count: number }[] }
   /** Same operationId with the same payload, target and revision: nothing changes, nothing is counted. */
   | { status: 'duplicate'; record: StoredDelivery }
   /** Same operationId with a different payload, target, revision or kind: rejected (R-04 step 3). */
   | { status: 'conflict'; existing: StoredDelivery }
-  | { status: 'limit-exceeded'; count: number; limit: number };
+  /** The first count (in the order given) that is at its limit; nothing was written. */
+  | { status: 'limit-exceeded'; key: string; count: number; limit: number }
+  /** A handoff without its `handoff` facts, or a peer message without `peer` (a caller bug, never stored). */
+  | { status: 'invalid'; detail: string };
 
 export interface ClaimInput {
   operationId: OperationId;
@@ -140,7 +216,17 @@ export interface DeliveryStore {
     attemptId: AttemptId,
     resolution: { decision: 'wait' | 'cancel' | 'retry'; at: Timestamp; note?: string },
   ): Promise<WriteResult>;
+  /**
+   * Records how the operation ended apart from delivery (C-05 of 0.4): once; a second call with another
+   * outcome is `stale`. The delivery record is not touched (a later reconcile as sent is still recorded).
+   */
+  recordOutcome(operationId: OperationId, outcome: OperationOutcome): Promise<WriteResult>;
   get(operationId: OperationId): Promise<StoredDelivery | undefined>;
+  /**
+   * The operation a tool call with this native identity created (C-08), so a resend after a GUI restart is
+   * recognised (CR2 §4). Identities are unique per runtime call; `undefined` when none.
+   */
+  findBySourceCallRef(sourceCallRef: string): Promise<StoredDelivery | undefined>;
   /**
    * For recovery after a restart: pending ones go through `claim` again; unknown ones are only reconciled.
    * Records carry their context or spec, so nothing else is needed to do either.

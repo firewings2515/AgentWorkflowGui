@@ -1,7 +1,7 @@
 // Test inputs for the delivery store: a handoff to a bound Codex thread and a provision for a new
 // Claude session, plus claim inputs with fresh attempt and client message IDs.
 import { createHash, randomUUID } from 'node:crypto';
-import { AttemptId, ClientMessageId, OperationId, type PayloadHash, SessionId } from '../../../contracts';
+import { AttemptId, ClientMessageId, HandoffId, InstanceId, NodeId, OperationId, type PayloadHash, SessionId, TaskId } from '../../../contracts';
 import type { AcceptInput, ClaimInput, PayloadKind } from '../../../core/ports';
 import { canonicalJson } from '../delivery-store';
 
@@ -19,8 +19,23 @@ export const at = (second = 0): string => new Date(Date.UTC(2026, 9, 26, 1, 0, s
 export const THREAD = 'thread-A';
 export const COUNT_KEY = 'instance-1/task-1/node-review';
 
-export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadInput =>
-  defined({
+/** The handoff facts stored with a handoff (C-12); one handoff per operation. */
+const handoffMeta = (operationId: string) => ({
+  handoffId: HandoffId.parse(`handoff-${operationId}`),
+  instanceId: InstanceId.parse('instance-1'),
+  taskId: TaskId.parse('task-1'),
+  fromNodeId: NodeId.parse('node-implement'),
+  toNodeId: NodeId.parse('node-review'),
+  fromSessionId: SessionId.parse('session-implement'),
+  ruleId: 'to-review',
+  rework: false,
+  round: 0,
+});
+
+export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadInput => {
+  const kind = 'kind' in overrides ? overrides.kind : 'handoff';
+  return defined({
+    ...(kind === 'handoff' && { handoff: handoffMeta(overrides.operationId ?? 'op-1') }),
     kind: 'handoff',
     operationId: op('op-1'),
     sourceCallRef: 'call-1',
@@ -35,9 +50,10 @@ export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadIn
       entry: { kind: 'new-turn' },
       session: { model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false },
     },
-    count: { key: COUNT_KEY, limit: 3 },
+    counts: [{ key: COUNT_KEY, limit: 3 }],
     ...overrides,
   });
+};
 
 /** A provision for target `name`: its own operationId, session, pre-allocated ref and binding key. */
 export const provisionInput = (overrides: Partial<ProvisionInput> = {}, name = '1'): ProvisionInput => {

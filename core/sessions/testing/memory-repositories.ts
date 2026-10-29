@@ -1,8 +1,25 @@
 // In-memory `AppRepositories` for the session service's tests, with the T015 semantics the service relies
 // on: compare-and-set on revision, a session must exist before its conversation, a repeated message is
-// ignored, and records are copied in and out so a caller cannot change what is stored.
-import type { AgentDefinition, AgentId, Escalation, LogicalSession, OwnedProcess, SessionId, UiPreferences, WorkflowId, WorkflowTemplate } from '../../../contracts';
-import type { AppRepositories, Conversation, DefinitionRepository, SaveResult, SnapshotData } from '../../ports';
+// ignored, and records are copied in and out so a caller cannot change what is stored. The 0.5 views
+// (handoffs, peer messages, transfers) are plain lists here: they do not read the delivery store, so they
+// are no reference for the projection rules of core/ports/repository.ts, which T022 tests on SQLite.
+import type {
+  AgentDefinition,
+  AgentId,
+  Escalation,
+  Handoff,
+  InstanceId,
+  LogicalSession,
+  OwnedProcess,
+  PeerMessage,
+  SessionId,
+  TransferProposal,
+  UiPreferences,
+  WorkflowId,
+  WorkflowInstance,
+  WorkflowTemplate,
+} from '../../../contracts';
+import type { AppRepositories, Conversation, DefinitionRepository, NodeSessionKey, SaveResult, SnapshotData } from '../../ports';
 
 /** A deep copy (core has no structuredClone: no DOM or Node types); records are plain JSON. */
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -46,6 +63,12 @@ export class MemoryRepositories implements AppRepositories {
   readonly escalationRecords = new Map<string, Escalation>();
   preferencesRecord: UiPreferences = { theme: 'dark' };
   readonly processRecords: OwnedProcess[] = [];
+  readonly instanceRecords = new Map<string, WorkflowInstance>();
+  readonly nodeSessions = new Map<string, SessionId>();
+  /** Handoffs and peer messages are views of the delivery store (C-12); tests put what they need here. */
+  readonly handoffRecords: Handoff[] = [];
+  readonly peerMessageRecords: PeerMessage[] = [];
+  readonly transferRecords = new Map<string, TransferProposal>();
 
   readonly sessions = {
     list: () => Promise.resolve([...this.sessionRecords.values()].map(copy)),
@@ -125,6 +148,65 @@ export class MemoryRepositories implements AppRepositories {
     listLive: () => Promise.resolve(this.processRecords.filter((p) => p.endedAt === undefined).map(copy)),
   };
 
+  readonly instances = {
+    list: () => Promise.resolve([...this.instanceRecords.values()].map(copy)),
+    get: (id: InstanceId) => Promise.resolve(this.instanceRecords.has(id) ? copy(this.instanceRecords.get(id)!) : undefined),
+    create: (instance: WorkflowInstance) => {
+      if (this.instanceRecords.has(instance.id)) return Promise.resolve('exists' as const);
+      this.instanceRecords.set(instance.id, { ...copy(instance), revision: 0 });
+      return Promise.resolve('created' as const);
+    },
+    update: (instance: WorkflowInstance, expectedRevision: number): Promise<SaveResult<WorkflowInstance>> => {
+      const current = this.instanceRecords.get(instance.id);
+      if (current?.revision !== expectedRevision) return Promise.resolve({ status: 'stale', current: current && copy(current) });
+      const stored = { ...copy(instance), revision: expectedRevision + 1 };
+      this.instanceRecords.set(instance.id, stored);
+      return Promise.resolve({ status: 'saved', record: copy(stored) });
+    },
+    bindNodeSession: (key: NodeSessionKey, sessionId: SessionId) => {
+      const k = JSON.stringify([key.instanceId, key.nodeId, key.taskId ?? null]);
+      const bound = this.nodeSessions.get(k);
+      if (bound !== undefined) return Promise.resolve({ status: 'exists' as const, sessionId: bound });
+      this.nodeSessions.set(k, sessionId);
+      return Promise.resolve({ status: 'bound' as const });
+    },
+    findNodeSession: (key: NodeSessionKey) => Promise.resolve(this.nodeSessions.get(JSON.stringify([key.instanceId, key.nodeId, key.taskId ?? null]))),
+  };
+
+  readonly handoffs = {
+    get: (id: string) => {
+      const found = this.handoffRecords.find((h) => h.id === id);
+      return Promise.resolve(found && copy(found));
+    },
+    listByInstance: (instanceId: InstanceId) => Promise.resolve(this.handoffRecords.filter((h) => h.instanceId === instanceId).map(copy)),
+  };
+
+  readonly peerMessages = {
+    get: (id: string) => {
+      const found = this.peerMessageRecords.find((m) => m.id === id);
+      return Promise.resolve(found && copy(found));
+    },
+    list: () => Promise.resolve(this.peerMessageRecords.map(copy)),
+  };
+
+  readonly transfers = {
+    get: (id: string) => Promise.resolve(this.transferRecords.has(id) ? copy(this.transferRecords.get(id)!) : undefined),
+    list: () => Promise.resolve([...this.transferRecords.values()].map(copy)),
+    create: (proposal: TransferProposal) => {
+      if (this.transferRecords.has(proposal.id)) return Promise.resolve('exists' as const);
+      this.transferRecords.set(proposal.id, copy(proposal));
+      return Promise.resolve('created' as const);
+    },
+    // T020 r2 P1: an approval, then a failure or cancel, each with the next revision.
+    update: (proposal: TransferProposal, expectedRevision: number): Promise<SaveResult<TransferProposal>> => {
+      if (proposal.revision !== expectedRevision + 1) return Promise.reject(new TypeError('a transfer update carries revision expectedRevision + 1'));
+      const current = this.transferRecords.get(proposal.id);
+      if (current?.revision !== expectedRevision) return Promise.resolve({ status: 'stale', current: current && copy(current) });
+      this.transferRecords.set(proposal.id, copy(proposal));
+      return Promise.resolve({ status: 'saved', record: copy(proposal) });
+    },
+  };
+
   async readSnapshotData(): Promise<SnapshotData> {
     const merged = emptyConversation();
     for (const c of this.conversationRecords.values()) for (const key of Object.keys(merged) as (keyof Conversation)[]) (merged[key] as unknown[]).push(...copy(c[key]));
@@ -135,6 +217,10 @@ export class MemoryRepositories implements AppRepositories {
       conversations: merged,
       escalations: await this.escalations.list(),
       preferences: await this.preferences.get(),
+      instances: await this.instances.list(),
+      handoffs: this.handoffRecords.map(copy),
+      peerMessages: this.peerMessageRecords.map(copy),
+      transfers: await this.transfers.list(),
     };
   }
 }

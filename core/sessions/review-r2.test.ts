@@ -79,7 +79,7 @@ describe('r2-P1-3 concurrent calls for one operation are checked against each ot
       w.service.sendMessage({ to: b, content: 'changed' }, { caller: c, operationId: op, sourceCallRef: 'call-c' }),
     ]);
     expect(first).toMatchObject({ status: 'accepted' });
-    expect(second).toMatchObject({ status: 'rejected', rejection: { reason: 'invalid-input' } });
+    expect(second).toMatchObject({ status: 'rejected', rejection: { reason: 'not-owner' } });
     expect(w.codex.get(b)!.dispatched.map((d) => d.text)).toEqual(['original']);
   });
 

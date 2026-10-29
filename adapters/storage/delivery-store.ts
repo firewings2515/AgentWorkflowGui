@@ -21,7 +21,9 @@ import type {
   ClaimInput,
   ClaimResult,
   DeliveryStore,
+  HandoffMeta,
   PayloadContext,
+  PeerMeta,
   ProvisionSpec,
   StoredDelivery,
   WriteResult,
@@ -62,7 +64,16 @@ export const canonicalJson = (value: unknown): string =>
 
 const parse = <T>(text: string): T => JSON.parse(text) as T;
 
-const bodyOf = (input: AcceptInput) => (input.kind === 'provision' ? { spec: input.spec } : { payload: input.payload, context: input.context });
+/** The kind-specific facts (C-12, C-09) are part of the body, so a resend that changes them is a conflict. */
+const bodyOf = (input: AcceptInput) =>
+  input.kind === 'provision'
+    ? { spec: input.spec }
+    : { payload: input.payload, context: input.context, ...(input.handoff !== undefined && { handoff: input.handoff }), ...(input.peer !== undefined && { peer: input.peer }) };
+
+/** Thrown for what contracts 0.5 added and T022 stores: the sender, several counts, outcomes. */
+export class NotStoredYetError extends Error {
+  override name = 'NotStoredYetError';
+}
 
 /** A provision's own target mirrors its delivery state and, once created, the new session (CR2 §3). */
 const provisionTarget = (target: DeliveryTarget, state: DeliveryRecord['state'], createdRef?: string): DeliveryTarget => {
@@ -91,6 +102,11 @@ export class SqliteDeliveryStore implements DeliveryStore {
   accept(input: AcceptInput): Promise<AcceptResult> {
     return this.run(() =>
       writeTransaction<AcceptResult>(this.db, () => {
+        if (input.kind === 'handoff' && input.handoff === undefined) return unchanged({ status: 'invalid', detail: 'a handoff needs its handoff facts' });
+        if (input.kind === 'peer-message' && input.peer === undefined) return unchanged({ status: 'invalid', detail: 'a peer message needs its peer facts' });
+        if (input.sender !== undefined) throw new NotStoredYetError('the sender of a delivery is stored from T022 on');
+        if ((input.counts?.length ?? 0) > 1) throw new NotStoredYetError('more than one receive count per delivery is stored from T022 on');
+        const count1 = input.counts?.[0];
         const existing = this.row(input.operationId);
         if (existing !== undefined) {
           const record = this.load(existing);
@@ -112,10 +128,10 @@ export class SqliteDeliveryStore implements DeliveryStore {
         }
 
         let count: number | undefined;
-        if (input.count !== undefined) {
-          const counted = this.receiveCount(input.count.key);
-          if (input.count.limit !== undefined && counted >= input.count.limit) {
-            return unchanged({ status: 'limit-exceeded', count: counted, limit: input.count.limit });
+        if (count1 !== undefined) {
+          const counted = this.receiveCount(count1.key);
+          if (count1.limit !== undefined && counted >= count1.limit) {
+            return unchanged({ status: 'limit-exceeded', key: count1.key, count: counted, limit: count1.limit });
           }
           count = counted + 1;
         }
@@ -137,10 +153,10 @@ export class SqliteDeliveryStore implements DeliveryStore {
             input.at,
           );
         if (bindingKey !== undefined) this.db.prepare('INSERT INTO provision (operation_id, binding_key) VALUES (?, ?)').run(input.operationId, bindingKey);
-        if (input.count !== undefined) this.db.prepare('INSERT INTO receive_admission (operation_id, count_key) VALUES (?, ?)').run(input.operationId, input.count.key);
+        if (count1 !== undefined) this.db.prepare('INSERT INTO receive_admission (operation_id, count_key) VALUES (?, ?)').run(input.operationId, count1.key);
 
         const record = this.load(this.mustRow(input.operationId));
-        return committed(count === undefined ? { status: 'accepted', record } : { status: 'accepted', record, count });
+        return committed(count === undefined || count1 === undefined ? { status: 'accepted', record } : { status: 'accepted', record, counts: [{ key: count1.key, count }] });
       }),
     );
   }
@@ -257,6 +273,17 @@ export class SqliteDeliveryStore implements DeliveryStore {
     );
   }
 
+  recordOutcome(): Promise<WriteResult> {
+    return Promise.reject(new NotStoredYetError('operation outcomes are stored from T022 on'));
+  }
+
+  findBySourceCallRef(sourceCallRef: string): Promise<StoredDelivery | undefined> {
+    return this.run(() => {
+      const row = this.db.prepare('SELECT * FROM delivery WHERE source_call_ref = ? ORDER BY accepted_at LIMIT 1').get(sourceCallRef) as DeliveryRow | undefined;
+      return row === undefined ? undefined : this.load(row);
+    });
+  }
+
   /** The bodies are synchronous; a throw becomes a rejection. */
   private run<T>(body: () => T): Promise<T> {
     return new Promise((resolve) => resolve(body()));
@@ -284,8 +311,8 @@ export class SqliteDeliveryStore implements DeliveryStore {
       acceptedAt: row.accepted_at,
     };
     if (row.kind === 'provision') return { ...base, kind: 'provision', spec: parse<{ spec: ProvisionSpec }>(row.body).spec };
-    const body = parse<{ payload: string; context: PayloadContext }>(row.body);
-    return { ...base, kind: row.kind, payload: body.payload, context: body.context };
+    const body = parse<{ payload: string; context: PayloadContext; handoff?: HandoffMeta; peer?: PeerMeta }>(row.body);
+    return { ...base, ...body, kind: row.kind };
   }
 
   private sameAcceptance(row: DeliveryRow, input: AcceptInput): boolean {
@@ -296,7 +323,7 @@ export class SqliteDeliveryStore implements DeliveryStore {
       row.proposal_revision === input.proposalRevision &&
       row.accepted_target === canonicalJson(input.target) &&
       row.body === canonicalJson(bodyOf(input)) &&
-      admission?.count_key === input.count?.key
+      admission?.count_key === input.counts?.[0]?.key
     );
   }
 

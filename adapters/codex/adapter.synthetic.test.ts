@@ -227,7 +227,7 @@ describe('permission requests', () => {
       outResponse(10),
     ]);
     await until(() => h.permissions.length === 1, 'elicitation');
-    expect(h.permissions[0]!.request).toMatchObject({ kind: 'mcpElicitation', elicitation: { mode: 'url', url: 'https://example.com/login', elicitationId: 'el-1' } });
+    expect(h.permissions[0]!.request).toMatchObject({ kind: 'mcpElicitation', server: 'docs', elicitation: { mode: 'url', url: 'https://example.com/login', elicitationId: 'el-1' } });
     expect(h.permissions[0]!.request.turnId).toBeUndefined();
     h.permissions[0]!.answer({ outcome: 'cancel', decidedBy: 'policy', at: AT });
     expect(h.fake.received.at(-1)).toEqual({ id: 10, result: { action: 'cancel', content: null, _meta: null } });

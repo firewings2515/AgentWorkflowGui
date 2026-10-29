@@ -31,6 +31,8 @@ const ruleMessages = {
   'permission.elicitation-kind': 'elicitation is set exactly for MCP elicitations',
   'permission.content-only-elicitation': 'only elicitation answers carry content',
   'permission.elicitation-once': 'an elicitation is answered once',
+  'permission.elicitation-server': 'an elicitation names its server in server',
+  'permission.shell-only-command': 'only command requests name a shell',
   // session.ts
   'usage.needs-counts': 'usage needs latest or cumulative counts',
   'scope.writable-includes-workspace': 'a writable session can write its own workspace',
@@ -42,7 +44,7 @@ const ruleMessages = {
   'peer.not-self': 'a session does not message itself',
   // transfer.ts
   'transfer.approval-pair': 'approvedAt and approvedRevision go together',
-  'transfer.approval-revision': 'the approval binds the current revision',
+  'transfer.approval-revision': 'the approval binds the revision it was saved with',
   'transfer.nothing-before-approval': 'nothing is created or sent before approval',
   'transfer.unapproved-is-clean': 'a proposal before approval has no approval, failure or cancel',
   'transfer.state-needs-approval': 'an approved or failed proposal needs an approval',
@@ -55,6 +57,7 @@ const ruleMessages = {
   'workflow.one-root': 'exactly one node is the root',
   'workflow.edge-missing-node': 'an edge references a missing node',
   'workflow.output-needs-edge': 'an output rule targets a node without an edge',
+  'instance.template-pinned': 'the pinned template is the started workflow revision',
   'instance.task-other-instance': 'a task belongs to another instance',
   'instance.task-invalid-dependency': 'a task depends on itself or on a missing task',
   'handoff.not-self': 'a node does not hand off to itself',

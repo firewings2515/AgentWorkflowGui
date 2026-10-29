@@ -2,7 +2,8 @@
 // with KILL_ON_JOB_CLOSE (R-14, CR-7, spike review-followup §1). Closing the session's Job ends its whole
 // tree, detached `Start-Process` children included, without touching other sessions; a GUI that dies
 // takes its Jobs with it. T013 implements it; how an adapter spawns inside a Job is between T013 and the
-// adapters (an injected spawn), not part of this port.
+// adapters (an injected spawn), not part of this port: spawning hands out Node streams, which core never
+// touches, and only the main process wires the spawn functions into the adapters (C-10 of 0.5: no change).
 import type { OwnedProcess, SessionId } from '../../contracts';
 
 export interface SessionJob {

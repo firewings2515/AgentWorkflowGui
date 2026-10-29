@@ -22,6 +22,9 @@ describe('permission requests', () => {
       turnId: h.of('turn.updated')[0]!.turn.id,
       itemId: 'toolu_1',
       kind: 'command',
+      // C-04: the tool and its shell as fields.
+      tool: 'Bash',
+      shell: 'bash',
       command: 'git status',
       cwd: 'E:\\work\\task-1',
       summary: 'Bash: git status',
@@ -45,6 +48,12 @@ describe('permission requests', () => {
       ['fileChange', ['E:\\work\\task-1\\a.ts'], 'Edit E:\\work\\task-1\\a.ts'],
       ['permissions', ['E:\\work\\task-1\\.env'], 'Read E:\\work\\task-1\\.env'],
       ['permissions', [], 'mcp__gui__send_message'],
+    ]);
+    // C-04: the tool and its MCP server as fields; no shell for tools that are not shells.
+    expect(h.permissions.map((p) => [p.request.tool, p.request.server, p.request.shell])).toEqual([
+      ['Edit', undefined, undefined],
+      ['Read', undefined, undefined],
+      ['mcp__gui__send_message', 'gui', undefined],
     ]);
   });
 

@@ -151,6 +151,16 @@ export const AppEvent = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('modelOptions.updated'), runtime: Runtime, options: z.array(ModelOption), at: Timestamp }),
   /** The saved preferences after `preferences.set`, so every window shows the same (C-03). */
   z.strictObject({ type: z.literal('preferences.updated'), preferences: UiPreferences, at: Timestamp }),
+  /** A saved Agent definition (C-05): after `agent.save`, so every view shows the stored revision. */
+  z.strictObject({ type: z.literal('agent.updated'), agent: AgentDefinition }),
+  z.strictObject({ type: z.literal('agent.deleted'), agentId: AgentId, at: Timestamp }),
+  /** A saved workflow template (C-05), after `workflow.save`. */
+  z.strictObject({ type: z.literal('workflow.updated'), workflow: WorkflowTemplate }),
+  /**
+   * What the renderer holds may differ from what is stored (C-05), e.g. an event could not be written and
+   * was not pushed: read the Snapshot again. `reason` is a fixed code, never data.
+   */
+  z.strictObject({ type: z.literal('snapshot.invalidated'), reason: z.enum(['event-write-failed', 'recovered']), at: Timestamp }),
   /** A new model observation for a session, including reroutes (R-12); Codex reports only "configured". */
   z.strictObject({ type: z.literal('model.observed'), sessionId: SessionId, observed: ObservedModel, at: Timestamp }),
   /**
@@ -174,9 +184,22 @@ export type AppEvent = z.infer<typeof AppEvent>;
 export const EventEnvelope = z.strictObject({ schemaVersion: SchemaVersion, seq: z.number().int().nonnegative(), event: AppEvent });
 export type EventEnvelope = z.infer<typeof EventEnvelope>;
 
+/**
+ * Whether the main process could open its data (C-06). `damaged`: the database or a record failed its
+ * checks at start; nothing else runs, the Snapshot's lists are empty and every command fails with
+ * `storage_failed`. `reason` is a fixed code (the failing table and rule, never stored content);
+ * `location` is the database file the user can open in the folder view.
+ */
+export const AppStatus = z.discriminatedUnion('status', [
+  z.strictObject({ status: z.literal('ready') }),
+  z.strictObject({ status: z.literal('damaged'), reason: z.string().min(1), location: z.string().min(1) }),
+]);
+export type AppStatus = z.infer<typeof AppStatus>;
+
 /** Read-only snapshot the renderer loads on start / reconnect (UI re-mount never resends commands). */
 export const Snapshot = z.strictObject({
   schemaVersion: SchemaVersion,
+  app: AppStatus.default({ status: 'ready' }),
   /** Last event seq already reflected here; apply only envelopes with a larger seq. */
   seq: z.number().int().nonnegative(),
   agents: z.array(AgentDefinition),

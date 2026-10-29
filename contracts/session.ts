@@ -39,7 +39,11 @@ export const SessionActivity = z.enum([
 ]);
 export type SessionActivity = z.infer<typeof SessionActivity>;
 
-/** Links a workflow session to its instance / node / task (R-06: one session per (node, task)). Root has no task. */
+/**
+ * Links a workflow session to its instance / node / task (R-06: one session per (node, task)). Root has no
+ * task. The session's agent, model and write policy come from the node of the instance's pinned workflow
+ * revision, not from the session (C-13); `requestedModel` records what the node asked for.
+ */
 export const WorkflowBinding = z.strictObject({
   instanceId: InstanceId,
   nodeId: NodeId,
@@ -104,6 +108,12 @@ const sessionShape = {
   parentId: SessionId.optional(),
   /** Set when this session was created by a cross-tool transfer from another session (R-02). */
   derivedFromSessionId: SessionId.optional(),
+  /**
+   * The native session/thread this GUI session is bound to once its provision was sent (C-03). The
+   * delivery store's provision record stays the source of truth during creation; this is the binding
+   * the session service resumes and dispatches with afterwards.
+   */
+  nativeSessionRef: z.string().min(1).optional(),
   tokenUsage: TokenUsage.optional(),
   createdAt: Timestamp,
   updatedAt: Timestamp,

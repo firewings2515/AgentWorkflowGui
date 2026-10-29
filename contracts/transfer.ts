@@ -45,7 +45,9 @@ export const TransferProposal = z
     const fail = (rule: ContractRule) => addRuleIssue(ctx, rule);
     const approved = p.approvedAt !== undefined;
     if (approved !== (p.approvedRevision !== undefined)) fail('transfer.approval-pair');
-    if (p.approvedRevision !== undefined && p.approvedRevision !== p.revision) fail('transfer.approval-revision');
+    // The approval binds the revision it was saved with: while approved it is the current one; a later
+    // failure or cancel is saved with a newer revision and keeps the approval as it was (T020 r2 P1).
+    if (p.approvedRevision !== undefined && (p.state === 'approved' ? p.approvedRevision !== p.revision : p.approvedRevision > p.revision)) fail('transfer.approval-revision');
     if (!approved && (p.provision || p.createdSessionId || p.delivery)) fail('transfer.nothing-before-approval');
     if (['draft', 'awaiting-confirmation', 'stale'].includes(p.state) && (approved || p.failure || p.cancelledAt)) fail('transfer.unapproved-is-clean');
     if ((p.state === 'approved' || p.state === 'failed') && !approved) fail('transfer.state-needs-approval');
