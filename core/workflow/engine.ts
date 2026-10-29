@@ -41,6 +41,7 @@ import { type AgentNode, agentNodes, briefing, handoffCounts, handoffText, hasEd
 import {
   firstMessageIdOf,
   firstMessageOperationOf,
+  startInstanceOf,
   startRefOf,
   handoffConfirmationId,
   handoffIdOf,
@@ -160,7 +161,6 @@ export class WorkflowEngine implements WorkflowHooks {
     const repos = this.repos;
     const messageId = firstMessageIdOf(instanceId);
     const operationId = firstMessageOperationOf(messageId);
-    const startRef = startRefOf(instanceId, title, crossToolConsent);
     // Only a call that wrote something says it may have had side effects (r2-P2).
     let wrote = false;
     const taken = (message = 'A workflow run with this ID already exists') => fail(requestId, 'already_exists', message, { mayHaveSideEffects: wrote });
@@ -183,9 +183,12 @@ export class WorkflowEngine implements WorkflowHooks {
     }
     const root = rootNode(template);
     const settings = { model: root.model, readOnly: root.writePolicy !== 'write' };
+    // Which workflow, root node and limit, also while no instance exists yet (r3-P1-1).
+    const startRef = startRefOf({ instanceId, workflowId, rootNodeId: root.id, reworkLimit: template.reworkLimit, title, crossToolConsent });
     if (intent !== undefined) {
       const same =
         intent.kind === 'user-message' &&
+        intent.outcome === undefined &&
         intent.payload === firstMessage &&
         intent.target.sessionId === rootSessionId &&
         intent.proposalRevision === workflowRevision &&
@@ -208,6 +211,8 @@ export class WorkflowEngine implements WorkflowHooks {
     }
     if (intent === undefined) {
       if ((await repos.sessions.get(rootSessionId)) !== undefined) return taken('A session with this ID already exists');
+      // The root ID may be held by another run's start that stopped before creating the session (r3-P1-2).
+      if (await this.rootClaimed(rootSessionId, operationId)) return taken('A session with this ID already exists');
       if (sessions.isClosing()) return fail(requestId, 'runtime_unavailable', 'The application is closing');
       const accepted = await this.delivery.accept({
         kind: 'user-message',
@@ -242,11 +247,19 @@ export class WorkflowEngine implements WorkflowHooks {
       createdAt: at,
     };
     if (sessions.isClosing()) return fail(requestId, 'runtime_unavailable', 'The application is closing', { mayHaveSideEffects: wrote });
-    const made = await sessions.createWorkflowSession({ sessionId: rootSessionId, instance: created, nodeId: root.id, cwd });
-    if (made === 'taken') return taken('A session with this ID already exists');
-    if (made === 'unresolvable') return fail(requestId, 'invalid_request', 'The working folder cannot be resolved', { mayHaveSideEffects: wrote });
-    if (made === 'closing') return fail(requestId, 'runtime_unavailable', 'The application is closing', { mayHaveSideEffects: wrote });
-    wrote ||= made === 'created';
+    // A run already started is recognised by its instance and its stored start: its root session's model may
+    // have been changed since (session.setModel), and that is no reason to refuse the repeat (r3-P2).
+    const existingRoot = instance === undefined ? undefined : await repos.sessions.get(rootSessionId);
+    if (existingRoot !== undefined) {
+      const bound = existingRoot.kind === 'workflow' && existingRoot.workflow.instanceId === instanceId && existingRoot.workflow.nodeId === root.id && existingRoot.workflow.taskId === undefined;
+      if (!bound) return taken('A session with this ID already exists');
+    } else {
+      const made = await sessions.createWorkflowSession({ sessionId: rootSessionId, instance: created, nodeId: root.id, cwd });
+      if (made === 'taken') return taken('A session with this ID already exists');
+      if (made === 'unresolvable') return fail(requestId, 'invalid_request', 'The working folder cannot be resolved', { mayHaveSideEffects: wrote });
+      if (made === 'closing') return fail(requestId, 'runtime_unavailable', 'The application is closing', { mayHaveSideEffects: wrote });
+      wrote ||= made === 'created';
+    }
     if ((await sessions.recordUserMessage(rootSessionId, messageId, firstMessage)) === 'taken') return taken();
     if (instance === undefined) {
       if ((await repos.instances.create(created)) === 'exists') return taken();
@@ -626,6 +639,33 @@ export class WorkflowEngine implements WorkflowHooks {
       await this.publishHandoff(handoff.id);
     }
     return cancelled;
+  }
+
+  /** Whether another run's first message, still on record, is meant for this root session ID (r3-P1-2). */
+  private async rootClaimed(rootSessionId: SessionId, own: OperationId): Promise<boolean> {
+    for (const state of ['pending', 'unknown', 'sent'] as const) {
+      for (const record of await this.store.listByState(state)) {
+        if (record.kind === 'user-message' && record.operationId !== own && record.target.sessionId === rootSessionId && startInstanceOf(record.sourceCallRef) !== undefined) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * `WorkflowHooks.userMessageFate` (r3-P1-2): a run's first message goes only to the root session of that
+   * run, once the run exists. While its session or instance is not there yet it waits (the start is being
+   * finished or repeated); when the session belongs to anything else it is cancelled and never sent.
+   */
+  async userMessageFate(record: StoredDelivery): Promise<'deliver' | 'wait' | 'cancel'> {
+    const instanceId = startInstanceOf(record.sourceCallRef);
+    const sessionId = record.target.sessionId;
+    if (instanceId === undefined || sessionId === undefined) return 'deliver';
+    const session = await this.repos.sessions.get(sessionId);
+    if (session === undefined) return 'wait';
+    if (session.kind !== 'workflow' || session.workflow.instanceId !== instanceId || session.workflow.taskId !== undefined) return 'cancel';
+    const instance = await this.repos.instances.get(instanceId);
+    if (instance === undefined) return 'wait';
+    return instance.rootSessionId === sessionId ? 'deliver' : 'cancel';
   }
 
   /** `WorkflowHooks.mayDeliver`: a handoff of a task stopped at a limit, or of a run that ended, is not sent. */

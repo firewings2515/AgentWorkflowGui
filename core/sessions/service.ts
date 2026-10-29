@@ -79,6 +79,12 @@ export interface WorkflowHooks {
   briefing(session: WorkflowSession): Promise<string | undefined>;
   /** Whether a formal handoff may still go: not when its task stopped at a limit (R-05, T024 r2-P1-1). */
   mayDeliver(handoff: HandoffMeta): Promise<boolean>;
+  /**
+   * Whether a user message may be dispatched now (T024 r3-P1-2): a workflow's first message only to the root
+   * session of its own run, once that run exists (`wait` until then); `cancel` when its session belongs
+   * to anything else. Every other user message is `deliver`.
+   */
+  userMessageFate(record: StoredDelivery): Promise<'deliver' | 'wait' | 'cancel'>;
 }
 
 /** How a workflow payload enters its target: a formal handoff waits for the target's turn to end (SP-05). */
@@ -1435,6 +1441,17 @@ export class SessionService {
    */
   private async dispatchOne(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry }): Promise<DispatchOutcome | undefined> {
     if (this.closing) return undefined;
+    // Every way a user message is dispatched (sent at once, recovered, retried) passes here (T024 r3-P1-2).
+    const record = this.workflow === undefined ? undefined : await this.store.get(operationId);
+    if (record?.kind === 'user-message' && this.workflow !== undefined) {
+      if (record.outcome !== undefined) return undefined;
+      const fate = await this.workflow.userMessageFate(record);
+      if (fate === 'wait') return undefined;
+      if (fate === 'cancel') {
+        await this.store.recordOutcome(operationId, { kind: 'cancelled', detail: 'its workflow run did not start in this session', at: this.options.now() });
+        return undefined;
+      }
+    }
     const outcome: DispatchOutcome = await this.delivery.dispatch(operationId, options);
     if (outcome.status === 'sent') {
       this.expectEcho(await this.store.get(operationId), outcome.attemptId);

@@ -25,7 +25,7 @@ const received = (w: World, sessionId: SessionId) => {
 };
 
 /** Makes `method` of `target` reject once with "crash" when `when` holds, as a GUI killed at that point. */
-const crashOnce = <T extends object, K extends keyof T>(target: T, method: K, when: (...args: unknown[]) => boolean = () => true) => {
+export const crashOnce = <T extends object, K extends keyof T>(target: T, method: K, when: (...args: unknown[]) => boolean = () => true) => {
   const original = (target[method] as (...args: unknown[]) => unknown).bind(target);
   let armed = true;
   (target as Record<K, unknown>)[method] = (...args: unknown[]) => {
