@@ -1,6 +1,7 @@
 // Ordinary sessions over the ports (T017): the commands of the renderer, the runtime events that become the
-// stored conversation, the GUI MCP server's `send_message`, and restart / exit. Workflow execution and
-// cross-tool transfer come with batch 4 and answer `unsupported`.
+// stored conversation, the GUI MCP server's `send_message`, and restart / exit. Workflow execution belongs
+// to the workflow engine (T024), attached with `attachWorkflow`; this service only gives it workflow
+// sessions, their deliveries and their escalations. Cross-tool transfer still answers `unsupported`.
 //
 // Every payload reaches a runtime through the CR-2 delivery service (T008); a session's runtime session is
 // itself created as a provision delivery, so a lost create response is never followed by a second create.
@@ -10,8 +11,10 @@ import {
   type AppEvent,
   type Command,
   type CommandResult,
+  type DeliveryTarget,
   type Escalation,
   EscalationId,
+  type InstanceId,
   type LogicalSession,
   type Message,
   MessageId,
@@ -28,7 +31,12 @@ import {
   type SendMessageToolResult,
   type SessionId,
   type SessionItem,
+  type TaskId,
   type Timestamp,
+  type Turn,
+  type DeliveryState,
+  type NodeId,
+  type WorkflowInstance,
   AttemptId,
 } from '../../contracts';
 import { DeliveryService, type DeliveryEscalation, type DispatchOutcome, type PayloadDelivery, type RecoveryReport } from '../delivery';
@@ -37,7 +45,9 @@ import type {
   Conversation,
   DeliveryStore,
   DispatchEntry,
+  HandoffMeta,
   McpMount,
+  PayloadContext,
   PermissionHandle,
   PermissionPolicy,
   RuntimeAdapter,
@@ -52,7 +62,33 @@ import { gated, ServiceClosedError } from './write-gate';
 
 type Failure = Extract<CommandResult, { ok: false }>;
 type Success = Extract<CommandResult, { ok: true }>;
-type CommandOf<T extends Command['type']> = Extract<Command, { type: T }>;
+export type CommandOf<T extends Command['type']> = Extract<Command, { type: T }>;
+export type WorkflowSession = Extract<LogicalSession, { kind: 'workflow' }>;
+
+/**
+ * What the workflow engine (T024) takes over from the session service, attached by the main process. The
+ * service keeps sessions, delivery and permissions; the engine decides what a workflow does with them.
+ */
+export interface WorkflowHooks {
+  start(command: CommandOf<'workflow.start'>): Promise<CommandResult>;
+  /** A workflow escalation answered with `escalation.respond`; undefined when it is not one of the engine's. */
+  respond(escalation: Escalation, command: CommandOf<'escalation.respond'>): Promise<CommandResult | undefined>;
+  /** The session's own turn ended (not a native sub-agent's): formal handoffs queued for it may go now (SP-05). */
+  turnEnded(sessionId: SessionId): void;
+  /** The node's part of a workflow session's instructions (rules, task, rework limit; R-05). */
+  briefing(session: WorkflowSession): Promise<string | undefined>;
+  /** Whether a formal handoff may still go: not when its task stopped at a limit (R-05, T024 r2-P1-1). */
+  mayDeliver(handoff: HandoffMeta): Promise<boolean>;
+  /**
+   * Whether a user message may be dispatched now (T024 r3-P1-2): a workflow's first message only to the root
+   * session of its own run, once that run exists (`wait` until then); `cancel` when its session belongs
+   * to anything else. Every other user message is `deliver`.
+   */
+  userMessageFate(record: StoredDelivery): Promise<'deliver' | 'wait' | 'cancel'>;
+}
+
+/** How a workflow payload enters its target: a formal handoff waits for the target's turn to end (SP-05). */
+export type WorkflowEntry = 'after-turn' | 'insert-if-busy';
 
 export interface SessionServiceOptions {
   repositories: AppRepositories;
@@ -187,6 +223,8 @@ interface PendingConfirmation {
   content: string;
   operationId: OperationId;
   sourceCallRef: string;
+  /** Both sessions in one workflow instance whose start-time consent covers them (R-11). */
+  instanceId?: InstanceId;
 }
 
 type Provisioned =
@@ -221,6 +259,13 @@ export class SessionService {
   private closing = false;
   /** Set when shutdown finished: nothing is stored any more (the database closes next). */
   private closed = false;
+  private workflow: WorkflowHooks | undefined;
+  /**
+   * A formal handoff dispatched to a session whose turn has not been seen to end yet (SP-05, T024 r1-P1-2/3):
+   * the main turns the session had before the dispatch, and the new one once it started. A replayed old turn
+   * is in `known` and never ends the wait; until it ends, no other handoff goes to that session.
+   */
+  private readonly handoffTurns = new Map<SessionId, { operationId: OperationId; known: Set<string>; started?: string; expected?: string }>();
 
   constructor(private readonly options: SessionServiceOptions) {
     // Storage only through the write gate: once shutdown returned, nothing reaches it (r2-P1-4).
@@ -237,6 +282,7 @@ export class SessionService {
       uuid: () => options.uuid(),
       log: (message) => options.log?.(message),
       isClosing: () => this.closing,
+      rootOf: (session) => this.rootOf(session),
     });
     this.runtimes = new SessionRuntimes({
       createAdapter: (runtime, sessionId) => options.createAdapter(runtime, sessionId),
@@ -262,6 +308,11 @@ export class SessionService {
         dispatchTimeoutMs: options.dispatchTimeoutMs,
       }),
     });
+  }
+
+  /** The workflow engine (T024); without one, `workflow.start` answers `unsupported`. */
+  attachWorkflow(hooks: WorkflowHooks): void {
+    this.workflow = hooks;
   }
 
   // ---- lifecycle ------------------------------------------------------------------------------------
@@ -307,17 +358,30 @@ export class SessionService {
     for (const escalation of await repositories.escalations.list({
       state: 'open',
     })) {
-      // Nothing in this process holds the request or the message waiting for confirmation any more.
-      if (escalation.kind === 'permission' || escalation.kind === 'confirmation') await this.closeEscalation(escalation, 'resolved');
+      // Nothing in this process holds the request or the message waiting for confirmation any more. A
+      // report's question is not held anywhere: the report itself was delivered, so it stays for the user.
+      if (escalation.kind === 'permission' || (escalation.kind === 'confirmation' && escalation.ref?.kind !== 'report')) await this.closeEscalation(escalation, 'resolved');
     }
     // A message accepted before a crash but never written is written now (r1-P1-8).
     for (const state of ['pending', 'unknown'] as const) {
       for (const record of await this.store.listByState(state)) if (record.kind === 'user-message') await this.ensureUserMessage(record);
     }
     const userMessages: OperationId[] = [];
+    const handoffs: { operationId: OperationId; sessionId: SessionId }[] = [];
+    // A workflow node's session is created for the work sent to it: a provision with none (a crash between
+    // the two acceptances) waits for the first handoff instead of starting a runtime now (T024 r1-P2-1).
+    const workflowSessions = new Set((await repositories.sessions.list()).filter((s) => s.kind === 'workflow').map((s) => s.id));
+    const withWork = new Set<string>();
+    for (const state of ['pending', 'unknown', 'sent'] as const)
+      for (const record of await this.store.listByState(state)) if (record.kind !== 'provision' && record.target.sessionId !== undefined) withWork.add(record.target.sessionId);
     const report = await this.delivery.recover({
       select: (record) => {
-        if (record.kind === 'provision') return {};
+        if (record.kind === 'provision') return workflowSessions.has(record.spec.sessionId) && !withWork.has(record.spec.sessionId) ? 'skip' : {};
+        // A formal handoff goes through the one queue of its target (T024 r1-P1-2), below.
+        if (record.kind === 'handoff' && record.target.sessionId !== undefined) {
+          handoffs.push({ operationId: record.operationId, sessionId: record.target.sessionId });
+          return 'skip';
+        }
         // Dispatched below, in the session's queue, so its echo is registered before its events (r2-P1-7).
         if (record.kind === 'user-message') {
           userMessages.push(record.operationId);
@@ -339,6 +403,13 @@ export class SessionService {
     }
     for (const { operationId, outcome } of [...report.reconciled, ...report.dispatched]) {
       if (outcome.status === 'sent' && !userMessages.includes(operationId)) await this.settled(operationId, outcome.attemptId);
+    }
+    for (const { operationId, sessionId } of handoffs) {
+      try {
+        await this.deliverWorkflow(operationId, sessionId, 'after-turn');
+      } catch (error) {
+        report.failed.push({ operationId, detail: errorName(error) });
+      }
     }
     return report;
   }
@@ -464,6 +535,8 @@ export class SessionService {
         return ok(command.requestId);
       }
       case 'workflow.start':
+        if (this.workflow !== undefined) return this.workflow.start(command);
+        return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
       case 'transfer.prepare':
       case 'transfer.confirm':
       case 'transfer.cancel':
@@ -521,6 +594,12 @@ export class SessionService {
     if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
     if (session.revision !== expectedRevision) return fail(requestId, 'stale_revision', 'The session has changed since it was loaded', { retryable: true });
     if (attachments.length > 0) return fail(requestId, 'unsupported', 'Attachments are not available yet');
+    return this.sendUserMessage(requestId, session, messageId, text);
+  }
+
+  /** The user's message to a session, written under its ID and sent once through the delivery service. */
+  private async sendUserMessage(requestId: Success['requestId'], session: LogicalSession, messageId: MessageId, text: string): Promise<CommandResult> {
+    const sessionId = session.id;
     const operationId = userMessageOp(messageId);
     const existing = await this.store.get(operationId);
     if (existing !== undefined && (existing.kind !== 'user-message' || existing.target.sessionId !== sessionId || existing.payload !== text)) {
@@ -702,6 +781,8 @@ export class SessionService {
       if (answered === 'answered') return ok(requestId);
       return fail(requestId, 'invalid_transition', 'The request is no longer open');
     }
+    const handled = await this.workflow?.respond(escalation, command);
+    if (handled !== undefined) return handled;
     if (escalation.kind === 'confirmation') return this.confirm(requestId, escalation, decision);
     return fail(requestId, 'invalid_transition', 'This escalation is answered with another command');
   }
@@ -735,17 +816,23 @@ export class SessionService {
     // Waiting keeps the question open; cancel and retry close it.
     if (decision === 'wait') return ok(requestId);
     await this.closeEscalation(escalation, 'resolved', 'user');
+    // The user decided on that attempt: its turn is no longer waited for (T024 r1-P1-2).
+    for (const [sessionId, mark] of this.handoffTurns) if (mark.operationId === attempt.operationId) this.handoffTurns.delete(sessionId);
     if (decision === 'retry') {
-      await this.dispatchPending(attempt.operationId, {
-        origin: await this.originOf(attempt.operationId),
-      });
-      if (escalation.ref?.kind === 'provision')
-        for (const blocked of escalation.ref.blocked)
-          await this.dispatchPending(blocked, {
-            origin: await this.originOf(blocked),
-          });
+      await this.retryPending(attempt.operationId);
+      if (escalation.ref?.kind === 'provision') for (const blocked of escalation.ref.blocked) await this.retryPending(blocked);
     }
     return ok(requestId);
+  }
+
+  /** A pending delivery the user retried: a formal handoff waits in its target's queue like any other (r1-P1-2). */
+  private async retryPending(operationId: OperationId): Promise<void> {
+    const record = await this.store.get(operationId);
+    if (record?.kind === 'handoff' && record.target.sessionId !== undefined) {
+      await this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn');
+      return;
+    }
+    await this.dispatchPending(operationId, { origin: await this.originOf(operationId) });
   }
 
   // ---- MCP send_message -----------------------------------------------------------------------------
@@ -776,12 +863,14 @@ export class SessionService {
     const target = await sessions.get(input.to);
     if (caller === undefined || target === undefined) return rejected('unknown-target', 'no such session');
     if (caller.id === target.id) return rejected('invalid-input', 'a session cannot send a message to itself');
+    const instanceId = await this.consentedInstance(caller, target);
     const pending: PendingConfirmation = {
       from: caller.id,
       to: target.id,
       content: input.content,
       operationId: ctx.operationId,
       sourceCallRef: ctx.sourceCallRef,
+      ...(instanceId !== undefined && { instanceId }),
     };
     // One call per operation at a time, so two calls racing for the same ID are checked against each other
     // (r2-P1-3); the target's part then runs in the target's queue.
@@ -795,15 +884,20 @@ export class SessionService {
     // same session to the same target (CR-2's fixed content), or it is refused (r1-P1-3).
     const mismatch = await this.resendMismatch(pending);
     if (mismatch !== undefined) return rejected(mismatch.reason, mismatch.detail);
-    if (caller.requestedModel.runtime !== target.requestedModel.runtime && (await this.store.get(pending.operationId)) === undefined) {
+    // Inside one started instance the start-time consent covers it (R-11); anywhere else the user confirms.
+    const crossTool = caller.requestedModel.runtime !== target.requestedModel.runtime && pending.instanceId === undefined;
+    if (crossTool && (await this.store.get(pending.operationId)) === undefined) {
       const id = EscalationId.parse(`confirm-${pending.operationId}`);
       const existing = await this.repos.escalations.get(id);
       // Re-checked after every wait, before anything is written (r2-P1-6).
       if (this.closing) return rejected('shutting-down', 'the GUI is closing');
       if (existing === undefined) {
+        // A workflow session's question goes to its instance's root (R-05, T024 r1-P1-6).
+        const root = await this.rootOf(caller);
         const escalation: Escalation = {
           id,
-          rootSessionId: caller.id,
+          ...(root.instanceId !== undefined && { instanceId: root.instanceId }),
+          rootSessionId: root.rootSessionId,
           fromSessionId: caller.id,
           kind: 'confirmation',
           title: 'Message to a session of another tool',
@@ -930,7 +1024,7 @@ export class SessionService {
           // C-01: a restarted GUI dispatches it as from the peer again, never as the user.
           origin,
         },
-        peer: { peerMessageId: peerIdOf(p.operationId), fromSessionId: p.from, toSessionId: p.to },
+        peer: { peerMessageId: peerIdOf(p.operationId), fromSessionId: p.from, toSessionId: p.to, ...(p.instanceId !== undefined && { instanceId: p.instanceId }) },
       });
       if (accepted.status === 'conflict') return { status: 'rejected', rejection: RESEND_MISMATCH };
       if (accepted.status === 'invalid') return { status: 'rejected', rejection: { reason: 'invalid-input', detail: 'the message cannot be accepted' } };
@@ -981,6 +1075,7 @@ export class SessionService {
       sourceCallRef: record.sourceCallRef ?? p.sourceCallRef,
       fromSessionId: p.from,
       toSessionId: p.to,
+      ...(p.instanceId !== undefined && { instanceId: p.instanceId }),
       ...(record.target.nativeSessionRef !== undefined && {
         toNativeSessionRef: record.target.nativeSessionRef,
       }),
@@ -993,11 +1088,209 @@ export class SessionService {
     this.options.publish({ type: 'peerMessage.updated', message });
   }
 
+  // ---- workflow sessions (T024) ---------------------------------------------------------------------
+
+  /** True once closing began: the workflow engine starts nothing new either (R-14). */
+  isClosing(): boolean {
+    return this.closing;
+  }
+
+  /** Storage as this service reaches it: once shutdown returned, nothing gets through (r2-P1-4). */
+  get storage(): { repositories: AppRepositories; store: DeliveryStore } {
+    return { repositories: this.repos, store: this.store };
+  }
+
+  runtimeAvailable(runtime: Runtime): boolean {
+    return this.options.isRuntimeAvailable?.(runtime) ?? true;
+  }
+
+  /** Whether a working folder resolves to a real folder (sessions are created only in those). */
+  canResolve(cwd: string): boolean {
+    return this.options.resolveRealPath(cwd) !== null;
+  }
+
+  /**
+   * Creates the GUI session of a workflow node (R-06): agent and model from the node of the instance's pinned
+   * template (C-13), folder scope from the node's write policy (read-only and exec-only nodes get no writable
+   * root). `exists`: the ID already holds this same binding; `taken`: it holds anything else.
+   */
+  async createWorkflowSession(input: {
+    sessionId: SessionId;
+    instance: WorkflowInstance;
+    nodeId: NodeId;
+    taskId?: TaskId;
+    cwd: string;
+    parentId?: SessionId;
+  }): Promise<'created' | 'exists' | 'taken' | 'unresolvable' | 'closing'> {
+    const { sessionId, instance, nodeId, taskId, cwd, parentId } = input;
+    const node = instance.template.nodes.find((n) => n.id === nodeId);
+    if (node?.kind !== 'agent') return 'taken';
+    // An existing session is this one only when everything the node gives it is the same (T024 r2-P1-4):
+    // a session made from another revision of the node must not stand in for it.
+    const same = (s: LogicalSession | undefined) =>
+      s !== undefined &&
+      s.kind === 'workflow' &&
+      s.workflow.instanceId === instance.id &&
+      s.workflow.nodeId === nodeId &&
+      s.workflow.taskId === taskId &&
+      s.cwd === cwd &&
+      s.agent.id === node.agentId &&
+      JSON.stringify([s.requestedModel.runtime, s.requestedModel.model, s.requestedModel.effort]) === JSON.stringify([node.model.runtime, node.model.model, node.model.effort]) &&
+      (s.folderScope.writableRoots.length > 0) === (node.writePolicy === 'write');
+    const existing = await this.repos.sessions.get(sessionId);
+    if (existing !== undefined) return same(existing) ? 'exists' : 'taken';
+    const root = this.options.resolveRealPath(cwd);
+    if (root === null) return 'unresolvable';
+    const agent = await this.repos.agents.get(node.agentId);
+    const at = this.options.now();
+    const session: WorkflowSession = {
+      id: sessionId,
+      revision: 0,
+      kind: 'workflow',
+      workflow: { instanceId: instance.id, nodeId, ...(taskId !== undefined && { taskId }) },
+      title: node.label,
+      agent: { id: node.agentId, revision: agent?.revision ?? 0 },
+      requestedModel: node.model,
+      observedModel: { source: 'unknown' },
+      activity: 'closed',
+      cwd,
+      folderScope: { source: 'session-cwd', workspaceRoot: root, writableRoots: node.writePolicy === 'write' ? [root] : [], readableRoots: [] },
+      ...(parentId !== undefined && { parentId }),
+      createdAt: at,
+      updatedAt: at,
+    };
+    if (this.closing) return 'closing';
+    if ((await this.repos.sessions.create(session)) === 'exists') return same(await this.repos.sessions.get(sessionId)) ? 'exists' : 'taken';
+    this.options.publish({ type: 'session.updated', session });
+    return 'created';
+  }
+
+  /**
+   * Where a workflow payload to this session goes (R-04 step 4): its bound native session, or else its
+   * provision, recorded now but not dispatched (the payload is accepted and counted first).
+   */
+  async payloadTarget(sessionId: SessionId): Promise<DeliveryTarget | undefined> {
+    const session = await this.repos.sessions.get(sessionId);
+    if (session === undefined) return undefined;
+    const ref = await this.binding(sessionId);
+    if (ref !== undefined) return { sessionId, nativeSessionRef: ref };
+    const record = await this.acceptProvision(session);
+    if ('ok' in record || record.target.provision === undefined) return undefined;
+    return { sessionId, provision: record.target.provision };
+  }
+
+  /** What a payload to this session is stored with (C-01): runtime, original cwd, settings, its origin. */
+  async payloadContext(sessionId: SessionId, origin: MessageOrigin): Promise<PayloadContext | undefined> {
+    const session = await this.repos.sessions.get(sessionId);
+    if (session === undefined) return undefined;
+    return { runtime: session.requestedModel.runtime, cwd: session.cwd, entry: { kind: 'new-turn' }, session: await this.settingsOf(session), origin };
+  }
+
+  /**
+   * Dispatches a pending workflow payload in its session's queue, in order with that session's events: its
+   * provision first when needed. `after-turn` (a formal handoff) leaves it pending while the session's own
+   * turn runs (SP-05), answering `queued`; `insert-if-busy` joins that turn.
+   */
+  deliverWorkflow(operationId: OperationId, sessionId: SessionId, entry: WorkflowEntry): Promise<DeliveryState | 'queued'> {
+    return this.serial(sessionKey(sessionId), async (): Promise<DeliveryState | 'queued'> => {
+      const record = await this.store.get(operationId);
+      if (record === undefined || record.delivery.state !== 'pending') return record?.delivery.state ?? 'pending';
+      const session = await this.repos.sessions.get(sessionId);
+      if (this.closing || session === undefined) return 'pending';
+      const provisioned = await this.ensureProvisioned(session);
+      if (!provisioned.ok || this.closing) return 'pending';
+      if (entry === 'after-turn') return this.dispatchHandoff(operationId, sessionId);
+      const origin = await this.originOf(operationId);
+      const current = (await this.repos.sessions.get(sessionId)) ?? session;
+      const inTurn = await this.inMainTurn(current);
+      return this.dispatchPending(operationId, { origin, entry: inTurn ? { kind: 'insert' } : { kind: 'new-turn' } });
+    });
+  }
+
+  /**
+   * The one gate of formal handoffs (SP-05, T024 r1-P1-2/3), in the target's queue: only the oldest pending
+   * handoff to the session, only while no turn of its own runs (by the stored turns, which an old event
+   * cannot undo, never by its activity), and only once the turn the previous handoff started has ended.
+   * The gate always sends the oldest one, whichever handoff opened it, so one left pending (a resume that
+   * failed) is never overtaken. It then starts a new turn; anything else waits (`queued`).
+   */
+  private async dispatchHandoff(operationId: OperationId, sessionId: SessionId): Promise<DeliveryState | 'queued'> {
+    if (this.handoffTurns.has(sessionId)) return 'queued';
+    const conversation = await this.repos.conversations.get(sessionId);
+    if (runningMainTurn(conversation) !== undefined) return 'queued';
+    const waiting = (await this.store.listByState('pending'))
+      .filter((r) => r.kind === 'handoff' && r.target.sessionId === sessionId && r.outcome === undefined)
+      .sort((a, b) => (a.acceptedAt < b.acceptedAt ? -1 : a.acceptedAt > b.acceptedAt ? 1 : a.operationId < b.operationId ? -1 : 1));
+    const next = waiting[0];
+    if (next === undefined) return 'queued';
+    // A task stopped at a limit sends nothing more, queued handoffs included (r2-P1-1).
+    if (next.kind === 'handoff' && next.handoff !== undefined && this.workflow !== undefined && !(await this.workflow.mayDeliver(next.handoff))) return 'queued';
+    const known = new Set<string>(conversation.turns.filter((t) => t.nativeTaskId === undefined).map((t) => t.id));
+    const mark: { operationId: OperationId; known: Set<string>; started?: string; expected?: string } = { operationId: next.operationId, known };
+    this.handoffTurns.set(sessionId, mark);
+    const state = await this.dispatchPending(next.operationId, { origin: await this.originOf(next.operationId), entry: { kind: 'new-turn' } });
+    // Nothing crossed the boundary: no turn to wait for. Sent or unknown: its turn is waited for.
+    if (state === 'pending' && this.handoffTurns.get(sessionId) === mark) this.handoffTurns.delete(sessionId);
+    // The runtime's ack names the turn it started (Claude's frame, Codex's turn/start): only that turn's end
+    // ends the wait (r2-P1-2). Its events are applied after this, in this same queue.
+    if (state === 'sent') {
+      const sent = (await this.store.get(next.operationId))?.delivery.attempts.at(-1);
+      if (sent?.state === 'sent' && sent.nativeRef.turnRef !== undefined) mark.expected = sent.nativeRef.turnRef;
+    }
+    return next.operationId === operationId ? state : 'queued';
+  }
+
+  /** The user's own message written under its ID before anything else is stored about it (a workflow's first message). */
+  recordUserMessage(sessionId: SessionId, messageId: MessageId, text: string): Promise<'written' | 'taken'> {
+    return this.serial(sessionKey(sessionId), () => this.writeUserMessage(sessionId, messageId, text, this.options.now()));
+  }
+
+  /**
+   * The provision a payload to this session waits for before the session is created (T024 r2-P1-4): the same
+   * operation and binding key the session's own provision is recorded under.
+   */
+  provisionFor(sessionId: SessionId): { operationId: OperationId; bindingKey: string; state: 'pending'; preallocated: false } {
+    return { operationId: provisionOp(sessionId), bindingKey: `session:${sessionId}`, state: 'pending', preallocated: false };
+  }
+
+  /** Where a session's escalations go (R-05): a workflow session's to its instance's root. */
+  private async rootOf(session: LogicalSession): Promise<{ rootSessionId: SessionId; instanceId?: InstanceId }> {
+    if (session.kind !== 'workflow') return { rootSessionId: session.id };
+    const instance = await this.repos.instances.get(session.workflow.instanceId);
+    return instance === undefined ? { rootSessionId: session.id } : { rootSessionId: instance.rootSessionId, instanceId: instance.id };
+  }
+
+  /**
+   * The instance both sessions work in, when its start-time consent covers messages between them (R-11):
+   * same instance, and consent recorded or both on one tool. Anything else is outside the group.
+   */
+  private async consentedInstance(a: LogicalSession, b: LogicalSession): Promise<InstanceId | undefined> {
+    if (a.kind !== 'workflow' || b.kind !== 'workflow' || a.workflow.instanceId !== b.workflow.instanceId) return undefined;
+    const instance = await this.repos.instances.get(a.workflow.instanceId);
+    if (instance === undefined) return undefined;
+    return instance.crossToolConsentAt !== undefined || a.requestedModel.runtime === b.requestedModel.runtime ? instance.id : undefined;
+  }
+
+  private async handoffRef(operationId: OperationId): Promise<Escalation['ref']> {
+    const record = await this.store.get(operationId);
+    return record?.kind === 'handoff' && record.handoff !== undefined ? { kind: 'handoff', handoffId: record.handoff.handoffId } : undefined;
+  }
+
   // ---- runtime sessions -----------------------------------------------------------------------------
 
   /** The session's runtime settings: its model and its agent's instructions (no MCP mount, C-07). */
   private async settingsOf(session: LogicalSession): Promise<SessionSettings> {
     const agent: AgentDefinition | undefined = await this.repos.agents.get(session.agent.id);
+    // A workflow node that may not write (read-only, exec-only) gets no writable root (T024, R-04).
+    if (session.kind === 'workflow') {
+      const briefing = await this.workflow?.briefing(session);
+      const instructions = [agent?.instructions, briefing].filter((t): t is string => t !== undefined && t.length > 0).join('\n\n');
+      return {
+        model: session.requestedModel,
+        readOnly: session.folderScope.writableRoots.length === 0,
+        ...(instructions.length > 0 && { instructions }),
+      };
+    }
     return {
       model: session.requestedModel,
       readOnly: false,
@@ -1020,6 +1313,41 @@ export class SessionService {
   private async ensureProvisioned(session: LogicalSession): Promise<Provisioned> {
     const closing: Provisioned = { ok: false, code: 'runtime_unavailable', message: 'The application is closing', retryable: false, mayHaveSideEffects: false };
     if (this.closing) return closing;
+    const operationId = provisionOp(session.id);
+    const accepted = await this.acceptProvision(session);
+    if ('ok' in accepted) return accepted;
+    let record: StoredDelivery | undefined = accepted;
+    if (record.delivery.state === 'pending') {
+      if (this.closing) return closing;
+      const outcome = await this.delivery.dispatch(operationId);
+      if (outcome.status === 'sent') await this.setActivity(session.id, 'idle');
+      record = await this.store.get(operationId);
+    }
+    const ref = await this.binding(session.id);
+    if (ref !== undefined) {
+      this.runtimes.bind(session.id, ref);
+      return { ok: true, nativeSessionRef: ref };
+    }
+    if (record?.delivery.state === 'unknown') {
+      return {
+        ok: false,
+        code: 'unknown_outcome',
+        message: 'It is not known whether the session was started; it is not started again',
+        retryable: false,
+        mayHaveSideEffects: true,
+      };
+    }
+    return {
+      ok: false,
+      code: 'runtime_unavailable',
+      message: 'The session could not be started',
+      retryable: true,
+      mayHaveSideEffects: false,
+    };
+  }
+
+  /** The session's provision, recorded once and not dispatched here (CR2 §3): its record, or why there is none. */
+  private async acceptProvision(session: LogicalSession): Promise<StoredDelivery | Extract<Provisioned, { ok: false }>> {
     const operationId = provisionOp(session.id);
     let record = await this.store.get(operationId);
     if (record === undefined) {
@@ -1071,33 +1399,15 @@ export class SessionService {
       }
       record = await this.store.get(operationId);
     }
-    if (record?.delivery.state === 'pending') {
-      if (this.closing) return closing;
-      const outcome = await this.delivery.dispatch(operationId);
-      if (outcome.status === 'sent') await this.setActivity(session.id, 'idle');
-      record = await this.store.get(operationId);
-    }
-    const ref = await this.binding(session.id);
-    if (ref !== undefined) {
-      this.runtimes.bind(session.id, ref);
-      return { ok: true, nativeSessionRef: ref };
-    }
-    if (record?.delivery.state === 'unknown') {
-      return {
+    return (
+      record ?? {
         ok: false,
-        code: 'unknown_outcome',
-        message: 'It is not known whether the session was started; it is not started again',
-        retryable: false,
-        mayHaveSideEffects: true,
-      };
-    }
-    return {
-      ok: false,
-      code: 'runtime_unavailable',
-      message: 'The session could not be started',
-      retryable: true,
-      mayHaveSideEffects: false,
-    };
+        code: 'storage_failed',
+        message: 'Starting the session could not be recorded',
+        retryable: true,
+        mayHaveSideEffects: false,
+      }
+    );
   }
 
   /** Before a claim (DeliveryOptions.prepareTarget): the target session is resumed when it is not open. */
@@ -1131,6 +1441,17 @@ export class SessionService {
    */
   private async dispatchOne(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry }): Promise<DispatchOutcome | undefined> {
     if (this.closing) return undefined;
+    // Every way a user message is dispatched (sent at once, recovered, retried) passes here (T024 r3-P1-2).
+    const record = this.workflow === undefined ? undefined : await this.store.get(operationId);
+    if (record?.kind === 'user-message' && this.workflow !== undefined) {
+      if (record.outcome !== undefined) return undefined;
+      const fate = await this.workflow.userMessageFate(record);
+      if (fate === 'wait') return undefined;
+      if (fate === 'cancel') {
+        await this.store.recordOutcome(operationId, { kind: 'cancelled', detail: 'its workflow run did not start in this session', at: this.options.now() });
+        return undefined;
+      }
+    }
     const outcome: DispatchOutcome = await this.delivery.dispatch(operationId, options);
     if (outcome.status === 'sent') {
       this.expectEcho(await this.store.get(operationId), outcome.attemptId);
@@ -1159,16 +1480,23 @@ export class SessionService {
           }
         : item.deliveryKind === 'peer-message'
           ? { kind: 'peerMessage', peerMessageId: peerIdOf(item.operationId) }
-          : undefined;
+          : item.deliveryKind === 'handoff'
+            ? await this.handoffRef(item.operationId)
+            : undefined;
     if (ref === undefined) return;
     const id = deliveryEscalationId(item.key);
     if ((await this.repos.escalations.get(id)) !== undefined) return;
+    // A workflow session's question goes to its instance's root (R-05).
+    const target = await this.repos.sessions.get(sessionId);
+    const root = target === undefined ? { rootSessionId: sessionId } : await this.rootOf(target);
     const escalation: Escalation = {
       id,
-      rootSessionId: sessionId,
+      ...(root.instanceId !== undefined && { instanceId: root.instanceId }),
+      rootSessionId: root.rootSessionId,
       fromSessionId: sessionId,
       kind: 'delivery-unknown',
-      title: item.deliveryKind === 'provision' ? 'Session start outcome unknown' : 'Message delivery outcome unknown',
+      title:
+        item.deliveryKind === 'provision' ? 'Session start outcome unknown' : item.deliveryKind === 'handoff' ? 'Handoff delivery outcome unknown' : 'Message delivery outcome unknown',
       // Fixed words only: the adapter's detail may quote paths or content.
       detail: `reason: ${item.reason}; duplicate risk on retry: ${item.duplicateRisk}`,
       ref,
@@ -1218,6 +1546,8 @@ export class SessionService {
     if (this.closed) return;
     if (event.type === 'runtime.exited') {
       this.runtimes.markExited(event.sessionIds);
+      // No turn of an exited runtime ends any more; the next handoff waits for a restart instead.
+      for (const sessionId of event.sessionIds) this.handoffTurns.delete(sessionId);
       for (const sessionId of event.sessionIds) void this.setActivity(sessionId, event.expected ? 'closed' : 'error').catch(() => undefined);
       this.options.publish(event);
       return;
@@ -1246,9 +1576,22 @@ export class SessionService {
       case 'session.activity':
         await this.setActivity(event.sessionId, event.activity);
         break;
-      case 'turn.updated':
-        await conversations.upsertTurn(event.turn);
+      case 'turn.updated': {
+        const { turn } = event;
+        // A turn that ended stays ended: a late `running` of it is dropped (T024 r2-P1-3).
+        if (turn.state === 'running') {
+          const stored = (await conversations.get(turn.sessionId)).turns.find((t) => t.id === turn.id);
+          if (stored !== undefined && stored.state !== 'running') return;
+        }
+        await conversations.upsertTurn(turn);
+        if (turn.nativeTaskId === undefined) this.followHandoffTurn(turn);
+        // Outside this queue: what the engine dispatches next runs in the same session's queue (T024).
+        if (turn.state !== 'running' && turn.nativeTaskId === undefined && this.workflow !== undefined) {
+          const hooks = this.workflow;
+          void Promise.resolve().then(() => hooks.turnEnded(turn.sessionId));
+        }
         break;
+      }
       case 'message.completed':
         // The user's own message was stored by session.send under the renderer's ID; its echo is not kept.
         // A native sub-agent's prompt is a user message too, and is kept (R-13).
@@ -1291,6 +1634,24 @@ export class SessionService {
     const stored = sessionOf(event);
     if (stored !== undefined) this.unsynced.delete(stored);
     this.options.publish(event);
+  }
+
+  /**
+   * The turn a dispatched handoff started (r1-P1-3, r2-P1-2): the turn the runtime's ack named, else the
+   * first main turn not known at dispatch that was seen running. Only that turn's end ends the wait: an
+   * end of any other turn, recorded or not, changes nothing. Without either, the wait ends with the user's
+   * decision on the delivery, the runtime's exit, or a restart.
+   */
+  private followHandoffTurn(turn: Turn): void {
+    const mark = this.handoffTurns.get(turn.sessionId);
+    if (mark === undefined) return;
+    if (mark.expected !== undefined) {
+      if (turn.id === mark.expected && turn.state !== 'running') this.handoffTurns.delete(turn.sessionId);
+      return;
+    }
+    if (mark.known.has(turn.id)) return;
+    if (turn.state === 'running') mark.started ??= turn.id;
+    else if (mark.started === turn.id) this.handoffTurns.delete(turn.sessionId);
   }
 
   /** Remembers a user message this process dispatched, so its runtime echo is recognised. */
@@ -1353,6 +1714,8 @@ export class SessionService {
   private async ensureUserMessage(record: PayloadDelivery): Promise<void> {
     const sessionId = record.target.sessionId;
     if (record.kind !== 'user-message' || sessionId === undefined) return;
+    // A workflow's first message is accepted before its root session exists (T024): written once it does.
+    if ((await this.repos.sessions.get(sessionId)) === undefined) return;
     const id = MessageId.parse(record.operationId.slice('user-message:'.length));
     if ((await this.writeUserMessage(sessionId, id, record.payload, record.acceptedAt)) === 'taken') this.log(`the message of ${record.operationId} has an ID another message holds`);
   }

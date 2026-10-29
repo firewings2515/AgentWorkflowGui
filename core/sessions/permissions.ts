@@ -5,6 +5,7 @@
 import {
   type Escalation,
   EscalationId,
+  type InstanceId,
   type LogicalSession,
   type PermissionDecision,
   type PermissionRequest,
@@ -49,6 +50,11 @@ export interface PermissionGateOptions {
   log?(message: string): void;
   /** True once the GUI began closing: from then on nothing is approved, by the policy or the user (r3-P1-2). */
   isClosing?(): boolean;
+  /**
+   * Where a session's escalations go (R-05): a workflow session's to its instance's root (T024). Defaults
+   * to the session itself, which is right for ordinary sessions.
+   */
+  rootOf?(session: LogicalSession): Promise<{ rootSessionId: SessionId; instanceId?: InstanceId }>;
 }
 
 export type RespondResult = 'answered' | 'not-found' | 'not-open' | 'gone';
@@ -82,9 +88,12 @@ export class PermissionGate {
       }
       return;
     }
+    const root = (await this.options.rootOf?.(session)) ?? { rootSessionId: session.id };
+    if (this.declinedForClosing(handle)) return;
     const escalation: Escalation = {
       id: EscalationId.parse(`permission-${this.options.uuid()}`),
-      rootSessionId: session.id,
+      ...(root.instanceId !== undefined && { instanceId: root.instanceId }),
+      rootSessionId: root.rootSessionId,
       fromSessionId: session.id,
       kind: 'permission',
       title: TITLES[decision.rule] ?? 'Permission request',

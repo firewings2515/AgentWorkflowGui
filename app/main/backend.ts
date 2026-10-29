@@ -27,6 +27,7 @@ import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../ada
 import { permissionPolicy } from '../../core/policy';
 import type { AppRepositories, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter } from '../../core/ports';
 import { Redactor, SessionService } from '../../core/sessions';
+import { WorkflowEngine } from '../../core/workflow';
 import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
@@ -63,6 +64,8 @@ export interface Backend {
   status: 'ready';
   facade: AppFacade;
   service: SessionService;
+  /** The workflow engine (T024) behind `workflow.start` and the workflow MCP tools. */
+  workflow: WorkflowEngine;
   repositories: AppRepositories;
   mcp: GuiMcpServer;
   /** What exiting now would cut off (R-14). */
@@ -173,11 +176,12 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   }
 
   // 4-5. MCP server, adapters, the session service. Handlers and hooks reach the service once it exists.
-  const ref: { service?: SessionService } = {};
+  const ref: { service?: SessionService; workflow?: WorkflowEngine } = {};
+  const starting = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is starting' } } as const;
   const handlers: McpToolHandlers = {
-    handoff: () => Promise.resolve(notInWorkflow),
-    create_tasks: () => Promise.resolve(notInWorkflow),
-    report_to_root: () => Promise.resolve(notInWorkflow),
+    handoff: (input, ctx) => ref.workflow?.handoff(input, ctx) ?? Promise.resolve(starting),
+    create_tasks: (input, ctx) => ref.workflow?.createTasks(input, ctx) ?? Promise.resolve(starting),
+    report_to_root: (input, ctx) => ref.workflow?.reportToRoot(input, ctx) ?? Promise.resolve(starting),
     wait_for_file: () => Promise.resolve(notInWorkflow),
     send_message: (input, ctx) => {
       if (ref.service === undefined) return Promise.resolve({ status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is starting' } });
@@ -271,12 +275,18 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     log,
   });
   ref.service = service;
+  // T024: workflow.start, the workflow tools and workflow escalations; it reaches storage through the service.
+  const workflow = new WorkflowEngine({ sessions: service, publish: (event) => void bus.publish(event), now, uuid, hashPayload: sha256, log });
+  service.attachWorkflow(workflow);
+  ref.workflow = workflow;
 
   // 6. Restart recovery (CR-2): unknown only reconciled, pending through the one dispatch entry. Stored data
   // it cannot read stops the start like damaged data does (r1-P1-6): no model probe, no runtime.
   try {
     const report = await service.start();
     if (report.failed.length > 0) log(`[backend] ${String(report.failed.length)} delivery(ies) could not be recovered`);
+    // Each run's tasks rebuilt from its handoffs, the record of what was counted (T024).
+    await workflow.recover();
   } catch (error) {
     await service.shutdown(closeTimeoutMs).catch(() => undefined);
     await mcp.close().catch(() => undefined);
@@ -360,6 +370,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     status: 'ready',
     facade,
     service,
+    workflow,
     repositories,
     mcp,
     async unfinishedWork() {
