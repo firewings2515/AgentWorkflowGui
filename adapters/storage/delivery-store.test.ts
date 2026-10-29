@@ -45,9 +45,9 @@ const admissions = () => (db.prepare('SELECT count(*) AS n FROM receive_admissio
 describe('accept', () => {
   it('stores the fixed operation as pending and counts it once', async () => {
     const result = await store.accept(payloadInput());
-    expect(result).toMatchObject({ status: 'accepted', count: 1 });
+    expect(result).toMatchObject({ status: 'accepted', counts: [{ key: COUNT_KEY, count: 1 }] });
     const record = valid(await store.get(OP));
-    expect(record).toEqual({ ...payloadInput(), count: undefined, at: undefined, acceptedAt: at(), delivery: { state: 'pending', attempts: [] } });
+    expect(record).toEqual({ ...payloadInput(), counts: undefined, at: undefined, acceptedAt: at(), delivery: { state: 'pending', attempts: [] } });
   });
 
   it('treats a resend with the same content, target and revision as a duplicate, even from another tool call', async () => {
@@ -66,8 +66,8 @@ describe('accept', () => {
     ['revision', payloadInput({ proposalRevision: 2 })],
     ['kind', payloadInput({ kind: 'transfer' })],
     ['dispatch context', payloadInput({ context: { ...payloadInput().context, cwd: 'E:/other' } })],
-    ['count key', payloadInput({ count: { key: 'instance-1/task-1/node-other' } })],
-    ['no count', payloadInput({ count: undefined })],
+    ['count key', payloadInput({ counts: [{ key: 'instance-1/task-1/node-other' }] })],
+    ['no count', payloadInput({ counts: undefined })],
   ])('rejects the same operationId with a changed %s', async (_, changed) => {
     await store.accept(payloadInput());
     const result = await store.accept(changed);
@@ -78,14 +78,14 @@ describe('accept', () => {
 
   it('enforces the receive limit in the same transaction, and still recognises a resend once the limit is reached', async () => {
     const limit = { key: COUNT_KEY, limit: 2 };
-    expect(await store.accept(payloadInput({ operationId: op('a'), count: limit }))).toMatchObject({ count: 1 });
-    expect(await store.accept(payloadInput({ operationId: op('b'), count: limit }))).toMatchObject({ count: 2 });
-    expect(await store.accept(payloadInput({ operationId: op('c'), count: limit }))).toEqual({ status: 'limit-exceeded', count: 2, limit: 2 });
+    expect(await store.accept(payloadInput({ operationId: op('a'), counts: [limit] }))).toMatchObject({ counts: [{ count: 1 }] });
+    expect(await store.accept(payloadInput({ operationId: op('b'), counts: [limit] }))).toMatchObject({ counts: [{ count: 2 }] });
+    expect(await store.accept(payloadInput({ operationId: op('c'), counts: [limit] }))).toEqual({ status: 'limit-exceeded', key: COUNT_KEY, count: 2, limit: 2 });
     expect(await store.get(op('c'))).toBeUndefined();
-    expect((await store.accept(payloadInput({ operationId: op('a'), count: limit }))).status).toBe('duplicate');
+    expect((await store.accept(payloadInput({ operationId: op('a'), counts: [limit] }))).status).toBe('duplicate');
     // Other keys and uncounted operations are independent.
-    expect(await store.accept(payloadInput({ operationId: op('d'), count: { key: 'other', limit: 2 } }))).toMatchObject({ count: 1 });
-    expect(await store.accept(payloadInput({ operationId: op('e'), count: undefined }))).toEqual({ status: 'accepted', record: expect.anything() as unknown });
+    expect(await store.accept(payloadInput({ operationId: op('d'), counts: [{ key: 'other', limit: 2 }] }))).toMatchObject({ counts: [{ count: 1 }] });
+    expect(await store.accept(payloadInput({ operationId: op('e'), counts: undefined }))).toEqual({ status: 'accepted', record: expect.anything() as unknown });
   });
 
   it('stores a provision with its spec and refuses a second provision for the same binding key', async () => {

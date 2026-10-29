@@ -206,7 +206,7 @@ describe('P1-12 Windows credential stores', () => {
   const home = sh`C:\Users\me`;
   const inHome = contextFor(home);
   const viaRefs: PolicyContext = { ...contextFor(), folderScope: { ...contextFor().folderScope, readableRoots: [sh`C:\Users\me\AppData`] } };
-  const read = (path: string) => request('permissions', `Read ${path}`, { paths: [path], cwd: home });
+  const read = (path: string) => request('permissions', `Read ${path}`, { tool: 'Read', paths: [path], cwd: home });
   it.each([
     [read(sh`C:\Users\me\AppData\Local\Microsoft\Vault\abc\123.vcrd`), inHome, 'secret-read'],
     [read(sh`C:\Users\me\AppData\Roaming\Microsoft\Protect\S-1-5-21\123`), inHome, 'secret-read'],

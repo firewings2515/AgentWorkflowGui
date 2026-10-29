@@ -122,6 +122,18 @@ export const PermissionRequest = z
     itemId: ItemId.optional(),
     nativeTaskId: NativeTaskId.optional(),
     kind: PermissionKind,
+    /**
+     * The runtime's own tool name when it has one (Claude `tool_name`, e.g. `Read`, `mcp__gui__handoff`), so
+     * the policy and the GUI's own-tool check never parse `summary` (C-04). Codex requests have none.
+     */
+    tool: z.string().min(1).optional(),
+    /** The MCP server the request is about: Claude `mcp__<server>__<tool>`, Codex elicitation `serverName`. */
+    server: z.string().min(1).optional(),
+    /**
+     * The shell `command` runs in when the runtime says so (Claude `Bash` → bash, `PowerShell` → powershell).
+     * Absent when unknown; the policy then reads the command both ways (T014).
+     */
+    shell: z.enum(['bash', 'powershell']).optional(),
     summary: z.string().min(1),
     command: z.string().min(1).optional(),
     cwd: z.string().min(1).optional(),
@@ -137,6 +149,8 @@ export const PermissionRequest = z
   .refine((p) => (p.state === 'held') === (p.hold !== undefined), ruleIssue('permission.hold-when-held'))
   .refine((p) => (p.state === 'answered') === (p.decision !== undefined), ruleIssue('permission.decision-when-answered'))
   .refine((p) => (p.kind === 'mcpElicitation') === (p.elicitation !== undefined), ruleIssue('permission.elicitation-kind'))
+  .refine((p) => p.elicitation === undefined || p.server === p.elicitation.serverName, ruleIssue('permission.elicitation-server'))
+  .refine((p) => p.shell === undefined || p.kind === 'command', ruleIssue('permission.shell-only-command'))
   .refine((p) => p.decision?.content === undefined || p.kind === 'mcpElicitation', ruleIssue('permission.content-only-elicitation'))
   .refine((p) => p.decision?.outcome !== 'approve-for-session' || p.kind !== 'mcpElicitation', ruleIssue('permission.elicitation-once'));
 export type PermissionRequest = z.infer<typeof PermissionRequest>;

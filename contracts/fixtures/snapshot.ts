@@ -138,7 +138,7 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
     { id: 'pr-2', sessionId: 's-wf-build-a', turnId: 'turn-a1', itemId: 'it-1', kind: 'command', summary: '執行 npm test', command: 'npm test', cwd: 'E:/work/.awg/wt/t1',
       state: 'answered', decision: { outcome: 'approve', decidedBy: 'policy', at: t('11:18') }, createdAt: t('11:18') },
     { id: 'pr-3', sessionId: 's-handoff-codex', turnId: 'turn-h1', kind: 'mcpElicitation', summary: 'issue-tracker 要求選擇目標分支',
-      elicitation: { mode: 'form', serverName: 'issue-tracker', message: '要把 issue 連到哪個分支？',
+      server: 'issue-tracker', elicitation: { mode: 'form', serverName: 'issue-tracker', message: '要把 issue 連到哪個分支？',
         requestedSchema: { type: 'object', properties: { branch: { type: 'string', title: '分支' } }, required: ['branch'] } },
       state: 'pending', createdAt: t('10:41') },
   ],
@@ -155,7 +155,7 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
   ],
   instances: [
     {
-      id: 'inst-login', workflowId: 'wf-default', workflowRevision: 3, title: '登入功能', rootSessionId: 's-wf-root', state: 'running', crossToolConsentAt: t('11:00'),
+      id: 'inst-login', revision: 4, workflowId: 'wf-default', workflowRevision: 3, reworkLimit: 2, title: '登入功能', rootSessionId: 's-wf-root', state: 'running', crossToolConsentAt: t('11:00'),
       tasks: [
         { id: 'task-a', instanceId: 'inst-login', title: '表單驗證', dependsOn: [], status: 'running', currentNodeId: 'n-review', worktree: { path: 'E:/work/.awg/wt/t1', branch: 'task/t1' }, reworkCount: 0 },
         { id: 'task-b', instanceId: 'inst-login', title: 'Session 儲存', dependsOn: [], status: 'running', currentNodeId: 'n-build', worktree: { path: 'E:/work/.awg/wt/t2', branch: 'task/t2' }, reworkCount: 0 },

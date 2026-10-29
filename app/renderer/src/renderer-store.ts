@@ -70,6 +70,11 @@ export function applyEnvelope(state: RendererState, envelope: EventEnvelope): Re
     case 'usage.limits': next.limits = event; break;
     case 'modelOptions.updated': snapshot.modelOptions = [...snapshot.modelOptions.filter(option => option.runtime !== event.runtime), ...event.options]; break;
     case 'preferences.updated': snapshot.preferences = event.preferences; break;
+    case 'agent.updated': snapshot.agents = upsert(snapshot.agents, event.agent); break;
+    case 'agent.deleted': snapshot.agents = snapshot.agents.filter(agent => agent.id !== event.agentId); break;
+    case 'workflow.updated': snapshot.workflows = upsert(snapshot.workflows, event.workflow); break;
+    // Re-reading the Snapshot on this event is T025's (contracts 0.5, C-05); until then only the seq moves.
+    case 'snapshot.invalidated': break;
     case 'model.observed': snapshot.sessions = snapshot.sessions.map(session => session.id === event.sessionId ? { ...session, observedModel: event.observed } : session); break;
     case 'runtime.exited': next.runtimeExits = { ...state.runtimeExits, [event.runtime]: event }; break;
     default: { const exhaustive: never = event; return exhaustive; }

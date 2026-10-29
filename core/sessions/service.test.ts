@@ -227,10 +227,10 @@ describe('permissions (R-05, R-08)', () => {
     const w = await world();
     const { sessionId } = await created(w);
     const { sessionId: claudeId } = await created(w, 'claude', 'c-1');
-    const elicitation = ask(w, sessionId, { kind: 'mcpElicitation', summary: 'gui wants input', elicitation: { mode: 'form', serverName: 'gui', message: 'm', requestedSchema: {} } });
-    const toolSearch = w.claude.ask(permissionRequest(claudeId, { kind: 'permissions', summary: 'ToolSearch select:mcp__gui__send_message' }));
-    const tool = w.claude.ask(permissionRequest(claudeId, { kind: 'permissions', summary: 'mcp__gui__report_to_root' }));
-    const other = ask(w, sessionId, { kind: 'mcpElicitation', summary: 'x', elicitation: { mode: 'form', serverName: 'other', message: 'm', requestedSchema: {} } });
+    const elicitation = ask(w, sessionId, { kind: 'mcpElicitation', summary: 'gui wants input', server: 'gui', elicitation: { mode: 'form', serverName: 'gui', message: 'm', requestedSchema: {} } });
+    const toolSearch = w.claude.ask(permissionRequest(claudeId, { kind: 'permissions', tool: 'ToolSearch', summary: 'ToolSearch select:mcp__gui__send_message' }));
+    const tool = w.claude.ask(permissionRequest(claudeId, { kind: 'permissions', tool: 'mcp__gui__report_to_root', server: 'gui', summary: 'mcp__gui__report_to_root' }));
+    const other = ask(w, sessionId, { kind: 'mcpElicitation', summary: 'x', server: 'other', elicitation: { mode: 'form', serverName: 'other', message: 'm', requestedSchema: {} } });
     w.decide = () => ({ action: 'escalate', rule: 'unrecognised', reason: 'not understood' });
     await settle();
     for (const h of [elicitation, toolSearch, tool]) expect(h.decision).toMatchObject({ outcome: 'approve', decidedBy: 'policy' });

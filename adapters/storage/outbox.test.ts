@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CommitUncertainError } from '../../core/ports';
 import { openDatabase } from './database';
 import { SqliteDeliveryStore } from './delivery-store';
-import { THREAD, at, claimInput, hashOf, op, payloadInput } from './testing/fixtures';
+import { COUNT_KEY, THREAD, at, claimInput, hashOf, op, payloadInput } from './testing/fixtures';
 import { createReceiver, dispatch, receive, receivedRows, reconcile, type Stage } from './testing/outbox';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -157,7 +157,7 @@ const recover = (paths: { db: string; receiver: string }) =>
 describe('CR-2 outbox scenarios (spike cr2-outbox-test.mjs)', () => {
   it('1. duplicate admission counts once; changed payload or destination is rejected', async () => {
     await withStore(join(mkdtempSync(join(root, 'dup-')), 'local.sqlite'), async (store, db) => {
-      expect(await store.accept(payloadInput())).toMatchObject({ status: 'accepted', count: 1 });
+      expect(await store.accept(payloadInput())).toMatchObject({ status: 'accepted', counts: [{ key: COUNT_KEY, count: 1 }] });
       expect(await store.accept(payloadInput({ at: at(5), sourceCallRef: 'call-1-resent' }))).toMatchObject({ status: 'duplicate' });
       expect(await store.accept(payloadInput({ target: { ...payloadInput().target, nativeSessionRef: 'thread-B' } }))).toMatchObject({ status: 'conflict' });
       expect(await store.accept(payloadInput({ payload: 'changed', payloadHash: hashOf('changed') }))).toMatchObject({ status: 'conflict' });

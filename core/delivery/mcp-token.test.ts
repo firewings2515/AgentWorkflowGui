@@ -101,7 +101,7 @@ describe('origin', () => {
     const other = payloadInput({
       operationId: OP.replace('1', '2') as typeof OP,
       payload: 'second',
-      count: undefined,
+      counts: undefined,
     });
     expect((await g.service.accept(other)).status).toBe('accepted');
     expect((await g.service.dispatch(other.operationId)).status).toBe('sent');

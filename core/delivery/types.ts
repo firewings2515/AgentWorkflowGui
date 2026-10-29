@@ -55,7 +55,7 @@ export interface DeliveryServiceOptions {
 }
 
 export type AcceptOutcome =
-  | AcceptResult
+  | Exclude<AcceptResult, { status: 'invalid' }>
   /**
    * Rejected before the store: the hash does not match the payload, the target contradicts itself, or the
    * input carries an MCP mount that must never be stored (C-07).

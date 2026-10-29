@@ -31,6 +31,8 @@ const ruleMessages = {
   'permission.elicitation-kind': 'elicitation is set exactly for MCP elicitations',
   'permission.content-only-elicitation': 'only elicitation answers carry content',
   'permission.elicitation-once': 'an elicitation is answered once',
+  'permission.elicitation-server': 'an elicitation names its server in server',
+  'permission.shell-only-command': 'only command requests name a shell',
   // session.ts
   'usage.needs-counts': 'usage needs latest or cumulative counts',
   'scope.writable-includes-workspace': 'a writable session can write its own workspace',

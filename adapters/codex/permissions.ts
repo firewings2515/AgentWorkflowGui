@@ -112,7 +112,7 @@ const build = (kind: PermissionKind, params: unknown, ctx: BuildContext): BuiltR
   };
   const reason = str(params.reason);
   let grant: JsonValue | undefined;
-  let fields: Pick<PermissionRequest, 'summary' | 'paths'> & Partial<Pick<PermissionRequest, 'command' | 'cwd' | 'elicitation'>>;
+  let fields: Pick<PermissionRequest, 'summary' | 'paths'> & Partial<Pick<PermissionRequest, 'command' | 'cwd' | 'elicitation' | 'server'>>;
   switch (kind) {
     case 'command': {
       const command = str(params.command);
@@ -165,7 +165,7 @@ const build = (kind: PermissionKind, params: unknown, ctx: BuildContext): BuiltR
           : { mode, serverName: params.serverName, message: params.message ?? '', requestedSchema: params.requestedSchema ?? null },
       );
       if (!parsed.success) return `unsupported elicitation: ${parsed.error.message}`;
-      fields = { summary: str(params.message) ?? `${parsed.data.serverName} asks for input`, paths: [], elicitation: parsed.data };
+      fields = { summary: str(params.message) ?? `${parsed.data.serverName} asks for input`, paths: [], elicitation: parsed.data, server: parsed.data.serverName };
       break;
     }
   }

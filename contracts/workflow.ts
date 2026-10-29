@@ -9,6 +9,7 @@ import {
   NodeId,
   OperationId,
   PayloadHash,
+  MessageId,
   PeerMessageId,
   PermissionRequestId,
   Revision,
@@ -122,6 +123,8 @@ export type WorkflowTask = z.infer<typeof WorkflowTask>;
 export const WorkflowInstance = z
   .strictObject({
     id: InstanceId,
+    /** Compare-and-set revision of this record (C-12): every change of state or tasks advances it. */
+    revision: Revision,
     workflowId: WorkflowId,
     workflowRevision: Revision,
     title: z.string().min(1),
@@ -129,6 +132,11 @@ export const WorkflowInstance = z
     state: z.enum(['running', 'blocked', 'completed', 'cancelled']),
     /** Consent to cross-tool handoffs between this instance's nodes, recorded at start (R-11). */
     crossToolConsentAt: Timestamp.optional(),
+    /**
+     * The template's rework limit at start (C-13): told to root at start and counted by the GUI per task
+     * (R-05). A later template edit does not change a running instance.
+     */
+    reworkLimit: z.number().int().nonnegative(),
     tasks: z.array(WorkflowTask),
     createdAt: Timestamp,
   })
@@ -199,6 +207,10 @@ export const EscalationRef = z.discriminatedUnion('kind', [
    * waiting for it, so the root screen can show what the decision affects.
    */
   z.strictObject({ kind: z.literal('provision'), operationId: OperationId, blocked: z.array(OperationId) }),
+  /** A user message of an ordinary session whose delivery stayed unknown (C-02), resolved with `delivery.resolve`. */
+  z.strictObject({ kind: z.literal('message'), operationId: OperationId, messageId: MessageId }),
+  /** A `report_to_root` call that asked for the user's confirmation (C-13); `operationId` is its delivery to root. */
+  z.strictObject({ kind: z.literal('report'), operationId: OperationId }),
 ]);
 
 export const Escalation = z
@@ -225,7 +237,7 @@ export const Escalation = z
     if (open !== (e.resolvedAt === undefined) || open !== (e.resolvedBy === undefined)) fail('escalation.resolved-fields');
     if ((e.state === 'approved' || e.state === 'declined') && e.resolvedBy !== 'user') fail('escalation.user-decides');
     if (e.kind === 'permission' && e.ref?.kind !== 'permission') fail('escalation.permission-ref');
-    if (e.kind === 'delivery-unknown' && !['handoff', 'peerMessage', 'transfer', 'provision'].includes(e.ref?.kind ?? '')) fail('escalation.delivery-ref');
+    if (e.kind === 'delivery-unknown' && !['handoff', 'peerMessage', 'transfer', 'provision', 'message'].includes(e.ref?.kind ?? '')) fail('escalation.delivery-ref');
   });
 export type Escalation = z.infer<typeof Escalation>;
 

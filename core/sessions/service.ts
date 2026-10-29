@@ -289,8 +289,8 @@ export class SessionService {
           userMessages.push(record.operationId);
           return 'skip';
         }
-        // PayloadContext keeps no origin (contracts gap): a restored non-user payload is marked as not the user's.
-        return { origin: { kind: 'system' } };
+        // The origin stored at acceptance (C-01); one stored before 0.5 is marked as not the user's.
+        return { origin: record.context.origin ?? { kind: 'system' } };
       },
     });
     for (const operationId of userMessages) {
@@ -703,12 +703,12 @@ export class SessionService {
     await this.closeEscalation(escalation, 'resolved', 'user');
     if (decision === 'retry') {
       await this.dispatchPending(attempt.operationId, {
-        origin: this.origins.get(attempt.operationId) ?? { kind: 'system' },
+        origin: await this.originOf(attempt.operationId),
       });
       if (escalation.ref?.kind === 'provision')
         for (const blocked of escalation.ref.blocked)
           await this.dispatchPending(blocked, {
-            origin: this.origins.get(blocked) ?? { kind: 'system' },
+            origin: await this.originOf(blocked),
           });
     }
     return ok(requestId);
@@ -886,7 +886,10 @@ export class SessionService {
           cwd: target.cwd,
           entry: { kind: 'new-turn' },
           session: await this.settingsOf(target),
+          // C-01: a restarted GUI dispatches it as from the peer again, never as the user.
+          origin,
         },
+        peer: { peerMessageId: peerIdOf(p.operationId), fromSessionId: p.from, toSessionId: p.to },
       });
       if (accepted.status === 'conflict' || accepted.status === 'invalid')
         return {
@@ -926,7 +929,15 @@ export class SessionService {
     };
   }
 
-  /** `peerMessage.updated` (not stored: there is no PeerMessage repository before batch 4). */
+  /** Who a payload comes from: as dispatched in this process, else as stored at acceptance (C-01), else not the user. */
+  private async originOf(operationId: OperationId): Promise<MessageOrigin> {
+    const known = this.origins.get(operationId);
+    if (known !== undefined) return known;
+    const record = await this.store.get(operationId);
+    return (record?.kind !== 'provision' ? record?.context.origin : undefined) ?? { kind: 'system' };
+  }
+
+  /** `peerMessage.updated` (stored from T022 on, read back by the PeerMessage repository). */
   private publishPeer(record: PayloadDelivery, p: PendingConfirmation): void {
     const message: PeerMessage = {
       id: peerIdOf(record.operationId),

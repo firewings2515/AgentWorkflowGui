@@ -90,10 +90,32 @@ const describe = (error: unknown): string => {
   return error.name;
 };
 
-export const damagedFacade = (): AppFacade => ({
-  snapshot: () => {
-    throw new Error(STORAGE_DAMAGED);
-  },
+/**
+ * The facade while the stored data is damaged (C-06): a Snapshot that says so, with the fixed reason code
+ * and the database location and nothing else, and every command refused.
+ */
+export const damagedFacade = (reason: string, location: string): AppFacade => ({
+  snapshot: (): Snapshot => ({
+    schemaVersion: CONTRACTS_VERSION,
+    app: { status: 'damaged', reason, location },
+    seq: 0,
+    agents: [],
+    workflows: [],
+    modelOptions: [],
+    sessions: [],
+    messages: [],
+    turns: [],
+    items: [],
+    permissionRequests: [],
+    nativeTasks: [],
+    artifacts: [],
+    instances: [],
+    handoffs: [],
+    peerMessages: [],
+    escalations: [],
+    transfers: [],
+    preferences: { theme: 'dark' },
+  }),
   execute: (command: Command) => failure(command.requestId, 'storage_failed', STORAGE_DAMAGED),
 });
 
@@ -126,7 +148,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     } catch {
       // Already unusable.
     }
-    return { status: 'damaged', facade: damagedFacade(), dbPath: options.dbPath, reason, shutdown: () => Promise.resolve() };
+    return { status: 'damaged', facade: damagedFacade(reason, options.dbPath), dbPath: options.dbPath, reason, shutdown: () => Promise.resolve() };
   };
   try {
     db = openDatabase(options.dbPath);
@@ -284,6 +306,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       const data = await repositories.readSnapshotData();
       return {
         schemaVersion: CONTRACTS_VERSION,
+        app: { status: 'ready' },
         seq,
         agents: data.agents,
         workflows: data.workflows,
@@ -295,11 +318,11 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         permissionRequests: data.conversations.permissionRequests,
         nativeTasks: data.conversations.nativeTasks,
         artifacts: data.conversations.artifacts,
-        instances: [],
-        handoffs: [],
-        peerMessages: [],
+        instances: data.instances,
+        handoffs: data.handoffs,
+        peerMessages: data.peerMessages,
         escalations: data.escalations,
-        transfers: [],
+        transfers: data.transfers,
         preferences: data.preferences,
       };
     },

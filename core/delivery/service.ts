@@ -9,10 +9,16 @@ import {
   type DeliveryTarget,
   DeliveryTarget as DeliveryTargetSchema,
   type DispatchAttempt,
+  type HandoffId,
+  type InstanceId,
+  MessageOrigin,
   type ModelSelection,
+  type NodeId,
   type OperationId,
+  type PeerMessageId,
   type Runtime,
   type SessionId,
+  type TaskId,
   deliveryTargetIssues,
 } from '../../contracts';
 import {
@@ -22,7 +28,9 @@ import {
   CommitUncertainError,
   type DispatchEntry,
   type DispatchResult,
+  type HandoffMeta,
   type PayloadKind,
+  type PeerMeta,
   type ReconcileResult,
   type SessionSettings,
   type StartSessionOptions,
@@ -185,6 +193,82 @@ class Rebuild {
     return { model: this.model(o.model, `${at}.model`), readOnly: o.readOnly === true, ...(instructions !== undefined && { instructions }) };
   }
 
+  number(o: Record<string, unknown>, key: string, at: string): number {
+    const v = o[key];
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    this.issues.push(`${at}.${key} is not a number`);
+    return 0;
+  }
+
+  /** A list's elements, read once through the array's own descriptors (no getters, no other prototype). */
+  list(v: unknown, at: string): unknown[] {
+    if (!Array.isArray(v) || Object.getPrototypeOf(v) !== Array.prototype) {
+      this.issues.push(`${at} is not a list`);
+      return [];
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(v);
+    const out: unknown[] = [];
+    for (let i = 0; i < v.length; i++) {
+      const d = descriptors[i];
+      if (d === undefined || !('value' in d)) this.issues.push(`${at}[${i}] is not plain data`);
+      else out.push(d.value);
+    }
+    return out;
+  }
+
+  /** C-01: parsed from a plain copy, so only the contract's fields of the origin are stored. */
+  origin(v: unknown, at: string): MessageOrigin {
+    const parsed = MessageOrigin.safeParse(this.object(v, at));
+    if (parsed.success) return parsed.data;
+    this.issues.push(`${at} is not a message origin`);
+    return { kind: 'system' };
+  }
+
+  handoff(v: unknown): HandoffMeta {
+    const o = this.object(v, 'handoff');
+    this.only(o, ['handoffId', 'instanceId', 'taskId', 'fromNodeId', 'toNodeId', 'fromSessionId', 'ruleId', 'round', 'expectedUpstream'], 'handoff');
+    const upstream =
+      o.expectedUpstream === undefined
+        ? undefined
+        : this.list(o.expectedUpstream, 'handoff.expectedUpstream').map((x, i) => {
+            if (typeof x === 'string') return x as NodeId;
+            this.issues.push(`handoff.expectedUpstream[${i}] is not a string`);
+            return '' as NodeId;
+          });
+    return {
+      handoffId: this.string(o, 'handoffId', 'handoff') as HandoffId,
+      instanceId: this.string(o, 'instanceId', 'handoff') as InstanceId,
+      taskId: this.string(o, 'taskId', 'handoff') as TaskId,
+      fromNodeId: this.string(o, 'fromNodeId', 'handoff') as NodeId,
+      toNodeId: this.string(o, 'toNodeId', 'handoff') as NodeId,
+      fromSessionId: this.string(o, 'fromSessionId', 'handoff') as SessionId,
+      ruleId: this.string(o, 'ruleId', 'handoff'),
+      round: this.number(o, 'round', 'handoff'),
+      ...(upstream !== undefined && { expectedUpstream: upstream }),
+    };
+  }
+
+  peer(v: unknown): PeerMeta {
+    const o = this.object(v, 'peer');
+    this.only(o, ['peerMessageId', 'fromSessionId', 'toSessionId', 'instanceId'], 'peer');
+    const instanceId = this.optionalString(o, 'instanceId', 'peer');
+    return {
+      peerMessageId: this.string(o, 'peerMessageId', 'peer') as PeerMessageId,
+      fromSessionId: this.string(o, 'fromSessionId', 'peer') as SessionId,
+      toSessionId: this.string(o, 'toSessionId', 'peer') as SessionId,
+      ...(instanceId !== undefined && { instanceId: instanceId as InstanceId }),
+    };
+  }
+
+  /** C-12: every count rebuilt as `{ key, limit? }`. */
+  counts(v: unknown): { key: string; limit?: number }[] {
+    return this.list(v, 'counts').map((x, i) => {
+      const c = this.object(x, `counts[${i}]`);
+      this.only(c, ['key', 'limit'], `counts[${i}]`);
+      return { key: this.string(c, 'key', `counts[${i}]`), ...(c.limit !== undefined && { limit: this.number(c, 'limit', `counts[${i}]`) }) };
+    });
+  }
+
   entry(v: unknown, at: string): DispatchEntry {
     const o = this.object(v, at);
     if (o.kind === 'insert') {
@@ -202,19 +286,19 @@ const rebuild = (input: AcceptInput): { input: AcceptInput } | { issues: string[
   const r = new Rebuild();
   const top = r.object(input, 'input');
   const target = r.target(top.target);
-  const countIn = top.count === undefined ? undefined : r.object(top.count, 'count');
-  const limit = countIn?.limit;
-  if (limit !== undefined && typeof limit !== 'number') r.issues.push('count.limit is not a number');
+  const counts = top.counts === undefined ? undefined : r.counts(top.counts);
   if (typeof top.proposalRevision !== 'number') r.issues.push('proposalRevision is not a number');
   const sourceCallRef = r.optionalString(top, 'sourceCallRef', 'input');
+  const sender = r.optionalString(top, 'sender', 'input');
   const base = {
     operationId: r.string(top, 'operationId', 'input') as OperationId,
     ...(sourceCallRef !== undefined && { sourceCallRef }),
+    ...(sender !== undefined && { sender: sender as SessionId }),
     payloadHash: r.string(top, 'payloadHash', 'input'),
     proposalRevision: top.proposalRevision as number,
     target,
     at: r.string(top, 'at', 'input'),
-    ...(countIn !== undefined && { count: { key: r.string(countIn, 'key', 'count'), ...(typeof limit === 'number' && { limit }) } }),
+    ...(counts !== undefined && { counts }),
   };
   let built: AcceptInput;
   if (top.kind === 'provision') {
@@ -244,7 +328,10 @@ const rebuild = (input: AcceptInput): { input: AcceptInput } | { issues: string[
         cwd: r.string(context, 'cwd', 'context'),
         entry: r.entry(context.entry, 'context.entry'),
         session: r.settings(context.session, 'context.session'),
+        ...(context.origin !== undefined && { origin: r.origin(context.origin, 'context.origin') }),
       },
+      ...(top.handoff !== undefined && { handoff: r.handoff(top.handoff) }),
+      ...(top.peer !== undefined && { peer: r.peer(top.peer) }),
     };
   }
   // Last line of defence: the data as it will be serialised carries no `mcp` key anywhere.
@@ -271,7 +358,9 @@ export class DeliveryService {
     const issues = await this.acceptIssues(input);
     if (issues.length > 0) return { status: 'invalid', issues };
     try {
-      return await this.options.store.accept(input);
+      const result = await this.options.store.accept(input);
+      // The store's own refusal (a handoff without its facts) reads like the checks above.
+      return result.status === 'invalid' ? { status: 'invalid', issues: [result.detail] } : result;
     } catch (error) {
       if (error instanceof CommitUncertainError) return { status: 'commit-uncertain', detail: error.message };
       throw error;
@@ -396,7 +485,8 @@ export class DeliveryService {
         // The persisted payload, never a caller's copy.
         text: record.payload,
         entry: options.entry ?? record.context.entry,
-        ...(options.origin !== undefined && { origin: options.origin }),
+        // The caller's origin, else the one stored at acceptance (C-01), so a recovery keeps it.
+        ...((options.origin ?? record.context.origin) !== undefined && { origin: options.origin ?? record.context.origin }),
         ...(timeoutMs !== undefined && { timeoutMs }),
       });
     } catch (error) {

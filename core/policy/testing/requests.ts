@@ -32,7 +32,7 @@ export const codex = (script: string, fields: Fields = {}) => {
 export const edit = (...paths: string[]) => request('fileChange', paths[0] ? `Write ${paths[0]}` : 'Write', { paths });
 
 /** Any other Claude tool call: the summary starts with the tool name. */
-export const tool = (name: string, ...paths: string[]) => request('permissions', paths[0] ? `${name} ${paths[0]}` : name, { paths });
+export const tool = (name: string, ...paths: string[]) => request('permissions', paths[0] ? `${name} ${paths[0]}` : name, { paths, tool: name });
 
 export const decide = (req: PermissionRequest, context: PolicyContext = contextFor()): PolicyDecision => permissionPolicy.evaluate(req, context);
 

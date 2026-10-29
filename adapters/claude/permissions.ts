@@ -2,7 +2,7 @@
 // adapter does not judge the escalation list; it only translates. Every tool call goes through here,
 // because under `bypassPermissions` the hook is the only point that sees cwd-internal reads (SP-04).
 import { type PermissionDecision, PermissionRequest, type PermissionRequestId, type Timestamp } from '../../contracts';
-import { COMMAND_TOOLS, FILE_TOOLS, isNonEmptyString, isObject, opt, type Placement, placed, str, toolPaths, toolSummary } from './mapping';
+import { COMMAND_TOOLS, FILE_TOOLS, isNonEmptyString, isObject, opt, type Placement, placed, splitMcpName, str, toolPaths, toolSummary } from './mapping';
 import type { WireHookOutput } from './wire';
 
 export interface PreToolUse {
@@ -45,6 +45,10 @@ export const buildPermissionRequest = (call: PreToolUse, ctx: { id: PermissionRe
     ...placed(ctx.placement),
     itemId: call.toolUseId,
     kind,
+    // C-04: the tool, its MCP server and the shell, as fields; nothing above parses the summary.
+    tool: call.toolName,
+    ...opt('server', splitMcpName(call.toolName).server),
+    ...opt('shell', call.toolName === 'Bash' ? 'bash' : call.toolName === 'PowerShell' ? 'powershell' : undefined),
     summary: toolSummary(call.toolName, input) || call.toolName,
     ...opt('command', kind === 'command' && isNonEmptyString(input.command) ? input.command : undefined),
     ...opt('cwd', call.cwd),

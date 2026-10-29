@@ -35,7 +35,7 @@ const recoverTwice = async (g: ReturnType<typeof gui>) => {
 describe('CR2_DELIVERY_FIX §6 scenarios', () => {
   it('1. accepts once with a fixed payload, hash and revision; a changed resend is rejected and never counted', async () => {
     const g = gui();
-    expect(await g.service.accept(payloadInput())).toMatchObject({ status: 'accepted', count: 1 });
+    expect(await g.service.accept(payloadInput())).toMatchObject({ status: 'accepted', counts: [{ key: COUNT_KEY, count: 1 }] });
     expect(await g.service.accept(payloadInput({ sourceCallRef: 'call-1-resent', at: at(5) }))).toMatchObject({ status: 'duplicate' });
     expect(await g.service.accept(payloadInput({ target: { ...payloadInput().target, nativeSessionRef: 'thread-B' } }))).toMatchObject({ status: 'conflict' });
     expect(await g.service.accept(payloadInput({ payload: 'changed' }))).toMatchObject({ status: 'conflict' });

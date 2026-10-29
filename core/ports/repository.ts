@@ -7,18 +7,28 @@ import type {
   Artifact,
   Escalation,
   EscalationId,
+  Handoff,
+  HandoffId,
+  InstanceId,
   LogicalSession,
   Message,
   NativeTask,
+  NodeId,
   OwnedProcess,
+  PeerMessage,
+  PeerMessageId,
   PermissionRequest,
   Revision,
   SessionId,
   SessionItem,
+  TaskId,
   Timestamp,
+  TransferId,
+  TransferProposal,
   Turn,
   UiPreferences,
   WorkflowId,
+  WorkflowInstance,
   WorkflowTemplate,
 } from '../../contracts';
 
@@ -27,7 +37,11 @@ export type SaveResult<T> = { status: 'saved'; record: T } | { status: 'stale'; 
 
 export type DeleteResult = 'deleted' | 'stale' | 'not-found';
 
-/** Agents and workflow templates: `expectedRevision` null means "create; it must not exist yet". */
+/**
+ * Agents and workflow templates: `expectedRevision` null means "create; it must not exist yet". Only the
+ * current revision is kept (C-11): a session started or resumed later uses the Agent's current
+ * instructions; a running workflow instance keeps its own pinned `workflowRevision` by number only.
+ */
 export interface DefinitionRepository<T, Id> {
   list(): Promise<T[]>;
   get(id: Id): Promise<T | undefined>;
@@ -92,10 +106,66 @@ export interface OwnedProcessRepository {
   listLive(): Promise<OwnedProcess[]>;
 }
 
+/** The one GUI session of a (node, task) of an instance (R-06); root has no task. */
+export interface NodeSessionKey {
+  instanceId: InstanceId;
+  nodeId: NodeId;
+  taskId?: TaskId;
+}
+
+/** Workflow instances with their tasks, and which session works each (node, task) (C-12). */
+export interface InstanceRepository {
+  list(): Promise<WorkflowInstance[]>;
+  get(id: InstanceId): Promise<WorkflowInstance | undefined>;
+  /** `exists` when the ID is taken (the renderer chose it with `workflow.start`). Stored with revision 0. */
+  create(instance: WorkflowInstance): Promise<'created' | 'exists'>;
+  /** Compare-and-set on `revision`; the stored instance gets `expectedRevision + 1`. */
+  update(instance: WorkflowInstance, expectedRevision: Revision): Promise<SaveResult<WorkflowInstance>>;
+  /**
+   * Binds the session of a (node, task) once: a second bind of the same key returns the session already
+   * bound and changes nothing, so two handoffs racing to the same node share one session.
+   */
+  bindNodeSession(key: NodeSessionKey, sessionId: SessionId): Promise<{ status: 'bound' } | { status: 'exists'; sessionId: SessionId }>;
+  findNodeSession(key: NodeSessionKey): Promise<SessionId | undefined>;
+}
+
+/**
+ * Handoffs as the views show them (C-12). They are written only by the delivery store's acceptance (with
+ * their `HandoffMeta`), so a handoff, its count and its delivery record cannot disagree; `delivery`,
+ * `target` and `outcome` are always the delivery store's current record.
+ */
+export interface HandoffRepository {
+  get(id: HandoffId): Promise<Handoff | undefined>;
+  listByInstance(instanceId: InstanceId): Promise<Handoff[]>;
+}
+
+/** Peer messages as the views show them (C-09), read from the delivery store's records with `PeerMeta`. */
+export interface PeerMessageRepository {
+  get(id: PeerMessageId): Promise<PeerMessage | undefined>;
+  list(): Promise<PeerMessage[]>;
+}
+
+/**
+ * Cross-tool transfer proposals (R-02, C-12). The proposal itself is saved here with compare-and-set on
+ * `revision` (a changed source makes it stale, CR-5); its `provision` and `delivery` are the delivery
+ * store's records of `provision.operationId` and `operationId`, read back on every get, and what a save
+ * passes for them is ignored.
+ */
+export interface TransferRepository {
+  get(id: TransferId): Promise<TransferProposal | undefined>;
+  list(): Promise<TransferProposal[]>;
+  /** `exists` when the ID is taken (the renderer chose it with `transfer.prepare`). */
+  create(proposal: TransferProposal): Promise<'created' | 'exists'>;
+  /**
+   * Compare-and-set on `revision`; the stored proposal gets `expectedRevision + 1`. An approval is saved
+   * with `approvedRevision` set to that new revision, so the approval binds what was stored with it.
+   */
+  update(proposal: TransferProposal, expectedRevision: Revision): Promise<SaveResult<TransferProposal>>;
+}
+
 /**
  * Everything the Snapshot holds that lives in these repositories, read in one transaction so it is
- * consistent. Workflow instances, handoffs, peer messages and transfers come with batch 4; until then an
- * implementation returns them empty.
+ * consistent.
  */
 export interface SnapshotData {
   agents: AgentDefinition[];
@@ -104,6 +174,10 @@ export interface SnapshotData {
   conversations: Conversation;
   escalations: Escalation[];
   preferences: UiPreferences;
+  instances: WorkflowInstance[];
+  handoffs: Handoff[];
+  peerMessages: PeerMessage[];
+  transfers: TransferProposal[];
 }
 
 export interface AppRepositories {
@@ -114,5 +188,9 @@ export interface AppRepositories {
   escalations: EscalationRepository;
   preferences: PreferencesRepository;
   processes: OwnedProcessRepository;
+  instances: InstanceRepository;
+  handoffs: HandoffRepository;
+  peerMessages: PeerMessageRepository;
+  transfers: TransferRepository;
   readSnapshotData(): Promise<SnapshotData>;
 }

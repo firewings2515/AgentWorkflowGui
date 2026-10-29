@@ -16,9 +16,9 @@ describe('SP-04 cases (spike/sp04/policy.test.mjs)', () => {
   const cases: [string, ReturnType<typeof command>, string][] = [
     ['Write inside', request('fileChange', 'Write', { paths: [`${root}\\a.txt`], ...at }), 'approve'],
     ['Write ..\\outside', request('fileChange', 'Write', { paths: [sh`..\outside\x.txt`], ...at }), 'write-outside-scope'],
-    ['Read inside', request('permissions', 'Read', { paths: [`${root}\\README.md`], ...at }), 'approve'],
-    ['Read .env', request('permissions', 'Read', { paths: [`${root}\\.env`], ...at }), 'secret-read'],
-    ['Read .ssh/id_test', request('permissions', 'Read', { paths: [sh`E:\sideproj\AgentWorkflowGui\spike\sandbox\sp04\outside\.ssh\id_test`], ...at }), 'secret-read'],
+    ['Read inside', request('permissions', 'Read', { tool: 'Read', paths: [`${root}\\README.md`], ...at }), 'approve'],
+    ['Read .env', request('permissions', 'Read', { tool: 'Read', paths: [`${root}\\.env`], ...at }), 'secret-read'],
+    ['Read .ssh/id_test', request('permissions', 'Read', { tool: 'Read', paths: [sh`E:\sideproj\AgentWorkflowGui\spike\sandbox\sp04\outside\.ssh\id_test`], ...at }), 'secret-read'],
     ['git status', command('git status', at), 'approve'],
     ['echo > a.txt', command('echo hi > a.txt', at), 'approve'],
     ['echo > ../outside', command('echo hi > ../outside/x.txt', at), 'write-outside-scope'],
@@ -276,13 +276,13 @@ describe('request kinds', () => {
   });
 
   it('escalates MCP elicitations, sandbox grants and unknown tools', () => {
-    const elicitation = request('mcpElicitation', 'Need a token', { elicitation: { mode: 'form', serverName: 'srv', message: 'Need a token', requestedSchema: {} } });
+    const elicitation = request('mcpElicitation', 'Need a token', { server: 'srv', elicitation: { mode: 'form', serverName: 'srv', message: 'Need a token', requestedSchema: {} } });
     expect(decide(elicitation)).toEqual({ action: 'escalate', rule: 'unrecognised', reason: REASONS.elicitation });
     expect(decide(request('permissions', sh`Grant write E:\work\proj`, { paths: [ROOT] }))).toMatchObject({ rule: 'unrecognised', reason: REASONS.grant });
     expect(decide(tool('mcp__srv__run'))).toMatchObject({ rule: 'unrecognised', reason: REASONS['unknown-tool'] });
     expect(decide(tool('WebFetch'))).toMatchObject({ rule: 'unrecognised', reason: REASONS['unknown-tool'] });
     expect(verdict(tool('TodoWrite'))).toBe('approve');
-    expect(verdict(request('permissions', 'Agent Explore the parser'))).toBe('approve');
+    expect(verdict(request('permissions', 'Agent Explore the parser', { tool: 'Agent' }))).toBe('approve');
   });
 
   it('escalates requests that lack what the check needs', () => {
@@ -297,7 +297,7 @@ describe('request kinds', () => {
     expect(verdict(command('git status', noCwd))).toBe('unrecognised');
     expect(verdict(command('cat E:/work/proj/a.txt', noCwd))).toBe('approve');
     expect(verdict(tool('Glob'), contextFor())).toBe('approve');
-    expect(verdict(request('permissions', 'Glob', { cwd: 'C:\\' }))).toBe('secret-read');
+    expect(verdict(request('permissions', 'Glob', { tool: 'Glob', cwd: 'C:\\' }))).toBe('secret-read');
   });
 
   it("checks the paths of Codex's commandActions as reads", () => {

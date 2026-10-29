@@ -21,12 +21,12 @@ const ack = { kind: 'live-ack' as const, at: at(11), detail: 'accepted' };
 describe('MemoryDeliveryStore (T007 semantics)', () => {
   it('counts once, enforces the limit, and rejects a changed resend', async () => {
     const store = new MemoryDeliveryStore();
-    expect(await store.accept(payloadInput())).toMatchObject({ status: 'accepted', count: 1 });
+    expect(await store.accept(payloadInput())).toMatchObject({ status: 'accepted', counts: [{ key: COUNT_KEY, count: 1 }] });
     expect((await store.accept(payloadInput({ sourceCallRef: 'call-2' }))).status).toBe('duplicate');
     expect((await store.accept(payloadInput({ context: { ...payloadInput().context, cwd: 'E:/other' } }))).status).toBe('conflict');
-    expect((await store.accept(payloadInput({ count: undefined }))).status).toBe('conflict');
+    expect((await store.accept(payloadInput({ counts: undefined }))).status).toBe('conflict');
     for (const id of ['op-2', 'op-3']) await store.accept(payloadInput({ operationId: op(id) }));
-    expect(await store.accept(payloadInput({ operationId: op('op-4') }))).toEqual({ status: 'limit-exceeded', count: 3, limit: 3 });
+    expect(await store.accept(payloadInput({ operationId: op('op-4') }))).toEqual({ status: 'limit-exceeded', key: COUNT_KEY, count: 3, limit: 3 });
     expect(store.admissions(COUNT_KEY)).toBe(3);
   });
 
