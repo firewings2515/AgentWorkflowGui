@@ -17,6 +17,7 @@ import { createIpcWorkflowRepository } from './workflow-repository';
 import { rendererStore } from './renderer-store';
 import type { RendererStore, RendererState } from './renderer-store';
 import { ConnectionStatus } from './ConnectionStatus';
+import { WorkflowStart } from './WorkflowStart';
 import './styles.css';
 
 export const APP_NAME = 'AgentWorkflowGui';
@@ -34,6 +35,7 @@ const subscribeWidth = (onChange: () => void) => {
 // Hash transport keeps the specified route paths usable under Electron's file:// URL.
 export const pageRegistry = [
   { id: 'workbench', title: '工作台', pattern: /^\/workbench$/, navigation: true },
+  { id: 'start', title: '啟動 Workflow', pattern: /^\/workflows\/start$/, navigation: false },
   { id: 'workflow', title: 'Workflow 編輯器', pattern: /^\/workflows\/([^/]+)\/edit$/, navigation: true },
   { id: 'agents', title: 'Agent 管理', pattern: /^\/agents(?:\/([^/]+))?$/, navigation: true },
   { id: 'progress', title: 'Workflow 執行進度', pattern: /^\/workflow-instances\/([^/]+)$/, navigation: false },
@@ -153,6 +155,16 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
   try { entityId = decodeURIComponent(entityId); } catch { /* Keep a malformed ID visible as missing. */ }
   const instance = snapshot.instances.find(item => item.id === entityId);
 
+  if (snapshot.app.status === 'damaged') return <div className="connection-screen damaged-screen">
+    <h1>{APP_NAME}</h1><section role="alert"><h2>資料損壞，所有操作已停用</h2>
+      <p>請保留資料庫並交由維護人員檢查。</p><dl><dt>原因代碼</dt><dd><code>{snapshot.app.reason}</code></dd><dt>資料庫位置</dt><dd><code>{snapshot.app.location}</code></dd></dl>
+    </section>
+    <button disabled={!store || ipcState?.connection === 'loading'} onClick={() => void store?.reconnect()}>重新讀取資料</button>
+    {ipcState?.connection === 'loading' && <p role="status">正在重新讀取資料…</p>}
+    {ipcState?.connection === 'error' && <p role="alert">資料同步失敗，請再次重新讀取。</p>}
+    <label>外觀主題<select disabled value={theme}><option value="dark">深色</option><option value="light">淺色</option></select></label>
+  </div>;
+
   return <div className="app-shell">
     <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true">≋</span><strong>{APP_NAME}</strong>{!store && <span className="demo-badge">示意資料 · 示意模式</span>}</div>
       <label className="theme-picker">外觀<select aria-label="外觀主題" value={theme} disabled={store?.isBlocked('preferences.set', 'preferences')} onChange={event => {
@@ -163,6 +175,7 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
     </header>
     <nav className="app-nav" aria-label="主要導覽">{pageRegistry.filter(entry => entry.navigation).map(entry => <a key={entry.id} href={`#${routes[entry.id]}`} aria-current={page?.id === entry.id ? 'page' : undefined} onClick={event => { event.preventDefault(); navigate(routes[entry.id] ?? '/workbench'); }}>{entry.title}</a>)}<span className="nav-note">{store ? '資料來自應用程式服務' : '以契約假資料預覽工作台'}</span></nav>
     <div className="page-toolbar"><h1 ref={pageHeading} tabIndex={-1}>{page?.title ?? '找不到頁面'}</h1>
+      {(workbenchVisible || page?.id === 'workflow') && <button onClick={() => navigate('/workflows/start')}>啟動 Workflow</button>}
       {workbenchVisible && <button className="primary" disabled={workspace.views.length >= 2 || snapshot.sessions.length === 0} title={workspace.views.length >= 2 ? '此階段提供兩組工作區' : '開啟第二組並排工作區'} onClick={() => {
         const sessionId = workspace.closedViews.at(-1)?.sessionId ?? snapshot.sessions.find(session => !workspace.views.some(view => view.sessionId === session.id))?.id ?? snapshot.sessions[0]?.id;
         if (sessionId) { const id = workspace.closedViews.at(-1)?.id ?? `view-${workspace.nextId}`; dispatch({ type: 'add', sessionId }); focusView(id); }
@@ -198,7 +211,8 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
       </div>
       <AgentCatalog repository={agentRepository} demo={agentDemo} selectedId={page?.id === 'agents' ? entityId : ''} visible={page?.id === 'agents'} onSelect={id => navigate(id ? `/agents/${encodeURIComponent(id)}` : '/agents')} />
       <WorkflowEditor repository={workflowRepository} demo={workflowDemo} agents={agentOptions} models={snapshot.modelOptions} selectedId={page?.id === 'workflow' ? entityId : ''} visible={page?.id === 'workflow'} onSelect={id => navigate(`/workflows/${encodeURIComponent(id)}/edit`)} />
-      {!workbenchVisible && page?.id !== 'agents' && page?.id !== 'workflow' && <section className="placeholder-page">
+      {page?.id === 'start' && <WorkflowStart snapshot={snapshot} store={store} ipcState={ipcState} onOpen={id => { navigate('/workbench'); openSession(id); }} />}
+      {!workbenchVisible && page?.id !== 'agents' && page?.id !== 'workflow' && page?.id !== 'start' && <section className="placeholder-page">
         {page?.id === 'progress' && <><span className="eyebrow">唯讀 · 指定執行群組</span><h2>{instance?.title ?? '找不到指定的 Workflow 執行群組'}</h2><p className="muted">{entityId || '無效 ID'} · 完整進度畫布將於後續任務提供。</p>{instance && <WorkflowSummary snapshot={snapshot} instance={instance} />}</>}
         {!page && <p>無法辨識路由：<code>{path}</code></p>}
         <button onClick={() => {

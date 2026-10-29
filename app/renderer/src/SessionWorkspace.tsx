@@ -1,4 +1,5 @@
 import { useLayoutEffect, useRef } from 'react';
+import type { RefObject } from 'react';
 import type { AgentDefinition, AgentId, LogicalSession, ModelOption, ModelSelection, SessionId, Snapshot } from '../../../contracts';
 import type { SessionViewContext, WorkspaceView } from './workbench-state';
 import { contextFor } from './workbench-state';
@@ -7,6 +8,7 @@ import { Empty, formatTime, Menu, observedModelText, Status } from './ui';
 import { MessageId, RequestId } from '../../../contracts';
 import { commandFeedback } from './command-feedback';
 import type { RendererStore, RendererState } from './renderer-store';
+import { EscalationPanel, openEscalations } from './EscalationPanel';
 
 export interface Selection { agentId: AgentId; model: ModelSelection }
 export interface WorkspaceProps {
@@ -28,7 +30,7 @@ export interface WorkspaceProps {
   onNotice: (message: string) => void;
 }
 
-function Transcript({ snapshot, session, view, visible, onContext, store, ipcState }: Pick<WorkspaceProps, 'snapshot' | 'view' | 'visible' | 'onContext' | 'store' | 'ipcState'> & { session: LogicalSession }) {
+function Transcript({ snapshot, session, view, visible, onContext, store, ipcState, pendingPanel }: Pick<WorkspaceProps, 'snapshot' | 'view' | 'visible' | 'onContext' | 'store' | 'ipcState'> & { session: LogicalSession; pendingPanel: RefObject<HTMLDetailsElement | null> }) {
   const scroll = useRef<HTMLDivElement>(null);
   const context = contextFor(view);
   // display:none can reset DOM scrollTop; restore when the page/pane reappears.
@@ -40,6 +42,10 @@ function Transcript({ snapshot, session, view, visible, onContext, store, ipcSta
     if (visible) onContext({ scrollTop: event.currentTarget.scrollTop });
   }}>
     <div className="transcript-heading"><span>對話紀錄</span><span>{store ? '目前快照' : '示意快照'}</span></div>
+    {openEscalations(snapshot, session.id).length > 0 && <details className="pending-panel" id={`${view.id}-pending`} ref={pendingPanel} key={session.id}>
+      <summary>展開／收合待處理項目</summary>
+      <div className="pending-panel-scroll"><EscalationPanel snapshot={snapshot} sessionId={session.id} store={store} ipcState={ipcState} /></div>
+    </details>}
     {messages.length === 0 && <Empty>這個 session 尚無主對話訊息。</Empty>}
     {messages.map(message => <article className={`message message-${message.role} origin-${message.origin.kind}`} key={message.id}>
       <div className="message-meta"><strong>{message.origin.kind === 'peer' || message.origin.kind === 'handoff'
@@ -57,10 +63,12 @@ function Transcript({ snapshot, session, view, visible, onContext, store, ipcSta
 export function SessionWorkspace(props: WorkspaceProps) {
   const { snapshot, view, active, selection, onFocus, onClose, onContext, onOpen, onAgent, onModel, onProgress, onNotice } = props;
   const latestDraft = useRef({ sessionId: view.sessionId, text: contextFor(view).draft });
+  const pendingPanel = useRef<HTMLDetailsElement>(null);
   useLayoutEffect(() => { latestDraft.current = { sessionId: view.sessionId, text: contextFor(view).draft }; }, [view]);
   const session = snapshot.sessions.find(candidate => candidate.id === view.sessionId);
   if (!session) return <section className="workspace"><Empty>找不到 session：{view.sessionId}</Empty><button onClick={onClose}>關閉工作區</button></section>;
   const context = contextFor(view);
+  const pendingCount = openEscalations(snapshot, session.id).length;
   const chosen = selection ?? { agentId: session.agent.id, model: session.requestedModel };
   const instance = session.kind === 'workflow' ? snapshot.instances.find(candidate => candidate.id === session.workflow.instanceId) : undefined;
   const activeTurn = snapshot.turns.some(turn => turn.sessionId === session.id && turn.state === 'running') || session.activity === 'running';
@@ -70,13 +78,21 @@ export function SessionWorkspace(props: WorkspaceProps) {
   return <section className={`workspace ${active ? 'active-workspace' : ''}`} data-workspace={view.id} data-active={active} aria-label={`工作區 ${view.id}`} onFocusCapture={onFocus} onPointerDown={onFocus}>
     <header className="workspace-header">
       <div className="workspace-heading"><span className="eyebrow">{session.kind === 'workflow' ? 'Workflow session' : '一般 session'}</span><h2 id={`${view.id}-heading`} tabIndex={-1}>{session.title}</h2></div>
+      {pendingCount > 0 && <button className="pending-badge" aria-controls={`${view.id}-pending`} onClick={() => {
+        const panel = pendingPanel.current;
+        if (!panel) return;
+        panel.open = true;
+        const transcript = panel.closest('.transcript');
+        if (transcript) transcript.scrollTop = 0;
+        panel.querySelector('summary')?.focus({ preventScroll: true });
+      }}><span aria-live="polite">待處理 {pendingCount} 件</span></button>}
       <button className="icon-button" aria-label={`關閉工作區 ${view.id}`} title="只關閉工作區視圖" onClick={onClose}>×</button>
     </header>
     <div className="session-toolbar"><Status value={session.activity} /><button aria-expanded={context.detailsVisible} onClick={() => onContext({ detailsVisible: !context.detailsVisible })}>{context.detailsVisible ? '收合細節' : '展開細節'}</button></div>
     {session.kind === 'workflow' && <div className="workflow-owner"><span>所屬 Workflow · {instance?.title ?? session.workflow.instanceId}</span><Menu label="所屬 Workflow 選單" className="owner-menu" actions={[{ label: '查看流程進度', onSelect: () => onProgress(session.workflow.instanceId) }]}>⋯</Menu></div>}
     <div className={`workspace-body ${context.detailsVisible ? '' : 'details-hidden'}`}>
       <div className="chat-panel">
-        <div className="transcript-frame"><Transcript snapshot={snapshot} session={session} view={view} visible={props.visible} onContext={onContext} store={props.store} ipcState={props.ipcState} /></div>
+        <div className="transcript-frame"><Transcript snapshot={snapshot} session={session} view={view} visible={props.visible} onContext={onContext} store={props.store} ipcState={props.ipcState} pendingPanel={pendingPanel} /></div>
         <form className="composer" onSubmit={event => {
           event.preventDefault();
           if (!props.store) { onNotice(`「${session.title}」尚未連接 runtime，草稿已保留，未送出訊息。`); return; }

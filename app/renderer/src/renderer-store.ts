@@ -73,7 +73,7 @@ export function applyEnvelope(state: RendererState, envelope: EventEnvelope): Re
     case 'agent.updated': snapshot.agents = upsert(snapshot.agents, event.agent); break;
     case 'agent.deleted': snapshot.agents = snapshot.agents.filter(agent => agent.id !== event.agentId); break;
     case 'workflow.updated': snapshot.workflows = upsert(snapshot.workflows, event.workflow); break;
-    // Re-reading the Snapshot on this event is T025's (contracts 0.5, C-05); until then only the seq moves.
+    // The subscription reloads the authoritative Snapshot before applying this sequence.
     case 'snapshot.invalidated': break;
     case 'model.observed': snapshot.sessions = snapshot.sessions.map(session => session.id === event.sessionId ? { ...session, observedModel: event.observed } : session); break;
     case 'runtime.exited': next.runtimeExits = { ...state.runtimeExits, [event.runtime]: event }; break;
@@ -103,6 +103,7 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
   let loading: Promise<void> | undefined;
   let generation = 0;
   let buffer: EventEnvelope[] | null = null;
+  let invalidatedSeq = 0;
   const publish = (next: RendererState) => { if (next === state) return; state = next; listeners.forEach(listener => listener()); };
   const receive = (envelope: EventEnvelope) => {
     const parsed = EventEnvelope.safeParse(envelope);
@@ -111,6 +112,12 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
       publish({ ...state, connection: 'error' }); return;
     }
     if (state.connection === 'error' || state.connection === 'idle') return;
+    if (parsed.data.event.type === 'snapshot.invalidated' && parsed.data.seq > (state.snapshot?.seq ?? -1)) {
+      invalidatedSeq = Math.max(invalidatedSeq, parsed.data.seq);
+      if (buffer) buffer.push(parsed.data);
+      else void reconnect();
+      return;
+    }
     if (buffer) buffer.push(parsed.data);
     else if (state.snapshot && parsed.data.seq > state.snapshot.seq + 1) {
       void reconnect();
@@ -118,38 +125,45 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
     } else publish(applyEnvelope(state, parsed.data));
   };
   // Subscribe before querying: events during snapshot() are buffered then filtered by its seq.
-  const reconnect = (retryGap = true): Promise<void> => {
+  const reconnect = (): Promise<void> => {
     if (loading) return loading;
     const current = ++generation;
-    let gap = false;
     buffer = [];
     publish({ ...state, connection: 'loading' });
     loading = Promise.resolve().then(async () => {
       if (current !== generation) return;
       unsubscribe?.();
       unsubscribe = bridge.onEvent(envelope => { if (current === generation) receive(envelope); });
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let snapshot: Snapshot;
-      try {
-        snapshot = Snapshot.parse(await Promise.race([bridge.snapshot(), new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error('snapshot timeout')), timeoutMs);
-        })]));
-      } finally { clearTimeout(timer); }
-      if (current !== generation) return;
-      if (state.snapshot && snapshot.seq < state.snapshot.seq) throw new Error('snapshot regressed');
-      let next: RendererState = { ...state, snapshot, connection: 'ready',
-        messageStreams: Object.fromEntries(Object.entries(state.messageStreams).filter(([, stream]) => !snapshot.messages.some(message => message.id === stream.messageId && message.sessionId === stream.sessionId))),
-        itemStreams: Object.fromEntries(Object.entries(state.itemStreams).filter(([, stream]) => !snapshot.items.some(item => item.id === stream.itemId && item.sessionId === stream.sessionId))),
-      };
-      for (const envelope of (buffer ?? []).sort((a, b) => a.seq - b.seq)) {
-        if (envelope.seq > next.snapshot!.seq + 1) { gap = true; throw new Error('event sequence gap'); }
-        next = applyEnvelope(next, envelope);
+      // Keep the subscription and loading state across reads; never flash an error
+      // while catching up with a newer invalidation or a buffered sequence gap.
+      for (let attempt = 0; attempt < 5; attempt++) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let snapshot: Snapshot;
+        try {
+          snapshot = Snapshot.parse(await Promise.race([bridge.snapshot(), new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('snapshot timeout')), timeoutMs);
+          })]));
+        } finally { clearTimeout(timer); }
+        if (current !== generation) return;
+        if (state.snapshot && snapshot.seq < state.snapshot.seq) throw new Error('snapshot regressed');
+        if (snapshot.seq < invalidatedSeq) continue;
+        let next: RendererState = { ...state, snapshot, connection: 'ready',
+          messageStreams: Object.fromEntries(Object.entries(state.messageStreams).filter(([, stream]) => !snapshot.messages.some(message => message.id === stream.messageId && message.sessionId === stream.sessionId))),
+          itemStreams: Object.fromEntries(Object.entries(state.itemStreams).filter(([, stream]) => !snapshot.items.some(item => item.id === stream.itemId && item.sessionId === stream.sessionId))),
+        };
+        let gap = false;
+        for (const envelope of (buffer ?? []).sort((a, b) => a.seq - b.seq)) {
+          if (envelope.seq > next.snapshot!.seq + 1) { gap = true; break; }
+          next = applyEnvelope(next, envelope);
+        }
+        if (gap) continue;
+        buffer = null;
+        publish(next);
+        return;
       }
-      buffer = null;
-      publish(next);
+      throw new Error('snapshot did not converge after 5 reads');
     }).catch(() => { if (current === generation) { buffer = null; publish({ ...state, connection: 'error' }); } })
-      .finally(() => { if (current === generation) loading = undefined; })
-      .then(async () => { if (gap && retryGap && current === generation) await reconnect(false); });
+      .finally(() => { if (current === generation) loading = undefined; });
     return loading;
   };
   const isBlocked = (type: Command['type'], target: string) => !!state.blockedCommands[blockKey(type, target)];
@@ -179,6 +193,10 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
       publish({ ...state, commands, blockedCommands });
     };
     record(null);
+    if (state.snapshot?.app.status === 'damaged') {
+      const result: CommandResult = { ok: false, requestId: command.requestId, code: 'storage_failed', message: '資料損壞，操作已停用。', retryable: false, mayHaveSideEffects: false };
+      record(result); return result;
+    }
     if (state.connection !== 'ready') {
       const result: CommandResult = { ok: false, requestId: command.requestId, code: 'runtime_unavailable', message: '尚未完成資料同步，未送出指令。', retryable: true, mayHaveSideEffects: false };
       record(result); return result;
@@ -189,7 +207,11 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
       if (!parsed.success || (parsed.data.requestId !== null && parsed.data.requestId !== command.requestId)) return unknownResult(command.requestId);
       return parsed.data;
     };
-    const response = Promise.resolve().then(() => bridge.send(command)).then(validate, () => unknownResult(command.requestId));
+    const response = Promise.resolve().then(() => {
+      if (state.snapshot?.app.status === 'damaged') return { ok: false as const, requestId: command.requestId, code: 'storage_failed' as const, message: '資料損壞，操作已停用。', retryable: false, mayHaveSideEffects: false };
+      if (state.connection !== 'ready') return unavailable('尚未完成資料同步，未送出指令。');
+      return bridge.send(command);
+    }).then(validate, () => unknownResult(command.requestId));
     const result = await Promise.race([response, new Promise<CommandResult>(resolve => { timer = setTimeout(() => resolve(unknownResult(command.requestId)), timeoutMs); })]);
     clearTimeout(timer);
     record(result);
