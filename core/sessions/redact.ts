@@ -2,7 +2,9 @@
 // r2-P1-2). A token is matched as written and in the encodings a runtime might quote it in: percent-encoded
 // (encodeURIComponent, and every character as %XX) and JSON \uXXXX escapes. Streaming deltas are held back
 // by the length of the longest of those forms minus one, so a token split across deltas is still found;
-// what is held is let out, redacted, when the message or the item ends, the turn ends or the runtime exits.
+// what is held is let out, redacted, only at its own end (r3-P1-1): a message's at its completion, the end
+// of its own turn or of its own native sub-agent; an item's output at the end of that item; and everything
+// of a session when its runtime exits. Another turn ending (a sub-agent's, say) lets nothing out.
 //
 // Accepted residual risk (main session): Base64 and other deliberate encodings are not matched. A token
 // is valid only on loopback, for this one session, until its next start or resume.
@@ -30,10 +32,17 @@ export const tokenForms = (token: string): string[] => {
 type Delta = Extract<RuntimeEvent, { type: 'message.delta' | 'item.outputDelta' }>;
 
 interface Stream {
+  kind: 'message' | 'item';
   sessionId: string;
+  /** For a message: the turn and the native sub-agent it belongs to, whose end lets it out. */
+  turnId?: string;
+  nativeTaskId?: string;
   tail: string;
   last: Delta;
 }
+
+/** A key no two (kind, session, ID) share, whatever the IDs contain (r3-P2-1). */
+const keyOf = (kind: Stream['kind'], sessionId: string, id: string) => JSON.stringify([kind, sessionId, id]);
 
 export class Redactor {
   /** Longest first, so a longer spelling is replaced before a shorter one inside it. */
@@ -71,19 +80,27 @@ export class Redactor {
   events(event: RuntimeEvent): RuntimeEvent[] {
     switch (event.type) {
       case 'message.delta':
-        return this.stream(`m:${event.sessionId}:${event.messageId}`, event);
+        return this.stream(keyOf('message', event.sessionId, event.messageId), 'message', event);
       case 'item.outputDelta':
-        return this.stream(`i:${event.sessionId}:${event.itemId}`, event);
+        return this.stream(keyOf('item', event.sessionId, event.itemId), 'item', event);
       case 'message.completed':
-        return [...this.flush(`m:${event.message.sessionId}:${event.message.id}`), this.value(event)];
+        return [...this.flush(keyOf('message', event.message.sessionId, event.message.id)), this.value(event)];
       case 'item.updated': {
         const open = event.item.kind === 'fileChange' ? event.item.state === 'proposed' : event.item.state === 'running';
-        return [...(open ? [] : this.flush(`i:${event.item.sessionId}:${event.item.id}`)), this.value(event)];
+        return [...(open ? [] : this.flush(keyOf('item', event.item.sessionId, event.item.id))), this.value(event)];
       }
-      case 'turn.updated':
-        return [...(event.turn.state === 'running' ? [] : this.flushSession(event.turn.sessionId)), this.value(event)];
+      case 'turn.updated': {
+        // Only the messages of this very turn (r3-P1-1).
+        const { turn } = event;
+        return [...(turn.state === 'running' ? [] : this.flushWhere((s) => s.kind === 'message' && s.sessionId === turn.sessionId && s.turnId === turn.id)), this.value(event)];
+      }
+      case 'nativeTask.updated': {
+        // A sub-agent's messages without a turn end with the sub-agent.
+        const { task } = event;
+        return [...(task.state === 'running' ? [] : this.flushWhere((s) => s.kind === 'message' && s.sessionId === task.sessionId && s.nativeTaskId === task.id)), this.value(event)];
+      }
       case 'runtime.exited':
-        return [...event.sessionIds.flatMap((id) => this.flushSession(id)), this.value(event)];
+        return [...this.flushWhere((s) => (event.sessionIds as readonly string[]).includes(s.sessionId)), this.value(event)];
       default:
         return [this.value(event)];
     }
@@ -93,7 +110,7 @@ export class Redactor {
     return Math.max(0, (this.forms[0]?.length ?? 0) - 1);
   }
 
-  private stream(key: string, event: Delta): RuntimeEvent[] {
+  private stream(key: string, kind: Stream['kind'], event: Delta): RuntimeEvent[] {
     const held = this.streams.get(key);
     const text = this.text((held?.tail ?? '') + event.delta);
     const keep = Math.min(this.holdBack, text.length);
@@ -101,7 +118,15 @@ export class Redactor {
     const out = text.slice(0, text.length - keep);
     const tail = text.slice(text.length - keep);
     if (tail === '') this.streams.delete(key);
-    else this.streams.set(key, { sessionId: event.sessionId, tail, last: event });
+    else
+      this.streams.set(key, {
+        kind,
+        sessionId: event.sessionId,
+        ...(event.type === 'message.delta' && event.turnId !== undefined && { turnId: event.turnId }),
+        ...(event.type === 'message.delta' && event.nativeTaskId !== undefined && { nativeTaskId: event.nativeTaskId }),
+        tail,
+        last: event,
+      });
     return out === '' ? [] : [{ ...event, delta: out }];
   }
 
@@ -113,7 +138,7 @@ export class Redactor {
     return delta === '' ? [] : [{ ...held.last, delta }];
   }
 
-  private flushSession(sessionId: string): RuntimeEvent[] {
-    return [...this.streams.entries()].filter(([, s]) => s.sessionId === sessionId).flatMap(([key]) => this.flush(key));
+  private flushWhere(match: (stream: Stream) => boolean): RuntimeEvent[] {
+    return [...this.streams.entries()].filter(([, s]) => match(s)).flatMap(([key]) => this.flush(key));
   }
 }

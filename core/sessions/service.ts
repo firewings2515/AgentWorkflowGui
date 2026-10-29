@@ -45,7 +45,7 @@ import type {
 import { PermissionGate } from './permissions';
 import { SessionRuntimes } from './runtimes';
 import { WrittenPaths, type WrittenPathsOptions } from './written-paths';
-import { gated } from './write-gate';
+import { gated, ServiceClosedError } from './write-gate';
 
 type Failure = Extract<CommandResult, { ok: false }>;
 type Success = Extract<CommandResult, { ok: true }>;
@@ -211,6 +211,7 @@ export class SessionService {
       now: () => options.now(),
       uuid: () => options.uuid(),
       log: (message) => options.log?.(message),
+      isClosing: () => this.closing,
     });
     this.runtimes = new SessionRuntimes({
       createAdapter: (runtime, sessionId) => options.createAdapter(runtime, sessionId),
@@ -312,11 +313,18 @@ export class SessionService {
    * R-14, after the MCP server stopped: every open session is closed (Claude interrupts before closing,
    * Codex closes stdin; the main process then ends its Job), then the adapters themselves.
    */
-  async shutdown(timeoutMs = 5000): Promise<void> {
-    // Nothing new starts (r1-P1-5): commands, MCP calls and queued work see this when their turn comes,
-    // and a start or resume still running is closed again as soon as it returns.
+  /**
+   * Nothing new starts from now on (r1-P1-5, r3-P1-2): commands, MCP calls, permission checks and queued
+   * work see this when their turn comes, and a start or resume still running is closed as soon as it returns.
+   * The main process calls it first thing on exit; `shutdown` calls it too.
+   */
+  beginClose(): void {
     this.closing = true;
     this.runtimes.beginClose();
+  }
+
+  async shutdown(timeoutMs = 5000): Promise<void> {
+    this.beginClose();
     // What already runs gets its chance to finish; past the deadline the sessions are closed anyway (R-14).
     await this.within(
       (async () => {
@@ -714,6 +722,16 @@ export class SessionService {
    * confirms first (R-11).
    */
   async sendMessage(input: SendMessageToolInput, ctx: { caller: SessionId; operationId: OperationId; sourceCallRef: string }): Promise<SendMessageToolResult> {
+    try {
+      return await this.sendMessageGuarded(input, ctx);
+    } catch (error) {
+      // A call that ran into the exit (the write gate, or anything after closing began) is answered as such (r3-P2-2).
+      if (this.closing || error instanceof ServiceClosedError) return { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } };
+      throw error;
+    }
+  }
+
+  private async sendMessageGuarded(input: SendMessageToolInput, ctx: { caller: SessionId; operationId: OperationId; sourceCallRef: string }): Promise<SendMessageToolResult> {
     const rejected = (reason: 'unknown-target' | 'invalid-input' | 'shutting-down', detail: string): SendMessageToolResult => ({
       status: 'rejected',
       rejection: { reason, detail },

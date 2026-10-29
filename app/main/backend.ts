@@ -319,7 +319,9 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
 
   const shutdown = (): Promise<void> => {
     closing ??= (async () => {
-      // R-14: no new tool calls, then every session closed gracefully, then whatever is left in a Job.
+      // R-14: the core stops taking anything new at once (a permission check under way is declined), then no new
+      // tool calls, then every session closed gracefully, then whatever is left in a Job.
+      service.beginClose();
       await mcp.close().catch(() => undefined);
       // Bounded inside (each wait has its deadline); the database closes only after it returned (r1-P1-5).
       await service.shutdown(closeTimeoutMs);

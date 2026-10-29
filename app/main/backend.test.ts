@@ -13,6 +13,8 @@ import { FakeAdapter, permissionRequest } from '../../core/sessions/testing/fake
 import { agent } from '../../core/sessions/testing/harness';
 import { type Backend, type BackendProcessHost, type DamagedBackend, STORAGE_DAMAGED, startBackend } from './backend';
 import { EventBus } from './event-bus';
+import { ClaudeAdapter } from '../../adapters/claude';
+import { FakeSdk } from '../../adapters/claude/testing/fake-sdk';
 
 let dir: string;
 beforeEach(() => {
@@ -381,5 +383,32 @@ describe('review round 2 (T017-r2-result.md)', () => {
     const db = openDatabase(join(dir, 'awg.sqlite'));
     expect((await new SqliteDeliveryStore(db).get(OperationId.parse('provision:slow')))?.delivery.state).toBe('unknown');
     db.close();
+  });
+});
+
+describe('review round 3 (T017-r3-result.md)', () => {
+  it('r3-P1-2 with the real ClaudeAdapter, a PreToolUse answered while the exit begins is denied, never allowed', async () => {
+    const sdk = new FakeSdk();
+    let claude: ClaudeAdapter | undefined;
+    const result = await startBackend({
+      dbPath: join(dir, 'awg.sqlite'),
+      bus: new EventBus(),
+      createHost: () => new FakeHost([]),
+      createAdapter: (_runtime, _sessionId, hooks) =>
+        (claude ??= new ClaudeAdapter({ sdk, onPermissionRequest: (h) => hooks.onPermissionRequest(h), cwdExists: () => true })),
+      listModels: () => Promise.resolve([]),
+      resolveRealPath: (p) => p,
+      log: () => undefined,
+    });
+    if (result.status !== 'ready') throw new Error('not ready');
+    const run = (command: Command) => result.facade.execute(command) as Promise<CommandResult>;
+    await run({ type: 'agent.save', requestId: rid(), agent: agent(), expectedRevision: null });
+    await run({ type: 'session.create', requestId: rid(), sessionId: SessionId.parse('c-1'), kind: 'ordinary', agentId: agent().id, model: { runtime: 'claude', model: 'haiku' }, cwd: dir });
+    await settle();
+    // A read inside the session folder: the policy would approve it.
+    const { output } = sdk.last.callHook({ tool_name: 'Read', tool_input: { file_path: join(dir, 'a.txt') }, tool_use_id: 't-read' });
+    const shutdown = result.shutdown();
+    expect((await output).hookSpecificOutput?.permissionDecision).toBe('deny');
+    await shutdown;
   });
 });

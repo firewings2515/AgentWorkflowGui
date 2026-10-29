@@ -48,6 +48,8 @@ export interface PermissionGateOptions {
   now(): Timestamp;
   uuid(): string;
   log?(message: string): void;
+  /** True once the GUI began closing: from then on nothing is approved, by the policy or the user (r3-P1-2). */
+  isClosing?(): boolean;
 }
 
 export type RespondResult = 'answered' | 'not-found' | 'not-open' | 'gone';
@@ -61,17 +63,21 @@ export class PermissionGate {
   /** `RuntimeAdapterHooks.onPermissionRequest`. A throw makes the adapter decline (fail closed). */
   async onPermissionRequest(handle: PermissionHandle): Promise<void> {
     const { request } = handle;
+    if (this.declinedForClosing(handle)) return;
     if (isGuiToolRequest(request)) {
       handle.answer(this.policyDecision('approve'));
       return;
     }
     const session = await this.options.repositories.sessions.get(request.sessionId);
+    // Checked again after every wait: closing may have begun meanwhile (r3-P1-2).
+    if (this.declinedForClosing(handle)) return;
     if (session === undefined) {
       handle.answer(this.policyDecision('decline', 'the session is not known to the GUI'));
       return;
     }
     const decision: PolicyDecision = this.options.policy.evaluate(request, this.context(session));
     if (decision.action === 'approve') {
+      if (this.declinedForClosing(handle)) return;
       if (handle.answer(this.policyDecision('approve')) && (request.kind === 'command' || request.kind === 'fileChange')) {
         this.options.written.add(session.id, request.paths, request.cwd ?? session.cwd);
       }
@@ -90,6 +96,10 @@ export class PermissionGate {
       createdAt: this.options.now(),
     };
     await this.options.repositories.escalations.upsert(escalation);
+    if (this.declinedForClosing(handle)) {
+      await this.close(escalation, 'resolved');
+      return;
+    }
     this.held.set(escalation.id, handle);
     if (!handle.hold({ reason: 'awaiting-user', escalationId: escalation.id }, { matchedRule: decision.rule })) {
       // Withdrawn while the escalation was being written: nothing is left to decide.
@@ -111,6 +121,11 @@ export class PermissionGate {
   ): Promise<RespondResult> {
     if (escalation.state !== 'open') return 'not-open';
     const handle = this.held.get(escalation.id);
+    if (handle !== undefined && this.declinedForClosing(handle)) {
+      this.held.delete(escalation.id);
+      await this.close(escalation, 'resolved');
+      return 'gone';
+    }
     const answered =
       handle?.answer({
         outcome: input.decision,
@@ -188,6 +203,13 @@ export class PermissionGate {
     };
     await this.options.repositories.escalations.upsert(closed);
     this.options.publish(closed);
+  }
+
+  /** Declines the request when closing began; true when it did. */
+  private declinedForClosing(handle: PermissionHandle): boolean {
+    if (this.options.isClosing?.() !== true) return false;
+    handle.answer(this.policyDecision('decline', 'the GUI is closing'));
+    return true;
   }
 
   private policyDecision(outcome: 'approve' | 'decline', reason?: string): PermissionDecision {
