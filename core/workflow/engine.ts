@@ -88,6 +88,15 @@ const NOT_IN_WORKFLOW = rejected('not-in-workflow', 'this tool works in workflow
 const RESEND_MISMATCH = rejected('resend-mismatch', 'this operation carries another handoff');
 const NOT_OWNER = rejected('not-owner', 'this operation belongs to another call');
 
+/** Report operation IDs say whether the report asked for the user's confirmation (r1-P1-7). */
+const REPORT = 'report-';
+const REPORT_ASKING = 'report-c-';
+const asksConfirmation = (operationId: OperationId) => operationId.startsWith(REPORT_ASKING);
+
+/** Whether two `handoff` inputs ask for the same handoff (`retryOf` aside). */
+const sameCall = (a: HandoffToolInput, b: HandoffToolInput): boolean =>
+  a.ruleId === b.ruleId && a.content === b.content && a.taskId === b.taskId && JSON.stringify(a.target) === JSON.stringify(b.target);
+
 const errorName = (error: unknown) => (error instanceof Error ? error.name : 'non-error thrown');
 const isClosedError = (error: unknown) => error instanceof Error && error.name === 'ServiceClosedError';
 
@@ -143,12 +152,31 @@ export class WorkflowEngine implements WorkflowHooks {
     const { requestId, instanceId, rootSessionId, workflowId, workflowRevision, title, cwd, firstMessage, crossToolConsent } = command;
     const sessions = this.options.sessions;
     const repos = this.repos;
+    const messageId = firstMessageIdOf(instanceId);
+    const taken = () => fail(requestId, 'already_exists', 'A workflow run with this ID already exists');
+    // What a start stores, in order: the root session (its cwd), the first message, then the instance (its
+    // title, revision and consent). A repeat must match all of it, wherever the first one stopped (r1-P1-4).
+    const sameSoFar = async (): Promise<boolean> => {
+      const root = await repos.sessions.get(rootSessionId);
+      if (root === undefined) return true;
+      if (root.kind !== 'workflow' || root.workflow.instanceId !== instanceId || root.workflow.taskId !== undefined || root.cwd !== cwd) return false;
+      const first = (await repos.conversations.get(rootSessionId)).messages.find((m) => m.id === messageId);
+      return first === undefined || (first.role === 'user' && first.origin.kind === 'user' && first.text === firstMessage);
+    };
     let instance = await repos.instances.get(instanceId);
     if (instance !== undefined) {
-      const root = await repos.sessions.get(instance.rootSessionId);
-      const same = instance.workflowId === workflowId && instance.workflowRevision === workflowRevision && instance.rootSessionId === rootSessionId && instance.title === title && (root === undefined || root.cwd === cwd);
-      if (!same) return fail(requestId, 'already_exists', 'A workflow run with this ID already exists');
+      const same =
+        instance.workflowId === workflowId &&
+        instance.workflowRevision === workflowRevision &&
+        instance.rootSessionId === rootSessionId &&
+        instance.title === title &&
+        (instance.crossToolConsentAt !== undefined) === crossToolConsent &&
+        (await repos.sessions.get(rootSessionId)) !== undefined &&
+        (await sameSoFar());
+      if (!same) return taken();
     } else {
+      // A session under this ID is only an earlier attempt of this same start (r1-P1-4).
+      if (!(await sameSoFar())) return taken();
       const template = await repos.workflows.get(workflowId);
       if (template === undefined) return fail(requestId, 'not_found', 'Unknown workflow');
       // Pinned to what the user saw and agreed to (R-11): a changed template is refused, never started.
@@ -160,7 +188,6 @@ export class WorkflowEngine implements WorkflowHooks {
       // Starting is the consent to cross-tool handoffs between the run's nodes (R-11); without it nothing starts.
       if (runtimesOf(template).size > 1 && !crossToolConsent) return fail(requestId, 'invalid_request', 'This workflow hands off between tools; starting it needs that consent');
       if (!sessions.canResolve(cwd)) return fail(requestId, 'invalid_request', 'The working folder cannot be resolved');
-      if ((await repos.sessions.get(rootSessionId)) !== undefined) return fail(requestId, 'already_exists', 'A session with this ID already exists');
       const at = this.options.now();
       const root = rootNode(template);
       const task: WorkflowTask = { id: taskIdOf(instanceId), instanceId, title, dependsOn: [], status: 'running', currentNodeId: root.id, reworkCount: 0 };
@@ -178,18 +205,18 @@ export class WorkflowEngine implements WorkflowHooks {
         createdAt: at,
       };
       if (sessions.isClosing()) return fail(requestId, 'runtime_unavailable', 'The application is closing');
-      if ((await repos.instances.create(created)) === 'exists') return fail(requestId, 'already_exists', 'A workflow run with this ID already exists');
+      const made = await sessions.createWorkflowSession({ sessionId: rootSessionId, instance: created, nodeId: root.id, cwd });
+      if (made === 'taken') return fail(requestId, 'already_exists', 'A session with this ID already exists');
+      if (made === 'unresolvable') return fail(requestId, 'invalid_request', 'The working folder cannot be resolved');
+      if (made === 'closing') return fail(requestId, 'runtime_unavailable', 'The application is closing');
+      if ((await sessions.recordUserMessage(rootSessionId, messageId, firstMessage)) === 'taken') return taken();
+      if ((await repos.instances.create(created)) === 'exists') return taken();
       instance = (await repos.instances.get(instanceId)) ?? created;
       this.options.publish({ type: 'instance.updated', instance });
     }
     const root = rootNode(instance.template);
     const bound = await repos.instances.bindNodeSession({ instanceId, nodeId: root.id }, rootSessionId);
     if (bound.status === 'exists' && bound.sessionId !== rootSessionId) return fail(requestId, 'already_exists', 'The run already has another root session');
-    const made = await sessions.createWorkflowSession({ sessionId: rootSessionId, instance, nodeId: root.id, cwd });
-    if (made === 'taken') return fail(requestId, 'already_exists', 'A session with this ID already exists');
-    if (made === 'unresolvable') return fail(requestId, 'invalid_request', 'The working folder cannot be resolved');
-    if (made === 'closing') return fail(requestId, 'runtime_unavailable', 'The application is closing');
-    const messageId = firstMessageIdOf(instanceId);
     const sent = await sessions.sendAsUser(requestId, rootSessionId, messageId, firstMessage);
     if (!sent.ok) return { ...sent, mayHaveSideEffects: true };
     return ok(requestId, {
@@ -222,6 +249,13 @@ export class WorkflowEngine implements WorkflowHooks {
 
   private async handoffNow(caller: WorkflowSession, input: HandoffToolInput, ctx: HandoffCallContext, confirmed: boolean): Promise<HandoffToolResult> {
     if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
+    // A `retryOf` of a handoff still waiting for the user is held to the same rules as any resend (r1-P1-5).
+    const waiting = handoffConfirmationId(ctx.operationId);
+    const pending = confirmed ? undefined : this.confirmations.get(waiting);
+    if (pending !== undefined) {
+      if (pending.caller !== caller.id) return NOT_OWNER;
+      return sameCall(pending.input, input) ? { status: 'escalated', escalationId: waiting, reason: 'needs-confirmation' } : RESEND_MISMATCH;
+    }
     const planned = await this.plan(caller, input);
     if ('status' in planned) return planned;
     const { instance, taskId, from, to } = planned;
@@ -229,8 +263,9 @@ export class WorkflowEngine implements WorkflowHooks {
     // A resend: the same call after a restart (same sourceCallRef) or a `retryOf` (same operationId, CR2 §4).
     const known = (await this.store.get(ctx.operationId)) ?? (await this.store.findBySourceCallRef(ctx.sourceCallRef));
     if (known !== undefined) return this.resent(known, caller, planned);
-    const waiting = handoffConfirmationId(ctx.operationId);
-    if (this.confirmations.has(waiting)) return { status: 'escalated', escalationId: waiting, reason: 'needs-confirmation' };
+
+    // A task stopped at a limit hands off nowhere, root included, until the user deals with it (R-05, r1-P1-1).
+    if (instance.tasks.find((t) => t.id === taskId)?.status === 'blocked') return this.stillBlocked(instance, taskId, caller);
 
     const handoffs = await this.repos.handoffs.listByInstance(instance.id);
     const rework = isRework(handoffs, taskId, to.id);
@@ -353,7 +388,14 @@ export class WorkflowEngine implements WorkflowHooks {
   /** Dispatches a pending handoff when its target's own turn is not running (SP-05); `pending` while it waits. */
   private async deliver(operationId: OperationId, sessionId: SessionId, handoffId: Handoff['id']): Promise<DeliveryState> {
     const state = await this.options.sessions.deliverWorkflow(operationId, sessionId, 'after-turn');
-    await this.publishHandoff(handoffId);
+    // The gate may have sent an older handoff to the session instead: every one to it is pushed again.
+    const target = await this.repos.sessions.get(sessionId);
+    if (target?.kind === 'workflow') {
+      for (const handoff of await this.repos.handoffs.listByInstance(target.workflow.instanceId))
+        if (handoff.target.sessionId === sessionId || handoff.id === handoffId) this.options.publish({ type: 'handoff.updated', handoff });
+    } else {
+      await this.publishHandoff(handoffId);
+    }
     return state === 'queued' ? 'pending' : state;
   }
 
@@ -405,21 +447,25 @@ export class WorkflowEngine implements WorkflowHooks {
     const payload = reportText(from, taskId, input.content, input.needsUserConfirmation);
     const hash = await this.options.hashPayload(payload);
 
-    // The same call again after a restart (CR2 §4): the report it made.
+    // Root reports to the user directly: nothing is delivered, only the question, named after the call so a
+    // resend of it (even after a restart) finds the same one (r1-P1-7).
+    if (caller.id === rootId) {
+      if (!input.needsUserConfirmation) return { status: 'reported' };
+      const digest = (await this.options.hashPayload(JSON.stringify([caller.id, ctx.sourceCallRef]))).slice('sha256:'.length, 'sha256:'.length + 40);
+      const escalation = await this.openReportQuestion(instance, caller.id, from, OperationIdSchema.parse(`report-root-${digest}`));
+      return { status: 'reported', escalationId: escalation.id };
+    }
+    // The same call again after a restart (CR2 §4): the report it made, with its question if it asked one
+    // (written again if a crash came between the two, r1-P1-7).
     const known = await this.store.findBySourceCallRef(ctx.sourceCallRef);
     if (known !== undefined) {
       if (known.kind !== 'peer-message' || known.sender !== caller.id) return NOT_OWNER;
       if (known.payloadHash !== hash) return rejected('resend-mismatch', 'this call carried another report');
-      const question = await this.repos.escalations.get(reportConfirmationId(known.operationId));
+      const question = asksConfirmation(known.operationId) ? await this.openReportQuestion(instance, caller.id, from, known.operationId) : undefined;
       return { status: 'reported', ...(question !== undefined && { escalationId: question.id }) };
     }
-    const operationId = OperationIdSchema.parse(`report-${this.options.uuid()}`);
-    // Root reports to the user directly: there is nothing to deliver, only the question.
-    if (caller.id === rootId) {
-      if (!input.needsUserConfirmation) return { status: 'reported' };
-      const escalation = await this.openReportQuestion(instance, caller, from, operationId);
-      return { status: 'reported', escalationId: escalation.id };
-    }
+    // Whether the report asks the user is part of its stored identity, so a restart can restore the question.
+    const operationId = OperationIdSchema.parse(`${input.needsUserConfirmation ? REPORT_ASKING : REPORT}${this.options.uuid()}`);
     const peerMessageId = peerIdOf(operationId);
     const origin: MessageOrigin = { kind: 'peer', fromSessionId: caller.id, peerMessageId };
     const target = await this.options.sessions.payloadTarget(rootId);
@@ -442,7 +488,7 @@ export class WorkflowEngine implements WorkflowHooks {
     if (accepted.status === 'conflict') return NOT_OWNER;
     if (accepted.status === 'invalid') return rejected('invalid-input', 'the report cannot be accepted');
     if (accepted.status === 'commit-uncertain' || accepted.status === 'limit-exceeded') throw new Error(`accepting the report ended ${accepted.status}`);
-    const escalation = input.needsUserConfirmation ? await this.openReportQuestion(instance, caller, from, operationId) : undefined;
+    const escalation = input.needsUserConfirmation ? await this.openReportQuestion(instance, caller.id, from, operationId) : undefined;
     await this.options.sessions.deliverWorkflow(operationId, rootId, 'insert-if-busy');
     const message = await this.repos.peerMessages.get(peerMessageId);
     if (message !== undefined) this.options.publish({ type: 'peerMessage.updated', message });
@@ -508,6 +554,25 @@ export class WorkflowEngine implements WorkflowHooks {
     return { status: 'escalated', escalationId: escalation.id, reason: 'limit-exceeded' };
   }
 
+  /** The open limit escalation of a blocked task, or a new one when the user closed the earlier one. */
+  private async stillBlocked(instance: WorkflowInstance, taskId: TaskId, caller: WorkflowSession): Promise<HandoffToolResult> {
+    const open = (await this.repos.escalations.list({ state: 'open' })).find(
+      (e) => e.kind === 'limit-exceeded' && e.instanceId === instance.id && e.ref?.kind === 'task' && e.ref.taskId === taskId,
+    );
+    const escalation =
+      open ??
+      (await this.openOnce(limitEscalationBase(JSON.stringify(['blocked', instance.id, taskId])), {
+        instanceId: instance.id,
+        rootSessionId: instance.rootSessionId,
+        fromSessionId: caller.id,
+        kind: 'limit-exceeded',
+        title: 'Handoff limit reached',
+        detail: 'the task stopped at a handoff limit; no handoff of it is delivered any more',
+        ref: { kind: 'task', taskId },
+      }));
+    return { status: 'escalated', escalationId: escalation.id, reason: 'limit-exceeded' };
+  }
+
   private async noRuleMatched(instance: WorkflowInstance, taskId: TaskId, caller: WorkflowSession, from: AgentNode): Promise<HandoffToolResult> {
     await this.openOnce(noRuleEscalationBase(instance.id, taskId, from.id), {
       instanceId: instance.id,
@@ -542,12 +607,15 @@ export class WorkflowEngine implements WorkflowHooks {
     return { status: 'escalated', escalationId: id, reason: 'needs-confirmation' };
   }
 
-  private async openReportQuestion(instance: WorkflowInstance, caller: WorkflowSession, from: { label: string }, operationId: OperationId): Promise<Escalation> {
+  /** The question of a report that asks the user, once per report: an existing one (open or answered) is kept. */
+  private async openReportQuestion(instance: WorkflowInstance, caller: SessionId, from: { label: string }, operationId: OperationId): Promise<Escalation> {
+    const existing = await this.repos.escalations.get(reportConfirmationId(operationId));
+    if (existing !== undefined) return existing;
     const escalation: Escalation = {
       id: reportConfirmationId(operationId),
       instanceId: instance.id,
       rootSessionId: instance.rootSessionId,
-      fromSessionId: caller.id,
+      fromSessionId: caller,
       kind: 'confirmation',
       title: 'A node asks for your confirmation',
       detail: `node "${from.label}" asks for your confirmation; its report is in the root session`,
@@ -596,7 +664,19 @@ export class WorkflowEngine implements WorkflowHooks {
    * handoffs, the one record of what was counted (`HandoffMeta.rework`), so the limit and the views agree.
    */
   async recover(): Promise<void> {
-    for (const instance of await this.repos.instances.list()) {
+    const instances = await this.repos.instances.list();
+    // A report that asked the user and was accepted before its question was written gets it now (r1-P1-7).
+    for (const state of ['pending', 'unknown', 'sent'] as const) {
+      for (const record of await this.store.listByState(state)) {
+        if (record.kind !== 'peer-message' || record.peer?.instanceId === undefined || !asksConfirmation(record.operationId)) continue;
+        const { instanceId, fromSessionId } = record.peer;
+        const instance = instances.find((i) => i.id === instanceId);
+        const caller = await this.repos.sessions.get(fromSessionId);
+        const from = instance !== undefined && caller?.kind === 'workflow' ? nodeOf(instance.template, caller.workflow.nodeId) : undefined;
+        if (instance !== undefined && from !== undefined) await this.openReportQuestion(instance, fromSessionId, from, record.operationId);
+      }
+    }
+    for (const instance of instances) {
       if (instance.state !== 'running' && instance.state !== 'blocked') continue;
       const handoffs = await this.repos.handoffs.listByInstance(instance.id);
       const root = rootNode(instance.template);

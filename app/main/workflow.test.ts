@@ -21,6 +21,8 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'awg-t024-'));
 });
 afterEach(async () => {
+  holding.clear();
+  open.clear();
   for (const c of clients.splice(0)) await c.close().catch(() => undefined);
   rmSync(dir, { recursive: true, force: true });
 });
@@ -56,6 +58,44 @@ interface Started {
   run(command: Command): Promise<CommandResult>;
 }
 
+/** Sessions whose turns stay running after a dispatch until the test ends them (r1-P2-3). */
+const holding = new Set<string>();
+const open = new Map<string, { adapter: FakeAdapter; turnId: string }>();
+let turnIds = 0;
+
+const emitTurn = (adapter: FakeAdapter, sessionId: SessionId, id: string, state: 'running' | 'completed') => {
+  adapter.emit({ type: 'turn.updated', turn: { id: TurnId.parse(id), sessionId, state, startedAt: '2026-10-29T01:00:00.000Z', ...(state !== 'running' && { endedAt: '2026-10-29T01:00:01.000Z' }) } });
+  adapter.emit({ type: 'session.activity', sessionId, activity: state === 'running' ? 'running' : 'idle', at: '2026-10-29T01:00:00.000Z' });
+};
+
+/** A dispatch that starts a turn, as the runtimes do: it runs, then completes unless its session is held. */
+const withTurns = (adapter: FakeAdapter, codexSession?: SessionId): FakeAdapter => {
+  const dispatch = adapter.dispatchOnce.bind(adapter);
+  adapter.dispatchOnce = async (request) => {
+    const result = await dispatch(request);
+    const sessionId =
+      codexSession ??
+      [...adapter.started.map((o) => [o.preallocatedRef, o.sessionId] as const), ...adapter.resumed.map((o) => [o.nativeSessionRef, o.sessionId] as const)].find(([ref]) => ref === request.nativeSessionRef)?.[1];
+    if (result.state === 'sent' && request.entry.kind === 'new-turn' && sessionId !== undefined) {
+      const id = `turn-${String(++turnIds)}`;
+      void Promise.resolve().then(() => {
+        emitTurn(adapter, sessionId, id, 'running');
+        if (holding.has(sessionId)) open.set(sessionId, { adapter, turnId: id });
+        else emitTurn(adapter, sessionId, id, 'completed');
+      });
+    }
+    return result;
+  };
+  return adapter;
+};
+
+const finishTurn = (sessionId: SessionId) => {
+  const turn = open.get(sessionId);
+  if (turn === undefined) throw new Error(`no open turn of ${sessionId}`);
+  open.delete(sessionId);
+  emitTurn(turn.adapter, sessionId, turn.turnId, 'completed');
+};
+
 const start = async (): Promise<Started> => {
   const logs: string[] = [];
   const adapters: FakeAdapter[] = [];
@@ -67,9 +107,9 @@ const start = async (): Promise<Started> => {
     dbPath: join(dir, 'awg.sqlite'),
     bus,
     createHost: () => new FakeHost(),
-    createAdapter: (runtime: Runtime, _sessionId, hooks: { onPermissionRequest(h: PermissionHandle): unknown }) => {
+    createAdapter: (runtime: Runtime, sessionId, hooks: { onPermissionRequest(h: PermissionHandle): unknown }) => {
       if (runtime === 'claude' && claude !== undefined) return claude;
-      const adapter = new FakeAdapter(runtime, (h) => hooks.onPermissionRequest(h));
+      const adapter = withTurns(new FakeAdapter(runtime, (h) => hooks.onPermissionRequest(h)), runtime === 'codex' ? sessionId : undefined);
       if (runtime === 'claude') claude = adapter;
       adapters.push(adapter);
       return adapter;
@@ -181,7 +221,7 @@ describe('the workflow engine in the backend (T024)', () => {
     await s.backend.shutdown();
   });
 
-  it('after a restart, a handoff queued for a busy target is sent once and the run is rebuilt from storage', async () => {
+  it('after a restart, two handoffs queued for a busy target go one per turn and the run is rebuilt from storage', async () => {
     const s = await start();
     await prepare(s);
     await startRun(s);
@@ -196,18 +236,29 @@ describe('the workflow engine in the backend (T024)', () => {
     codex.emit({ type: 'session.activity', sessionId: impl, activity: 'running', at: '2026-10-29T01:00:00.000Z' });
     await settle();
     expect(await call(s, review, 'handoff', { ruleId: 'rework', target: { kind: 'node', nodeId: IMPL }, content: 'Validate the email.' })).toMatchObject({ status: 'accepted', delivery: 'pending' });
+    expect(await call(s, ROOT, 'handoff', { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, content: 'Also add a logo.' })).toMatchObject({ status: 'accepted', delivery: 'pending' });
     expect(codex.dispatched).toHaveLength(1);
     await s.backend.shutdown();
+    holding.add(impl);
 
     const again = await start();
     await settle();
     const resumed = again.adapters.find((a) => a.runtime === 'codex');
     expect(resumed?.resumed.map((r) => r.sessionId)).toEqual([impl]);
+    // The oldest only; its turn runs (held), so the other waits for it (SP-05, r1-P1-2).
     expect(resumed?.dispatched).toHaveLength(1);
     expect(resumed?.dispatched[0]).toMatchObject({ origin: { kind: 'handoff', fromSessionId: review }, entry: { kind: 'new-turn' } });
-    const snap = await snapshot(again);
-    expect(snap.handoffs.at(-1)).toMatchObject({ rework: true, delivery: { state: 'sent' } });
-    expect(snap.instances[0]?.tasks[0]).toMatchObject({ reworkCount: 1, currentNodeId: IMPL });
+    let snap = await snapshot(again);
+    expect(snap.handoffs.slice(-2).map((h) => [h.fromNodeId, h.rework, h.delivery.state])).toEqual([
+      [REVIEW, true, 'sent'],
+      [PLAN, true, 'pending'],
+    ]);
+    finishTurn(impl);
+    await settle();
+    expect(resumed?.dispatched.map((d) => (d.origin?.kind === 'handoff' ? d.origin.fromSessionId : ''))).toEqual([review, ROOT]);
+    snap = await snapshot(again);
+    expect(snap.handoffs.at(-1)?.delivery.state).toBe('sent');
+    expect(snap.instances[0]?.tasks[0]).toMatchObject({ reworkCount: 2, currentNodeId: IMPL });
     await again.backend.shutdown();
   });
 });

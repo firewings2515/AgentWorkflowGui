@@ -17,6 +17,7 @@ import {
   RequestId,
   type Runtime,
   SessionId,
+  TurnId,
   WorkflowId,
   type WorkflowNode,
   type WorkflowTemplate,
@@ -200,9 +201,47 @@ export interface World {
   service: SessionService;
   engine: WorkflowEngine;
   logs: string[];
+  /**
+   * The runtime's turn after each new-turn dispatch (r1-P2-3): it starts, then completes at once, unless its
+   * session is in `holding`; `finishTurn` then completes the turn the session runs.
+   */
+  holding: Set<SessionId>;
+  /** Sessions whose runtime reports no turn at all after a dispatch (a lost notification). */
+  silent: Set<SessionId>;
+  open: Map<SessionId, string>;
+  finishTurn(sessionId: SessionId): Promise<void>;
+  /** Emits a turn event of a session as its runtime would (a replay of an old one included). */
+  emitTurn(sessionId: SessionId, turnId: string, state: 'running' | 'completed'): void;
   run(command: Command): Promise<CommandResult>;
   restart(): Promise<World>;
 }
+
+let turns = 0;
+const adapterOf = (w: World, sessionId: SessionId) => w.codex.get(sessionId) ?? w.claude;
+
+/** Adds the turn a dispatch starts: Codex adapters serve one session; Claude's maps its refs back. */
+const withTurns = (adapter: FakeAdapter, w: World, codexSession?: SessionId): FakeAdapter => {
+  const dispatch = adapter.dispatchOnce.bind(adapter);
+  adapter.dispatchOnce = async (request) => {
+    const result = await dispatch(request);
+    const sessionId =
+      codexSession ??
+      [...adapter.started.map((o) => [o.preallocatedRef, o.sessionId] as const), ...adapter.resumed.map((o) => [o.nativeSessionRef, o.sessionId] as const)].find(
+        ([ref]) => ref === request.nativeSessionRef,
+      )?.[1];
+    if (result.state === 'sent' && request.entry.kind === 'new-turn' && sessionId !== undefined && !w.silent.has(sessionId)) {
+      const id = `turn-run-${String(++turns)}`;
+      // After the dispatch returned, as a runtime's notifications arrive.
+      void Promise.resolve().then(() => {
+        w.emitTurn(sessionId, id, 'running');
+        if (w.holding.has(sessionId)) w.open.set(sessionId, id);
+        else w.emitTurn(sessionId, id, 'completed');
+      });
+    }
+    return result;
+  };
+  return adapter;
+};
 
 const build = (repositories: WorkflowRepositories, store: MemoryDeliveryStore, previous?: World): World => {
   const world = {
@@ -213,10 +252,13 @@ const build = (repositories: WorkflowRepositories, store: MemoryDeliveryStore, p
     mounts: [] as World['mounts'],
     decide: previous?.decide ?? ((): PolicyDecision => ({ action: 'approve' })),
     logs: [] as string[],
+    holding: previous?.holding ?? new Set<SessionId>(),
+    silent: previous?.silent ?? new Set<SessionId>(),
+    open: new Map<SessionId, string>(),
   } as unknown as World;
   const policy: PermissionPolicy = { evaluate: () => world.decide() };
   let mounts = 0;
-  world.claude = new FakeAdapter('claude', (handle) => world.service.onPermissionRequest(handle));
+  world.claude = withTurns(new FakeAdapter('claude', (handle) => world.service.onPermissionRequest(handle)), world);
   world.service = new SessionService({
     repositories,
     store,
@@ -228,7 +270,7 @@ const build = (repositories: WorkflowRepositories, store: MemoryDeliveryStore, p
     resolveRealPath: (path) => (path.startsWith('E:\\work') ? path.replace('E:\\work', 'E:\\real') : null),
     createAdapter: (runtime: Runtime, sessionId: SessionId) => {
       if (runtime === 'claude') return world.claude;
-      const adapter = new FakeAdapter('codex', (handle) => world.service.onPermissionRequest(handle));
+      const adapter = withTurns(new FakeAdapter('codex', (handle) => world.service.onPermissionRequest(handle)), world, sessionId);
       world.codex.set(sessionId, adapter);
       return adapter;
     },
@@ -243,6 +285,21 @@ const build = (repositories: WorkflowRepositories, store: MemoryDeliveryStore, p
   });
   world.engine = new WorkflowEngine({ sessions: world.service, publish: (event) => world.events.push(event), now, uuid, hashPayload: hashOf, log: (m) => world.logs.push(m) });
   world.service.attachWorkflow(world.engine);
+  world.emitTurn = (sessionId, turnId, state) => {
+    const adapter = adapterOf(world, sessionId);
+    adapter.emit({
+      type: 'turn.updated',
+      turn: { id: TurnId.parse(turnId), sessionId, state, startedAt: '2026-10-29T01:00:00.000Z', ...(state !== 'running' && { endedAt: '2026-10-29T01:00:01.000Z' }) },
+    });
+    adapter.emit({ type: 'session.activity', sessionId, activity: state === 'running' ? 'running' : 'idle', at: '2026-10-29T01:00:00.000Z' });
+  };
+  world.finishTurn = async (sessionId) => {
+    const id = world.open.get(sessionId);
+    if (id === undefined) throw new Error(`no open turn of ${sessionId}`);
+    world.open.delete(sessionId);
+    world.emitTurn(sessionId, id, 'completed');
+    await settle();
+  };
   world.run = (command) => world.service.execute(command);
   world.restart = async () => {
     const next = build(repositories, store, world);
