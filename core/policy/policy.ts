@@ -4,7 +4,7 @@
 // (R-05); the session service applies the decision.
 //
 // Shell commands are read twice, as PowerShell and as Git Bash, unless they arrive in Codex's
-// `powershell.exe -Command "..."` wrapper. Claude's Bash and PowerShell tools both arrive as `command`
+// `powershell.exe -Command "..."` or `-Command '...'` wrapper. Claude's Bash and PowerShell tools both arrive as `command`
 // requests, and the request does not say which shell runs them, so both readings must be safe.
 import type { PermissionRequest } from '../../contracts';
 import type { PermissionPolicy, PolicyContext, PolicyDecision, PolicyRule } from '../ports';
@@ -193,11 +193,33 @@ const WRAPPER = /^\s*(?:"([^"]+)"|(\S+))\s+((?:-(?:NoProfile|NoLogo|NonInteracti
  * `$`, backticks and `!` inside the double quotes and joins lines ending in `\`. Rule E: the wrapper is
  * opened only when the script has none of `\`, a line break, `$`, a backtick or `!`.
  */
-export const unwrapPowerShell = (command: string): { script: string; safe: boolean } | undefined => {
+export const unwrapPowerShell = (command: string): { script: string; safe: boolean; alsoAs?: string } | undefined => {
   const m = WRAPPER.exec(command);
+  if (m) {
+    const exe = normaliseAbsolute(m[1] ?? m[2]!);
+    if (exe === undefined || !POWERSHELL_EXE.test(exe)) return undefined;
+    return { script: m[4]!, safe: !/[\\\r\n$`!]/.test(m[4]!) };
+  }
+  return unwrapSingleQuoted(command);
+};
+
+/** The same wrapper with the script as exactly one single-quoted token that runs to the end of the command. */
+const WRAPPER_SINGLE = /^\s*(?:"([^"]+)"|(\S+))\s+((?:-(?:NoProfile|NoLogo|NonInteractive)\s+)*)-(?:Command|c)\s+'((?:[^']|'')*)'\s*$/i;
+
+/**
+ * T021: Codex 0.160 quotes a script without `'` in single quotes (`... -NoProfile -Command 'Get-Content a.txt'`,
+ * the executable in double quotes with doubled backslashes). Inside single quotes neither PowerShell nor Bash
+ * expands anything, so rule E's characters do not matter and the script is read as written. The one place the
+ * two shells differ is `''`: PowerShell keeps one quote, Bash joins the two pieces. A script with `''` is read
+ * both ways (`alsoAs`), and both readings must be approved. Anything after the closing quote, an unpaired
+ * quote or another parameter in front does not match, so such a command stays unread (unrecognised).
+ */
+const unwrapSingleQuoted = (command: string): { script: string; safe: boolean; alsoAs?: string } | undefined => {
+  const m = WRAPPER_SINGLE.exec(command);
   const exe = m ? normaliseAbsolute(m[1] ?? m[2]!) : undefined;
   if (!m || exe === undefined || !POWERSHELL_EXE.test(exe)) return undefined;
-  return { script: m[4]!, safe: !/[\\\r\n$`!]/.test(m[4]!) };
+  const body = m[4]!;
+  return { script: body.replaceAll("''", "'"), safe: true, ...(body.includes("''") && { alsoAs: body.replaceAll("''", '') }) };
 };
 
 
@@ -262,6 +284,8 @@ export const evaluatePermission = (request: PermissionRequest, context: PolicyCo
         // Not safe to open: never approved, but the script is still read as PowerShell for a clearer rule.
         if (!wrapped.safe) c.add('unrecognised', 'syntax');
         c.script(wrapped.script, 'ps', cwd);
+        // A single-quoted script with `''` as Bash would hand it on: both readings must pass.
+        if (wrapped.alsoAs !== undefined) c.script(wrapped.alsoAs, 'ps', cwd);
       }
       // Codex's own parse of the command (`commandActions`) adds the paths it reads.
       for (const p of request.paths) c.target({ text: p, wild: false }, 'read', [cwd], 'win');
