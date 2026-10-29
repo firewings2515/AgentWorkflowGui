@@ -108,6 +108,8 @@ describe('session.send (CR-2)', () => {
   it('inserts into the running turn when the session is busy', async () => {
     const w = await world();
     const { sessionId } = await created(w);
+    // As the adapters report a turn that starts: the turn, then the activity (t021-r1-P1-2: both are needed).
+    w.codex.get(sessionId)!.emit({ type: 'turn.updated', turn: { id: TurnId.parse('turn-1'), sessionId, state: 'running', startedAt: '2026-10-29T01:00:00.000Z' } });
     w.codex.get(sessionId)!.emit({ type: 'session.activity', sessionId, activity: 'running', at: '2026-10-29T01:00:00.000Z' });
     await settle();
     await send(w, sessionId, 'more', 'm-2', await latest(w, 'session-a'));

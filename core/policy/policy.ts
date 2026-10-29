@@ -184,7 +184,27 @@ class Checker {
 }
 
 const POWERSHELL_EXE = /^(c:\/windows\/(system32|syswow64)\/windowspowershell\/v1\.0\/powershell\.exe|c:\/program files\/powershell\/\d+(-preview)?\/pwsh\.exe)$/;
-const WRAPPER = /^\s*(?:"([^"]+)"|(\S+))\s+((?:-(?:NoProfile|NoLogo|NonInteractive)\s+)*)-(?:Command|c)\s+"([^"]*)"\s*$/i;
+// What follows the executable. Spaces and tabs only between the tokens: a line break would end the command in Bash.
+const WRAPPER = /^[ \t]+((?:-(?:NoProfile|NoLogo|NonInteractive)[ \t]+)*)-(?:Command|c)[ \t]+"([^"]*)"[ \t]*$/i;
+// The executable token: a double-quoted path, or a bare one; only path characters, so no `;`, `&`, `|`, `#`,
+// backtick, `$`, quote, line break or NUL can hide a second command in it (t021-r1-P1-1).
+const EXE_QUOTED = /^[ \t]*"([A-Za-z0-9 _.:\\/-]+)"/;
+const EXE_BARE = /^[ \t]*([A-Za-z0-9_.:\\/-]+)(?=[ \t])/;
+
+/**
+ * The rest of the command after an executable token that names the system PowerShell exactly, else
+ * undefined. The token is checked as written before it is normalised: a `.` or `..` segment could fold
+ * away anything in front of it (`.../x;payload.cmd;#/../../../powershell.exe`), so it is never accepted.
+ */
+const afterPowerShell = (command: string): string | undefined => {
+  const m = EXE_QUOTED.exec(command) ?? EXE_BARE.exec(command);
+  if (!m) return undefined;
+  const path = m[1]!;
+  if (path.split(/[\\/]/).some((segment) => segment === '.' || segment === '..')) return undefined;
+  const exe = normaliseAbsolute(path);
+  if (exe === undefined || !POWERSHELL_EXE.test(exe)) return undefined;
+  return command.slice(m[0].length);
+};
 
 /**
  * Codex reports each command inside its shell call: `"C:\...\powershell.exe" -Command "<script>"`.
@@ -194,17 +214,15 @@ const WRAPPER = /^\s*(?:"([^"]+)"|(\S+))\s+((?:-(?:NoProfile|NoLogo|NonInteracti
  * opened only when the script has none of `\`, a line break, `$`, a backtick or `!`.
  */
 export const unwrapPowerShell = (command: string): { script: string; safe: boolean; alsoAs?: string } | undefined => {
-  const m = WRAPPER.exec(command);
-  if (m) {
-    const exe = normaliseAbsolute(m[1] ?? m[2]!);
-    if (exe === undefined || !POWERSHELL_EXE.test(exe)) return undefined;
-    return { script: m[4]!, safe: !/[\\\r\n$`!]/.test(m[4]!) };
-  }
-  return unwrapSingleQuoted(command);
+  const rest = afterPowerShell(command);
+  if (rest === undefined) return undefined;
+  const m = WRAPPER.exec(rest);
+  if (m) return { script: m[2]!, safe: !/[\\\r\n$`!]/.test(m[2]!) };
+  return unwrapSingleQuoted(rest);
 };
 
 /** The same wrapper with the script as exactly one single-quoted token that runs to the end of the command. */
-const WRAPPER_SINGLE = /^\s*(?:"([^"]+)"|(\S+))\s+((?:-(?:NoProfile|NoLogo|NonInteractive)\s+)*)-(?:Command|c)\s+'((?:[^']|'')*)'\s*$/i;
+const WRAPPER_SINGLE = /^[ \t]+((?:-(?:NoProfile|NoLogo|NonInteractive)[ \t]+)*)-(?:Command|c)[ \t]+'((?:[^']|'')*)'[ \t]*$/i;
 
 /**
  * T021: Codex 0.160 quotes a script without `'` in single quotes (`... -NoProfile -Command 'Get-Content a.txt'`,
@@ -214,11 +232,10 @@ const WRAPPER_SINGLE = /^\s*(?:"([^"]+)"|(\S+))\s+((?:-(?:NoProfile|NoLogo|NonIn
  * both ways (`alsoAs`), and both readings must be approved. Anything after the closing quote, an unpaired
  * quote or another parameter in front does not match, so such a command stays unread (unrecognised).
  */
-const unwrapSingleQuoted = (command: string): { script: string; safe: boolean; alsoAs?: string } | undefined => {
-  const m = WRAPPER_SINGLE.exec(command);
-  const exe = m ? normaliseAbsolute(m[1] ?? m[2]!) : undefined;
-  if (!m || exe === undefined || !POWERSHELL_EXE.test(exe)) return undefined;
-  const body = m[4]!;
+const unwrapSingleQuoted = (rest: string): { script: string; safe: boolean; alsoAs?: string } | undefined => {
+  const m = WRAPPER_SINGLE.exec(rest);
+  if (!m) return undefined;
+  const body = m[2]!;
   return { script: body.replaceAll("''", "'"), safe: true, ...(body.includes("''") && { alsoAs: body.replaceAll("''", '') }) };
 };
 

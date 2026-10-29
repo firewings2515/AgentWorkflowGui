@@ -234,3 +234,44 @@ describe('T021 Job members on the real machine (simulated kernel32)', () => {
     ]);
   });
 });
+
+describe('t021-r1-P2-1 a PID reused inside a Job is another process (simulated kernel32)', () => {
+  it("t021-r1-P2-1 the reviewer's case: PID 200 at A exits, PID 200 at B appears; closing marks both ended", async () => {
+    const members = [100, 200];
+    const created: Record<number, number> = { 100: 100_000, 200: 200_000 };
+    const native: HostNative = {
+      createKillOnCloseJob: () => 1n,
+      terminateJob: () => undefined,
+      jobProcessIds: () => members,
+      openProcess: (pid) => (members.includes(pid) ? BigInt(pid) : undefined),
+      isProcessInJob: (handle, job) => job === 1n && members.includes(Number(handle)),
+      creationTime: (handle) => created[Number(handle)]!,
+      imagePath: () => 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
+      exitCodeOf: (handle) => (members.includes(Number(handle)) ? undefined : 0),
+      terminateProcess: () => true,
+      closeHandle: () => undefined,
+    };
+    const launch = () => Object.assign(new EventEmitter(), { pid: 100, startedAt: 100_000 }) as unknown as JobChild;
+    const { rows, repository } = memoryRepository();
+    const host = new WindowsProcessHost({ repository, native, launch });
+    host.spawn(A, 'codex', { command: 'codex.exe' });
+
+    expect((await host.listOwned(A)).map((p) => [p.pid, p.startedAt])).toEqual([
+      [100, new Date(100_000).toISOString()],
+      [200, new Date(200_000).toISOString()],
+    ]);
+    // The first PID 200 exits and the OS hands the PID to a new command in the same Job.
+    created[200] = 300_000;
+    expect((await host.listOwned(A)).map((p) => [p.pid, p.startedAt])).toEqual([
+      [100, new Date(100_000).toISOString()],
+      [200, new Date(300_000).toISOString()],
+    ]);
+    members.splice(0, members.length);
+    await host.closeJob(A);
+    expect(rows.map((r) => [r.pid, r.startedAt, r.endedAt !== undefined])).toEqual([
+      [100, new Date(100_000).toISOString(), true],
+      [200, new Date(200_000).toISOString(), true],
+      [200, new Date(300_000).toISOString(), true],
+    ]);
+  });
+});

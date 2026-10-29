@@ -291,6 +291,31 @@ describe('review round 1 (T017-r1-result.md)', () => {
     expect(s.logs.join('\n')).not.toContain(token);
   });
 
+  it('t021-r1-P2-2 the token printed as AWG_GUI_MCP_TOKEN=<value>, with no Bearer, is redacted in the events, the database and the log', async () => {
+    const s = await start();
+    await createSession(s);
+    const sessionId = SessionId.parse('session-a');
+    // The mount's token stands in for the one a session's claude.exe carries in its environment (T021).
+    const token = s.adapters[0]!.started[0]!.mcp!.token;
+    const env = `PATH=C:\\Windows\nAWG_GUI_MCP_TOKEN=${token}\nUSERNAME=u`;
+    const adapter = s.adapters[0]!;
+    const at = '2026-10-29T01:00:00.000Z';
+    const itemId = 'cmd-env' as never;
+    // `npm run env`, `Get-ChildItem Env:` and the like: the command's streamed output, its final output, the reply.
+    adapter.emit({ type: 'item.updated', item: { id: itemId, sessionId, kind: 'command', command: 'npm run env', cwd: dir, state: 'running', output: '', outputTruncated: false, startedAt: at } });
+    adapter.emit({ type: 'item.outputDelta', sessionId, itemId, delta: env.slice(0, 30) });
+    adapter.emit({ type: 'item.outputDelta', sessionId, itemId, delta: env.slice(30) });
+    adapter.emit({ type: 'item.updated', item: { id: itemId, sessionId, kind: 'command', command: 'npm run env', cwd: dir, state: 'completed', exitCode: 0, output: env, outputTruncated: false, startedAt: at, endedAt: at } });
+    adapter.emit({ type: 'message.completed', message: { id: MessageId.parse('a-env'), sessionId, role: 'assistant', origin: { kind: 'agent' }, text: `The environment has AWG_GUI_MCP_TOKEN=${token}.`, attachments: [], createdAt: at } });
+    adapter.emit({ type: 'runtime.exited', runtime: 'codex', sessionIds: [sessionId], expected: false, code: 1, signal: null, error: `env: AWG_GUI_MCP_TOKEN=${token}`, at });
+    await settle();
+    await s.backend.shutdown();
+    expect(databaseBytes()).not.toContain(token);
+    expect(JSON.stringify(s.envelopes)).not.toContain(token);
+    expect(JSON.stringify(s.envelopes)).toContain('AWG_GUI_MCP_TOKEN=[redacted]');
+    expect(s.logs.join('\n')).not.toContain(token);
+  });
+
   it('r1-P1-5 the database closes only after the core settled: a start still running at exit is closed first', async () => {
     const order: string[] = [];
     const s = await start({ order, configure: (adapter) => adapter.startModes.push('held') });

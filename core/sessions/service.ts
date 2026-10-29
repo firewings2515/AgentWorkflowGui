@@ -34,6 +34,7 @@ import {
 import { DeliveryService, type DeliveryEscalation, type DispatchOutcome, type PayloadDelivery, type RecoveryReport } from '../delivery';
 import type {
   AppRepositories,
+  Conversation,
   DeliveryStore,
   DispatchEntry,
   McpMount,
@@ -104,8 +105,10 @@ const fail = (
 
 const errorName = (error: unknown) => (error instanceof Error ? error.name : 'non-error thrown');
 
-/** A turn is running: also while it waits for the user (R-05) or a file lock (R-07). */
-const inTurn = (s: Pick<LogicalSession, 'activity'>) => s.activity === 'running' || s.activity === 'waiting-user' || s.activity === 'waiting-lock';
+/** Busy: running, or waiting for the user (R-05) or a file lock (R-07). Not proof that the main turn runs. */
+const busy = (s: Pick<LogicalSession, 'activity'>) => s.activity === 'running' || s.activity === 'waiting-user' || s.activity === 'waiting-lock';
+/** The session's own running turn, not a native sub-agent's (R-13). */
+const runningMainTurn = (conversation: Conversation) => conversation.turns.find((t) => t.state === 'running' && t.nativeTaskId === undefined);
 
 /** An item the last run left open, as ended by that run's exit (T021); undefined when it had ended. */
 const endedByExit = (item: SessionItem, endedAt: Timestamp): SessionItem | undefined => {
@@ -384,7 +387,7 @@ export class SessionService {
     for (const s of sessions)
       runningNativeTasks += (await this.repos.conversations.get(s.id)).nativeTasks.filter((t) => t.state === 'running').length;
     return {
-      runningSessions: sessions.filter(inTurn).map((s) => s.id),
+      runningSessions: sessions.filter(busy).map((s) => s.id),
       heldRequests: sessions.reduce((n, s) => n + this.gate.heldFor(s.id).length, 0),
       runningNativeTasks,
     };
@@ -527,7 +530,7 @@ export class SessionService {
       const provisioned = await this.ensureProvisioned(session);
       if (this.closing) return closingFailure(requestId);
       if (!provisioned.ok) return fail(requestId, provisioned.code, provisioned.message, provisioned);
-      const entry: DispatchEntry = inTurn(session) ? { kind: 'insert' } : { kind: 'new-turn' };
+      const entry: DispatchEntry = (await this.inMainTurn(session)) ? { kind: 'insert' } : { kind: 'new-turn' };
       const accepted = await this.delivery.accept({
         kind: 'user-message',
         operationId,
@@ -938,7 +941,7 @@ export class SessionService {
       // A busy target gets the message inside its running turn (SP-05).
       await this.dispatchPending(p.operationId, {
         origin,
-        entry: inTurn(target) ? { kind: 'insert' } : { kind: 'new-turn' },
+        entry: (await this.inMainTurn(target)) ? { kind: 'insert' } : { kind: 'new-turn' },
       });
       record = (await this.store.get(p.operationId)) ?? record;
     }
@@ -1343,16 +1346,28 @@ export class SessionService {
    * nothing of it waits any more it is back to running, or idle when its turn ended meanwhile (T021).
    */
   private async followHold(request: PermissionRequest): Promise<void> {
-    const waits = (r: PermissionRequest) => r.state === 'held' && r.hold?.reason === 'awaiting-user';
     const { sessionId } = request;
+    const conversation = await this.repos.conversations.get(sessionId);
+    // Only what blocks the session itself counts: a background sub-agent waiting for the user leaves an idle
+    // session idle, so a new message still starts a turn (t021-r1-P1-2, R-13).
+    const main = runningMainTurn(conversation);
+    const waits = (r: PermissionRequest) =>
+      r.state === 'held' && r.hold?.reason === 'awaiting-user' && (r.nativeTaskId === undefined || (main !== undefined && r.turnId === main.id));
     if (waits(request)) {
       await this.updateSession(sessionId, (s) => (s.activity === 'running' || s.activity === 'idle' ? { ...s, activity: 'waiting-user' } : undefined));
       return;
     }
     if ((await this.repos.sessions.get(sessionId))?.activity !== 'waiting-user') return;
-    const conversation = await this.repos.conversations.get(sessionId);
     if (conversation.permissionRequests.some(waits)) return;
-    await this.setActivity(sessionId, conversation.turns.some((t) => t.state === 'running' && t.nativeTaskId === undefined) ? 'running' : 'idle');
+    await this.setActivity(sessionId, main !== undefined ? 'running' : 'idle');
+  }
+
+  /**
+   * A message joins the running turn only when the session's own turn really runs: busy is not enough, since
+   * waiting-user may come from a request outside any turn (t021-r1-P1-2).
+   */
+  private async inMainTurn(session: Pick<LogicalSession, 'id' | 'activity'>): Promise<boolean> {
+    return busy(session) && runningMainTurn(await this.repos.conversations.get(session.id)) !== undefined;
   }
 
   private async setActivity(sessionId: SessionId, activity: LogicalSession['activity']): Promise<void> {

@@ -32,13 +32,18 @@ interface OpenJob extends SessionJob {
   handle: kernel32.Handle;
   runtime?: Runtime;
   hosts: Set<JobChild>;
-  /** Every process seen in the Job, by PID, with its creation time. */
-  seen: Map<number, OwnedProcess>;
+  /**
+   * Every process seen in the Job, by PID and creation time: a PID the OS reuses inside the Job is another
+   * process, and the earlier one keeps its record until the Job ends (t021-r1-P2-1).
+   */
+  seen: Map<string, OwnedProcess>;
 }
 
 const iso = (ms: number) => new Date(ms).toISOString();
 const sameProcess = (a: Pick<OwnedProcess, 'pid' | 'startedAt'>, b: Pick<OwnedProcess, 'pid' | 'startedAt'>) =>
   a.pid === b.pid && Date.parse(a.startedAt) === Date.parse(b.startedAt);
+/** The key of one process: its PID alone can come back as another process. */
+const identityKey = (p: Pick<OwnedProcess, 'pid' | 'startedAt'>) => `${String(p.pid)}@${String(Date.parse(p.startedAt))}`;
 /** Image names (lower case) of Job members that are never the agent's commands. */
 const HELPER_IMAGES = new Set(['conhost.exe', 'codex-code-mode-host.exe']);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -136,8 +141,8 @@ export class WindowsProcessHost implements ProcessHost {
         this.log('debug', `cannot read process ${pid} of ${job.jobRef}`, error);
       }
       if (!info) continue;
-      const known = job.seen.get(pid);
-      if (known && known.startedAt === info.startedAt) {
+      const known = job.seen.get(identityKey({ pid, startedAt: info.startedAt }));
+      if (known) {
         live.push(known);
         continue;
       }
@@ -151,7 +156,7 @@ export class WindowsProcessHost implements ProcessHost {
 
   private remember(job: OpenJob, runtime: Runtime, p: Pick<OwnedProcess, 'pid' | 'startedAt' | 'kind'>): OwnedProcess {
     const record: OwnedProcess = { ...p, sessionId: job.sessionId, runtime, jobRef: job.jobRef, recordedAt: this.now() };
-    job.seen.set(p.pid, record);
+    job.seen.set(identityKey(p), record);
     this.options.repository?.record(record).catch((error: unknown) => this.log('warn', 'could not record an owned process', error));
     return record;
   }

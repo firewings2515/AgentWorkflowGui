@@ -65,3 +65,35 @@ describe('T021 R-12: the model a turn was started with is the configured one fro
     expect(h.of('model.observed')).toEqual([]);
   });
 });
+
+describe('t021-r1-P1-3 the configured model is reported whichever comes first, the turn/start response or turn/started', () => {
+  const startWithModel = out('turn/start', 3, { threadId: THREAD_ID, input: [{ type: 'text', text: 'go', text_elements: [] }], clientUserMessageId: attempt.clientMessageId, model: 'gpt-5.6-luna', effort: 'low' });
+  const go = { nativeSessionRef: THREAD_ID, attempt, text: 'go', entry: { kind: 'new-turn' as const, model: { runtime: 'codex' as const, model: 'gpt-5.6-luna', effort: 'low' } } };
+  const expected = [{ type: 'model.observed', sessionId: SESSION, observed: { source: 'configured', model: 'gpt-5.6-luna', observedAt: AT }, at: AT }];
+
+  it('t021-r1-P1-3 the response first, turn/started only after dispatchOnce returned: reported once', async () => {
+    const h = await resumed([startWithModel, reply(3, recordedResult(sp01, 'turn/start'))]);
+    await h.adapter.dispatchOnce(go);
+    expect(h.of('model.observed')).toEqual([]);
+    // The notification arrives later, on its own.
+    h.fake.stdout.write(`${JSON.stringify(turnStarted.data)}\n`);
+    await until(() => h.of('session.activity').length === 1, 'turn/started');
+    expect(h.of('model.observed')).toEqual(expected);
+    expect(h.of('turn.updated')[0]?.turn.requestedModel).toMatchObject({ model: 'gpt-5.6-luna' });
+    expectValidEvents(h.events);
+  });
+
+  it('t021-r1-P1-3 turn/started first, then the response: reported once', async () => {
+    const h = await resumed([startWithModel, turnStarted, reply(3, recordedResult(sp01, 'turn/start'))]);
+    await h.adapter.dispatchOnce(go);
+    await until(() => h.fake.finished && h.of('session.activity').length === 1, 'turn/started');
+    expect(h.of('model.observed')).toEqual(expected);
+  });
+
+  it('t021-r1-P1-3 a repeated turn/started of the same turn does not report it again', async () => {
+    const h = await resumed([startWithModel, reply(3, recordedResult(sp01, 'turn/start')), turnStarted, turnStarted]);
+    await h.adapter.dispatchOnce(go);
+    await until(() => h.fake.finished && h.of('session.activity').length === 2, 'both notifications');
+    expect(h.of('model.observed')).toEqual(expected);
+  });
+});
