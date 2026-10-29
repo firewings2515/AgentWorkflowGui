@@ -13,27 +13,32 @@ import type {
   DispatchAttempt,
   NativeRef,
   OperationId,
+  OperationOutcome,
   ProvisionRecord,
+  SessionId,
 } from '../../contracts';
+import { DeliveryTarget as TargetSchema, DispatchAttempt as AttemptSchema, OperationOutcome as OutcomeSchema } from '../../contracts';
 import type {
   AcceptInput,
   AcceptResult,
   ClaimInput,
   ClaimResult,
   DeliveryStore,
-  HandoffMeta,
-  PayloadContext,
-  PeerMeta,
   ProvisionSpec,
   StoredDelivery,
   WriteResult,
 } from '../../core/ports';
 import { committed, readTransaction, unchanged, writeTransaction } from './transaction';
+import { checkRecord, epochMs, InvalidRecordError, readRecord, StoredDataError } from './codec';
+import { readDeliveryBody, validateDelivery } from './delivery-codec';
 
 interface DeliveryRow {
   operation_id: string;
   kind: StoredDelivery['kind'];
   source_call_ref: string | null;
+  sender: string | null;
+  outcome: string | null;
+  metadata_required: number;
   payload_hash: string;
   proposal_revision: number;
   accepted_target: string;
@@ -44,6 +49,7 @@ interface DeliveryRow {
 }
 
 interface AttemptRow {
+  seq: number;
   attempt_id: string;
   client_message_id: string;
   state: DispatchAttempt['state'];
@@ -62,18 +68,16 @@ export const canonicalJson = (value: unknown): string =>
       : v,
   );
 
-const parse = <T>(text: string): T => JSON.parse(text) as T;
+const parse = <T>(text: string): T => {
+  try { return JSON.parse(text) as T; }
+  catch { throw new StoredDataError('delivery', ['$:json']); }
+};
 
 /** The kind-specific facts (C-12, C-09) are part of the body, so a resend that changes them is a conflict. */
 const bodyOf = (input: AcceptInput) =>
   input.kind === 'provision'
     ? { spec: input.spec }
     : { payload: input.payload, context: input.context, ...(input.handoff !== undefined && { handoff: input.handoff }), ...(input.peer !== undefined && { peer: input.peer }) };
-
-/** Thrown for what contracts 0.5 added and T022 stores: the sender, several counts, outcomes. */
-export class NotStoredYetError extends Error {
-  override name = 'NotStoredYetError';
-}
 
 /** A provision's own target mirrors its delivery state and, once created, the new session (CR2 §3). */
 const provisionTarget = (target: DeliveryTarget, state: DeliveryRecord['state'], createdRef?: string): DeliveryTarget => {
@@ -83,6 +87,8 @@ const provisionTarget = (target: DeliveryTarget, state: DeliveryRecord['state'],
 };
 
 const toAttempt = (row: AttemptRow): DispatchAttempt => {
+  if ((row.state === 'sent') !== (row.native_ref !== null && row.evidence !== null) ||
+    (row.state === 'unknown' && (row.native_ref !== null || row.evidence !== null))) throw new StoredDataError('dispatch_attempt', ['evidence:mismatch']);
   const base = {
     attemptId: row.attempt_id as AttemptId,
     clientMessageId: row.client_message_id as ClientMessageId,
@@ -90,10 +96,10 @@ const toAttempt = (row: AttemptRow): DispatchAttempt => {
   };
   if (row.state === 'sent' && row.native_ref !== null && row.evidence !== null) {
     const resolution = row.resolution === null ? {} : { resolution: parse<Extract<DispatchAttempt, { state: 'sent' }>['resolution']>(row.resolution) };
-    return { ...base, state: 'sent', nativeRef: parse<NativeRef>(row.native_ref), evidence: parse<DeliveryEvidence>(row.evidence), ...resolution };
+    return readRecord(AttemptSchema, 'dispatch_attempt', JSON.stringify({ ...base, state: 'sent', nativeRef: parse<NativeRef>(row.native_ref), evidence: parse<DeliveryEvidence>(row.evidence), ...resolution }));
   }
   const resolution = row.resolution === null ? {} : { resolution: parse<Extract<DispatchAttempt, { state: 'unknown' }>['resolution']>(row.resolution) };
-  return { ...base, state: 'unknown', ...resolution };
+  return readRecord(AttemptSchema, 'dispatch_attempt', JSON.stringify({ ...base, state: row.state, ...resolution }));
 };
 
 export class SqliteDeliveryStore implements DeliveryStore {
@@ -102,11 +108,25 @@ export class SqliteDeliveryStore implements DeliveryStore {
   accept(input: AcceptInput): Promise<AcceptResult> {
     return this.run(() =>
       writeTransaction<AcceptResult>(this.db, () => {
-        if (input.kind === 'handoff' && input.handoff === undefined) return unchanged({ status: 'invalid', detail: 'a handoff needs its handoff facts' });
-        if (input.kind === 'peer-message' && input.peer === undefined) return unchanged({ status: 'invalid', detail: 'a peer message needs its peer facts' });
-        if (input.sender !== undefined) throw new NotStoredYetError('the sender of a delivery is stored from T022 on');
-        if ((input.counts?.length ?? 0) > 1) throw new NotStoredYetError('more than one receive count per delivery is stored from T022 on');
-        const count1 = input.counts?.[0];
+        let target: DeliveryTarget;
+        try {
+          checkRecord(TargetSchema, 'delivery', input.target);
+          target = input.kind === 'provision' ? provisionTarget(input.target, 'pending') : input.target;
+          validateDelivery({
+            ...bodyOf(input), kind: input.kind, operationId: input.operationId, sourceCallRef: input.sourceCallRef,
+            sender: input.sender, payloadHash: input.payloadHash, proposalRevision: input.proposalRevision,
+            target, acceptedAt: input.at, delivery: { state: 'pending', attempts: [] },
+            ...('handoff' in input && { handoff: input.handoff }), ...('peer' in input && { peer: input.peer }),
+          }, true);
+        } catch (error) {
+          if (error instanceof InvalidRecordError) return unchanged({ status: 'invalid', detail: 'invalid delivery acceptance' });
+          throw error;
+        }
+        // A transfer payload belongs to its approved proposal (CR-5): one that does not match it is refused
+        // here, before it could make every later read of the proposal fail closed (T022 r2 P2-1).
+        if (input.kind === 'transfer' && this.transferMismatch(input.operationId, input.payloadHash, input.proposalRevision)) {
+          return unchanged({ status: 'invalid', detail: 'the transfer delivery does not match its approved proposal' });
+        }
         const existing = this.row(input.operationId);
         if (existing !== undefined) {
           const record = this.load(existing);
@@ -114,32 +134,41 @@ export class SqliteDeliveryStore implements DeliveryStore {
           return unchanged(this.sameAcceptance(existing, input) ? { status: 'duplicate', record } : { status: 'conflict', existing: record });
         }
 
-        let target = input.target;
         let bindingKey: string | undefined;
         if (input.kind === 'provision') {
           const provision = input.target.provision;
           if (provision?.operationId !== input.operationId) {
-            throw new TypeError('a provision is accepted with target.provision describing itself (operationId and bindingKey)');
+            return unchanged({ status: 'invalid', detail: 'invalid delivery acceptance' });
           }
           bindingKey = provision.bindingKey;
           const other = this.db.prepare('SELECT operation_id FROM provision WHERE binding_key = ?').get(bindingKey) as { operation_id: string } | undefined;
           if (other !== undefined) return unchanged({ status: 'conflict', existing: this.load(this.mustRow(other.operation_id)) });
-          target = provisionTarget(target, 'pending');
         }
 
-        let count: number | undefined;
-        if (count1 !== undefined) {
-          const counted = this.receiveCount(count1.key);
-          if (count1.limit !== undefined && counted >= count1.limit) {
-            return unchanged({ status: 'limit-exceeded', key: count1.key, count: counted, limit: count1.limit });
+        // Indexed lookups run under BEGIN IMMEDIATE; unique indexes also enforce these identities.
+        if (input.sourceCallRef !== undefined) {
+          const other = this.db.prepare('SELECT * FROM delivery WHERE source_call_ref = ?').get(input.sourceCallRef) as DeliveryRow | undefined;
+          if (other !== undefined) return unchanged({ status: 'conflict', existing: this.load(other) });
+        }
+        if (input.kind === 'handoff' || input.kind === 'peer-message') {
+          const other = this.loadProjection(input.kind, input.kind === 'handoff' ? input.handoff!.handoffId : input.peer!.peerMessageId);
+          if (other !== undefined) return unchanged({ status: 'conflict', existing: other });
+        }
+
+        const counts: { key: string; count: number }[] = [];
+        for (const c of input.counts ?? []) {
+          if (typeof c.key !== 'string' || !c.key || (c.limit !== undefined && (!Number.isSafeInteger(c.limit) || c.limit < 0)) || counts.some((v) => v.key === c.key)) {
+            return unchanged({ status: 'invalid', detail: 'invalid receive count' });
           }
-          count = counted + 1;
+          const counted = this.receiveCount(c.key);
+          if (c.limit !== undefined && counted >= c.limit) return unchanged({ status: 'limit-exceeded', key: c.key, count: counted, limit: c.limit });
+          counts.push({ key: c.key, count: counted + 1 });
         }
 
         this.db
           .prepare(
-            `INSERT INTO delivery (operation_id, kind, source_call_ref, payload_hash, proposal_revision, accepted_target, target, body, state, accepted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+            `INSERT INTO delivery (operation_id, kind, source_call_ref, payload_hash, proposal_revision, accepted_target, target, body, state, accepted_at, accepted_ms, sender, metadata_required)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 1)`,
           )
           .run(
             input.operationId,
@@ -151,12 +180,14 @@ export class SqliteDeliveryStore implements DeliveryStore {
             canonicalJson(target),
             canonicalJson(bodyOf(input)),
             input.at,
+            epochMs(input.at),
+            input.sender ?? null,
           );
         if (bindingKey !== undefined) this.db.prepare('INSERT INTO provision (operation_id, binding_key) VALUES (?, ?)').run(input.operationId, bindingKey);
-        if (count1 !== undefined) this.db.prepare('INSERT INTO receive_admission (operation_id, count_key) VALUES (?, ?)').run(input.operationId, count1.key);
+        counts.forEach((c, ordinal) => this.db.prepare('INSERT INTO receive_admission (operation_id, count_key, ordinal) VALUES (?, ?, ?)').run(input.operationId, c.key, ordinal));
 
         const record = this.load(this.mustRow(input.operationId));
-        return committed(count === undefined || count1 === undefined ? { status: 'accepted', record } : { status: 'accepted', record, counts: [{ key: count1.key, count }] });
+        return committed(counts.length === 0 ? { status: 'accepted', record } : { status: 'accepted', record, counts });
       }),
     );
   }
@@ -165,6 +196,7 @@ export class SqliteDeliveryStore implements DeliveryStore {
     return this.run(() =>
       writeTransaction<WriteResult>(this.db, () => {
         const row = this.row(operationId);
+        if (row !== undefined) this.load(row);
         if (row === undefined || row.state !== 'pending' || row.target !== canonicalJson(expected)) return unchanged('stale');
         // Setting the target it already has is applied by definition: nothing changes, so nothing is written.
         if (canonicalJson(next) === row.target) return unchanged('recorded');
@@ -187,6 +219,7 @@ export class SqliteDeliveryStore implements DeliveryStore {
       writeTransaction<ClaimResult>(this.db, () => {
         const row = this.row(input.operationId);
         if (row === undefined) return unchanged({ status: 'not-found' });
+        this.load(row);
         if (row.state !== 'pending') return unchanged({ status: 'not-pending' });
         // Re-checked inside the transaction (R-04 step 5).
         if (row.proposal_revision !== input.expectedProposalRevision) return unchanged({ status: 'revision-changed' });
@@ -217,6 +250,7 @@ export class SqliteDeliveryStore implements DeliveryStore {
     return this.run(() =>
       writeTransaction<WriteResult>(this.db, () => {
         const row = this.row(operationId);
+        if (row !== undefined) this.load(row);
         if (row?.state !== 'unknown' || !this.isLiveUnknown(operationId, attemptId)) return unchanged('stale');
         const target = parse<DeliveryTarget>(row.target);
         if (!this.refMatchesTarget(row, target, nativeRef)) return unchanged('stale');
@@ -241,6 +275,7 @@ export class SqliteDeliveryStore implements DeliveryStore {
     return this.run(() =>
       writeTransaction<WriteResult>(this.db, () => {
         const row = this.row(operationId);
+        if (row !== undefined) this.load(row);
         if (row?.state !== 'unknown' || !this.isLiveUnknown(operationId, attemptId)) return unchanged('stale');
         const decided = canonicalJson({ decision: resolution.decision, decidedBy: 'user', at: resolution.at, note: resolution.note });
         if (resolution.decision !== 'retry') {
@@ -268,20 +303,64 @@ export class SqliteDeliveryStore implements DeliveryStore {
   listByState(state: DeliveryRecord['state']): Promise<StoredDelivery[]> {
     return this.run(() =>
       readTransaction(this.db, () =>
-        (this.db.prepare('SELECT * FROM delivery WHERE state = ? ORDER BY accepted_at, rowid').all(state) as unknown as DeliveryRow[]).map((row) => this.load(row)),
+        (this.db.prepare('SELECT * FROM delivery WHERE state = ? ORDER BY accepted_ms, rowid').all(state) as unknown as DeliveryRow[]).map((row) => this.load(row)),
       ),
     );
   }
 
-  recordOutcome(): Promise<WriteResult> {
-    return Promise.reject(new NotStoredYetError('operation outcomes are stored from T022 on'));
+  recordOutcome(operationId: OperationId, outcome: OperationOutcome): Promise<WriteResult> {
+    return this.run(() => writeTransaction<WriteResult>(this.db, () => {
+      const row = this.row(operationId);
+      if (row === undefined) return unchanged('stale');
+      this.load(row);
+      const text = canonicalJson(checkRecord(OutcomeSchema, 'delivery', outcome));
+      if (row.outcome !== null) return unchanged(canonicalJson(readRecord(OutcomeSchema, 'delivery', row.outcome)) === text ? 'recorded' : 'stale');
+      this.db.prepare('UPDATE delivery SET outcome = ? WHERE operation_id = ? AND outcome IS NULL').run(text, operationId);
+      return committed('recorded');
+    }));
   }
 
   findBySourceCallRef(sourceCallRef: string): Promise<StoredDelivery | undefined> {
-    return this.run(() => {
-      const row = this.db.prepare('SELECT * FROM delivery WHERE source_call_ref = ? ORDER BY accepted_at LIMIT 1').get(sourceCallRef) as DeliveryRow | undefined;
+    return this.run(() => readTransaction(this.db, () => {
+      const row = this.db.prepare('SELECT * FROM delivery WHERE source_call_ref = ?').get(sourceCallRef) as DeliveryRow | undefined;
       return row === undefined ? undefined : this.load(row);
-    });
+    }));
+  }
+
+  /** Internal synchronous readers: caller owns the transaction (repository projections/snapshot). */
+  loadById(operationId: string): StoredDelivery | undefined {
+    const row = this.row(operationId);
+    return row === undefined ? undefined : this.load(row);
+  }
+
+  loadAll(): StoredDelivery[] {
+    return (this.db.prepare('SELECT * FROM delivery ORDER BY accepted_ms, rowid').all() as unknown as DeliveryRow[]).map((row) => this.load(row));
+  }
+
+  loadProjection(kind: 'handoff' | 'peer-message', id: string): StoredDelivery | undefined {
+    const field = kind === 'handoff' ? 'handoff.handoffId' : 'peer.peerMessageId';
+    const row = this.db.prepare(`SELECT * FROM delivery WHERE kind = '${kind}' AND
+      CASE WHEN json_valid(body) THEN json_extract(body, '$.${field}') END = ?`).get(id) as DeliveryRow | undefined;
+    return row === undefined ? undefined : this.load(row);
+  }
+
+  /** True when a proposal names this operation and is not approved for exactly this payload and revision. */
+  private transferMismatch(operationId: string, payloadHash: string, proposalRevision: number): boolean {
+    const row = this.db
+      .prepare("SELECT body FROM transfer_proposal WHERE CASE WHEN json_valid(body) THEN json_extract(body, '$.operationId') END = ?")
+      .get(operationId) as { body: string } | undefined;
+    if (row === undefined) return false;
+    const proposal = JSON.parse(row.body) as { payloadHash?: unknown; approvedRevision?: unknown };
+    return proposal.payloadHash !== payloadHash || proposal.approvedRevision !== proposalRevision;
+  }
+
+  loadProjections(kind: 'handoff' | 'peer-message', instanceId?: string): StoredDelivery[] {
+    // The instance is in the kind's own facts: `$.handoff.instanceId` or `$.peer.instanceId` (T022 r2 P2-3).
+    const path = kind === 'handoff' ? '$.handoff.instanceId' : '$.peer.instanceId';
+    const filter = instanceId === undefined ? '' : ` AND CASE WHEN json_valid(body) THEN json_extract(body, '${path}') END = ?`;
+    const rows = this.db.prepare(`SELECT * FROM delivery WHERE kind = '${kind}'${filter} ORDER BY accepted_ms, rowid`)
+      .all(...(instanceId === undefined ? [] : [instanceId])) as unknown as DeliveryRow[];
+    return rows.map((row) => this.load(row));
   }
 
   /** The bodies are synchronous; a throw becomes a rejection. */
@@ -300,30 +379,51 @@ export class SqliteDeliveryStore implements DeliveryStore {
   }
 
   private load(row: DeliveryRow): StoredDelivery {
-    const attempts = (this.db.prepare('SELECT * FROM dispatch_attempt WHERE operation_id = ? ORDER BY seq').all(row.operation_id) as unknown as AttemptRow[]).map(toAttempt);
+    if (row.metadata_required !== 0 && row.metadata_required !== 1) throw new StoredDataError('delivery', ['metadata:flag']);
+    readRecord(TargetSchema, 'delivery', row.accepted_target);
+    const admissions = this.db.prepare('SELECT count_key, ordinal FROM receive_admission WHERE operation_id = ? ORDER BY ordinal').all(row.operation_id);
+    if (admissions.some((a, i) => typeof a.count_key !== 'string' || a.count_key.length === 0 || a.ordinal !== i)) {
+      throw new StoredDataError('receive_admission', ['count:invalid']);
+    }
+    const attemptRows = this.db.prepare('SELECT * FROM dispatch_attempt WHERE operation_id = ? ORDER BY seq').all(row.operation_id) as unknown as AttemptRow[];
+    if (attemptRows.some((a, i) => a.seq !== i + 1 || (a.abandoned !== 0 && a.abandoned !== 1))) throw new StoredDataError('dispatch_attempt', ['sequence:invalid']);
+    const attempts = attemptRows.map(toAttempt);
+    if (attemptRows.some((a, i) => (a.abandoned === 1) !== (attempts[i]?.resolution?.decision === 'retry'))) throw new StoredDataError('dispatch_attempt', ['abandoned:mismatch']);
     const base = {
       operationId: row.operation_id as OperationId,
       ...(row.source_call_ref !== null && { sourceCallRef: row.source_call_ref }),
+      ...(row.sender !== null && { sender: row.sender as SessionId }),
+      ...(row.outcome !== null && { outcome: readRecord(OutcomeSchema, 'delivery', row.outcome) }),
       payloadHash: row.payload_hash,
       proposalRevision: row.proposal_revision,
       target: parse<DeliveryTarget>(row.target),
       delivery: { state: row.state, attempts },
       acceptedAt: row.accepted_at,
     };
-    if (row.kind === 'provision') return { ...base, kind: 'provision', spec: parse<{ spec: ProvisionSpec }>(row.body).spec };
-    const body = parse<{ payload: string; context: PayloadContext; handoff?: HandoffMeta; peer?: PeerMeta }>(row.body);
-    return { ...base, ...body, kind: row.kind };
+    if (row.kind === 'provision') {
+      const record = validateDelivery({ ...readDeliveryBody(row.kind, row.body), ...base, kind: 'provision' });
+      const link = this.db.prepare('SELECT binding_key FROM provision WHERE operation_id = ?').get(row.operation_id);
+      if (link?.binding_key !== record.target.provision?.bindingKey) throw new StoredDataError('provision', ['binding:mismatch']);
+      return record;
+    }
+    const body = readDeliveryBody(row.kind, row.body);
+    const record = validateDelivery({ ...body, ...base, kind: row.kind });
+    if (row.metadata_required === 1 && ((record.kind === 'handoff' && record.handoff === undefined) || (record.kind === 'peer-message' && record.peer === undefined))) {
+      throw new StoredDataError('delivery', ['metadata:missing']);
+    }
+    return record;
   }
 
   private sameAcceptance(row: DeliveryRow, input: AcceptInput): boolean {
-    const admission = this.db.prepare('SELECT count_key FROM receive_admission WHERE operation_id = ?').get(row.operation_id) as { count_key: string } | undefined;
+    const admissions = this.db.prepare('SELECT count_key FROM receive_admission WHERE operation_id = ? ORDER BY ordinal').all(row.operation_id) as { count_key: string }[];
     return (
       row.kind === input.kind &&
       row.payload_hash === input.payloadHash &&
       row.proposal_revision === input.proposalRevision &&
       row.accepted_target === canonicalJson(input.target) &&
       row.body === canonicalJson(bodyOf(input)) &&
-      admission?.count_key === input.counts?.[0]?.key
+      row.sender === (input.sender ?? null) &&
+      canonicalJson(admissions.map((a) => a.count_key)) === canonicalJson((input.counts ?? []).map((c) => c.key))
     );
   }
 

@@ -38,7 +38,7 @@ export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadIn
     ...(kind === 'handoff' && { handoff: handoffMeta(overrides.operationId ?? 'op-1') }),
     kind: 'handoff',
     operationId: op('op-1'),
-    sourceCallRef: 'call-1',
+    sourceCallRef: overrides.operationId === undefined || overrides.operationId === 'op-1' ? 'call-1' : `call-${overrides.operationId}`,
     payloadHash: hashOf('payload'),
     payload: 'payload',
     proposalRevision: 1,

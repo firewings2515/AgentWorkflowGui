@@ -53,7 +53,8 @@ export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadIn
     ...(kind === 'handoff' && { handoff: meta }),
     kind: 'handoff',
     operationId: OP,
-    sourceCallRef: 'call-1',
+    // One tool call per operation (C-08): another operation reusing it would be a conflict.
+    sourceCallRef: `call-${operationId}`,
     payloadHash: hashOf(overrides.payload ?? 'payload'),
     payload: 'payload',
     proposalRevision: 1,

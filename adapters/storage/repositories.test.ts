@@ -12,7 +12,7 @@ import { fixtureSnapshot as fx } from '../../contracts/fixtures/snapshot';
 import type { AppRepositories } from '../../core/ports';
 import { InvalidRecordError, StoredDataError } from './codec';
 import { openDatabase } from './database';
-import { SqliteDeliveryStore } from './delivery-store';
+import { canonicalJson, SqliteDeliveryStore } from './delivery-store';
 import { MIGRATIONS, latestVersion, migrate } from './migrations';
 import { createRepositories } from './repositories';
 import { op, payloadInput } from './testing/fixtures';
@@ -563,10 +563,17 @@ describe('upgrading from the T007 schema', () => {
     const first = MIGRATIONS[0];
     if (first === undefined) throw new Error('no migrations');
     expect(migrate(old, [first])).toBe(1);
-    const store = new SqliteDeliveryStore(old);
-    const accepted = await store.accept(payloadInput());
-    expect(accepted.status).toBe('accepted');
-    const before = await store.get(op('op-1'));
+    // Seed the historical schema as its writer did; the current writer requires v4.
+    const input = payloadInput();
+    const body = { payload: input.payload, context: input.context };
+    old.prepare(`INSERT INTO delivery (operation_id, kind, source_call_ref, payload_hash, proposal_revision,
+      accepted_target, target, body, state, accepted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
+      .run(input.operationId, input.kind, input.sourceCallRef!, input.payloadHash, input.proposalRevision,
+        canonicalJson(input.target), canonicalJson(input.target), canonicalJson(body), input.at);
+    old.prepare('INSERT INTO receive_admission (operation_id, count_key) VALUES (?, ?)').run(input.operationId, input.counts![0]!.key);
+    const before = { operationId: input.operationId, kind: input.kind, sourceCallRef: input.sourceCallRef,
+      payloadHash: input.payloadHash, proposalRevision: input.proposalRevision, target: input.target, ...body,
+      delivery: { state: 'pending', attempts: [] }, acceptedAt: input.at };
     old.close();
 
     const upgraded = openDatabase(v1);

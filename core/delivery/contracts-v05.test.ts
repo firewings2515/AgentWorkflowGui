@@ -48,7 +48,7 @@ describe('C-12, C-09: the facts of a handoff and of a peer message are stored wi
     const withGetter = { ...handoffMeta() } as Record<string, unknown>;
     Object.defineProperty(withGetter, 'ruleId', { enumerable: true, get: () => (read++, 'x') });
     expect((await g.service.accept(payloadInput({ handoff: withGetter as never }))).status).toBe('invalid');
-    const upstream = new Proxy(['node-a'], {});
+    const upstream = new Proxy(['node-implement', 'node-review'], {});
     expect((await g.service.accept(payloadInput({ handoff: { ...handoffMeta(), expectedUpstream: upstream as never } }))).status).toBe('accepted');
     const extra = { ...peer, mcp: { token: 'secret' } };
     expect((await g.service.accept(payloadInput({ kind: 'peer-message', operationId: op('op-p'), peer: extra, counts: undefined }))).status).toBe('invalid');
@@ -119,7 +119,7 @@ describe('outcomes and lookup by tool-call identity', () => {
     expect(await store.recordOutcome(OP, { ...outcome, kind: 'failed' })).toBe('stale');
     expect(await store.recordOutcome(OperationId.parse('missing'), outcome)).toBe('stale');
     expect(await store.get(OP)).toMatchObject({ outcome, delivery: { state: 'pending' } });
-    expect((await store.findBySourceCallRef('call-1'))?.operationId).toBe(OP);
+    expect((await store.findBySourceCallRef(`call-${OP}`))?.operationId).toBe(OP);
     expect(await store.findBySourceCallRef('call-other')).toBeUndefined();
   });
 });
@@ -168,5 +168,14 @@ describe('T020 r2: review counterexamples', () => {
     expect(await g.service.dispatch(OP, { origin: peerOrigin })).toMatchObject({ status: 'not-dispatched', reason: 'origin-mismatch' });
     expect((await g.service.dispatch(OP)).status).toBe('sent');
     expect(g.codex.dispatched[0]).not.toHaveProperty('origin');
+  });
+});
+
+describe('T022 r2 P2-4: one operation per tool call', () => {
+  it('a second operation with an accepted sourceCallRef is a conflict with the first', async () => {
+    const store = new MemoryDeliveryStore();
+    await store.accept(payloadInput());
+    expect(await store.accept(payloadInput({ operationId: op('op-2'), sourceCallRef: `call-${OP}` }))).toMatchObject({ status: 'conflict', existing: { operationId: OP } });
+    expect(await store.get(op('op-2'))).toBeUndefined();
   });
 });
