@@ -275,7 +275,7 @@ export class TransferService implements TransferHooks {
   /** The draft's real content, bound to the source's content version now (at its turn boundary). */
   private async complete(p: TransferProposal, source: LogicalSession, noteTurn: string | undefined): Promise<void> {
     const history = await this.history(source);
-    // A session a transfer created has no message of the user's: its goal is that transfer's.
+    // A session a transfer created keeps that transfer's goal: a later message of the user is a step of it.
     const inherited = (await this.repos.transfers.list()).find((t) => t.createdSessionId === source.id)?.content.goal;
     const digest = digestOf(history.entries, inherited ?? (source.title.trim().length > 0 ? source.title : `Continue the work of session ${source.id}`));
     let note = digest.note;
@@ -290,7 +290,7 @@ export class TransferService implements TransferHooks {
     // Nothing the GUI handed out (an MCP token quoted in a transcript) leaves in a proposal (C-07).
     const redact = (text: string) => this.options.sessions.runtimes.redactText(text);
     const content: TransferProposal['content'] = {
-      goal: redact(digest.goal),
+      goal: redact(inherited ?? digest.goal),
       note: redact(note),
       noteSource: p.content.noteSource,
       diff: redact(digest.diff),

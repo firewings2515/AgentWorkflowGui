@@ -1,9 +1,9 @@
 // T023 acceptance in core: fake adapters and memory ports (the proposals projected from the delivery store).
 import { describe, expect, it } from 'vitest';
-import { SessionId, TransferId } from '../../../contracts';
+import { MessageId, SessionId, TransferId } from '../../../contracts';
 import { NOTE_REQUEST } from '../frame';
 import { noteOperationOf, payloadOperationOf, targetSessionOf } from '../ids';
-import { CLAUDE, CODEX, cancel, confirm, dispatches, prepare, proposal, settle, source, starts, work, type World } from './harness';
+import { CLAUDE, CODEX, cancel, confirm, dispatches, prepare, proposal, rid, settle, source, starts, work, type World } from './harness';
 
 const T = TransferId.parse('tr-1');
 const target = targetSessionOf(T);
@@ -134,12 +134,18 @@ export const commandCases = (backend: string, make: () => Promise<World>) =>
         const s = await source(w);
         await ready(w, s);
         expect(await confirm(w, T)).toMatchObject({ ok: true });
+        // The user asks the new session for one more step first (as in the live run): the goal stays the transfer's.
+        const next = await w.repositories.sessions.get(target);
+        expect(
+          await w.run({ type: 'session.send', requestId: rid(), sessionId: target, messageId: MessageId.parse('m-step'), expectedRevision: next!.revision, text: 'Now do subtract() only.', attachments: [] }),
+        ).toMatchObject({ ok: true });
         const back = TransferId.parse('tr-back');
         expect(await prepare(w, target, back, { target: CLAUDE })).toMatchObject({ ok: true });
         const p = await proposal(w, back);
         expect(p).toMatchObject({ state: 'awaiting-confirmation', sourceSessionId: target, content: { goal: 'Implement add() and subtract() in calc.js.' } });
         expect(p.content.note).toContain(`(Work transferred in from session ${s}, transfer ${T})`);
         expect(p.content.note).not.toContain('## Goal');
+        expect(p.content.note).toContain('User: Now do subtract() only.');
         expect(await confirm(w, back)).toMatchObject({ ok: true });
         expect((await w.repositories.sessions.get(targetSessionOf(back)))?.derivedFromSessionId).toBe(target);
       });
