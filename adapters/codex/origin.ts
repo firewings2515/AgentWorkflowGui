@@ -2,7 +2,7 @@
 // input, so a payload that is not from the user is wrapped in a text envelope naming its source; the
 // model is told it is not the user and not the user's approval. The envelope is also read back, so a
 // restarted GUI shows a stored peer message with its origin and reconciliation still matches its text.
-import { HandoffId, type MessageOrigin, PeerMessageId, SessionId } from '../../contracts';
+import { HandoffId, type MessageOrigin, PeerMessageId, SessionId, TransferId } from '../../contracts';
 
 const HEADER = '[AgentWorkflowGui]';
 const SEPARATOR = '\n---\n';
@@ -13,6 +13,8 @@ const describeSource = (origin: Exclude<MessageOrigin, { kind: 'user' }>): strin
       return `from GUI session ${origin.fromSessionId} (peer message ${origin.peerMessageId})`;
     case 'handoff':
       return `from GUI session ${origin.fromSessionId} (handoff ${origin.handoffId})`;
+    case 'transfer':
+      return `from GUI session ${origin.fromSessionId} (transfer ${origin.transferId})`;
     case 'agent':
       return 'from an agent';
     case 'system':
@@ -41,6 +43,14 @@ const PATTERNS: [RegExp, (m: RegExpExecArray) => MessageOrigin | undefined][] = 
       const from = SessionId.safeParse(m[1]);
       const id = HandoffId.safeParse(m[2]);
       return from.success && id.success ? { kind: 'handoff', fromSessionId: from.data, handoffId: id.data } : undefined;
+    },
+  ],
+  [
+    /^This message comes from GUI session (\S+) \(transfer (\S+)\), not from the user\./,
+    (m) => {
+      const from = SessionId.safeParse(m[1]);
+      const id = TransferId.safeParse(m[2]);
+      return from.success && id.success ? { kind: 'transfer', fromSessionId: from.data, transferId: id.data } : undefined;
     },
   ],
   [/^This message comes from an agent, not from the user\./, () => ({ kind: 'agent' })],

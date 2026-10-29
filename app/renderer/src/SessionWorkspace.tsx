@@ -49,8 +49,8 @@ function Transcript({ snapshot, session, view, visible, onContext, store, ipcSta
     </details>}
     {messages.length === 0 && <Empty>這個 session 尚無主對話訊息。</Empty>}
     {messages.map(message => <article className={`message message-${message.role} origin-${message.origin.kind}`} key={message.id}>
-      <div className="message-meta"><strong>{message.origin.kind === 'peer' || message.origin.kind === 'handoff'
-        ? `來自 ${snapshot.sessions.find(source => 'fromSessionId' in message.origin && source.id === message.origin.fromSessionId)?.title ?? message.origin.fromSessionId}`
+      <div className="message-meta"><strong>{message.origin.kind === 'peer' || message.origin.kind === 'handoff' || message.origin.kind === 'transfer'
+        ? `${message.origin.kind === 'transfer' ? '轉交自' : '來自'} ${snapshot.sessions.find(source => 'fromSessionId' in message.origin && source.id === message.origin.fromSessionId)?.title ?? message.origin.fromSessionId}`
         : message.role === 'user' ? '你' : message.role === 'system' ? '系統' : 'Agent'}
       </strong><time dateTime={message.createdAt}>{formatTime(message.createdAt)}</time></div>
       <p>{message.text}</p>

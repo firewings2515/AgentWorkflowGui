@@ -17,6 +17,7 @@ import {
   SessionId,
   TaskId,
   Timestamp,
+  TransferId,
   TurnId,
 } from './common';
 import { DeliveryRecord, OperationOutcome, deliveryTargetIssues } from './delivery';
@@ -150,13 +151,17 @@ export type Turn = z.infer<typeof Turn>;
 
 /**
  * Where a message came from. `peer` (send_message) and `handoff` come from another session via the GUI
- * broker (R-03, R-04); neither is ever treated as the user's approval.
+ * broker (R-03, R-04); neither is ever treated as the user's approval. `transfer` is a cross-tool transfer
+ * (R-02): the confirmed payload in the new session, or the GUI asking the source for its handoff note; its
+ * `fromSessionId` is the transfer's source session (the session itself for that note request). It is not
+ * the user's approval either.
  */
 export const MessageOrigin = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('user') }),
   z.strictObject({ kind: z.literal('agent') }),
   z.strictObject({ kind: z.literal('peer'), fromSessionId: SessionId, peerMessageId: PeerMessageId }),
   z.strictObject({ kind: z.literal('handoff'), fromSessionId: SessionId, handoffId: HandoffId }),
+  z.strictObject({ kind: z.literal('transfer'), fromSessionId: SessionId, transferId: TransferId }),
   z.strictObject({ kind: z.literal('system') }),
 ]);
 
@@ -166,7 +171,7 @@ export const Attachment = z.strictObject({
   name: z.string().min(1),
 });
 
-const originsByRole = { user: ['user', 'peer', 'handoff'], assistant: ['agent'], system: ['system'] } as const;
+const originsByRole = { user: ['user', 'peer', 'handoff', 'transfer'], assistant: ['agent'], system: ['system'] } as const;
 
 export const Message = z
   .strictObject({

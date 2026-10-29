@@ -206,7 +206,8 @@ const within = <T>(promise: Promise<T>, ms: number): Promise<{ value: T } | unde
 
 /**
  * `SDKUserMessage.origin` for a payload (R-03, SP-05): only the user's own input is `human`; a message from
- * another session is `peer` and never counts as the user's approval; anything else stays unattributed.
+ * another session (a peer message, a handoff, a transfer) is `peer` and never counts as the user's approval;
+ * anything else stays unattributed.
  */
 const wireOrigin = (origin: MessageOrigin | undefined): WireOrigin | undefined => {
   switch (origin?.kind) {
@@ -214,6 +215,7 @@ const wireOrigin = (origin: MessageOrigin | undefined): WireOrigin | undefined =
       return { kind: 'human' };
     case 'peer':
     case 'handoff':
+    case 'transfer':
       return { kind: 'peer', from: origin.fromSessionId };
     default:
       return undefined;

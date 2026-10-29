@@ -10,6 +10,7 @@ import {
   issueRule,
   LogicalSession,
   McpRejection,
+  Message,
   PermissionRequest,
   Snapshot,
   TransferProposal,
@@ -135,5 +136,14 @@ describe('T020 r2: transfer lifecycle after approval, rework on handoffs', () =>
     const handoff = pick(fixtureSnapshotInput.handoffs, 1);
     expect(Handoff.parse(handoff).rework).toBe(false);
     expect(Handoff.parse({ ...handoff, rework: true }).rework).toBe(true);
+  });
+
+  it('T023 G-1: a transfer payload is a user-role message from the transfer, never a system one', () => {
+    const message = { id: 'm-transfer', sessionId: 's-target', role: 'user', text: 'payload', createdAt: at };
+    const origin = { kind: 'transfer', fromSessionId: 's-source', transferId: 'transfer-1' };
+    expect(ok(Message, { ...message, origin })).toBe(true);
+    expect(ruleIssues(Message, { ...message, role: 'system', origin })).toContainEqual(expect.objectContaining({ rule: 'message.origin-role' }));
+    expect(ruleIssues(Message, { ...message, role: 'assistant', origin })).toContainEqual(expect.objectContaining({ rule: 'message.origin-role' }));
+    expect(ok(Message, { ...message, origin: { kind: 'transfer', fromSessionId: 's-source' } })).toBe(false);
   });
 });
