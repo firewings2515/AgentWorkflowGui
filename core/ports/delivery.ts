@@ -159,6 +159,10 @@ export type AcceptInput =
   | (AcceptBase & PayloadMeta & { kind: PayloadKind; payload: string; context: PayloadContext })
   | (AcceptBase & { kind: 'provision'; spec: ProvisionSpec });
 
+/**
+ * `sourceCallRef` is unique per runtime call (C-08): another operationId accepted with a `sourceCallRef`
+ * already stored is a `conflict` with the operation that has it.
+ */
 export type AcceptResult =
   /** `counts`: each key's count after this acceptance, in the order given. */
   | { status: 'accepted'; record: StoredDelivery; counts?: { key: string; count: number }[] }

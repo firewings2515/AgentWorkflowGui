@@ -99,7 +99,7 @@ describe('accept', () => {
 
   it('requires a provision to describe itself in target.provision', async () => {
     const input = provisionInput();
-    await expect(store.accept({ ...input, target: { sessionId: input.spec.sessionId } })).rejects.toThrow(TypeError);
+    expect(await store.accept({ ...input, target: { sessionId: input.spec.sessionId } })).toEqual({ status: 'invalid', detail: 'invalid delivery acceptance' });
   });
 });
 
@@ -132,7 +132,7 @@ describe('claim', () => {
     expect(await store.claim(claimInput(op('unbound')))).toEqual({ status: 'target-not-ready' });
   });
 
-  it('lets two connections race for the claim and gives it to one', async () => {
+  it('sequential claims across two connections give the claim to one', async () => {
     const other = openDatabase(join(dir, 'app.sqlite'));
     try {
       const results = await Promise.all([store.claim(claimInput(OP)), new SqliteDeliveryStore(other).claim(claimInput(OP))]);

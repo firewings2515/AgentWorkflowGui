@@ -66,8 +66,8 @@ const withStore = async <T>(path: string, body: (store: SqliteDeliveryStore, db:
   }
 };
 
-type Mode = Stage | 'before-claim' | 'race' | 'none';
-const runsToEnd = (stage: Mode) => stage === 'none' || stage === 'race';
+type Mode = Stage | 'before-claim' | 'race' | 'none' | 'accept-race' | 'accept-uncommitted' | 'accept-committed';
+const runsToEnd = (stage: Mode) => stage === 'none' || stage === 'race' || stage === 'accept-race';
 
 type ChildMessage = { ready?: boolean; claimed?: boolean; stage?: string; result?: string };
 
@@ -113,7 +113,7 @@ const launch = (paths: { db: string; receiver: string }, stage: Mode, onMessage?
  * claim attempt, so the losers' claims certainly overlap the winner's committed unknown. `log` records
  * the order in which claim attempts settled and winners were released.
  */
-const race = async (paths: { db: string; receiver: string }, count: number) => {
+const race = async (paths: { db: string; receiver: string }, count: number, mode: 'race' | 'accept-race' = 'race') => {
   const ready: ChildProcess[] = [];
   const winners: ChildProcess[] = [];
   const log: string[] = [];
@@ -125,7 +125,7 @@ const race = async (paths: { db: string; receiver: string }, count: number) => {
   };
   const results = await Promise.all(
     Array.from({ length: count }, () =>
-      launch(paths, 'race', (message, proc) => {
+      launch(paths, mode, (message, proc) => {
         if (message.ready === true && ready.push(proc) === count) for (const p of ready) p.send('go');
         if (message.claimed === true) {
           log.push('claimed');
@@ -155,6 +155,33 @@ const recover = (paths: { db: string; receiver: string }) =>
   });
 
 describe('CR-2 outbox scenarios (spike cr2-outbox-test.mjs)', () => {
+  it('T022: concurrent processes accept the same handoff and both counts exactly once', async () => {
+    const dir = mkdtempSync(join(root, 'accept-race-'));
+    const paths = { db: join(dir, 'local.sqlite'), receiver: join(dir, 'unused.sqlite') };
+    openDatabase(paths.db).close();
+    const { results } = await race(paths, 2, 'accept-race');
+    expect(results.map((r) => r.result).sort()).toEqual(['accepted', 'duplicate']);
+    await withStore(paths.db, async (store, db) => {
+      expect((await store.get(OP))?.kind).toBe('handoff');
+      expect(db.prepare('SELECT count_key FROM receive_admission ORDER BY ordinal').all()).toEqual([{ count_key: COUNT_KEY }, { count_key: 'rework' }]);
+    });
+  });
+
+  it.each(['accept-uncommitted', 'accept-committed'] as const)('T022: crash at %s leaves the handoff and every count atomic', async (stage) => {
+    const dir = mkdtempSync(join(root, 'accept-crash-'));
+    const paths = { db: join(dir, 'local.sqlite'), receiver: join(dir, 'unused.sqlite') };
+    openDatabase(paths.db).close();
+    await launch(paths, stage);
+    await withStore(paths.db, async (store, db) => {
+      const before = await store.get(OP);
+      expect(before !== undefined).toBe(stage === 'accept-committed');
+      expect(db.prepare('SELECT count(*) AS n FROM receive_admission').get()).toEqual({ n: stage === 'accept-committed' ? 2 : 0 });
+      expect((await store.accept(payloadInput({ counts: [{ key: COUNT_KEY, limit: 3 }, { key: 'rework', limit: 1 }] }))).status)
+        .toBe(stage === 'accept-committed' ? 'duplicate' : 'accepted');
+      expect(db.prepare('SELECT count(*) AS n FROM receive_admission').get()).toEqual({ n: 2 });
+    });
+  });
+
   it('1. duplicate admission counts once; changed payload or destination is rejected', async () => {
     await withStore(join(mkdtempSync(join(root, 'dup-')), 'local.sqlite'), async (store, db) => {
       expect(await store.accept(payloadInput())).toMatchObject({ status: 'accepted', counts: [{ key: COUNT_KEY, count: 1 }] });

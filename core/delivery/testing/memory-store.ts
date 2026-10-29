@@ -106,6 +106,9 @@ export class MemoryDeliveryStore implements DeliveryStore {
       if (existing !== undefined) {
         return { value: this.sameAcceptance(existing, input) ? { status: 'duplicate', record: this.load(existing) } : { status: 'conflict', existing: this.load(existing) } };
       }
+      // A tool call's identity names one operation (C-08), as the SQLite store's unique index does.
+      const sameCall = input.sourceCallRef === undefined ? undefined : [...this.rows.values()].find((r) => r.sourceCallRef === input.sourceCallRef);
+      if (sameCall !== undefined) return { value: { status: 'conflict', existing: this.load(sameCall) } };
       let target = input.target;
       let bindingKey: string | undefined;
       if (input.kind === 'provision') {

@@ -202,10 +202,85 @@ UPDATE permission_request SET body = json_set(body, '$.server', json_extract(bod
   WHERE json_extract(body, '$.elicitation.serverName') IS NOT NULL AND json_extract(body, '$.server') IS NULL;
 `;
 
+/** v4: atomic multi-count admissions and workflow/transfer persistence (T022). */
+const storage05V4 = `
+ALTER TABLE delivery ADD COLUMN sender TEXT;
+ALTER TABLE delivery ADD COLUMN outcome TEXT;
+-- Older payloads did not always carry projection metadata. Never invent missing facts.
+ALTER TABLE delivery ADD COLUMN metadata_required INTEGER NOT NULL DEFAULT 0 CHECK (metadata_required IN (0, 1));
+CREATE INDEX delivery_by_source_call ON delivery (source_call_ref);
+ALTER TABLE receive_admission RENAME TO receive_admission_v1;
+DROP INDEX receive_admission_by_key;
+CREATE TABLE receive_admission (
+  operation_id TEXT NOT NULL REFERENCES delivery (operation_id),
+  count_key TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  PRIMARY KEY (operation_id, count_key),
+  UNIQUE (operation_id, ordinal)
+) STRICT;
+INSERT INTO receive_admission SELECT operation_id, count_key, 0 FROM receive_admission_v1;
+DROP TABLE receive_admission_v1;
+CREATE INDEX receive_admission_by_key ON receive_admission (count_key);
+CREATE TABLE workflow_instance (
+  id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK (revision >= 0),
+  created_ms INTEGER NOT NULL,
+  body TEXT NOT NULL
+) STRICT;
+CREATE TABLE node_session (
+  instance_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  -- Empty task means the root; contract task IDs are nonempty.
+  task_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  PRIMARY KEY (instance_id, node_id, task_id)
+) STRICT;
+CREATE TABLE transfer_proposal (
+  id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK (revision >= 0),
+  created_ms INTEGER NOT NULL,
+  body TEXT NOT NULL
+) STRICT;
+`;
+
+/** v5: indexed identities, chronological delivery ordering and pending transfer links. */
+const storageReviewV5 = `
+ALTER TABLE delivery ADD COLUMN accepted_ms INTEGER NOT NULL DEFAULT 0;
+-- Parse whole seconds, truncate fractions like Date.parse, and apply the offset as integer math.
+-- This avoids SQLite rounding sub-ms fractions or restricting otherwise valid ISO offsets.
+-- An unparsable time becomes 0 (T022 r2 P2-2): the migration still opens the database, and reading the
+-- record then fails closed on its acceptedAt, as for any other damaged row.
+UPDATE delivery SET accepted_ms = coalesce(CAST(strftime('%s', substr(accepted_at, 1, 19)) AS INTEGER) * 1000
+  + CASE WHEN substr(accepted_at, 20, 1) = '.' THEN CAST(substr(substr(accepted_at, 21,
+      length(accepted_at) - 20 - CASE WHEN substr(accepted_at, -1) = 'Z' THEN 1 ELSE 6 END) || '000', 1, 3) AS INTEGER) ELSE 0 END
+  - CASE WHEN substr(accepted_at, -1) = 'Z' THEN 0 ELSE
+      (CASE WHEN substr(accepted_at, -6, 1) = '+' THEN 1 ELSE -1 END)
+      * (CAST(substr(accepted_at, -5, 2) AS INTEGER) * 60 + CAST(substr(accepted_at, -2) AS INTEGER)) * 60000 END, 0);
+DROP INDEX delivery_by_state;
+CREATE INDEX delivery_by_state ON delivery (state, accepted_ms);
+DROP INDEX delivery_by_source_call;
+CREATE UNIQUE INDEX delivery_by_source_call ON delivery (source_call_ref) WHERE source_call_ref IS NOT NULL;
+-- Guard JSON extraction so unrelated damaged bodies do not prevent accepting new operations.
+CREATE UNIQUE INDEX delivery_handoff_id ON delivery
+  (CASE WHEN json_valid(body) THEN json_extract(body, '$.handoff.handoffId') END) WHERE kind = 'handoff';
+CREATE UNIQUE INDEX delivery_peer_id ON delivery
+  (CASE WHEN json_valid(body) THEN json_extract(body, '$.peer.peerMessageId') END) WHERE kind = 'peer-message';
+CREATE INDEX delivery_handoff_instance ON delivery
+  (CASE WHEN json_valid(body) THEN json_extract(body, '$.handoff.instanceId') END, accepted_ms) WHERE kind = 'handoff';
+-- v4 kept only the identity. Recover known preallocation facts from the accepted provision, if any.
+UPDATE transfer_proposal SET body = json_set(body, '$.provision', json_patch(
+  coalesce((SELECT json_set(json_extract(d.accepted_target, '$.provision'), '$.state', 'pending')
+    FROM delivery d WHERE d.operation_id = json_extract(transfer_proposal.body, '$.provision.operationId') AND d.kind = 'provision'),
+    json_object('state', 'pending', 'preallocated', json('false'))), json_extract(body, '$.provision')))
+  WHERE json_type(body, '$.provision') = 'object';
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
   { version: 3, name: 'contracts-0.5', sql: contracts05V3 },
+  { version: 4, name: 'storage-0.5', sql: storage05V4 },
+  { version: 5, name: 'storage-0.5-review', sql: storageReviewV5 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;
