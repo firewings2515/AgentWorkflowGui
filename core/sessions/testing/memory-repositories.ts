@@ -172,12 +172,18 @@ export class MemoryRepositories implements AppRepositories {
   };
 
   readonly handoffs = {
-    get: (id: string) => Promise.resolve(copy(this.handoffRecords.find((h) => h.id === id))),
+    get: (id: string) => {
+      const found = this.handoffRecords.find((h) => h.id === id);
+      return Promise.resolve(found && copy(found));
+    },
     listByInstance: (instanceId: InstanceId) => Promise.resolve(this.handoffRecords.filter((h) => h.instanceId === instanceId).map(copy)),
   };
 
   readonly peerMessages = {
-    get: (id: string) => Promise.resolve(copy(this.peerMessageRecords.find((m) => m.id === id))),
+    get: (id: string) => {
+      const found = this.peerMessageRecords.find((m) => m.id === id);
+      return Promise.resolve(found && copy(found));
+    },
     list: () => Promise.resolve(this.peerMessageRecords.map(copy)),
   };
 
@@ -190,11 +196,11 @@ export class MemoryRepositories implements AppRepositories {
       return Promise.resolve('created' as const);
     },
     update: (proposal: TransferProposal, expectedRevision: number): Promise<SaveResult<TransferProposal>> => {
+      if (proposal.revision !== expectedRevision + 1) return Promise.reject(new TypeError('a transfer update carries revision expectedRevision + 1'));
       const current = this.transferRecords.get(proposal.id);
       if (current?.revision !== expectedRevision) return Promise.resolve({ status: 'stale', current: current && copy(current) });
-      const stored = { ...copy(proposal), revision: expectedRevision + 1 };
-      this.transferRecords.set(proposal.id, stored);
-      return Promise.resolve({ status: 'saved', record: copy(stored) });
+      this.transferRecords.set(proposal.id, copy(proposal));
+      return Promise.resolve({ status: 'saved', record: copy(proposal) });
     },
   };
 

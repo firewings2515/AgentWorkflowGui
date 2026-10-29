@@ -41,14 +41,16 @@ export const handoffMeta = (operationId: string = OP): HandoffMeta => ({
   toNodeId: NodeId.parse('node-review'),
   fromSessionId: SessionId.parse('session-implement'),
   ruleId: 'to-review',
+  rework: false,
   round: 0,
 });
 
 export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadInput => {
   const kind = 'kind' in overrides ? overrides.kind : 'handoff';
   const operationId = overrides.operationId ?? OP;
+  const meta = handoffMeta(operationId);
   return defined({
-    ...(kind === 'handoff' && { handoff: handoffMeta(operationId) }),
+    ...(kind === 'handoff' && { handoff: meta }),
     kind: 'handoff',
     operationId: OP,
     sourceCallRef: 'call-1',
@@ -62,6 +64,8 @@ export const payloadInput = (overrides: Overrides<PayloadInput> = {}): PayloadIn
       cwd: 'E:/work',
       entry: { kind: 'new-turn' },
       session: { model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false },
+      // A handoff names whose it is (C-01); other kinds set their own origin in the test.
+      ...(kind === 'handoff' && { origin: { kind: 'handoff', fromSessionId: meta.fromSessionId, handoffId: meta.handoffId } }),
     },
     counts: [{ key: COUNT_KEY, limit: 3 }],
     ...overrides,
@@ -94,13 +98,22 @@ export const provisionInput = (name = '1', overrides: Partial<ProvisionInput> = 
   };
 };
 
+const originOf = (input: PayloadInput) => (input.context.origin === undefined ? {} : { origin: input.context.origin });
+
+/** The default payload's context without an origin (a user message, or a pre-0.5 record). */
+export const contextWithoutOrigin = (): PayloadInput['context'] => {
+  const context = { ...payloadInput().context };
+  delete context.origin;
+  return context;
+};
+
 /** A payload for the Claude session that provision `name` creates, accepted before it exists. */
 export const waitingPayload = (name = '1', overrides: Overrides<PayloadInput> = {}): PayloadInput => {
   const provision = provisionInput(name);
   return payloadInput({
     operationId: op(`payload-for-${name}`),
     target: { sessionId: provision.spec.sessionId, provision: provision.target.provision },
-    context: { runtime: 'claude', cwd: 'E:/work', entry: { kind: 'new-turn' }, session: { model: provision.spec.model, readOnly: true } },
+    context: { runtime: 'claude', cwd: 'E:/work', entry: { kind: 'new-turn' }, session: { model: provision.spec.model, readOnly: true }, ...originOf(payloadInput()) },
     counts: [{ key: `instance-1/task-1/node-${name}` }],
     ...overrides,
   });

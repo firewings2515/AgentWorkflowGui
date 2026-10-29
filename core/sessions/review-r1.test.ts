@@ -62,9 +62,9 @@ describe('r1-P1-3 a resend must be the same message from the same session', () =
     const { sessionId: c } = await created(w, 'codex', 'session-c');
     expect(await call(w, a, b, 'original')).toMatchObject({ status: 'accepted' });
     // The reviewer's case: same operationId, new sourceCallRef, changed content.
-    expect(await call(w, a, b, 'changed', 'op-1', 'call-2')).toMatchObject({ status: 'rejected', rejection: { reason: 'invalid-input' } });
-    expect(await call(w, a, c, 'original')).toMatchObject({ status: 'rejected', rejection: { reason: 'invalid-input' } });
-    expect(await call(w, c, b, 'original')).toMatchObject({ status: 'rejected', rejection: { reason: 'invalid-input' } });
+    expect(await call(w, a, b, 'changed', 'op-1', 'call-2')).toMatchObject({ status: 'rejected', rejection: { reason: 'resend-mismatch' } });
+    expect(await call(w, a, c, 'original')).toMatchObject({ status: 'rejected', rejection: { reason: 'resend-mismatch' } });
+    expect(await call(w, c, b, 'original')).toMatchObject({ status: 'rejected', rejection: { reason: 'not-owner' } });
     // The same message again is still the same operation.
     expect(await call(w, a, b, 'original', 'op-1', 'call-3')).toMatchObject({ status: 'duplicate' });
     expect(w.codex.get(b)!.dispatched).toHaveLength(1);
@@ -77,7 +77,7 @@ describe('r1-P1-3 a resend must be the same message from the same session', () =
     expect(await call(w, a, b, 'original')).toMatchObject({ status: 'accepted' });
     const after = w.restart();
     await after.service.start();
-    expect(await call(after, a, b, 'original', 'op-1', 'call-9')).toMatchObject({ status: 'rejected', rejection: { reason: 'invalid-input' } });
+    expect(await call(after, a, b, 'original', 'op-1', 'call-9')).toMatchObject({ status: 'rejected', rejection: { reason: 'not-owner' } });
   });
 
   it('r1-P1-3 a cross-tool message waiting for the user cannot be swapped by a resend', async () => {

@@ -64,6 +64,13 @@ export interface HandoffMeta {
   toNodeId: NodeId;
   fromSessionId: SessionId;
   ruleId: string;
+  /**
+   * Whether this handoff is rework (R-05, T020 review r1 P2): its target node is one the task was already
+   * handed to before (implement → review → implement counts once, and the review after it does not).
+   * Decided by the caller at acceptance and stored with the handoff, so a restart and the progress view
+   * count rework from the handoffs alone; the acceptance also advances the task's rework count key.
+   */
+  rework: boolean;
   /** Fan-out round and the upstream set expected in it (CR-4); batch 4 always uses round 0 and no set. */
   round: number;
   expectedUpstream?: readonly NodeId[];

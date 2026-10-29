@@ -97,11 +97,21 @@ describe('contracts 0.5', () => {
     });
   });
 
-  it('C-12, C-13: an instance has a compare-and-set revision and the rework limit it started with', () => {
+  it('C-12, C-13: an instance has a compare-and-set revision and keeps the template it started with', () => {
     const instance = pick(fixtureSnapshotInput.instances, 0);
     expect(ok(WorkflowInstance, instance)).toBe(true);
     expect(ok(WorkflowInstance, { ...instance, revision: undefined })).toBe(false);
-    expect(ok(WorkflowInstance, { ...instance, reworkLimit: undefined })).toBe(false);
-    expect(ok(WorkflowInstance, { ...instance, reworkLimit: -1 })).toBe(false);
+    expect(ok(WorkflowInstance, { ...instance, template: undefined })).toBe(false);
+  });
+
+  it('T020 r1 P1-1: the pinned template is the started revision, so a later edit cannot change the run', () => {
+    const instance = pick(fixtureSnapshotInput.instances, 0);
+    const template = pick(fixtureSnapshotInput.workflows, 0);
+    expect(ruleIssues(WorkflowInstance, { ...instance, template: { ...template, revision: 4, name: MARKER } })).toEqual([
+      { rule: 'instance.template-pinned', message: 'the pinned template is the started workflow revision' },
+    ]);
+    expect(ruleIssues(WorkflowInstance, { ...instance, template: { ...template, id: 'wf-other' } }).map((i) => i.rule)).toEqual(['instance.template-pinned']);
+    // The run keeps its own nodes and rework limit, whatever the stored template becomes.
+    expect(WorkflowInstance.parse(instance).template.reworkLimit).toBe(template.reworkLimit);
   });
 });

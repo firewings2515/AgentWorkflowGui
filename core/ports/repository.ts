@@ -40,7 +40,8 @@ export type DeleteResult = 'deleted' | 'stale' | 'not-found';
 /**
  * Agents and workflow templates: `expectedRevision` null means "create; it must not exist yet". Only the
  * current revision is kept (C-11): a session started or resumed later uses the Agent's current
- * instructions; a running workflow instance keeps its own pinned `workflowRevision` by number only.
+ * instructions; a running workflow instance keeps its own copy of the template it started with
+ * (`WorkflowInstance.template`), so it never needs an older revision from here.
  */
 export interface DefinitionRepository<T, Id> {
   list(): Promise<T[]>;
@@ -157,8 +158,11 @@ export interface TransferRepository {
   /** `exists` when the ID is taken (the renderer chose it with `transfer.prepare`). */
   create(proposal: TransferProposal): Promise<'created' | 'exists'>;
   /**
-   * Compare-and-set on `revision`; the stored proposal gets `expectedRevision + 1`. An approval is saved
-   * with `approvedRevision` set to that new revision, so the approval binds what was stored with it.
+   * Compare-and-set on `revision`: `stale` unless the stored proposal is at `expectedRevision`. The proposal
+   * is stored as given and must already carry `revision: expectedRevision + 1` (anything else is a caller
+   * bug and is refused with a thrown `TypeError`), so an approval saved with `approvedRevision` equal to
+   * that revision passes `transfer.approval-revision` and binds exactly what was stored with it; a later
+   * cancel or failure is another update with the next revision, keeping `approvedRevision`.
    */
   update(proposal: TransferProposal, expectedRevision: Revision): Promise<SaveResult<TransferProposal>>;
 }

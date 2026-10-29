@@ -57,6 +57,7 @@ const ruleMessages = {
   'workflow.one-root': 'exactly one node is the root',
   'workflow.edge-missing-node': 'an edge references a missing node',
   'workflow.output-needs-edge': 'an output rule targets a node without an edge',
+  'instance.template-pinned': 'the pinned template is the started workflow revision',
   'instance.task-other-instance': 'a task belongs to another instance',
   'instance.task-invalid-dependency': 'a task depends on itself or on a missing task',
   'handoff.not-self': 'a node does not hand off to itself',

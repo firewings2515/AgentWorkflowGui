@@ -106,6 +106,11 @@ const errorName = (error: unknown) => (error instanceof Error ? error.name : 'no
 const provisionOp = (sessionId: SessionId): OperationId => OperationIdSchema.parse(`provision:${sessionId}`);
 const userMessageOp = (messageId: string): OperationId => OperationIdSchema.parse(`user-message:${messageId}`);
 const peerIdOf = (operationId: OperationId) => PeerMessageId.parse(`peer-${operationId}`);
+
+/** Why a `send_message` resend is refused (C-07); the details are fixed text, never the call's content. */
+type Refusal = { reason: 'invalid-input' | 'not-owner' | 'resend-mismatch'; detail: string };
+const NOT_OWNER: Refusal = { reason: 'not-owner', detail: 'this operation belongs to another call' };
+const RESEND_MISMATCH: Refusal = { reason: 'resend-mismatch', detail: 'this operation carries another message' };
 /** One queue per session for its commands and its runtime events (r1-P1-4). */
 const sessionKey = (sessionId: SessionId) => `session:${sessionId}`;
 const closingFailure = (requestId: Failure['requestId']) => fail(requestId, 'runtime_unavailable', 'The application is closing');
@@ -755,12 +760,12 @@ export class SessionService {
   }
 
   private async sendMessageNow(caller: LogicalSession, target: LogicalSession, pending: PendingConfirmation): Promise<SendMessageToolResult> {
-    const rejected = (reason: 'invalid-input' | 'shutting-down', detail: string): SendMessageToolResult => ({ status: 'rejected', rejection: { reason, detail } });
+    const rejected = (reason: Refusal['reason'] | 'shutting-down', detail: string): SendMessageToolResult => ({ status: 'rejected', rejection: { reason, detail } });
     if (this.closing) return rejected('shutting-down', 'the GUI is closing');
     // A resend or a `retryOf` names an operation that already exists: it must be the same message from the
     // same session to the same target (CR-2's fixed content), or it is refused (r1-P1-3).
     const mismatch = await this.resendMismatch(pending);
-    if (mismatch !== undefined) return rejected('invalid-input', mismatch);
+    if (mismatch !== undefined) return rejected(mismatch.reason, mismatch.detail);
     if (caller.requestedModel.runtime !== target.requestedModel.runtime && (await this.store.get(pending.operationId)) === undefined) {
       const id = EscalationId.parse(`confirm-${pending.operationId}`);
       const existing = await this.repos.escalations.get(id);
@@ -809,23 +814,27 @@ export class SessionService {
    * Why an existing operation cannot be this call: another kind, target, payload or sender. The sender is
    * known only for operations this process accepted (contracts store none), so an unknown one is refused.
    */
-  private async resendMismatch(p: PendingConfirmation): Promise<string | undefined> {
+  private async resendMismatch(p: PendingConfirmation): Promise<Refusal | undefined> {
     const record = await this.store.get(p.operationId);
     const waiting = this.confirmations.get(EscalationId.parse(`confirm-${p.operationId}`));
     if (record === undefined && waiting === undefined) {
       const escalation = await this.repos.escalations.get(EscalationId.parse(`confirm-${p.operationId}`));
-      return escalation === undefined ? undefined : 'this operation is no longer waiting';
+      return escalation === undefined ? undefined : { reason: 'invalid-input', detail: 'this operation is no longer waiting' };
     }
-    if (this.owners.get(p.operationId) !== p.from) return 'this operation belongs to another call';
-    if (waiting !== undefined) return waiting.to === p.to && waiting.content === p.content ? undefined : 'this operation carries another message';
+    if (this.owners.get(p.operationId) !== p.from) return NOT_OWNER;
+    if (waiting !== undefined) return waiting.to === p.to && waiting.content === p.content ? undefined : RESEND_MISMATCH;
     return record === undefined ? undefined : this.recordMismatch(record, p);
   }
 
-  /** The stored operation must be this call's message: sender, target and payload (r1-P1-3, r2-P1-3). */
-  private async recordMismatch(record: StoredDelivery, p: PendingConfirmation): Promise<string | undefined> {
-    if (record.kind !== 'peer-message') return 'this operation is not a message';
-    if (this.owners.get(p.operationId) !== p.from) return 'this operation belongs to another call';
-    if (record.target.sessionId !== p.to || record.payloadHash !== (await this.options.hashPayload(p.content))) return 'this operation carries another message';
+  /**
+   * The stored operation must be this call's message: sender, target and payload (r1-P1-3, r2-P1-3). An
+   * operation of another (or, after a restart, an unknown) caller is `not-owner`; the caller's own with
+   * another target or content is `resend-mismatch` (C-07).
+   */
+  private async recordMismatch(record: StoredDelivery, p: PendingConfirmation): Promise<Refusal | undefined> {
+    if (record.kind !== 'peer-message') return { reason: 'invalid-input', detail: 'this operation is not a message' };
+    if (this.owners.get(p.operationId) !== p.from) return NOT_OWNER;
+    if (record.target.sessionId !== p.to || record.payloadHash !== (await this.options.hashPayload(p.content))) return RESEND_MISMATCH;
     return undefined;
   }
 
@@ -891,14 +900,8 @@ export class SessionService {
         },
         peer: { peerMessageId: peerIdOf(p.operationId), fromSessionId: p.from, toSessionId: p.to },
       });
-      if (accepted.status === 'conflict' || accepted.status === 'invalid')
-        return {
-          status: 'rejected',
-          rejection: {
-            reason: 'invalid-input',
-            detail: 'this call already sent another message',
-          },
-        };
+      if (accepted.status === 'conflict') return { status: 'rejected', rejection: RESEND_MISMATCH };
+      if (accepted.status === 'invalid') return { status: 'rejected', rejection: { reason: 'invalid-input', detail: 'the message cannot be accepted' } };
       // Thrown, so the MCP server answers with a generic error and a resend tries the same operation again.
       if (accepted.status !== 'accepted' && accepted.status !== 'duplicate') throw new Error(`accepting the peer message ended ${accepted.status}`);
       // Only the call that created the operation owns it; a duplicate is checked below like any resend.
@@ -906,8 +909,8 @@ export class SessionService {
       record = await this.store.get(p.operationId);
     }
     // Checked again here, inside the target's queue, with the record this call will use (r2-P1-3).
-    const mismatch = record === undefined ? 'this operation is not a message' : await this.recordMismatch(record, p);
-    if (mismatch !== undefined || record?.kind !== 'peer-message') return { status: 'rejected', rejection: { reason: 'invalid-input', detail: mismatch ?? 'this operation is not a message' } };
+    const mismatch: Refusal | undefined = record === undefined ? { reason: 'invalid-input', detail: 'this operation is not a message' } : await this.recordMismatch(record, p);
+    if (mismatch !== undefined || record?.kind !== 'peer-message') return { status: 'rejected', rejection: mismatch ?? { reason: 'invalid-input', detail: 'this operation is not a message' } };
     this.origins.set(p.operationId, origin);
     const fresh = record.delivery.state === 'pending';
     if (fresh) {

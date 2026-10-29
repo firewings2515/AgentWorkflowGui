@@ -133,14 +133,16 @@ export const WorkflowInstance = z
     /** Consent to cross-tool handoffs between this instance's nodes, recorded at start (R-11). */
     crossToolConsentAt: Timestamp.optional(),
     /**
-     * The template's rework limit at start (C-13): told to root at start and counted by the GUI per task
-     * (R-05). A later template edit does not change a running instance.
+     * The template as it was at start (C-13), so a restart rebuilds the run from what was started and agreed
+     * to (R-11), whatever the template became since: only the current revision of a template is stored (C-11).
+     * Its `reworkLimit` is the one told to root and counted by the GUI per task (R-05).
      */
-    reworkLimit: z.number().int().nonnegative(),
+    template: WorkflowTemplate,
     tasks: z.array(WorkflowTask),
     createdAt: Timestamp,
   })
   .superRefine((inst, ctx) => {
+    if (inst.template.id !== inst.workflowId || inst.template.revision !== inst.workflowRevision) addRuleIssue(ctx, 'instance.template-pinned', ['template']);
     const ids = new Set<string>(inst.tasks.map((t) => t.id));
     inst.tasks.forEach((t, i) => {
       if (t.instanceId !== inst.id) addRuleIssue(ctx, 'instance.task-other-instance', ['tasks', i, 'instanceId']);

@@ -206,9 +206,15 @@ class Rebuild {
       this.issues.push(`${at} is not a list`);
       return [];
     }
+    // The length too comes from the one descriptor read: a Proxy cannot answer another length (T020 r1 P1-3).
     const descriptors = Object.getOwnPropertyDescriptors(v);
+    const length: unknown = (descriptors as Record<string, PropertyDescriptor | undefined>).length?.value;
+    if (typeof length !== 'number' || !Number.isInteger(length) || length < 0) {
+      this.issues.push(`${at} has no length`);
+      return [];
+    }
     const out: unknown[] = [];
-    for (let i = 0; i < v.length; i++) {
+    for (let i = 0; i < length; i++) {
       const d = descriptors[i];
       if (d === undefined || !('value' in d)) this.issues.push(`${at}[${i}] is not plain data`);
       else out.push(d.value);
@@ -226,7 +232,8 @@ class Rebuild {
 
   handoff(v: unknown): HandoffMeta {
     const o = this.object(v, 'handoff');
-    this.only(o, ['handoffId', 'instanceId', 'taskId', 'fromNodeId', 'toNodeId', 'fromSessionId', 'ruleId', 'round', 'expectedUpstream'], 'handoff');
+    this.only(o, ['handoffId', 'instanceId', 'taskId', 'fromNodeId', 'toNodeId', 'fromSessionId', 'ruleId', 'rework', 'round', 'expectedUpstream'], 'handoff');
+    if (typeof o.rework !== 'boolean') this.issues.push('handoff.rework is not a boolean');
     const upstream =
       o.expectedUpstream === undefined
         ? undefined
@@ -243,6 +250,7 @@ class Rebuild {
       toNodeId: this.string(o, 'toNodeId', 'handoff') as NodeId,
       fromSessionId: this.string(o, 'fromSessionId', 'handoff') as SessionId,
       ruleId: this.string(o, 'ruleId', 'handoff'),
+      rework: o.rework === true,
       round: this.number(o, 'round', 'handoff'),
       ...(upstream !== undefined && { expectedUpstream: upstream }),
     };
@@ -281,6 +289,11 @@ class Rebuild {
 }
 
 const PAYLOAD_KINDS: readonly PayloadKind[] = ['handoff', 'peer-message', 'transfer', 'user-message'];
+
+const originFor = (record: PayloadDelivery, options: DispatchOptions): { origin?: MessageOrigin } => {
+  const origin = options.origin ?? record.context.origin ?? (record.kind === 'user-message' ? undefined : ({ kind: 'system' } as const));
+  return origin === undefined ? {} : { origin };
+};
 
 const rebuild = (input: AcceptInput): { input: AcceptInput } | { issues: string[] } => {
   const r = new Rebuild();
@@ -447,8 +460,11 @@ export class DeliveryService {
     const issues: string[] = deliveryTargetIssues(undefined, input.target);
     if (input.kind === 'provision') {
       if (input.target.provision?.operationId !== input.operationId) issues.push('a provision describes itself in target.provision');
-    } else if ((await this.options.hashPayload(input.payload)) !== input.payloadHash) {
-      issues.push('payloadHash does not match the payload');
+    } else {
+      if ((await this.options.hashPayload(input.payload)) !== input.payloadHash) issues.push('payloadHash does not match the payload');
+      // A payload that is not the user's says whose it is, so no restart can deliver it as the user's (C-01).
+      if ((input.kind === 'handoff' || input.kind === 'peer-message') && input.context.origin === undefined) issues.push(`a ${input.kind} names its origin in context.origin`);
+      if (input.context.origin?.kind === 'user' && input.kind !== 'user-message') issues.push(`a ${input.kind} is never from the user`);
     }
     return issues;
   }
@@ -485,8 +501,9 @@ export class DeliveryService {
         // The persisted payload, never a caller's copy.
         text: record.payload,
         entry: options.entry ?? record.context.entry,
-        // The caller's origin, else the one stored at acceptance (C-01), so a recovery keeps it.
-        ...((options.origin ?? record.context.origin) !== undefined && { origin: options.origin ?? record.context.origin }),
+        // The caller's origin, else the one stored at acceptance (C-01), else, for anything but a user message,
+        // "not the user" (T020 r1 P1-4): only a user message may reach the runtime as the user's.
+        ...originFor(record, options),
         ...(timeoutMs !== undefined && { timeoutMs }),
       });
     } catch (error) {

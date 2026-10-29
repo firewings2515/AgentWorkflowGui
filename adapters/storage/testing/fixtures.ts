@@ -28,6 +28,7 @@ const handoffMeta = (operationId: string) => ({
   toNodeId: NodeId.parse('node-review'),
   fromSessionId: SessionId.parse('session-implement'),
   ruleId: 'to-review',
+  rework: false,
   round: 0,
 });
 

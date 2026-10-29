@@ -235,7 +235,7 @@ describe('dispatch entry', () => {
     await flush();
     const [request] = g.codex.dispatched;
     const attempt = valid(await g.store.get(OP)).delivery.attempts[0];
-    expect(request).toEqual({ nativeSessionRef: THREAD, attempt, text: 'payload', entry: { kind: 'insert', expectedTurnRef: 'turn-7' }, timeoutMs: 5000 });
+    expect(request).toEqual({ nativeSessionRef: THREAD, attempt, text: 'payload', entry: { kind: 'insert', expectedTurnRef: 'turn-7' }, origin: payloadInput().context.origin, timeoutMs: 5000 });
     // A restarted GUI knows nothing but the store.
     const next = g.restart();
     await next.service.recover();

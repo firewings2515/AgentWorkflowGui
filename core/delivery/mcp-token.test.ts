@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import type { MessageOrigin, PeerMessageId, SessionId } from '../../contracts';
 import type { McpMount, ProvisionSpec, SessionSettings, StartSessionOptions } from '../ports';
-import { OP, gui, payloadInput, provisionInput } from './testing/fixtures';
+import { OP, contextWithoutOrigin, gui, payloadInput, provisionInput } from './testing/fixtures';
 
 const TOKEN = 'secret-token-0123456789abcdef';
 const mount: McpMount = { url: 'http://127.0.0.1:4000/mcp', token: TOKEN };
@@ -87,7 +87,7 @@ describe('the MCP token is never stored', () => {
 });
 
 describe('origin', () => {
-  it('hands the caller’s origin to the adapter, and none when the caller gives none', async () => {
+  it('hands the caller’s origin to the adapter; a user message without one reaches it as the user’s', async () => {
     const g = gui();
     const peer: MessageOrigin = {
       kind: 'peer',
@@ -99,9 +99,11 @@ describe('origin', () => {
     expect(g.codex.dispatched[0]?.origin).toEqual(peer);
 
     const other = payloadInput({
+      kind: 'user-message',
       operationId: OP.replace('1', '2') as typeof OP,
       payload: 'second',
       counts: undefined,
+      context: contextWithoutOrigin(),
     });
     expect((await g.service.accept(other)).status).toBe('accepted');
     expect((await g.service.dispatch(other.operationId)).status).toBe('sent');

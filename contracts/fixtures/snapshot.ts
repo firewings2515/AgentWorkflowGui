@@ -6,6 +6,7 @@ import type { z } from 'zod';
 import { CONTRACTS_VERSION } from '../common';
 import type { DeliveryRecord } from '../delivery';
 import { Snapshot } from '../ipc';
+import type { WorkflowTemplate } from '../workflow';
 
 const v = CONTRACTS_VERSION;
 const t = (hhmm: string) => `2026-10-24T${hhmm}:00+08:00`;
@@ -33,6 +34,40 @@ const sentDelivery = (n: number, at: string, sessionRef: string, turnRef?: strin
   }],
 });
 
+const workflowDefault: z.input<typeof WorkflowTemplate> = {
+  schemaVersion: v,
+  id: 'wf-default',
+  revision: 3,
+  name: '規劃 → 實作 → Review → 測試',
+  description: '內建範本',
+  reworkLimit: 3,
+  isolation: 'worktree',
+  nodes: [
+    { id: 'n-plan', kind: 'agent', label: '規劃', agentId: 'agent-planner', model: claudeOpus, writePolicy: 'read-only', isRoot: true, position: { x: 0, y: 120 },
+      inputRules: [{ id: 'in-user', condition: '使用者訊息：閒聊直接回答，需求整理成計畫' }],
+      outputRules: [{ id: 'out-plan', condition: '計畫經使用者確認', payload: '計畫與驗收條件', target: node('n-build'), requiresUserConfirmation: true }] },
+    { id: 'n-build', kind: 'agent', label: '實作', agentId: 'agent-builder', model: codexAstra, writePolicy: 'write', concurrency: 2, position: { x: 260, y: 120 },
+      inputRules: [{ id: 'in-plan', condition: '來自規劃的計畫' }, { id: 'in-rework', condition: '來自 review 或測試的退回' }],
+      outputRules: [{ id: 'out-done', condition: '完成', payload: '變更摘要與檔案清單', target: node('n-review') }, { id: 'out-unclear', condition: '需求不清楚', payload: '問題', target: root }] },
+    { id: 'n-review', kind: 'agent', label: 'Review', agentId: 'agent-reviewer', model: claudeSonnet, writePolicy: 'read-only', position: { x: 520, y: 60 },
+      inputRules: [{ id: 'in-impl', condition: '來自實作', acceptanceLimit: 3 }],
+      outputRules: [{ id: 'out-pass', condition: '通過', payload: '結論', target: node('n-test') }, { id: 'out-fix', condition: '需要修改', payload: '問題清單', target: node('n-build') }] },
+    { id: 'n-test', kind: 'agent', label: '測試', agentId: 'agent-tester', model: claudeSonnet, writePolicy: 'exec-only', position: { x: 780, y: 60 },
+      inputRules: [{ id: 'in-review', condition: '來自 review 的通過' }],
+      outputRules: [{ id: 'out-green', condition: '全部通過', payload: '測試結果', target: node('n-merge') }, { id: 'out-red', condition: '失敗', payload: '失敗紀錄', target: node('n-build') }] },
+    { id: 'n-merge', kind: 'merge', label: '合併', writePolicy: 'write', position: { x: 1040, y: 120 }, inputRules: [], outputRules: [{ id: 'out-merged', condition: '整合測試通過並合併', payload: '合併 commit', target: root }] },
+  ],
+  edges: [
+    { source: 'n-plan', target: 'n-build' },
+    { source: 'n-build', target: 'n-review' },
+    { source: 'n-review', target: 'n-test' },
+    { source: 'n-review', target: 'n-build' },
+    { source: 'n-test', target: 'n-merge' },
+    { source: 'n-test', target: 'n-build' },
+  ],
+  updatedAt: t('09:30'),
+};
+
 export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
   schemaVersion: v,
   seq: 42,
@@ -42,41 +77,7 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
     { schemaVersion: v, id: 'agent-reviewer', revision: 1, name: 'Review Agent', description: '只提問題，不改程式碼', instructions: '問題分 P1／P2，附位置與理由。', updatedAt: t('09:10') },
     { schemaVersion: v, id: 'agent-tester', revision: 1, name: '測試 Agent', description: '執行測試並回報', instructions: '不改原始碼，只執行指令。', updatedAt: t('09:15') },
   ],
-  workflows: [
-    {
-      schemaVersion: v,
-      id: 'wf-default',
-      revision: 3,
-      name: '規劃 → 實作 → Review → 測試',
-      description: '內建範本',
-      reworkLimit: 3,
-      isolation: 'worktree',
-      nodes: [
-        { id: 'n-plan', kind: 'agent', label: '規劃', agentId: 'agent-planner', model: claudeOpus, writePolicy: 'read-only', isRoot: true, position: { x: 0, y: 120 },
-          inputRules: [{ id: 'in-user', condition: '使用者訊息：閒聊直接回答，需求整理成計畫' }],
-          outputRules: [{ id: 'out-plan', condition: '計畫經使用者確認', payload: '計畫與驗收條件', target: node('n-build'), requiresUserConfirmation: true }] },
-        { id: 'n-build', kind: 'agent', label: '實作', agentId: 'agent-builder', model: codexAstra, writePolicy: 'write', concurrency: 2, position: { x: 260, y: 120 },
-          inputRules: [{ id: 'in-plan', condition: '來自規劃的計畫' }, { id: 'in-rework', condition: '來自 review 或測試的退回' }],
-          outputRules: [{ id: 'out-done', condition: '完成', payload: '變更摘要與檔案清單', target: node('n-review') }, { id: 'out-unclear', condition: '需求不清楚', payload: '問題', target: root }] },
-        { id: 'n-review', kind: 'agent', label: 'Review', agentId: 'agent-reviewer', model: claudeSonnet, writePolicy: 'read-only', position: { x: 520, y: 60 },
-          inputRules: [{ id: 'in-impl', condition: '來自實作', acceptanceLimit: 3 }],
-          outputRules: [{ id: 'out-pass', condition: '通過', payload: '結論', target: node('n-test') }, { id: 'out-fix', condition: '需要修改', payload: '問題清單', target: node('n-build') }] },
-        { id: 'n-test', kind: 'agent', label: '測試', agentId: 'agent-tester', model: claudeSonnet, writePolicy: 'exec-only', position: { x: 780, y: 60 },
-          inputRules: [{ id: 'in-review', condition: '來自 review 的通過' }],
-          outputRules: [{ id: 'out-green', condition: '全部通過', payload: '測試結果', target: node('n-merge') }, { id: 'out-red', condition: '失敗', payload: '失敗紀錄', target: node('n-build') }] },
-        { id: 'n-merge', kind: 'merge', label: '合併', writePolicy: 'write', position: { x: 1040, y: 120 }, inputRules: [], outputRules: [{ id: 'out-merged', condition: '整合測試通過並合併', payload: '合併 commit', target: root }] },
-      ],
-      edges: [
-        { source: 'n-plan', target: 'n-build' },
-        { source: 'n-build', target: 'n-review' },
-        { source: 'n-review', target: 'n-test' },
-        { source: 'n-review', target: 'n-build' },
-        { source: 'n-test', target: 'n-merge' },
-        { source: 'n-test', target: 'n-build' },
-      ],
-      updatedAt: t('09:30'),
-    },
-  ],
+  workflows: [workflowDefault],
   modelOptions: [
     { runtime: 'claude', model: 'claude-opus-5-5', displayName: 'Opus 5.5', efforts: claudeEfforts, defaultEffort: 'high' },
     { runtime: 'claude', model: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5', efforts: claudeEfforts, defaultEffort: 'high', isDefault: true },
@@ -155,7 +156,7 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
   ],
   instances: [
     {
-      id: 'inst-login', revision: 4, workflowId: 'wf-default', workflowRevision: 3, reworkLimit: 2, title: '登入功能', rootSessionId: 's-wf-root', state: 'running', crossToolConsentAt: t('11:00'),
+      id: 'inst-login', revision: 4, workflowId: 'wf-default', workflowRevision: 3, template: workflowDefault, title: '登入功能', rootSessionId: 's-wf-root', state: 'running', crossToolConsentAt: t('11:00'),
       tasks: [
         { id: 'task-a', instanceId: 'inst-login', title: '表單驗證', dependsOn: [], status: 'running', currentNodeId: 'n-review', worktree: { path: 'E:/work/.awg/wt/t1', branch: 'task/t1' }, reworkCount: 0 },
         { id: 'task-b', instanceId: 'inst-login', title: 'Session 儲存', dependsOn: [], status: 'running', currentNodeId: 'n-build', worktree: { path: 'E:/work/.awg/wt/t2', branch: 'task/t2' }, reworkCount: 0 },
