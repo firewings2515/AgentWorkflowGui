@@ -940,6 +940,7 @@ export class SessionService {
     const known = this.origins.get(operationId);
     if (known !== undefined) return known;
     const record = await this.store.get(operationId);
+    if (record?.kind === 'user-message') return { kind: 'user' };
     return (record?.kind !== 'provision' ? record?.context.origin : undefined) ?? { kind: 'system' };
   }
 

@@ -136,6 +136,32 @@ describe('T020 r2: review counterexamples', () => {
     }
   });
 
+  it('r3-P1 the origin is read once: a getter or a change during the dispatch cannot swap it for the user', async () => {
+    for (const kind of ['handoff', 'peer-message', 'transfer'] as const) {
+      const input = kind === 'peer-message' ? payloadInput({ kind, peer, counts: undefined, context: { ...payloadInput().context, origin: peerOrigin } }) : payloadInput({ kind, counts: undefined });
+      // A getter that answers system to the check and user afterwards.
+      const g = gui();
+      await g.service.accept(input);
+      let reads = 0;
+      const options = { get origin(): MessageOrigin { return ++reads === 1 ? { kind: 'system' } : { kind: 'user' }; } };
+      expect((await g.service.dispatch(OP, options)).status).toBe('sent');
+      expect(g.codex.dispatched[0]?.origin).toEqual({ kind: 'system' });
+      expect(reads).toBe(1);
+      // A plain object changed while the target is prepared.
+      const origin: { kind: string } = { kind: 'system' };
+      const h = gui(undefined, undefined, { prepareTarget: () => { origin.kind = 'user'; return Promise.resolve(); } });
+      await h.service.accept(input);
+      expect((await h.service.dispatch(OP, { origin: origin as MessageOrigin })).status).toBe('sent');
+      expect(h.codex.dispatched[0]?.origin).toEqual({ kind: 'system' });
+      // An origin given through an accessor is not plain data: refused, nothing sent.
+      const k = gui();
+      await k.service.accept(input);
+      const sneaky = Object.defineProperty({}, 'kind', { enumerable: true, get: () => 'system' }) as MessageOrigin;
+      expect(await k.service.dispatch(OP, { origin: sneaky })).toMatchObject({ status: 'not-dispatched', reason: 'origin-mismatch' });
+      expect(k.codex.dispatched).toHaveLength(0);
+    }
+  });
+
   it('r2-P1 a user message is the user’s only', async () => {
     const g = gui();
     expect((await g.service.accept(payloadInput({ kind: 'user-message', counts: undefined, context: contextWithoutOrigin() }))).status).toBe('accepted');

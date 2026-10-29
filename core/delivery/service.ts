@@ -290,8 +290,18 @@ class Rebuild {
 
 const PAYLOAD_KINDS: readonly PayloadKind[] = ['handoff', 'peer-message', 'transfer', 'user-message'];
 
-const originFor = (record: PayloadDelivery, options: DispatchOptions): { origin?: MessageOrigin } => {
-  const origin = options.origin ?? record.context.origin ?? (record.kind === 'user-message' ? undefined : ({ kind: 'system' } as const));
+/**
+ * The origin this dispatch uses, read once (T020 r3 P1): the caller's `options.origin` is read a single
+ * time, copied from its own data properties only and checked against the contract, so what is checked is
+ * what is sent, whatever the caller's object does later. `invalid` when it is not plain origin data.
+ */
+const originFor = (record: PayloadDelivery, options: DispatchOptions): { origin?: MessageOrigin } | 'invalid' => {
+  const given: unknown = options.origin;
+  if (given !== undefined) {
+    const parsed = MessageOrigin.safeParse(snapshot(given));
+    return parsed.success ? { origin: parsed.data } : 'invalid';
+  }
+  const origin = record.context.origin ?? (record.kind === 'user-message' ? undefined : ({ kind: 'system' } as const));
   return origin === undefined ? {} : { origin };
 };
 
@@ -472,8 +482,11 @@ export class DeliveryService {
   private async dispatchPayload(accepted: PayloadDelivery, options: DispatchOptions): Promise<DispatchOutcome> {
     const adapter = this.options.runtimes[accepted.context.runtime];
     if (adapter === undefined) return notDispatched('no-runtime', `no ${accepted.context.runtime} adapter`);
-    // Checked before the claim, so a caller's origin can never make another kind of payload the user's.
-    const chosen = originFor(accepted, options).origin;
+    // Chosen and checked once, before the claim, and that same copy is sent: a caller's origin can never make
+    // another kind of payload the user's (T020 r2, r3 P1).
+    const selected = originFor(accepted, options);
+    if (selected === 'invalid') return notDispatched('origin-mismatch', 'the origin is not plain origin data');
+    const chosen = selected.origin;
     const fits = accepted.kind === 'user-message' ? chosen === undefined || chosen.kind === 'user' : chosen !== undefined && chosen.kind !== 'user';
     if (!fits) {
       return notDispatched('origin-mismatch', `a ${accepted.kind} cannot be dispatched as from ${chosen?.kind ?? 'nobody'}`);
@@ -508,8 +521,8 @@ export class DeliveryService {
         text: record.payload,
         entry: options.entry ?? record.context.entry,
         // The caller's origin, else the one stored at acceptance (C-01), else, for anything but a user message,
-        // "not the user" (T020 r1 P1-4): only a user message may reach the runtime as the user's.
-        ...originFor(record, options),
+        // "not the user" (T020 r1 P1-4): the copy checked above, never read from the caller again.
+        ...(chosen !== undefined && { origin: chosen }),
         ...(timeoutMs !== undefined && { timeoutMs }),
       });
     } catch (error) {
