@@ -65,10 +65,11 @@ export interface HandoffMeta {
   fromSessionId: SessionId;
   ruleId: string;
   /**
-   * Whether this handoff is rework (R-05, T020 review r1 P2): its target node is one the task was already
-   * handed to before (implement → review → implement counts once, and the review after it does not).
-   * Decided by the caller at acceptance and stored with the handoff, so a restart and the progress view
-   * count rework from the handoffs alone; the acceptance also advances the task's rework count key.
+   * Whether this handoff is rework (R-05): its target node already received a handoff of this task in this
+   * instance. Every return counts: plan → implement → review → implement → review is two reworks (the
+   * second implement and the second review). Decided by the caller at acceptance, stored with the handoff
+   * and shown as `Handoff.rework`; the same acceptance advances the task's rework count key, so the limit,
+   * a restart (`WorkflowTask.reworkCount` is rebuilt from the handoffs) and the progress view agree.
    */
   rework: boolean;
   /** Fan-out round and the upstream set expected in it (CR-4); batch 4 always uses round 0 and no set. */

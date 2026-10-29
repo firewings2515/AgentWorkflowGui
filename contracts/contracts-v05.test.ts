@@ -6,11 +6,13 @@ import {
   AppEvent,
   CONTRACTS_VERSION,
   Escalation,
+  Handoff,
   issueRule,
   LogicalSession,
   McpRejection,
   PermissionRequest,
   Snapshot,
+  TransferProposal,
   WorkflowInstance,
 } from './index';
 import { fixtureSnapshot, fixtureSnapshotInput } from './fixtures/snapshot';
@@ -113,5 +115,25 @@ describe('contracts 0.5', () => {
     expect(ruleIssues(WorkflowInstance, { ...instance, template: { ...template, id: 'wf-other' } }).map((i) => i.rule)).toEqual(['instance.template-pinned']);
     // The run keeps its own nodes and rework limit, whatever the stored template becomes.
     expect(WorkflowInstance.parse(instance).template.reworkLimit).toBe(template.reworkLimit);
+  });
+});
+
+describe('T020 r2: transfer lifecycle after approval, rework on handoffs', () => {
+  const proposal = pick(fixtureSnapshotInput.transfers, 0);
+  it('r2-P1 an approved proposal can later fail or be cancelled with a newer revision, keeping its approval', () => {
+    expect(proposal.state).toBe('approved');
+    const failed = { ...proposal, revision: (proposal.revision ?? 0) + 1, state: 'failed', failure: { message: 'target creation failed' }, provision: undefined, createdSessionId: undefined, delivery: undefined };
+    expect(ok(TransferProposal, failed)).toBe(true);
+    const cancelled = { ...proposal, revision: (proposal.revision ?? 0) + 1, state: 'cancelled', cancelledAt: at };
+    expect(ok(TransferProposal, cancelled)).toBe(true);
+    // While approved the approval is the current revision; an approval never runs ahead of the record.
+    expect(ruleIssues(TransferProposal, { ...proposal, revision: (proposal.revision ?? 0) + 1 }).map((i) => i.rule)).toContain('transfer.approval-revision');
+    expect(ruleIssues(TransferProposal, { ...cancelled, approvedRevision: cancelled.revision + 1 }).map((i) => i.rule)).toContain('transfer.approval-revision');
+  });
+
+  it('r2-P2 a handoff says whether it is rework; old records read as not', () => {
+    const handoff = pick(fixtureSnapshotInput.handoffs, 1);
+    expect(Handoff.parse(handoff).rework).toBe(false);
+    expect(Handoff.parse({ ...handoff, rework: true }).rework).toBe(true);
   });
 });

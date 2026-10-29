@@ -1,6 +1,8 @@
 // In-memory `AppRepositories` for the session service's tests, with the T015 semantics the service relies
 // on: compare-and-set on revision, a session must exist before its conversation, a repeated message is
-// ignored, and records are copied in and out so a caller cannot change what is stored.
+// ignored, and records are copied in and out so a caller cannot change what is stored. The 0.5 views
+// (handoffs, peer messages, transfers) are plain lists here: they do not read the delivery store, so they
+// are no reference for the projection rules of core/ports/repository.ts, which T022 tests on SQLite.
 import type {
   AgentDefinition,
   AgentId,
@@ -195,6 +197,7 @@ export class MemoryRepositories implements AppRepositories {
       this.transferRecords.set(proposal.id, copy(proposal));
       return Promise.resolve('created' as const);
     },
+    // T020 r2 P1: an approval, then a failure or cancel, each with the next revision.
     update: (proposal: TransferProposal, expectedRevision: number): Promise<SaveResult<TransferProposal>> => {
       if (proposal.revision !== expectedRevision + 1) return Promise.reject(new TypeError('a transfer update carries revision expectedRevision + 1'));
       const current = this.transferRecords.get(proposal.id);

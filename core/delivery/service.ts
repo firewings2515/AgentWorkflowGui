@@ -472,6 +472,12 @@ export class DeliveryService {
   private async dispatchPayload(accepted: PayloadDelivery, options: DispatchOptions): Promise<DispatchOutcome> {
     const adapter = this.options.runtimes[accepted.context.runtime];
     if (adapter === undefined) return notDispatched('no-runtime', `no ${accepted.context.runtime} adapter`);
+    // Checked before the claim, so a caller's origin can never make another kind of payload the user's.
+    const chosen = originFor(accepted, options).origin;
+    const fits = accepted.kind === 'user-message' ? chosen === undefined || chosen.kind === 'user' : chosen !== undefined && chosen.kind !== 'user';
+    if (!fits) {
+      return notDispatched('origin-mismatch', `a ${accepted.kind} cannot be dispatched as from ${chosen?.kind ?? 'nobody'}`);
+    }
     let record = accepted;
     if (record.target.provision !== undefined) {
       const bound = await this.bindToProvision(record);

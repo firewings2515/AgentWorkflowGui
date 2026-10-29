@@ -123,3 +123,24 @@ describe('outcomes and lookup by tool-call identity', () => {
     expect(await store.findBySourceCallRef('call-other')).toBeUndefined();
   });
 });
+
+describe('T020 r2: review counterexamples', () => {
+  it('r2-P1 a caller cannot dispatch a handoff, peer message or transfer as the user', async () => {
+    for (const kind of ['handoff', 'peer-message', 'transfer'] as const) {
+      const g = gui();
+      const input = kind === 'peer-message' ? payloadInput({ kind, peer, counts: undefined, context: { ...payloadInput().context, origin: peerOrigin } }) : payloadInput({ kind, counts: undefined });
+      expect((await g.service.accept(input)).status).toBe('accepted');
+      expect(await g.service.dispatch(OP, { origin: { kind: 'user' } })).toMatchObject({ status: 'not-dispatched', reason: 'origin-mismatch' });
+      expect(g.codex.dispatched).toHaveLength(0);
+      expect((await g.store.get(OP))?.delivery.state).toBe('pending');
+    }
+  });
+
+  it('r2-P1 a user message is the user’s only', async () => {
+    const g = gui();
+    expect((await g.service.accept(payloadInput({ kind: 'user-message', counts: undefined, context: contextWithoutOrigin() }))).status).toBe('accepted');
+    expect(await g.service.dispatch(OP, { origin: peerOrigin })).toMatchObject({ status: 'not-dispatched', reason: 'origin-mismatch' });
+    expect((await g.service.dispatch(OP)).status).toBe('sent');
+    expect(g.codex.dispatched[0]).not.toHaveProperty('origin');
+  });
+});

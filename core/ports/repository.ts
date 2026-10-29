@@ -148,9 +148,11 @@ export interface PeerMessageRepository {
 
 /**
  * Cross-tool transfer proposals (R-02, C-12). The proposal itself is saved here with compare-and-set on
- * `revision` (a changed source makes it stale, CR-5); its `provision` and `delivery` are the delivery
- * store's records of `provision.operationId` and `operationId`, read back on every get, and what a save
- * passes for them is ignored.
+ * `revision` (a changed source makes it stale, CR-5). What is saved of the delivery side is only the link:
+ * `operationId` and `provision.operationId` (with its `bindingKey`, fixed at approval). Every read takes
+ * the rest from the delivery store in the same transaction: `provision` is that provision's current
+ * record, `delivery` the payload's, and `createdSessionId` is the provision's target session once the
+ * provision is sent (so `transfer.created-session` always holds). What a save passes for these is ignored.
  */
 export interface TransferRepository {
   get(id: TransferId): Promise<TransferProposal | undefined>;

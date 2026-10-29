@@ -169,6 +169,8 @@ export const Handoff = z
     toNodeId: NodeId,
     fromSessionId: SessionId,
     ruleId: z.string().min(1),
+    /** Rework (R-05): the target node already received a handoff of this task; see `HandoffMeta.rework`. */
+    rework: z.boolean().default(false),
     payload: z.string(),
     payloadHash: PayloadHash,
     proposalRevision: Revision,
@@ -211,7 +213,11 @@ export const EscalationRef = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('provision'), operationId: OperationId, blocked: z.array(OperationId) }),
   /** A user message of an ordinary session whose delivery stayed unknown (C-02), resolved with `delivery.resolve`. */
   z.strictObject({ kind: z.literal('message'), operationId: OperationId, messageId: MessageId }),
-  /** A `report_to_root` call that asked for the user's confirmation (C-13); `operationId` is its delivery to root. */
+  /**
+   * A `report_to_root` call that asked for the user's confirmation (C-13); `operationId` is its delivery to
+   * root. The report is delivered as a peer message, so if that delivery's outcome stays unknown, the
+   * `delivery-unknown` escalation points at its `peerMessage` ref; both refs name the same operation.
+   */
   z.strictObject({ kind: z.literal('report'), operationId: OperationId }),
 ]);
 

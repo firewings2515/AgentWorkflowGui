@@ -819,7 +819,10 @@ export class SessionService {
     const waiting = this.confirmations.get(EscalationId.parse(`confirm-${p.operationId}`));
     if (record === undefined && waiting === undefined) {
       const escalation = await this.repos.escalations.get(EscalationId.parse(`confirm-${p.operationId}`));
-      return escalation === undefined ? undefined : { reason: 'invalid-input', detail: 'this operation is no longer waiting' };
+      if (escalation === undefined) return undefined;
+      // The user already answered the caller's own confirmation; anyone else, and anyone after a restart
+      // (the owner is no longer known here), does not own it (T020 r2 P2).
+      return this.owners.get(p.operationId) === p.from ? { reason: 'invalid-input', detail: 'this operation is no longer waiting' } : NOT_OWNER;
     }
     if (this.owners.get(p.operationId) !== p.from) return NOT_OWNER;
     if (waiting !== undefined) return waiting.to === p.to && waiting.content === p.content ? undefined : RESEND_MISMATCH;

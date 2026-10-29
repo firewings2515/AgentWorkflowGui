@@ -44,7 +44,7 @@ const ruleMessages = {
   'peer.not-self': 'a session does not message itself',
   // transfer.ts
   'transfer.approval-pair': 'approvedAt and approvedRevision go together',
-  'transfer.approval-revision': 'the approval binds the current revision',
+  'transfer.approval-revision': 'the approval binds the revision it was saved with',
   'transfer.nothing-before-approval': 'nothing is created or sent before approval',
   'transfer.unapproved-is-clean': 'a proposal before approval has no approval, failure or cancel',
   'transfer.state-needs-approval': 'an approved or failed proposal needs an approval',

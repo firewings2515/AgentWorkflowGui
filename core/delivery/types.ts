@@ -93,6 +93,11 @@ export type NotDispatchedReason =
    */
   | 'provision-cancelled'
   | 'no-runtime'
+  /**
+   * The origin chosen for this dispatch does not fit the delivery (T020 r2 P1): only a user message is the
+   * user's, and a user message is nobody else's. Nothing crossed the boundary.
+   */
+  | 'origin-mismatch'
   | 'prepare-failed'
   /** A claim or binding write whose commit could not be confirmed; recovery reconciles if it applied. */
   | 'commit-uncertain'
