@@ -1,0 +1,213 @@
+// The workflow engine assembled in the backend (T024): a real SQLite file, the real GUI MCP server reached
+// over HTTP with each session's own token, and fake adapters. Runs the template flow plan → implement →
+// review (sent back once) → implement → review → root, then a restart with a handoff still queued.
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { type Command, type CommandResult, type EventEnvelope, InstanceId, RequestId, type Runtime, SessionId, Snapshot, TurnId } from '../../contracts';
+import type { McpMount, PermissionHandle } from '../../core/ports';
+import { FakeAdapter } from '../../core/sessions/testing/fake-adapter';
+import { agents, IMPL, PLAN, REVIEW, template, WORKFLOW } from '../../core/workflow/testing/harness';
+import type { OwnedProcess } from '../../contracts';
+import { type Backend, type BackendProcessHost, startBackend } from './backend';
+import { EventBus } from './event-bus';
+
+let dir: string;
+const clients: Client[] = [];
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'awg-t024-'));
+});
+afterEach(async () => {
+  for (const c of clients.splice(0)) await c.close().catch(() => undefined);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+class FakeHost implements BackendProcessHost {
+  openJob(sessionId: SessionId) {
+    return Promise.resolve({ sessionId, jobRef: `job-${sessionId}` });
+  }
+  closeJob() {
+    return Promise.resolve({ ended: [] as OwnedProcess[] });
+  }
+  listOwned() {
+    return Promise.resolve([] as OwnedProcess[]);
+  }
+  cleanupOrphans(records: readonly OwnedProcess[]) {
+    return Promise.resolve({ ended: [] as OwnedProcess[], gone: [...records] });
+  }
+  spawn(): never {
+    throw new Error('no process is started in these tests');
+  }
+}
+
+let requests = 0;
+const rid = () => RequestId.parse(`r-${++requests}`);
+const INSTANCE = InstanceId.parse('run-main');
+const ROOT = SessionId.parse('root-main');
+
+interface Started {
+  backend: Backend;
+  envelopes: EventEnvelope[];
+  adapters: FakeAdapter[];
+  logs: string[];
+  run(command: Command): Promise<CommandResult>;
+}
+
+const start = async (): Promise<Started> => {
+  const logs: string[] = [];
+  const adapters: FakeAdapter[] = [];
+  const bus = new EventBus();
+  const envelopes: EventEnvelope[] = [];
+  bus.subscribe((e) => envelopes.push(e));
+  let claude: FakeAdapter | undefined;
+  const result = await startBackend({
+    dbPath: join(dir, 'awg.sqlite'),
+    bus,
+    createHost: () => new FakeHost(),
+    createAdapter: (runtime: Runtime, _sessionId, hooks: { onPermissionRequest(h: PermissionHandle): unknown }) => {
+      if (runtime === 'claude' && claude !== undefined) return claude;
+      const adapter = new FakeAdapter(runtime, (h) => hooks.onPermissionRequest(h));
+      if (runtime === 'claude') claude = adapter;
+      adapters.push(adapter);
+      return adapter;
+    },
+    listModels: (runtime: Runtime) => Promise.resolve([{ runtime, model: `${runtime}-m`, displayName: 'M', efforts: [], isDefault: true, hidden: false }]),
+    resolveRealPath: (p) => p,
+    watch: () => {
+      const watcher = { close: () => undefined, on: () => watcher };
+      return watcher as unknown as ReturnType<NonNullable<Parameters<typeof startBackend>[0]['watch']>>;
+    },
+    log: (message) => logs.push(message),
+  });
+  if (result.status !== 'ready') throw new Error(`backend not ready: ${result.reason}`);
+  return { backend: result, envelopes, adapters, logs, run: (command) => result.facade.execute(command) as Promise<CommandResult> };
+};
+
+const settle = async () => {
+  for (let i = 0; i < 30; i++) await new Promise((resolve) => setImmediate(resolve));
+};
+
+/** The MCP mount a session got at its latest start or resume, as its runtime would use it. */
+const mountOf = (s: Started, sessionId: SessionId): McpMount => {
+  const opened = s.adapters.flatMap((a) => [...a.started, ...a.resumed]).filter((o) => o.sessionId === sessionId);
+  const mount = opened.at(-1)?.mcp;
+  if (mount === undefined) throw new Error(`no mount for ${sessionId}`);
+  return mount;
+};
+
+/** Calls a GUI tool as the session's runtime would: over HTTP, with its own bearer token. */
+const call = async (s: Started, sessionId: SessionId, name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+  const mount = mountOf(s, sessionId);
+  const client = new Client({ name: 'node', version: '0.0.0' });
+  await client.connect(new StreamableHTTPClientTransport(new URL(mount.url), { requestInit: { headers: { Authorization: `Bearer ${mount.token}` } } }));
+  clients.push(client);
+  const result = await client.callTool({ name, arguments: args });
+  const content = result.content as { type: string; text: string }[];
+  return JSON.parse(content[0]?.text ?? 'null') as Record<string, unknown>;
+};
+
+const snapshot = async (s: Started) => Snapshot.parse(await s.backend.facade.snapshot());
+
+const prepare = async (s: Started) => {
+  for (const a of agents()) expect(await s.run({ type: 'agent.save', requestId: rid(), agent: a, expectedRevision: null })).toMatchObject({ ok: true });
+  expect(await s.run({ type: 'workflow.save', requestId: rid(), workflow: template({}), expectedRevision: null })).toMatchObject({ ok: true });
+};
+
+const startRun = (s: Started) =>
+  s.run({ type: 'workflow.start', requestId: rid(), instanceId: INSTANCE, rootSessionId: ROOT, workflowId: WORKFLOW, workflowRevision: 0, title: 'Login page', cwd: dir, firstMessage: 'Plan a login page.', crossToolConsent: true });
+
+const nodeSession = async (s: Started, nodeId: string) => {
+  const snap = await snapshot(s);
+  const found = snap.sessions.find((x) => x.kind === 'workflow' && x.workflow.nodeId === nodeId);
+  if (found === undefined) throw new Error(`no session of ${nodeId}`);
+  return found.id;
+};
+
+const databaseBytes = () =>
+  readdirSync(dir)
+    .filter((f) => f.startsWith('awg.sqlite'))
+    .map((f) => readFileSync(join(dir, f)).toString('latin1'))
+    .join('\n');
+
+describe('the workflow engine in the backend (T024)', () => {
+  it('runs the template flow through the GUI MCP server, counting rework on a real SQLite file', async () => {
+    const s = await start();
+    await prepare(s);
+    expect(await startRun(s)).toMatchObject({ ok: true });
+    await settle();
+
+    expect(await call(s, ROOT, 'handoff', { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, content: 'Build the form.' })).toMatchObject({ status: 'accepted', delivery: 'sent' });
+    const impl = await nodeSession(s, IMPL);
+    expect(await call(s, impl, 'handoff', { ruleId: 'to-review', target: { kind: 'node', nodeId: REVIEW }, content: 'Form built.' })).toMatchObject({ status: 'accepted' });
+    const review = await nodeSession(s, REVIEW);
+    expect(await call(s, review, 'handoff', { ruleId: 'rework', target: { kind: 'node', nodeId: IMPL }, content: 'Validate the email.' })).toMatchObject({ status: 'accepted' });
+    expect(await call(s, impl, 'handoff', { ruleId: 'to-review', target: { kind: 'node', nodeId: REVIEW }, content: 'Validation added.' })).toMatchObject({ status: 'accepted' });
+    expect(await call(s, review, 'handoff', { ruleId: 'done', target: { kind: 'root' }, content: 'Approved.' })).toMatchObject({ status: 'accepted' });
+    // Not connected: implement has no edge to plan. create_tasks waits for batch 5.
+    expect(await call(s, impl, 'handoff', { ruleId: 'to-review', target: { kind: 'node', nodeId: PLAN }, content: 'x' })).toMatchObject({ status: 'rejected', rejection: { reason: 'not-connected' } });
+    expect(await call(s, ROOT, 'create_tasks', { tasks: [{ key: 'a', title: 'A' }] })).toMatchObject({ status: 'rejected', rejection: { reason: 'unsupported' } });
+
+    const snap = await snapshot(s);
+    const [instance] = snap.instances;
+    expect(instance).toMatchObject({ id: INSTANCE, workflowRevision: 0, rootSessionId: ROOT, template: { reworkLimit: 2 } });
+    expect(instance?.crossToolConsentAt).toBeDefined();
+    expect(instance?.tasks[0]).toMatchObject({ reworkCount: 2, currentNodeId: PLAN });
+    expect(snap.handoffs.map((h) => [h.fromNodeId, h.toNodeId, h.rework, h.delivery.state])).toEqual([
+      [PLAN, IMPL, false, 'sent'],
+      [IMPL, REVIEW, false, 'sent'],
+      [REVIEW, IMPL, true, 'sent'],
+      [IMPL, REVIEW, true, 'sent'],
+      [REVIEW, PLAN, false, 'sent'],
+    ]);
+    // One session per (node, task): three sessions, implement and review reused for the rework.
+    expect(snap.sessions.filter((x) => x.kind === 'workflow').map((x) => x.id).sort()).toEqual([ROOT, impl, review].sort());
+    const codex = s.adapters.filter((a) => a.runtime === 'codex');
+    expect(codex).toHaveLength(1);
+    expect(codex[0]?.started).toHaveLength(1);
+    expect(codex[0]?.dispatched.map((d) => d.origin?.kind)).toEqual(['handoff', 'handoff']);
+    expect(s.envelopes.some((e) => e.event.type === 'handoff.updated')).toBe(true);
+    // No token in the database or the log (C-07).
+    const tokens = s.adapters.flatMap((a) => [...a.started, ...a.resumed]).flatMap((o) => (o.mcp === undefined ? [] : [o.mcp.token]));
+    expect(tokens.length).toBeGreaterThan(0);
+    const bytes = databaseBytes();
+    for (const token of tokens) {
+      expect(bytes).not.toContain(token);
+      expect(s.logs.join('\n')).not.toContain(token);
+      expect(JSON.stringify(s.envelopes)).not.toContain(token);
+    }
+    await s.backend.shutdown();
+  });
+
+  it('after a restart, a handoff queued for a busy target is sent once and the run is rebuilt from storage', async () => {
+    const s = await start();
+    await prepare(s);
+    await startRun(s);
+    await settle();
+    await call(s, ROOT, 'handoff', { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, content: 'Build the form.' });
+    const impl = await nodeSession(s, IMPL);
+    await call(s, impl, 'handoff', { ruleId: 'to-review', target: { kind: 'node', nodeId: REVIEW }, content: 'Form built.' });
+    const review = await nodeSession(s, REVIEW);
+    // Implement is busy in its own turn: the formal handoff waits for it (SP-05).
+    const codex = s.adapters.find((a) => a.runtime === 'codex')!;
+    codex.emit({ type: 'turn.updated', turn: { id: TurnId.parse('t-busy'), sessionId: impl, state: 'running', startedAt: '2026-10-29T01:00:00.000Z' } });
+    codex.emit({ type: 'session.activity', sessionId: impl, activity: 'running', at: '2026-10-29T01:00:00.000Z' });
+    await settle();
+    expect(await call(s, review, 'handoff', { ruleId: 'rework', target: { kind: 'node', nodeId: IMPL }, content: 'Validate the email.' })).toMatchObject({ status: 'accepted', delivery: 'pending' });
+    expect(codex.dispatched).toHaveLength(1);
+    await s.backend.shutdown();
+
+    const again = await start();
+    await settle();
+    const resumed = again.adapters.find((a) => a.runtime === 'codex');
+    expect(resumed?.resumed.map((r) => r.sessionId)).toEqual([impl]);
+    expect(resumed?.dispatched).toHaveLength(1);
+    expect(resumed?.dispatched[0]).toMatchObject({ origin: { kind: 'handoff', fromSessionId: review }, entry: { kind: 'new-turn' } });
+    const snap = await snapshot(again);
+    expect(snap.handoffs.at(-1)).toMatchObject({ rework: true, delivery: { state: 'sent' } });
+    expect(snap.instances[0]?.tasks[0]).toMatchObject({ reworkCount: 1, currentNodeId: IMPL });
+    await again.backend.shutdown();
+  });
+});
