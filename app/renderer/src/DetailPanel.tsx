@@ -17,7 +17,7 @@ interface DetailProps {
 }
 
 export function WorkflowSummary({ snapshot, instance }: { snapshot: Snapshot; instance: WorkflowInstance }) {
-  const template = snapshot.workflows.find(workflow => workflow.id === instance.workflowId && workflow.revision === instance.workflowRevision);
+  const template = instance.template;
   return <section aria-label="Workflow 群組摘要">
     <h3>{instance.title}</h3><Status value={instance.state} />
     <p className="muted">範本 revision {instance.workflowRevision} · 各 task 目前節點</p>
@@ -25,7 +25,7 @@ export function WorkflowSummary({ snapshot, instance }: { snapshot: Snapshot; in
       <strong>{task.title}</strong><Status value={task.status} />
       <p>{task.currentNodeId ? (template?.nodes.find(node => node.id === task.currentNodeId)?.label ?? task.currentNodeId) : '尚未進入節點'}</p>
       {task.dependsOn.length > 0 && <p className="muted">依賴：{task.dependsOn.map(id => instance.tasks.find(other => other.id === id)?.title ?? id).join('、')}</p>}
-      <small>返工 {task.reworkCount} 次</small>
+      <small>返工 {task.reworkCount} 次／上限 {template.reworkLimit} 次</small>
     </article>)}
     <h4>交接紀錄</h4>
     {snapshot.handoffs.filter(handoff => handoff.instanceId === instance.id).map(handoff => <article className="detail-card" key={handoff.id}>
@@ -101,7 +101,7 @@ function SessionInfo({ snapshot, session }: Pick<DetailProps, 'snapshot' | 'sess
       </dl><p className="muted">附件不會擴大寫入或執行權限。</p>
     </dd>
     <dt>活動狀態</dt><dd><Status value={session.activity} /></dd>
-    <dt>狀態來源</dt><dd>示意快照 · seq {snapshot.seq}<br />Session 更新於 <time dateTime={session.updatedAt}>{formatTime(session.updatedAt)}</time></dd>
+    <dt>狀態來源</dt><dd>Session 快照 · seq {snapshot.seq}<br />Session 更新於 <time dateTime={session.updatedAt}>{formatTime(session.updatedAt)}</time></dd>
     {session.derivedFromSessionId && <><dt>轉交來源</dt><dd>{snapshot.sessions.find(source => source.id === session.derivedFromSessionId)?.title ?? session.derivedFromSessionId}</dd></>}
     <dt>Token 用量</dt><dd>{session.tokenUsage ? <>
       {session.tokenUsage.latest && <div>最近回報：{session.tokenUsage.latest.total.toLocaleString('zh-TW')}</div>}

@@ -25,6 +25,7 @@ export function SessionTree({ snapshot, demo = true, selectedId, onOpen }: { sna
           {pending > 0 && <span className="pending-badge">待處理 {pending} 件</span>}
         </button>
       </div>
+      {session.derivedFromSessionId && <p className="tree-derived">接續自 <button onClick={() => onOpen(session.derivedFromSessionId!)}>{snapshot.sessions.find(s => s.id === session.derivedFromSessionId)?.title ?? session.derivedFromSessionId}</button></p>}
       {children.length > 0 && expanded && <ul>{children.map(renderBranch)}</ul>}
     </li>;
   };

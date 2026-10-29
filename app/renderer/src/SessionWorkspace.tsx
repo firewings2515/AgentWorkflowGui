@@ -26,6 +26,7 @@ export interface WorkspaceProps {
   onOpen: (id: SessionId) => void;
   onAgent: (id: AgentId) => void;
   onModel: (model: ModelOption) => void;
+  onTransfer: () => void;
   onProgress: (instanceId: string) => void;
   onNotice: (message: string) => void;
 }
@@ -88,7 +89,7 @@ export function SessionWorkspace(props: WorkspaceProps) {
       }}><span aria-live="polite">待處理 {pendingCount} 件</span></button>}
       <button className="icon-button" aria-label={`關閉工作區 ${view.id}`} title="只關閉工作區視圖" onClick={onClose}>×</button>
     </header>
-    <div className="session-toolbar"><Status value={session.activity} /><button aria-expanded={context.detailsVisible} onClick={() => onContext({ detailsVisible: !context.detailsVisible })}>{context.detailsVisible ? '收合細節' : '展開細節'}</button></div>
+    <div className="session-toolbar"><Status value={session.activity} />{session.kind === 'ordinary' && <button data-transfer-trigger onClick={props.onTransfer}>換到另一個工具</button>}<button aria-expanded={context.detailsVisible} onClick={() => onContext({ detailsVisible: !context.detailsVisible })}>{context.detailsVisible ? '收合細節' : '展開細節'}</button></div>
     {session.kind === 'workflow' && <div className="workflow-owner"><span>所屬 Workflow · {instance?.title ?? session.workflow.instanceId}</span><Menu label="所屬 Workflow 選單" className="owner-menu" actions={[{ label: '查看流程進度', onSelect: () => onProgress(session.workflow.instanceId) }]}>⋯</Menu></div>}
     <div className={`workspace-body ${context.detailsVisible ? '' : 'details-hidden'}`}>
       <div className="chat-panel">
@@ -107,12 +108,16 @@ export function SessionWorkspace(props: WorkspaceProps) {
               const agent = props.agentOptions.find(candidate => candidate.id === event.target.value);
               if (agent) onAgent(agent.id);
             }}>{(session.kind === 'workflow' ? snapshot.agents : props.agentOptions).map(agent => <option key={`${agent.id}:${agent.revision}`} value={agent.id}>{agent.name}</option>)}</select></label>
-            <label>Model<select aria-label="Model" disabled={props.store?.isBlocked('session.setModel', `session:${session.id}`)} value={`${chosen.model.runtime}:${chosen.model.model}`} onChange={event => {
+            <label>Model<select aria-label="Model" aria-describedby={session.kind === 'workflow' ? `${view.id}-model-lock` : undefined} disabled={props.store?.isBlocked('session.setModel', `session:${session.id}`)} value={`${chosen.model.runtime}:${chosen.model.model}`} onChange={event => {
               const model = snapshot.modelOptions.find(candidate => `${candidate.runtime}:${candidate.model}` === event.target.value);
               if (model) onModel(model);
-            }}>{snapshot.modelOptions.filter(model => !model.hidden).map(model => <option key={`${model.runtime}:${model.model}`} value={`${model.runtime}:${model.model}`}>{model.displayName} · {model.runtime}</option>)}</select></label>
+            }}>{snapshot.modelOptions.filter(model => !model.hidden).map(model => {
+              const crossToolLocked = session.kind === 'workflow' && model.runtime !== session.requestedModel.runtime;
+              return <option key={`${model.runtime}:${model.model}`} value={`${model.runtime}:${model.model}`} disabled={crossToolLocked}>{model.displayName} · {model.runtime}{crossToolLocked ? '（workflow 的 node 不能換工具）' : ''}</option>;
+            })}</select></label>
           </div>
           {session.kind === 'workflow' && <p id={`${view.id}-agent-lock`} className="composer-note">Workflow Agent 已鎖定；更換 Agent 請建立新 Workflow，由轉接 Agent 協助接手。</p>}
+          {session.kind === 'workflow' && <p id={`${view.id}-model-lock`} className="composer-note">workflow 的 node 不能換工具；僅能選擇同一工具的 Model。</p>}
           <p className="composer-note">{selection ? '示意選擇，尚未套用。' : observedModelText(session)} {chosen.model.runtime === 'codex' ? 'Model 於下一個 turn 生效。' : 'Model 於下一次模型呼叫生效。'}</p>
           <label className="sr-only" htmlFor={`${view.id}-draft`}>傳訊息給 {session.title}</label>
           <textarea id={`${view.id}-draft`} value={context.draft} onChange={event => onContext({ draft: event.target.value })} placeholder={`傳訊息給 ${session.title}…`} rows={3} />

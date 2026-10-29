@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { applyNodeChanges, Background, BaseEdge, ControlButton, Controls, EdgeText, Handle, MarkerType, Position, ReactFlow, ReactFlowProvider, useNodesInitialized, useReactFlow } from '@xyflow/react';
-import type { EdgeProps, NodeProps } from '@xyflow/react';
+import { applyNodeChanges, Background, ControlButton, Controls, Handle, MarkerType, Position, ReactFlow, ReactFlowProvider, useNodesInitialized, useReactFlow } from '@xyflow/react';
+import type { NodeProps } from '@xyflow/react';
+import { ReturnEdge } from './ReturnEdge';
 import type { WorkflowNode, WorkflowTemplate } from '../../../../contracts';
 import { isolationLabels, writePolicyLabels } from '../workflow-editor-state';
 import type { GraphSelection } from '../workflow-editor-state';
@@ -24,11 +25,6 @@ function NodeCard({ data }: NodeProps<CanvasNode>) {
   </div>;
 }
 const nodeTypes = { workflow: NodeCard };
-function ReturnEdge({ id, sourceX, sourceY, targetX, targetY, markerEnd, data }: EdgeProps) {
-  const laneY = typeof data?.laneY === 'number' ? data.laneY : Math.min(sourceY, targetY) - 100;
-  const path = `M ${sourceX} ${sourceY} H ${sourceX + 10} V ${laneY} H ${targetX - 10} V ${targetY} H ${targetX}`;
-  return <><BaseEdge id={id} path={path} {...(markerEnd ? { markerEnd } : {})} /><EdgeText x={(sourceX + targetX) / 2} y={laneY} label={typeof data?.label === 'string' ? data.label : '返回'} /></>;
-}
 const edgeTypes = { return: ReturnEdge };
 interface Props {
   workflow: WorkflowTemplate; selection: GraphSelection; disabled: boolean;
