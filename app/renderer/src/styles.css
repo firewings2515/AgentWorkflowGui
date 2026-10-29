@@ -43,6 +43,43 @@
   --transparent: transparent;
 }
 * { box-sizing: border-box; }
+.transfer-dialog { width: min(760px, calc(100vw - 32px)); max-width: calc(100vw - 32px); max-height: calc(100dvh - 32px); padding: 0; overflow: auto; }
+.transfer-dialog > header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 16px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.transfer-dialog > header .eyebrow { width: 100%; }
+.transfer-dialog > header button { margin-left: auto; }
+.transfer-body { padding: 20px; overflow-wrap: anywhere; }
+.transfer-body label { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 14px 0; }
+.transfer-body fieldset { min-width: 0; margin-top: 18px; border: 1px solid var(--line); }
+.transfer-body button { margin: 4px 8px 4px 0; }
+.transfer-content { height: min(300px, 40dvh); overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 16px; background: var(--panel); }
+.transfer-content pre, .workflow-progress pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.transfer-content h3 { color: var(--accent); margin-top: 18px; }
+.transfer-content h3:first-child { margin-top: 0; }
+.transfer-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; margin: 18px 0; }
+.transfer-facts dt { color: var(--muted); }
+.transfer-facts dd { margin: 0; }
+.tree-derived { margin: 0 0 10px 24px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.tree-derived button { padding: 2px 4px; font-size: inherit; }
+.workflow-progress { height: 100%; overflow: auto; padding: 20px; }
+.progress-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.progress-header p { overflow-wrap: anywhere; }
+.progress-task { border: 1px solid var(--line); padding: 14px; border-radius: 8px; margin: 16px 0; }
+.progress-task h3 { display: inline; margin-right: 12px; }
+.progress-task p { margin: 10px 0 0; }
+.progress-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; margin-bottom: 20px; }
+.progress-canvas { height: 450px; min-width: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.progress-logs { max-height: 450px; overflow: auto; }
+.progress-logs h4 { margin-top: 0; }
+.progress-logs button { display: block; margin: 8px 0; }
+.progress-node[data-current='true'], .progress-logs [data-current='true'] { border: 2px solid var(--accent); background: var(--accent-bg); }
+.progress-node button span { display: block; }
+.current-node { color: var(--accent); }
+.status[data-state='stale'], .status[data-state='awaiting-confirmation'] { color: var(--warning); }
+.handoff-table { overflow: auto; }
+.handoff-table table { width: 100%; border-collapse: collapse; }
+.handoff-table th, .handoff-table td { min-width: 125px; padding: 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.handoff-table td pre { min-width: 180px; max-height: 240px; overflow: auto; }
+@media (max-width: 1100px) { .progress-layout { grid-template-columns: minmax(0, 1fr); } .progress-logs { max-height: none; } .workflow-progress { padding: 14px; } .session-toolbar { flex-wrap: wrap; } }
 .workflow-start { height: 100%; overflow: auto; padding: 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
 .workflow-start form { max-width: 850px; }
 .workflow-start fieldset, .escalation-card fieldset { min-width: 0; border: 0; padding: 0; margin: 0; }

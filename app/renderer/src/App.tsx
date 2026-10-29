@@ -1,11 +1,13 @@
-import { useEffect, useReducer, useRef, useState, useSyncExternalStore } from 'react';
-import type { AgentId, ModelOption, SessionId, Snapshot } from '../../../contracts';
+import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from 'react';
+import type { AgentId, SessionId, Snapshot } from '../../../contracts';
 import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
 import { SessionTree } from './SessionTree';
 import { SessionWorkspace } from './SessionWorkspace';
 import type { Selection } from './SessionWorkspace';
 import { initialWorkspace, workspaceReducer } from './workbench-state';
-import { WorkflowSummary } from './DetailPanel';
+import { WorkflowProgress } from './WorkflowProgress';
+import { TransferDialog } from './TransferDialog';
+import type { TransferPreview } from './TransferDialog';
 import { readTheme, THEME_KEY, type Theme } from './theme';
 import { AgentCatalog } from './AgentCatalog';
 import { createAgentDemo } from './agent-demo';
@@ -41,28 +43,7 @@ export const pageRegistry = [
   { id: 'progress', title: 'Workflow 執行進度', pattern: /^\/workflow-instances\/([^/]+)$/, navigation: false },
 ] as const;
 const currentRoute = () => window.location.hash.slice(1) || '/workbench';
-
-interface TransferPreview { sessionId: SessionId; model: ModelOption; viewId: string }
-function TransferDialog({ snapshot, preview, onClose }: { snapshot: Snapshot; preview: TransferPreview; onClose: () => void }) {
-  const dialog = useRef<HTMLDialogElement>(null);
-  const session = snapshot.sessions.find(item => item.id === preview.sessionId);
-  useEffect(() => {
-    const element = dialog.current;
-    if (element?.showModal) element.showModal(); else element?.setAttribute('open', '');
-    return () => { if (element?.close) element.close(); };
-  }, []);
-  return <dialog ref={dialog} aria-labelledby="transfer-heading" onCancel={event => { event.preventDefault(); onClose(); }} onKeyDown={event => {
-    if (event.key === 'Escape') { event.preventDefault(); onClose(); }
-    if (event.key === 'Tab') { event.preventDefault(); dialog.current?.querySelector('button')?.focus(); }
-  }}>
-    <span className="eyebrow">跨工具轉交 · 示意預覽</span><h2 id="transfer-heading">轉交到新的 session</h2>
-    <p>{session?.title ?? preview.sessionId}</p>
-    <div className="transfer-route">{session?.requestedModel.runtime} → {preview.model.runtime} · {preview.model.displayName}</div>
-    <p>跨工具需先整理交接內容、審閱並確認，再建立新 session。</p>
-    <p className="muted">本階段尚未接入轉交流程。原 session 與 Model 保持原設定，未建立新 session、未傳送內容。</p>
-    <button className="primary" autoFocus onClick={onClose}>返回工作台</button>
-  </dialog>;
-}
+const focusView = (viewId: string) => requestAnimationFrame(() => document.getElementById(`${viewId}-heading`)?.focus());
 
 export function App({ snapshot }: { snapshot?: Snapshot }) {
   return window.awg ? <ConnectedApp store={rendererStore(window.awg)} /> : <AppContent snapshot={snapshot ?? fixtureSnapshot} />;
@@ -95,6 +76,8 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
   const [notice, setNotice] = useState('');
   const [selections, setSelections] = useState<Record<string, Selection>>({});
   const [transfer, setTransfer] = useState<TransferPreview | null>(null);
+  // Discard the preview as soon as damaged data is observed, before recovery can render it again.
+  if (snapshot.app.status === 'damaged' && transfer) setTransfer(null);
   const returnAnchor = useRef<{ viewId: string; sessionId: SessionId } | null>(null);
   const pageHeading = useRef<HTMLHeadingElement>(null);
   const path = route.split('?')[0] ?? '/workbench';
@@ -125,13 +108,16 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
     }
   }, [workbenchVisible, workspaceViewIds]);
 
-  const navigate = (next: string) => { window.history.pushState(null, '', `#${next}`); setRoute(next); };
-  const focusView = (viewId: string) => requestAnimationFrame(() => document.getElementById(`${viewId}-heading`)?.focus());
-  const openSession = (sessionId: SessionId, viewId?: string) => {
+  const navigate = useCallback((next: string) => { window.history.pushState(null, '', `#${next}`); setRoute(next); }, []);
+  const openSession = useCallback((sessionId: SessionId, viewId?: string) => {
     if (!snapshot.sessions.some(session => session.id === sessionId)) { setNotice(`找不到 session：${sessionId}`); return; }
     dispatch({ type: 'open', sessionId, ...(viewId ? { viewId } : {}) });
     focusView(viewId ?? (workspace.activeViewId || workspace.closedViews.at(-1)?.id || `view-${workspace.nextId}`));
-  };
+  }, [snapshot.sessions, workspace.activeViewId, workspace.closedViews, workspace.nextId]);
+  const openProgressSession = useCallback((id: SessionId) => {
+    navigate('/workbench');
+    openSession(id, returnAnchor.current?.viewId);
+  }, [navigate, openSession]);
   const changeSelection = (sessionId: SessionId, patch: Partial<Selection>) => {
     const session = snapshot.sessions.find(candidate => candidate.id === sessionId);
     if (!session) return;
@@ -147,13 +133,12 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
     setTransfer(null);
     requestAnimationFrame(() => {
       const view = document.querySelector(`[data-workspace="${viewId}"]`);
-      view?.querySelector<HTMLSelectElement>('select[aria-label="Model"]')?.focus();
+      view?.querySelector<HTMLElement>(transfer?.model ? 'select[aria-label="Model"]' : '[data-transfer-trigger]')?.focus();
     });
   };
 
   let entityId = page?.pattern.exec(path)?.[1] ?? '';
   try { entityId = decodeURIComponent(entityId); } catch { /* Keep a malformed ID visible as missing. */ }
-  const instance = snapshot.instances.find(item => item.id === entityId);
 
   if (snapshot.app.status === 'damaged') return <div className="connection-screen damaged-screen">
     <h1>{APP_NAME}</h1><section role="alert"><h2>資料損壞，所有操作已停用</h2>
@@ -197,9 +182,13 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
             }}
             onContext={patch => dispatch({ type: 'context', viewId: view.id, sessionId: view.sessionId, patch })}
             onOpen={id => openSession(id, view.id)} onAgent={id => changeAgent(view.sessionId, id)}
+            onTransfer={() => setTransfer({ sessionId: view.sessionId, viewId: view.id })}
             onModel={model => {
               const session = snapshot.sessions.find(candidate => candidate.id === view.sessionId);
-              if (model.runtime !== session?.requestedModel.runtime) setTransfer({ sessionId: view.sessionId, model, viewId: view.id });
+              if (model.runtime !== session?.requestedModel.runtime) {
+                if (session?.kind === 'ordinary') setTransfer({ sessionId: view.sessionId, model, viewId: view.id });
+                else setNotice('workflow 的 node 不能換工具。');
+              }
               else {
                 const selection = { runtime: model.runtime, model: model.model, ...(model.defaultEffort ? { effort: model.defaultEffort } : {}) };
                 if (store && session) void store.send({ type: 'session.setModel', requestId: RequestId.parse(crypto.randomUUID()), sessionId: session.id, expectedRevision: session.revision, model: selection });
@@ -212,17 +201,16 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
       <AgentCatalog repository={agentRepository} demo={agentDemo} selectedId={page?.id === 'agents' ? entityId : ''} visible={page?.id === 'agents'} onSelect={id => navigate(id ? `/agents/${encodeURIComponent(id)}` : '/agents')} />
       <WorkflowEditor repository={workflowRepository} demo={workflowDemo} agents={agentOptions} models={snapshot.modelOptions} selectedId={page?.id === 'workflow' ? entityId : ''} visible={page?.id === 'workflow'} onSelect={id => navigate(`/workflows/${encodeURIComponent(id)}/edit`)} />
       {page?.id === 'start' && <WorkflowStart snapshot={snapshot} store={store} ipcState={ipcState} onOpen={id => { navigate('/workbench'); openSession(id); }} />}
-      {!workbenchVisible && page?.id !== 'agents' && page?.id !== 'workflow' && page?.id !== 'start' && <section className="placeholder-page">
-        {page?.id === 'progress' && <><span className="eyebrow">唯讀 · 指定執行群組</span><h2>{instance?.title ?? '找不到指定的 Workflow 執行群組'}</h2><p className="muted">{entityId || '無效 ID'} · 完整進度畫布將於後續任務提供。</p>{instance && <WorkflowSummary snapshot={snapshot} instance={instance} />}</>}
-        {!page && <p>無法辨識路由：<code>{path}</code></p>}
-        <button onClick={() => {
+      {page?.id === 'progress' && <WorkflowProgress snapshot={snapshot} instanceId={entityId} onOpen={openProgressSession} onBack={() => {
           navigate('/workbench');
-          if (page?.id === 'progress' && returnAnchor.current) { const anchor = returnAnchor.current; openSession(anchor.sessionId, anchor.viewId); }
-        }}>返回工作台</button>
+          if (returnAnchor.current) { const anchor = returnAnchor.current; openSession(anchor.sessionId, anchor.viewId); }
+        }} />}
+      {!page && <section className="placeholder-page">
+        <p>無法辨識路由：<code>{path}</code></p><button onClick={() => navigate('/workbench')}>返回工作台</button>
       </section>}
     </main>
     <footer className="app-footer">{store && ipcState ? <ConnectionStatus store={store} state={ipcState} /> : <span>示意資料 · 示意模式 · 未連接 runtime</span>}<span>{workspace.views.length} 組工作區</span></footer>
     {notice && <div className="notice" role="status"><span>{notice}</span><button aria-label="關閉提示" onClick={() => setNotice('')}>×</button></div>}
-    {transfer && <TransferDialog snapshot={snapshot} preview={transfer} onClose={closeTransfer} />}
+    {transfer && <TransferDialog key={`${transfer.sessionId}:${transfer.viewId}`} snapshot={snapshot} preview={transfer} store={store} ipcState={ipcState} onClose={closeTransfer} onOpen={id => { openSession(id, transfer.viewId); closeTransfer(); }} />}
   </div>;
 }

@@ -1,17 +1,32 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import type { LogicalSession } from '../../../contracts';
+import type { CreateTasksToolResult, HandoffToolResult, LogicalSession, OperationOutcome, ReportToRootToolResult, SendMessageToolResult, Snapshot, WaitForFileToolResult } from '../../../contracts';
 
-const labels: Record<string, string> = {
+type ContractStatus = LogicalSession['activity'] | Snapshot['app']['status'] | Snapshot['turns'][number]['state'] |
+  Snapshot['nativeTasks'][number]['state'] | Snapshot['items'][number]['state'] | Snapshot['permissionRequests'][number]['state'] |
+  Snapshot['artifacts'][number]['access'] | Snapshot['instances'][number]['state'] | Snapshot['instances'][number]['tasks'][number]['status'] |
+  Snapshot['transfers'][number]['state'] | Snapshot['handoffs'][number]['delivery']['state'] | Snapshot['escalations'][number]['state'] |
+  OperationOutcome['kind'] | HandoffToolResult['status'] | CreateTasksToolResult['status'] | SendMessageToolResult['status'] |
+  ReportToRootToolResult['status'] | WaitForFileToolResult['status'];
+
+const labels = {
   idle: '閒置', running: '執行中', 'waiting-user': '待確認', 'waiting-lock': '等待檔案鎖',
   interrupted: '已中斷', error: '錯誤', reconciling: '核對中', closed: '已釋放 runtime',
   completed: '已完成', failed: '失敗', stopped: '已停止', pending: '等待中',
   available: '可存取', missing: '檔案遺失', 'out-of-scope': '範圍外', unreadable: '無法讀取',
   sent: '已送達（不代表已讀）', unknown: '送達結果未知', 'not-sent': '尚未送出',
   merged: '已合併', blocked: '受阻', cancelled: '已取消', rejected: '已拒絕', declined: '已拒絕',
-};
+  draft: '準備中', 'awaiting-confirmation': '等待確認', stale: '已過期', approved: '已核准',
+  'awaiting-merge': '等待合併', merging: '合併中', proposed: '等待套用', applied: '已套用',
+  held: '暫緩處理', answered: '已回覆', withdrawn: '已撤回', open: '待處理', resolved: '已解決',
+  ready: '就緒', damaged: '資料損壞', accepted: '已接納', duplicate: '重複請求', escalated: '已提請處理',
+  created: '已建立', reported: '已回報', free: '已釋放', 'not-locked': '未鎖定', timeout: '已逾時',
+} satisfies Record<ContractStatus | 'not-sent', string>;
+export function statusLabel(value: string): string {
+  return Object.hasOwn(labels, value) ? labels[value as keyof typeof labels] : value;
+}
 export function Status({ value }: { value: string }) {
-  return <span className="status" data-state={value}><span aria-hidden="true">●</span> {labels[value] ?? value}</span>;
+  return <span className="status" data-state={value}><span aria-hidden="true">●</span> {statusLabel(value)}</span>;
 }
 export const formatTime = (value: string) => new Intl.DateTimeFormat('zh-TW', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value));
 export function observedModelText(session: LogicalSession): string {
