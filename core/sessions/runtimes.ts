@@ -268,6 +268,8 @@ export class SessionRuntimes {
     this.refs.set(info.nativeSessionRef, info.sessionId);
     this.open.add(info.nativeSessionRef);
     this.options.onOpened?.(info.sessionId, info.cwd);
+    // R-12: Codex reports its configured model only here (start or resume), never in an event (T021).
+    if (info.model.source !== 'unknown') this.options.onEvent({ type: 'model.observed', sessionId: info.sessionId, observed: info.model, at: info.model.observedAt });
   }
 
   /** The port view of one runtime: every call goes to the adapter of the session it names. */

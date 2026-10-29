@@ -32,13 +32,20 @@ interface OpenJob extends SessionJob {
   handle: kernel32.Handle;
   runtime?: Runtime;
   hosts: Set<JobChild>;
-  /** Every process seen in the Job, by PID, with its creation time. */
-  seen: Map<number, OwnedProcess>;
+  /**
+   * Every process seen in the Job, by PID and creation time: a PID the OS reuses inside the Job is another
+   * process, and the earlier one keeps its record until the Job ends (t021-r1-P2-1).
+   */
+  seen: Map<string, OwnedProcess>;
 }
 
 const iso = (ms: number) => new Date(ms).toISOString();
 const sameProcess = (a: Pick<OwnedProcess, 'pid' | 'startedAt'>, b: Pick<OwnedProcess, 'pid' | 'startedAt'>) =>
   a.pid === b.pid && Date.parse(a.startedAt) === Date.parse(b.startedAt);
+/** The key of one process: its PID alone can come back as another process. */
+const identityKey = (p: Pick<OwnedProcess, 'pid' | 'startedAt'>) => `${String(p.pid)}@${String(Date.parse(p.startedAt))}`;
+/** Image names (lower case) of Job members that are never the agent's commands. */
+const HELPER_IMAGES = new Set(['conhost.exe', 'codex-code-mode-host.exe']);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class WindowsProcessHost implements ProcessHost {
@@ -134,13 +141,14 @@ export class WindowsProcessHost implements ProcessHost {
         this.log('debug', `cannot read process ${pid} of ${job.jobRef}`, error);
       }
       if (!info) continue;
-      const known = job.seen.get(pid);
-      if (known && known.startedAt === info.startedAt) {
+      const known = job.seen.get(identityKey({ pid, startedAt: info.startedAt }));
+      if (known) {
         live.push(known);
         continue;
       }
-      // The console host Windows adds for CREATE_NO_WINDOW is not the runtime's work.
-      const kind = basename(info.image).toLowerCase() === 'conhost.exe' ? 'helper' : 'command';
+      // The console host Windows adds for CREATE_NO_WINDOW, and the runtimes' own resident helpers, are not
+      // the agent's commands: counted as commands they made exiting warn of work that is not there (T021).
+      const kind = HELPER_IMAGES.has(basename(info.image).toLowerCase()) ? 'helper' : 'command';
       live.push(this.remember(job, runtime, { pid, startedAt: info.startedAt, kind }));
     }
     return live;
@@ -148,7 +156,7 @@ export class WindowsProcessHost implements ProcessHost {
 
   private remember(job: OpenJob, runtime: Runtime, p: Pick<OwnedProcess, 'pid' | 'startedAt' | 'kind'>): OwnedProcess {
     const record: OwnedProcess = { ...p, sessionId: job.sessionId, runtime, jobRef: job.jobRef, recordedAt: this.now() };
-    job.seen.set(p.pid, record);
+    job.seen.set(identityKey(p), record);
     this.options.repository?.record(record).catch((error: unknown) => this.log('warn', 'could not record an owned process', error));
     return record;
   }
@@ -169,7 +177,10 @@ export class WindowsProcessHost implements ProcessHost {
     }
     const at = this.now();
     const ended = before.map((p) => ({ ...p, endedAt: at }));
-    await this.markEnded(ended);
+    // What exited before the Job was ended (a graceful close lets the runtime end its own processes) is
+    // recorded as ended too, by now at the latest; otherwise its record stays open until the next start (T021).
+    const exited = [...job.seen.values()].filter((p) => !before.some((b) => sameProcess(b, p))).map((p) => ({ ...p, endedAt: at }));
+    await this.markEnded([...ended, ...exited]);
     return { ended };
   }
 

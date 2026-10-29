@@ -28,6 +28,16 @@ export const codex = (script: string, fields: Fields = {}) => {
   return request('command', `Run command: ${cmd}`, { command: cmd, ...fields });
 };
 
+/**
+ * A command as Codex 0.160 reported it on the real machine (T021): the executable in double quotes with
+ * doubled backslashes, `-NoProfile`, and a script without `'` in single quotes.
+ */
+export const CODEX_PS_EXE = String.raw`"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"`;
+export const codexSingle = (script: string, fields: Fields = {}) => {
+  const cmd = `${CODEX_PS_EXE} -NoProfile -Command '${script}'`;
+  return request('command', `Run command: ${cmd}`, { command: cmd, ...fields });
+};
+
 /** A Claude edit tool call. */
 export const edit = (...paths: string[]) => request('fileChange', paths[0] ? `Write ${paths[0]}` : 'Write', { paths });
 

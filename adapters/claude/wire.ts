@@ -58,6 +58,8 @@ export interface WireQueryOptions {
   settings: { disableClaudeAiConnectors: true };
   strictMcpConfig: true;
   mcpServers?: Record<string, WireMcpServer>;
+  /** claude.exe's whole environment (the SDK's default is process.env); `${NAME}` in MCP headers reads it. */
+  env?: Record<string, string | undefined>;
   /** R-08: every tool runs without the CLI asking; the PreToolUse hook hands each call to the GUI. */
   permissionMode: 'bypassPermissions';
   allowDangerouslySkipPermissions: true;

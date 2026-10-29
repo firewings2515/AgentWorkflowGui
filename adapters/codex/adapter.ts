@@ -259,6 +259,8 @@ export class CodexAdapter implements RuntimeAdapter {
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   private readonly threads = new Map<string, ThreadBinding>();
   private readonly turnModels = new Map<string, ModelSelection>();
+  /** Turns whose configured model was reported already (R-12). */
+  private readonly reportedModels = new Set<string>();
   private readonly items = new Map<string, TrackedItem>();
   private readonly nativeTasks = new Map<string, NativeTask>();
   /** State implied by each child thread's latest turn (running while a turn is open), seen live or read from history. */
@@ -1115,11 +1117,14 @@ export class CodexAdapter implements RuntimeAdapter {
   private onTurn(method: string, threadId: string | undefined, turn: WireTurn | undefined): void {
     const binding = threadId === undefined ? undefined : this.threads.get(threadId);
     if (!binding || !turn || typeof turn.id !== 'string') return;
+    const now = this.now();
     if (method === 'turn/started' && binding.nextTurnModel && !this.turnModels.has(turn.id)) {
       this.turnModels.set(turn.id, binding.nextTurnModel);
       delete binding.nextTurnModel;
     }
-    const now = this.now();
+    // The turn's model is known here whichever came first: the turn/start response (turnModels) or this
+    // notification (nextTurnModel, just moved over). Reported once per turn (t021-r1-P1-3).
+    const configured = method === 'turn/started' && !this.reportedModels.has(turn.id) ? this.turnModels.get(turn.id)?.model : undefined;
     const mapped = toTurn(binding.sessionId, turn, { now, requestedModel: this.turnModels.get(turn.id), nativeTaskId: binding.nativeTaskId });
     if (method === 'turn/started') binding.activeTurnId = turn.id;
     if (method === 'turn/completed') {
@@ -1135,11 +1140,27 @@ export class CodexAdapter implements RuntimeAdapter {
         if (entry.threadId === threadId && entry.nativeTurnId === turn.id) this.withdraw(entry);
       }
       this.turnModels.delete(turn.id);
+      this.reportedModels.delete(turn.id);
     }
     // A sub-agent's turns carry its nativeTaskId, so they are not the session's own turns (R-13); they
     // also decide its NativeTask state.
     this.emit({ type: 'turn.updated', turn: mapped });
-    if (binding.nativeTaskId !== undefined) this.onChildTurn(threadId!, turn, method === 'turn/completed', mapped.endedAt ?? now);
+    if (binding.nativeTaskId !== undefined) {
+      this.onChildTurn(threadId!, turn, method === 'turn/completed', mapped.endedAt ?? now);
+      return;
+    }
+    // The session's own turn sets its activity, as the Claude adapter's does (T021: Codex sessions stayed
+    // idle, so a message to a busy one started a new turn instead of joining the running one).
+    if (method === 'turn/started') {
+      this.emit({ type: 'session.activity', sessionId: binding.sessionId, activity: 'running', at: now });
+      // R-12: the model set for this turn is what Codex is configured with from now on, not what it used.
+      if (configured !== undefined) {
+        this.reportedModels.add(turn.id);
+        this.emit({ type: 'model.observed', sessionId: binding.sessionId, observed: { source: 'configured', model: configured, observedAt: now }, at: now });
+      }
+    } else if (method === 'turn/completed') {
+      this.emit({ type: 'session.activity', sessionId: binding.sessionId, activity: mapped.state === 'interrupted' ? 'interrupted' : 'idle', at: mapped.endedAt ?? now });
+    }
   }
 
   private onItem(method: string, params: Record<string, unknown>): void {

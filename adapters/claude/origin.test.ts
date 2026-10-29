@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { type MessageOrigin, PeerMessageId, SessionId } from '../../contracts';
 import type { DispatchRequest } from '../../core/ports';
+import { GUI_TOKEN_ENV } from './adapter';
 import { attempt, CWD, echo, promptLine, REF, result, SESSION, started, transcript, u, until } from './testing/harness';
 
 const TOKEN = 'tok-0123456789abcdef0123456789abcdef';
@@ -29,10 +30,13 @@ describe('the GUI MCP server from the port’s mcp option', () => {
       gui: {
         type: 'http',
         url: MOUNT.url,
-        headers: { Authorization: `Bearer ${TOKEN}` },
+        headers: { Authorization: 'Bearer ${AWG_GUI_MCP_TOKEN}' },
       },
       docs: { command: 'docs-server' },
     });
+    // T021: the token goes to this session's claude.exe in its environment, never in its arguments.
+    expect(h.sdk.last.options.env?.[GUI_TOKEN_ENV]).toBe(TOKEN);
+    expect(JSON.stringify(h.sdk.last.options.mcpServers)).not.toContain(TOKEN);
     expect(JSON.stringify([h.events, h.logs])).not.toContain(TOKEN);
   });
 
@@ -52,14 +56,21 @@ describe('the GUI MCP server from the port’s mcp option', () => {
       gui: {
         type: 'http',
         url: MOUNT.url,
-        headers: { Authorization: 'Bearer second' },
+        headers: { Authorization: 'Bearer ${AWG_GUI_MCP_TOKEN}' },
       },
     });
+    expect(h.sdk.last.options.env?.[GUI_TOKEN_ENV]).toBe('second');
   });
 
   it('mounts nothing without the option or a configured server', async () => {
     const h = await started();
     expect(h.sdk.last.options.mcpServers).toBeUndefined();
+    expect(h.sdk.last.options.env).toBeUndefined();
+  });
+
+  it('T021 keeps the rest of the environment, so claude.exe still finds its login and PATH', async () => {
+    const h = await started({}, { mcp: MOUNT });
+    expect(h.sdk.last.options.env?.['PATH'] ?? h.sdk.last.options.env?.['Path']).toBe(process.env['PATH'] ?? process.env['Path']);
   });
 });
 

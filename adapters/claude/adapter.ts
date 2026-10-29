@@ -180,6 +180,8 @@ interface LiveSession {
 
 const MAIN = 'main';
 const DEFAULT_MAX_OUTPUT = 64 * 1024;
+/** The environment variable that carries a session's GUI MCP token into its own claude.exe only. */
+export const GUI_TOKEN_ENV = 'AWG_GUI_MCP_TOKEN';
 
 /** Same folder, compared the way Windows does (case-insensitive, either separator, no trailing one). */
 const sameFolder = (a: string, b: string): boolean => {
@@ -594,7 +596,10 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const effort = toEffort(settings.model?.effort);
     const configured = sessionId === undefined ? undefined : this.options.mcpServers?.({ sessionId, cwd });
     // The GUI MCP server with this start's token (R-03) wins over a configured server of the same name.
-    const gui: Record<string, WireMcpServer> | undefined = settings.mcp && { gui: { type: 'http', url: settings.mcp.url, headers: { Authorization: `Bearer ${settings.mcp.token}` } } };
+    // The SDK hands mcpServers to claude.exe as a command-line argument, which any process of the user can
+    // list (T021: another session's agent could read the token and call as this session). The header only
+    // names a variable, which Claude Code expands from the environment of this session's claude.exe alone.
+    const gui: Record<string, WireMcpServer> | undefined = settings.mcp && { gui: { type: 'http', url: settings.mcp.url, headers: { Authorization: `Bearer \${${GUI_TOKEN_ENV}}` } } };
     const mcpServers = configured || gui ? { ...configured, ...gui } : undefined;
     const spawn = sessionId === undefined ? undefined : this.options.spawnProcess?.({ sessionId });
     return {
@@ -608,6 +613,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
       settings: { disableClaudeAiConnectors: true },
       strictMcpConfig: true,
       ...opt('mcpServers', mcpServers),
+      ...(settings.mcp && { env: { ...process.env, [GUI_TOKEN_ENV]: settings.mcp.token } }),
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       // Read-only nodes (R-04): the edit tools are not offered at all. Shell writes still reach the hook.
