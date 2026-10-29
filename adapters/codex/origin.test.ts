@@ -189,7 +189,12 @@ describe('origin (R-03)', () => {
     });
     expect(unwrap(`hi\n${inner}`)).toBeUndefined();
     expect(unwrap('[AgentWorkflowGui] This message comes from the user.\n---\nx')).toBeUndefined();
-    for (const origin of [{ kind: 'agent' }, { kind: 'system' }, { kind: 'handoff', fromSessionId: 's', handoffId: 'h' }] as MessageOrigin[]) {
+    for (const origin of [
+      { kind: 'agent' },
+      { kind: 'system' },
+      { kind: 'handoff', fromSessionId: 's', handoffId: 'h' },
+      { kind: 'transfer', fromSessionId: 's', transferId: 't' },
+    ] as MessageOrigin[]) {
       expect(unwrap(envelope('body', origin))).toEqual({
         text: 'body',
         origin,
