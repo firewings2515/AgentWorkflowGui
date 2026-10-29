@@ -108,3 +108,54 @@ describe('origin', () => {
     expect(g.codex.dispatched[1]).not.toHaveProperty('origin');
   });
 });
+
+describe('r1-P1-1 every level is rebuilt from plain data', () => {
+  const stored = async (g: ReturnType<typeof gui>, id = provisionInput().operationId) => JSON.stringify(await g.store.get(id));
+
+  it('r1-P1-1 an MCP mount nested in spec.model is not stored', async () => {
+    const g = gui();
+    const base = provisionInput();
+    const spec = { ...base.spec, model: { ...base.spec.model, mcp: { token: TOKEN } } } as unknown as ProvisionSpec;
+    expect((await g.service.accept({ ...base, spec })).status).toBe('accepted');
+    expect(await stored(g)).not.toContain(TOKEN);
+    expect(await stored(g)).not.toContain('"mcp"');
+  });
+
+  it('r1-P1-1 a getter (on the model, or returning a model that carries the mount) is refused, not read', async () => {
+    const g = gui();
+    const base = provisionInput();
+    const spec = { ...base.spec } as Record<string, unknown>;
+    Object.defineProperty(spec, 'model', { enumerable: true, get: () => ({ ...base.spec.model, mcp: mount }) });
+    expect(await g.service.accept({ ...base, spec: spec as unknown as ProvisionSpec })).toMatchObject({ status: 'invalid' });
+    const model = { ...base.spec.model } as Record<string, unknown>;
+    Object.defineProperty(model, 'effort', { enumerable: true, get: () => TOKEN });
+    expect(await g.service.accept({ ...base, spec: { ...base.spec, model: model as unknown as ProvisionSpec['model'] } })).toMatchObject({ status: 'invalid' });
+    expect(await g.store.get(base.operationId)).toBeUndefined();
+  });
+
+  it('r1-P1-1 a model that is an array or a class instance is refused', async () => {
+    const g = gui();
+    const base = provisionInput();
+    const asArray = Object.assign([TOKEN], { runtime: 'claude', model: 'x' });
+    expect(await g.service.accept({ ...base, spec: { ...base.spec, model: asArray as unknown as ProvisionSpec['model'] } })).toMatchObject({ status: 'invalid' });
+    class Model {
+      runtime = 'claude';
+      model = 'x';
+      token = TOKEN;
+    }
+    expect(await g.service.accept({ ...base, spec: { ...base.spec, model: new Model() as unknown as ProvisionSpec['model'] } })).toMatchObject({ status: 'invalid' });
+    const payload = payloadInput();
+    const session = { ...payload.context.session, model: [payload.context.session.model] } as unknown as SessionSettings;
+    expect(await g.service.accept({ ...payload, context: { ...payload.context, session } })).toMatchObject({ status: 'invalid' });
+    expect(await g.store.get(base.operationId)).toBeUndefined();
+    expect(await g.store.get(OP)).toBeUndefined();
+  });
+
+  it('r1-P1-1 an entry model is rebuilt too, and a payload keeps working', async () => {
+    const g = gui();
+    const payload = payloadInput();
+    const entry = { kind: 'new-turn', model: { runtime: 'codex', model: 'gpt-6-luna', mcp: mount } } as unknown as typeof payload.context.entry;
+    expect((await g.service.accept({ ...payload, context: { ...payload.context, entry } })).status).toBe('accepted');
+    expect(await stored(g, OP)).not.toContain(TOKEN);
+  });
+});

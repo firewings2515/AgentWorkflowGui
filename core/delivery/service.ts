@@ -9,7 +9,10 @@ import {
   type DeliveryTarget,
   DeliveryTarget as DeliveryTargetSchema,
   type DispatchAttempt,
+  type ModelSelection,
   type OperationId,
+  type Runtime,
+  type SessionId,
   deliveryTargetIssues,
 } from '../../contracts';
 import {
@@ -17,7 +20,9 @@ import {
   type ClaimInput,
   type ClaimResult,
   CommitUncertainError,
+  type DispatchEntry,
   type DispatchResult,
+  type PayloadKind,
   type ReconcileResult,
   type SessionSettings,
   type StartSessionOptions,
@@ -74,29 +79,129 @@ const startOptions = (spec: ProvisionDelivery['spec']): StartSessionOptions => (
   ...(spec.preallocatedRef !== undefined && { preallocatedRef: spec.preallocatedRef }),
 });
 
-const settingsOf = (s: SessionSettings): SessionSettings => ({
-  model: s.model,
-  readOnly: s.readOnly,
-  ...(s.instructions !== undefined && { instructions: s.instructions }),
-});
+/** Own data properties only, from Object.prototype or null, no symbols: what JSON would see, and nothing more. */
+const isPlain = (v: unknown): v is Record<string, unknown> => {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const proto: unknown = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return false;
+  if (Object.getOwnPropertySymbols(v).length > 0) return false;
+  return Object.values(Object.getOwnPropertyDescriptors(v)).every((d) => 'value' in d);
+};
+
+const hasKey = (v: unknown, key: string): boolean =>
+  Array.isArray(v) ? v.some((x) => hasKey(x, key)) : typeof v === 'object' && v !== null && Object.entries(v).some(([k, x]) => k === key || hasKey(x, key));
 
 /**
- * What the store gets: the spec and the session settings rebuilt from the fields the port allows, so
- * nothing else that rode along on the caller's object (an MCP token above all, C-07) is written.
+ * Rebuilds what the store gets, every level from primitives the port allows (C-07: the MCP token never
+ * reaches the store, T017 r1-P1-1). Anything that is not plain data where an object is expected (an
+ * array, a class instance, a getter, a symbol key) is refused rather than read.
  */
-const storable = (input: AcceptInput): AcceptInput => {
-  if (input.kind !== 'provision') return { ...input, context: { ...input.context, session: settingsOf(input.context.session) } };
-  const { spec } = input;
-  return {
-    ...input,
-    spec: {
-      runtime: spec.runtime,
-      sessionId: spec.sessionId,
-      cwd: spec.cwd,
-      ...settingsOf(spec),
-      ...(spec.preallocatedRef !== undefined && { preallocatedRef: spec.preallocatedRef }),
-    },
+class Rebuild {
+  readonly issues: string[] = [];
+
+  object(v: unknown, at: string): Record<string, unknown> {
+    if (isPlain(v)) return v;
+    this.issues.push(`${at} is not plain data`);
+    return {};
+  }
+
+  string(o: Record<string, unknown>, key: string, at: string): string {
+    const v = o[key];
+    if (typeof v === 'string') return v;
+    this.issues.push(`${at}.${key} is not a string`);
+    return '';
+  }
+
+  optionalString(o: Record<string, unknown>, key: string, at: string): string | undefined {
+    return o[key] === undefined ? undefined : this.string(o, key, at);
+  }
+
+  runtime(o: Record<string, unknown>, at: string): Runtime {
+    const v = o.runtime;
+    if (v === 'claude' || v === 'codex') return v;
+    this.issues.push(`${at}.runtime is not a runtime`);
+    return 'claude';
+  }
+
+  model(v: unknown, at: string): ModelSelection {
+    const o = this.object(v, at);
+    const effort = this.optionalString(o, 'effort', at);
+    return { runtime: this.runtime(o, at), model: this.string(o, 'model', at), ...(effort !== undefined && { effort }) };
+  }
+
+  settings(v: unknown, at: string): SessionSettings {
+    const o = this.object(v, at);
+    if (typeof o.readOnly !== 'boolean') this.issues.push(`${at}.readOnly is not a boolean`);
+    const instructions = this.optionalString(o, 'instructions', at);
+    return { model: this.model(o.model, `${at}.model`), readOnly: o.readOnly === true, ...(instructions !== undefined && { instructions }) };
+  }
+
+  entry(v: unknown, at: string): DispatchEntry {
+    const o = this.object(v, at);
+    if (o.kind === 'insert') {
+      const expectedTurnRef = this.optionalString(o, 'expectedTurnRef', at);
+      return { kind: 'insert', ...(expectedTurnRef !== undefined && { expectedTurnRef }) };
+    }
+    if (o.kind !== 'new-turn') this.issues.push(`${at}.kind is not an entry kind`);
+    return { kind: 'new-turn', ...(o.model !== undefined && { model: this.model(o.model, `${at}.model`) }) };
+  }
+}
+
+const PAYLOAD_KINDS: readonly PayloadKind[] = ['handoff', 'peer-message', 'transfer', 'user-message'];
+
+const rebuild = (input: AcceptInput): { input: AcceptInput } | { issues: string[] } => {
+  const r = new Rebuild();
+  const top = r.object(input, 'input');
+  const target = DeliveryTargetSchema.safeParse(top.target);
+  if (!target.success) return { issues: target.error.issues.map((i) => `target: ${i.message}`) };
+  const countIn = top.count === undefined ? undefined : r.object(top.count, 'count');
+  const limit = countIn?.limit;
+  if (limit !== undefined && typeof limit !== 'number') r.issues.push('count.limit is not a number');
+  if (typeof top.proposalRevision !== 'number') r.issues.push('proposalRevision is not a number');
+  const sourceCallRef = r.optionalString(top, 'sourceCallRef', 'input');
+  const base = {
+    operationId: r.string(top, 'operationId', 'input') as OperationId,
+    ...(sourceCallRef !== undefined && { sourceCallRef }),
+    payloadHash: r.string(top, 'payloadHash', 'input'),
+    proposalRevision: top.proposalRevision as number,
+    target: target.data,
+    at: r.string(top, 'at', 'input'),
+    ...(countIn !== undefined && { count: { key: r.string(countIn, 'key', 'count'), ...(typeof limit === 'number' && { limit }) } }),
   };
+  let built: AcceptInput;
+  if (top.kind === 'provision') {
+    const spec = r.object(top.spec, 'spec');
+    const preallocatedRef = r.optionalString(spec, 'preallocatedRef', 'spec');
+    built = {
+      ...base,
+      kind: 'provision',
+      spec: {
+        runtime: r.runtime(spec, 'spec'),
+        sessionId: r.string(spec, 'sessionId', 'spec') as SessionId,
+        cwd: r.string(spec, 'cwd', 'spec'),
+        ...r.settings(spec, 'spec'),
+        ...(preallocatedRef !== undefined && { preallocatedRef }),
+      },
+    };
+  } else {
+    const context = r.object(top.context, 'context');
+    const kind = PAYLOAD_KINDS.find((k) => k === top.kind);
+    if (kind === undefined) r.issues.push('input.kind is not a delivery kind');
+    built = {
+      ...base,
+      kind: kind ?? 'user-message',
+      payload: r.string(top, 'payload', 'input'),
+      context: {
+        runtime: r.runtime(context, 'context'),
+        cwd: r.string(context, 'cwd', 'context'),
+        entry: r.entry(context.entry, 'context.entry'),
+        session: r.settings(context.session, 'context.session'),
+      },
+    };
+  }
+  // Last line of defence: the data as it will be serialised carries no `mcp` key anywhere.
+  if (r.issues.length === 0 && hasKey(JSON.parse(JSON.stringify(built)), 'mcp')) r.issues.push('the delivery carries an MCP mount, which is never stored');
+  return r.issues.length > 0 ? { issues: r.issues } : { input: built };
 };
 
 export class DeliveryService {
@@ -111,11 +216,14 @@ export class DeliveryService {
    * anything is a conflict. Nothing is dispatched; the caller decides when (a handoff waits for the
    * target's turn to end).
    */
-  async accept(input: AcceptInput): Promise<AcceptOutcome> {
-    const issues = await this.acceptIssues(input);
+  async accept(given: AcceptInput): Promise<AcceptOutcome> {
+    const rebuilt = rebuild(given);
+    if ('issues' in rebuilt) return { status: 'invalid', issues: rebuilt.issues };
+    const { input } = rebuilt;
+    const issues = await this.acceptIssues(given, input);
     if (issues.length > 0) return { status: 'invalid', issues };
     try {
-      return await this.options.store.accept(storable(input));
+      return await this.options.store.accept(input);
     } catch (error) {
       if (error instanceof CommitUncertainError) return { status: 'commit-uncertain', detail: error.message };
       throw error;
@@ -198,12 +306,10 @@ export class DeliveryService {
     return report;
   }
 
-  private async acceptIssues(input: AcceptInput): Promise<string[]> {
+  private async acceptIssues(given: AcceptInput, input: AcceptInput): Promise<string[]> {
     // The types forbid it, but a spread through `SessionSettings` or a cast still compiles (C-07).
-    const settings: object = input.kind === 'provision' ? input.spec : input.context.session;
-    if ('mcp' in settings) return [`${input.kind === 'provision' ? 'spec' : 'context.session'} carries an MCP mount, which is never stored`];
-    const parsed = DeliveryTargetSchema.safeParse(input.target);
-    if (!parsed.success) return parsed.error.issues.map((i) => `target: ${i.message}`);
+    const settings: object = given.kind === 'provision' ? given.spec : given.context.session;
+    if ('mcp' in settings) return [`${given.kind === 'provision' ? 'spec' : 'context.session'} carries an MCP mount, which is never stored`];
     const issues: string[] = deliveryTargetIssues(undefined, input.target);
     if (input.kind === 'provision') {
       if (input.target.provision?.operationId !== input.operationId) issues.push('a provision describes itself in target.provision');

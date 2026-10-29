@@ -95,7 +95,7 @@ describe('session.send (CR-2)', () => {
     expect((await w.repositories.conversations.get(sessionId)).messages).toMatchObject([{ id: 'm-1', role: 'user', origin: { kind: 'user' }, text: 'hello' }]);
 
     // The runtime's echo of the same message is not stored a second time.
-    codex.emit({ type: 'message.completed', message: { id: MessageId.parse('echo-1'), sessionId, role: 'user', origin: { kind: 'user' }, text: 'hello', attachments: [], createdAt: '2026-10-29T01:00:00.000Z' } });
+    codex.emit({ type: 'message.completed', message: { id: MessageId.parse('echo-1'), sessionId, turnId: TurnId.parse('turn-1'), role: 'user', origin: { kind: 'user' }, text: 'hello', attachments: [], createdAt: '2026-10-29T01:00:00.000Z' } });
     await settle();
     expect((await w.repositories.conversations.get(sessionId)).messages).toHaveLength(1);
 

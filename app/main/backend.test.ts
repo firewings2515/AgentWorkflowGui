@@ -56,7 +56,7 @@ interface Started {
 let requests = 0;
 const rid = () => RequestId.parse(`r-${++requests}`);
 
-const start = async (options: { order?: string[]; realModels?: boolean } = {}): Promise<Started> => {
+const start = async (options: { order?: string[]; realModels?: boolean; configure?: (adapter: FakeAdapter) => void } = {}): Promise<Started> => {
   const order = options.order ?? [];
   const logs: string[] = [];
   const adapters: FakeAdapter[] = [];
@@ -77,6 +77,7 @@ const start = async (options: { order?: string[]; realModels?: boolean } = {}): 
         return closeSession(ref);
       };
       if (runtime === 'claude') claude = adapter;
+      options.configure?.(adapter);
       adapters.push(adapter);
       return adapter;
     },
@@ -250,5 +251,100 @@ describe('the assembled backend', () => {
     expect(await result.facade.execute({ type: 'preferences.set', requestId: rid(), preferences: { theme: 'light' } })).toMatchObject({ ok: false, code: 'storage_failed' });
     expect(logs.join('\n')).not.toContain('DATA_MARKER');
     expect(result.reason).not.toContain('DATA_MARKER');
+  });
+});
+
+describe('review round 1 (T017-r1-result.md)', () => {
+  it('r1-P1-1 a mount nested in a model never reaches the SQLite body', async () => {
+    const s = await start();
+    const token = 'NESTED_TOKEN_0123456789';
+    const outcome = await s.backend.service.delivery.accept({
+      kind: 'provision',
+      operationId: OperationId.parse('provision:nested'),
+      payloadHash: `sha256:${'0'.repeat(64)}`,
+      proposalRevision: 0,
+      target: { sessionId: SessionId.parse('nested'), provision: { operationId: OperationId.parse('provision:nested'), bindingKey: 'session:nested', state: 'pending', preallocated: false } },
+      at: '2026-10-29T01:00:00.000Z',
+      spec: { runtime: 'codex', sessionId: SessionId.parse('nested'), cwd: dir, model: { runtime: 'codex', model: 'm', mcp: { token } } as never, readOnly: false },
+    });
+    expect(outcome.status).toBe('accepted');
+    await s.backend.shutdown();
+    expect(databaseBytes()).not.toContain(token);
+  });
+
+  it('r1-P1-2 a token quoted by the runtime reaches neither the database, the envelopes nor the log', async () => {
+    const s = await start();
+    await createSession(s);
+    const sessionId = SessionId.parse('session-a');
+    const token = s.adapters[0]!.started[0]!.mcp!.token;
+    const adapter = s.adapters[0]!;
+    adapter.emit({ type: 'message.completed', message: { id: MessageId.parse('a-1'), sessionId, role: 'assistant', origin: { kind: 'agent' }, text: `Bearer ${token}`, attachments: [], createdAt: '2026-10-29T01:00:00.000Z' } });
+    adapter.emit({ type: 'runtime.exited', runtime: 'codex', sessionIds: [sessionId], expected: false, code: 1, signal: null, error: `gui: ${token}`, at: '2026-10-29T01:00:00.000Z' });
+    await settle();
+    await s.backend.shutdown();
+    expect(databaseBytes()).not.toContain(token);
+    expect(JSON.stringify(s.envelopes)).not.toContain(token);
+    expect(JSON.stringify(s.envelopes)).toContain('[redacted]');
+    expect(s.logs.join('\n')).not.toContain(token);
+  });
+
+  it('r1-P1-5 the database closes only after the core settled: a start still running at exit is closed first', async () => {
+    const order: string[] = [];
+    const s = await start({ order, configure: (adapter) => adapter.startModes.push('held') });
+    await s.run({ type: 'agent.save', requestId: rid(), agent: agent(), expectedRevision: null });
+    await s.run({ type: 'session.create', requestId: rid(), sessionId: SessionId.parse('slow'), kind: 'ordinary', agentId: agent().id, model: { runtime: 'codex', model: 'codex-m' }, cwd: dir });
+    await settle();
+    const adapter = s.adapters.at(-1)!;
+    expect(adapter.calls).toContain('startSession');
+    order.length = 0;
+    let done = false;
+    const shutdown = s.backend.shutdown().then(() => (done = true));
+    await settle();
+    // The exit waits for the start that is still running.
+    expect(done).toBe(false);
+    adapter.release();
+    await shutdown;
+    expect(s.backend.service.runtimes.openSessions()).toEqual([]);
+    expect(order).toEqual(['closeSession:thread-1', 'closeJob:slow']);
+    // Only now is the database closed.
+    await expect(s.backend.repositories.sessions.list()).rejects.toThrow();
+  });
+
+  it('r1-P1-6 a damaged delivery record stops the start: no ready backend, no model probe, no runtime', async () => {
+    const db = openDatabase(join(dir, 'awg.sqlite'));
+    const store = new SqliteDeliveryStore(db);
+    await store.accept({
+      kind: 'provision',
+      operationId: OperationId.parse('provision:x'),
+      payloadHash: `sha256:${'0'.repeat(64)}`,
+      proposalRevision: 0,
+      target: { sessionId: SessionId.parse('x'), provision: { operationId: OperationId.parse('provision:x'), bindingKey: 'session:x', state: 'pending', preallocated: false } },
+      at: '2026-10-29T01:00:00.000Z',
+      spec: { runtime: 'codex', sessionId: SessionId.parse('x'), cwd: dir, model: { runtime: 'codex', model: 'm' }, readOnly: false },
+    });
+    db.exec(`UPDATE delivery SET body = '{not json DATA_MARKER'`);
+    db.close();
+    let probes = 0;
+    let adapters = 0;
+    const logs: string[] = [];
+    const result = await startBackend({
+      dbPath: join(dir, 'awg.sqlite'),
+      bus: new EventBus(),
+      createHost: () => new FakeHost([]),
+      createAdapter: () => {
+        adapters++;
+        return new FakeAdapter('codex');
+      },
+      listModels: () => {
+        probes++;
+        return Promise.resolve([]);
+      },
+      resolveRealPath: (p) => p,
+      log: (m) => logs.push(m),
+    });
+    expect(result.status).toBe('damaged');
+    expect({ probes, adapters }).toEqual({ probes: 0, adapters: 0 });
+    expect(() => result.facade.snapshot()).toThrow(STORAGE_DAMAGED);
+    expect(logs.join('\n')).not.toContain('DATA_MARKER');
   });
 });

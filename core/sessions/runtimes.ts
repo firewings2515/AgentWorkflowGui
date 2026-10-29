@@ -48,6 +48,8 @@ interface Entry {
   adapter: Promise<RuntimeAdapter>;
 }
 
+export const REDACTED = '[redacted]';
+
 const notRunning = (detail: string): DispatchResult => ({
   state: 'unknown',
   reason: 'not-running',
@@ -64,6 +66,11 @@ export class SessionRuntimes {
   private readonly started = new WeakSet<RuntimeAdapter>();
   private readonly subscribed = new WeakSet<RuntimeAdapter>();
   private readonly views: Record<Runtime, RuntimeAdapter>;
+  /** Every MCP token handed out in this process, revoked ones included; never shown anywhere (C-07). */
+  private readonly tokens = new Set<string>();
+  /** Starts and resumes still waiting for their adapter, so closing can wait for them. */
+  private readonly inflight = new Set<Promise<unknown>>();
+  private closing = false;
 
   constructor(private readonly options: SessionRuntimesOptions) {
     this.views = { codex: this.view('codex'), claude: this.view('claude') };
@@ -91,6 +98,38 @@ export class SessionRuntimes {
     });
   }
 
+  /** Replaces every MCP token this process handed out with `[redacted]`, in any string. */
+  redactText(text: string): string {
+    let out = text;
+    for (const token of this.tokens) if (out.includes(token)) out = out.split(token).join(REDACTED);
+    return out;
+  }
+
+  /** A copy of plain data with every token redacted from every string in it. */
+  redact<T>(value: T): T {
+    if (this.tokens.size === 0) return value;
+    const walk = (v: unknown): unknown => {
+      if (typeof v === 'string') return this.redactText(v);
+      if (Array.isArray(v)) return v.map(walk);
+      if (typeof v === 'object' && v !== null) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]));
+      return v;
+    };
+    return walk(value) as T;
+  }
+
+  /**
+   * From now on nothing opens: a start or resume that was already running is closed as soon as it
+   * returns (R-14), and new ones are refused.
+   */
+  beginClose(): void {
+    this.closing = true;
+  }
+
+  /** Waits until every start and resume that was running has returned (and been closed again). */
+  async settled(): Promise<void> {
+    while (this.inflight.size > 0) await Promise.allSettled([...this.inflight]);
+  }
+
   /** The runtime host of these sessions ended: they are no longer open. */
   markExited(sessionIds: readonly SessionId[]): void {
     // The next use creates the session's adapter again, so a Codex host that died is not reused.
@@ -104,21 +143,47 @@ export class SessionRuntimes {
     }
   }
 
-  async startSession(runtime: Runtime, options: StartSessionOptions): Promise<NativeSessionInfo> {
-    const adapter = await this.adapterFor(runtime, options.sessionId);
-    const mcp = await this.options.mountMcp(options.sessionId);
-    const info = await adapter.startSession({ ...options, mcp });
-    this.opened(info);
-    return info;
+  startSession(runtime: Runtime, options: StartSessionOptions): Promise<NativeSessionInfo> {
+    return this.openWith(runtime, options.sessionId, (adapter, mcp) => adapter.startSession({ ...options, mcp }));
   }
 
-  async resumeSession(runtime: Runtime, options: ResumeSessionOptions): Promise<NativeSessionInfo> {
-    const adapter = await this.adapterFor(runtime, options.sessionId);
-    const mcp = await this.options.mountMcp(options.sessionId);
+  resumeSession(runtime: Runtime, options: ResumeSessionOptions): Promise<NativeSessionInfo> {
     this.refs.set(options.nativeSessionRef, options.sessionId);
-    const info = await adapter.resumeSession({ ...options, mcp });
-    this.opened(info);
-    return info;
+    return this.openWith(runtime, options.sessionId, (adapter, mcp) => adapter.resumeSession({ ...options, mcp }));
+  }
+
+  /**
+   * Start or resume with a new mount. An adapter error is rethrown with every token redacted; a session that
+   * comes up after closing began is closed again at once and never counted as open (R-14).
+   */
+  private openWith(runtime: Runtime, sessionId: SessionId, call: (adapter: RuntimeAdapter, mcp: McpMount) => Promise<NativeSessionInfo>): Promise<NativeSessionInfo> {
+    if (this.closing) return Promise.reject(new Error('the GUI is closing'));
+    const run = (async () => {
+      const adapter = await this.adapterFor(runtime, sessionId);
+      const mcp = await this.options.mountMcp(sessionId);
+      this.tokens.add(mcp.token);
+      let info: NativeSessionInfo;
+      try {
+        info = await call(adapter, mcp);
+      } catch (error) {
+        // The original is not attached as the cause: it would carry the token along.
+        // eslint-disable-next-line preserve-caught-error
+        throw new Error(this.redactText(error instanceof Error ? error.message : String(error)));
+      }
+      if (this.closing) {
+        await adapter.closeSession(info.nativeSessionRef).catch(() => undefined);
+        await this.options.onClosed?.(sessionId);
+        return info;
+      }
+      this.opened(info);
+      return info;
+    })();
+    this.inflight.add(run);
+    void run.then(
+      () => this.inflight.delete(run),
+      () => this.inflight.delete(run),
+    );
+    return run;
   }
 
   /** Releases one session (R-14: the adapter interrupts before closing). Nothing to do when it is not open. */
@@ -171,7 +236,8 @@ export class SessionRuntimes {
       const created = this.options.createAdapter(runtime, sessionId);
       if (!this.subscribed.has(created)) {
         this.subscribed.add(created);
-        created.subscribe((event) => this.options.onEvent(event));
+        // Runtime errors and output can quote the mount (e.g. a failed MCP connection): redacted here, before anything stores or shows it.
+        created.subscribe((event) => this.options.onEvent(this.redact(event)));
       }
       if (!this.started.has(created)) {
         await created.start();

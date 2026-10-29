@@ -32,7 +32,14 @@ export class FakeAdapter implements RuntimeAdapter {
   readonly stoppedTasks: { ref: string; taskRef: string }[] = [];
   readonly closedSessions: string[] = [];
   dispatchModes: FakeDispatch[] = [];
-  startModes: ('ok' | 'fail' | 'lost')[] = [];
+  /** `held`: answers when the test calls `release()`. */
+  startModes: ('ok' | 'fail' | 'lost' | 'held')[] = [];
+  /** The message a failed start rejects with (e.g. one quoting the MCP mount). */
+  startError = 'could not start';
+  /** When set, setModel waits for it; `setModelError` makes it fail. */
+  setModelGate: Promise<void> | undefined;
+  setModelError: Error | undefined;
+  private readonly held: (() => void)[] = [];
   /** What the runtime has stored, by clientMessageId, for reconcile. */
   readonly history = new Map<string, { ref: string; text: string }>();
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
@@ -57,10 +64,17 @@ export class FakeAdapter implements RuntimeAdapter {
     this.calls.push('startSession');
     this.started.push(options);
     const mode = this.startModes.shift() ?? 'ok';
-    if (mode === 'fail') return Promise.reject(new Error('could not start'));
+    if (mode === 'fail') return Promise.reject(new Error(this.startError));
     if (mode === 'lost') return Promise.reject(new Error('the create response was lost'));
     const ref = options.preallocatedRef ?? `thread-${++this.next}`;
-    return Promise.resolve({ sessionId: options.sessionId, nativeSessionRef: ref, cwd: options.cwd, model: { source: 'unknown' } });
+    const info: NativeSessionInfo = { sessionId: options.sessionId, nativeSessionRef: ref, cwd: options.cwd, model: { source: 'unknown' } };
+    if (mode === 'held') return new Promise((resolve) => this.held.push(() => resolve(info)));
+    return Promise.resolve(info);
+  }
+
+  /** Lets the oldest held start answer. */
+  release(): void {
+    this.held.shift()?.();
   }
 
   resumeSession(options: ResumeSessionOptions): Promise<NativeSessionInfo> {
@@ -116,9 +130,11 @@ export class FakeAdapter implements RuntimeAdapter {
     return Promise.resolve();
   }
 
-  setModel(ref: string, model: ModelSelection): Promise<'next-turn'> {
+  async setModel(ref: string, model: ModelSelection): Promise<'next-turn'> {
+    await this.setModelGate;
+    if (this.setModelError) throw this.setModelError;
     this.models.push({ ref, model });
-    return Promise.resolve('next-turn');
+    return 'next-turn';
   }
 
   stopNativeTask(ref: string, taskRef: string): Promise<void> {

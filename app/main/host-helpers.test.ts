@@ -35,6 +35,32 @@ describe('resolveRealPath', () => {
   });
 });
 
+describe('r1-P2 UNC paths', () => {
+  it('r1-P2 resolves //server/share as \\\\server\\share, and still refuses device paths in either form', () => {
+    // An administrative share of this machine may or may not be reachable; both spellings must agree.
+    const back = resolveRealPath('\\\\localhost\\C$\\Windows');
+    expect(resolveRealPath('//localhost/C$/Windows')).toBe(back);
+    if (back !== null) expect(back.toLowerCase()).toContain('windows');
+    for (const device of ['//?/C:/x', '//./pipe/x', '\\\\?\\C:\\x', '\\\\.\\pipe\\x']) expect(resolveRealPath(device)).toBeNull();
+  });
+
+  it('r1-P2 hands the file system the backslash form of //server/share', () => {
+    const asked: string[] = [];
+    const realpath = (path: string) => {
+      asked.push(path);
+      if (path === '\\\\server\\share\\work') return '\\\\server\\share\\real';
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+    };
+    expect(resolveRealPath('//server/share/work/a.txt', realpath)).toBe('\\\\server\\share\\real\\a.txt');
+    expect(asked[0]).toBe('\\\\server\\share\\work\\a.txt');
+  });
+
+  it('r1-P2 takes forward slashes in a drive path too', () => {
+    mkdirSync(join(dir, 'fwd'));
+    expect(resolveRealPath(`${dir.replace(/\\/g, '/')}/fwd/new.txt`)).toBe(join(dir, 'fwd', 'new.txt'));
+  });
+});
+
 describe('resolveCodexExecutable', () => {
   const env = (path: string, extra: Record<string, string> = {}) => ({ Path: path, ...extra });
 

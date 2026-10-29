@@ -101,30 +101,24 @@ const sha256 = (text: string): PayloadHash => `sha256:${createHash('sha256').upd
 
 const notInWorkflow = { status: 'rejected', rejection: { reason: 'not-in-workflow', detail: 'this tool works in workflow sessions only' } } as const;
 
-/** Runs `run` with a deadline; past it, resolves undefined and leaves the work behind. */
-const within = async <T>(run: Promise<T>, ms: number): Promise<T | undefined> => {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([run, new Promise<undefined>((resolve) => (timer = setTimeout(() => resolve(undefined), ms)))]);
-  } finally {
-    clearTimeout(timer);
-  }
-};
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref());
 
 export async function startBackend(options: BackendOptions): Promise<Backend | DamagedBackend> {
-  const { bus, log } = options;
+  const { bus } = options;
+  // Every MCP token handed out, revoked ones included: no log line carries one (r1-P1-2).
+  const tokens = new Set<string>();
+  const redact = (text: string) => [...tokens].reduce((out, token) => out.split(token).join('[redacted]'), text);
+  const log = (message: string) => options.log(redact(message));
   const now = () => (options.now?.() ?? new Date()).toISOString();
   const uuid = () => options.uuid?.() ?? randomUUID();
   const closeTimeoutMs = options.closeTimeoutMs ?? 5000;
 
   // 1-2. Storage, read once in full: a damaged record stops everything here (T015 fails closed).
+  // The deliveries recovery will read are read here too (r1-P1-6): pending and unknown ones.
   let db: DatabaseSync | undefined;
   let repositories: AppRepositories;
-  try {
-    db = openDatabase(options.dbPath);
-    repositories = createRepositories(db);
-    await repositories.readSnapshotData();
-  } catch (error) {
+  let store: SqliteDeliveryStore;
+  const damaged = (error: unknown): DamagedBackend => {
     const reason = describe(error);
     log(`[backend] the database cannot be used (${reason}); nothing is started`);
     try {
@@ -133,8 +127,17 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       // Already unusable.
     }
     return { status: 'damaged', facade: damagedFacade(), dbPath: options.dbPath, reason, shutdown: () => Promise.resolve() };
+  };
+  try {
+    db = openDatabase(options.dbPath);
+    repositories = createRepositories(db);
+    store = new SqliteDeliveryStore(db);
+    await repositories.readSnapshotData();
+    await store.listByState('pending');
+    await store.listByState('unknown');
+  } catch (error) {
+    return damaged(error);
   }
-  const store = new SqliteDeliveryStore(db);
   const host = options.createHost(repositories.processes);
 
   // 3. A crashed run's processes: only those whose PID and creation time both still match are ended.
@@ -222,7 +225,12 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     hashPayload: sha256,
     resolveRealPath: (path) => options.resolveRealPath(path),
     createAdapter: (runtime, sessionId) => createAdapter(runtime, sessionId, hooks),
-    mountMcp: (sessionId) => mcp.mount(sessionId),
+    mountMcp: (sessionId) => {
+      const mount = mcp.mount(sessionId);
+      tokens.add(mount.token);
+      return mount;
+    },
+    sleep,
     listModels,
     isRuntimeAvailable: (runtime) => runtime === 'claude' || options.codexExecutable !== undefined || options.createAdapter !== undefined,
     onSessionOpened: (sessionId) => {
@@ -242,12 +250,18 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   });
   ref.service = service;
 
-  // 6. Restart recovery (CR-2): unknown only reconciled, pending through the one dispatch entry.
+  // 6. Restart recovery (CR-2): unknown only reconciled, pending through the one dispatch entry. Stored data
+  // it cannot read stops the start like damaged data does (r1-P1-6): no model probe, no runtime.
   try {
     const report = await service.start();
     if (report.failed.length > 0) log(`[backend] ${String(report.failed.length)} delivery(ies) could not be recovered`);
   } catch (error) {
-    log(`[backend] recovery failed (${describe(error)})`);
+    await service.shutdown(closeTimeoutMs).catch(() => undefined);
+    await mcp.close().catch(() => undefined);
+    const left: OwnedProcess[] = await host.listOwned().catch(() => []);
+    for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
+    watchers.stopAll();
+    return damaged(error);
   }
 
   // 7. Model lists, in the background: the window does not wait for them (R-12).
@@ -307,7 +321,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     closing ??= (async () => {
       // R-14: no new tool calls, then every session closed gracefully, then whatever is left in a Job.
       await mcp.close().catch(() => undefined);
-      await within(service.shutdown(closeTimeoutMs), closeTimeoutMs * 2);
+      // Bounded inside (each wait has its deadline); the database closes only after it returned (r1-P1-5).
+      await service.shutdown(closeTimeoutMs);
       const left: OwnedProcess[] = await host.listOwned().catch(() => []);
       for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
       watchers.stopAll();

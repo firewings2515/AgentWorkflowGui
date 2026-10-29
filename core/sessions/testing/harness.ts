@@ -42,6 +42,8 @@ export interface World {
   realPath: (path: string) => string | null;
   /** Called with every new Codex adapter before it is used. */
   configure: (adapter: FakeAdapter) => void;
+  /** The exit deadline (SessionServiceOptions.sleep); by default it never passes. */
+  sleeper: (ms: number) => Promise<void>;
   service: SessionService;
   logs: string[];
   run(command: Command): Promise<CommandResult>;
@@ -57,12 +59,13 @@ const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, pre
     mounts: [] as World['mounts'],
     closed: [] as SessionId[],
     contexts: [] as PolicyContext[],
-    decide: previous?.decide ?? (() => ({ action: 'approve' })),
+    decide: previous?.decide ?? ((): PolicyDecision => ({ action: 'approve' })),
     // E:\work is a junction to E:\real; anything else cannot be resolved.
     realPath: previous?.realPath ?? ((path: string) => (path.startsWith('E:\\work') ? path.replace('E:\\work', 'E:\\real') : path.startsWith('E:\\real') ? path : null)),
     logs: [] as string[],
     configure: previous?.configure ?? (() => undefined),
-  } as World;
+    sleeper: (): Promise<void> => new Promise<void>(() => undefined),
+  } as unknown as World;
   const policy: PermissionPolicy = {
     evaluate: (_request, context) => {
       world.contexts.push(context);
@@ -97,6 +100,7 @@ const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, pre
       world.closed.push(sessionId);
     },
     log: (message) => world.logs.push(message),
+    sleep: (ms) => world.sleeper(ms),
   });
   world.run = (command) => world.service.execute(command);
   world.restart = () => build(repositories, store, world);

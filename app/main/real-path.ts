@@ -6,14 +6,16 @@ import { win32 } from 'node:path';
 
 const MISSING = new Set(['ENOENT', 'ENOTDIR']);
 
-export const resolveRealPath = (absolutePath: string): string | null => {
-  // Drive and UNC paths only: device paths (\\?\, \\.\) skip the normalisation the policy relies on.
-  if (!/^(?:[A-Za-z]:[\\/]|\\\\[^\\?.])/.test(absolutePath)) return null;
+/** `realpath` is the file system's (tests replace it). */
+export const resolveRealPath = (absolutePath: string, realpath: (path: string) => string = realpathSync.native): string | null => {
+  // Drive and UNC paths only, with either slash (the policy writes UNC as //server/share, r1-P2); device
+  // paths (\\?\, \\.\, //?/, //./) skip the normalisation the policy relies on.
+  if (!/^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/?.])/.test(absolutePath)) return null;
   const tail: string[] = [];
-  let existing = absolutePath;
+  let existing = absolutePath.replace(/\//g, '\\');
   for (;;) {
     try {
-      const real = realpathSync.native(existing);
+      const real = realpath(existing);
       return tail.length === 0 ? real : win32.join(real, ...tail.reverse());
     } catch (error) {
       if (!MISSING.has((error as NodeJS.ErrnoException).code ?? '')) return null;
