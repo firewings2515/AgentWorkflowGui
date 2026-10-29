@@ -9,7 +9,10 @@ import {
   type DeliveryTarget,
   DeliveryTarget as DeliveryTargetSchema,
   type DispatchAttempt,
+  type ModelSelection,
   type OperationId,
+  type Runtime,
+  type SessionId,
   deliveryTargetIssues,
 } from '../../contracts';
 import {
@@ -17,8 +20,11 @@ import {
   type ClaimInput,
   type ClaimResult,
   CommitUncertainError,
+  type DispatchEntry,
   type DispatchResult,
+  type PayloadKind,
   type ReconcileResult,
+  type SessionSettings,
   type StartSessionOptions,
   type StoredDelivery,
 } from '../ports';
@@ -73,6 +79,179 @@ const startOptions = (spec: ProvisionDelivery['spec']): StartSessionOptions => (
   ...(spec.preallocatedRef !== undefined && { preallocatedRef: spec.preallocatedRef }),
 });
 
+/**
+ * A copy of a plain object's own data properties, read once through their descriptors (T017 r2-P1-1):
+ * nothing is read a second time, so a getter never runs and a Proxy cannot answer one value to the check
+ * and another to the copy. Undefined for anything that is not plain data: an array, an object of another
+ * prototype, a symbol key, or an accessor.
+ */
+const snapshot = (v: unknown): Record<string, unknown> | undefined => {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined;
+  const proto: unknown = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return undefined;
+  const descriptors = Object.getOwnPropertyDescriptors(v);
+  const out = Object.create(null) as Record<string, unknown>;
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key === 'symbol') return undefined;
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !('value' in descriptor)) return undefined;
+    out[key] = descriptor.value;
+  }
+  return out;
+};
+
+const hasKey = (v: unknown, key: string): boolean =>
+  Array.isArray(v) ? v.some((x) => hasKey(x, key)) : typeof v === 'object' && v !== null && Object.entries(v).some(([k, x]) => k === key || hasKey(x, key));
+
+/**
+ * Rebuilds what the store gets, every level from primitives the port allows (C-07: the MCP token never
+ * reaches the store, T017 r1-P1-1). Anything that is not plain data where an object is expected (an
+ * array, a class instance, a getter, a symbol key) is refused rather than read.
+ */
+class Rebuild {
+  readonly issues: string[] = [];
+
+  object(v: unknown, at: string): Record<string, unknown> {
+    const copy = snapshot(v);
+    if (copy !== undefined) return copy;
+    this.issues.push(`${at} is not plain data`);
+    return Object.create(null) as Record<string, unknown>;
+  }
+
+  /** Keys other than `allowed` make the object invalid (the target is a strict contract shape). */
+  only(o: Record<string, unknown>, allowed: readonly string[], at: string): void {
+    for (const key of Object.keys(o)) if (!allowed.includes(key)) this.issues.push(`${at}.${key} is not allowed`);
+  }
+
+  target(v: unknown): DeliveryTarget {
+    const o = this.object(v, 'target');
+    this.only(o, ['sessionId', 'nativeSessionRef', 'provision'], 'target');
+    const sessionId = this.optionalString(o, 'sessionId', 'target');
+    const nativeSessionRef = this.optionalString(o, 'nativeSessionRef', 'target');
+    let provision: Record<string, unknown> | undefined;
+    if (o.provision !== undefined) {
+      const p = this.object(o.provision, 'target.provision');
+      this.only(p, ['operationId', 'bindingKey', 'state', 'nativeSessionRef', 'preallocated'], 'target.provision');
+      const ref = this.optionalString(p, 'nativeSessionRef', 'target.provision');
+      provision = {
+        operationId: this.string(p, 'operationId', 'target.provision'),
+        bindingKey: this.string(p, 'bindingKey', 'target.provision'),
+        state: this.string(p, 'state', 'target.provision'),
+        ...(ref !== undefined && { nativeSessionRef: ref }),
+        preallocated: p.preallocated,
+      };
+    }
+    // Plain data from here on, so the contract check reads nothing it did not copy.
+    const parsed = DeliveryTargetSchema.safeParse({
+      ...(sessionId !== undefined && { sessionId }),
+      ...(nativeSessionRef !== undefined && { nativeSessionRef }),
+      ...(provision !== undefined && { provision }),
+    });
+    if (parsed.success) return parsed.data;
+    for (const i of parsed.error.issues) this.issues.push(`target: ${i.message}`);
+    return {};
+  }
+
+  string(o: Record<string, unknown>, key: string, at: string): string {
+    const v = o[key];
+    if (typeof v === 'string') return v;
+    this.issues.push(`${at}.${key} is not a string`);
+    return '';
+  }
+
+  optionalString(o: Record<string, unknown>, key: string, at: string): string | undefined {
+    return o[key] === undefined ? undefined : this.string(o, key, at);
+  }
+
+  runtime(o: Record<string, unknown>, at: string): Runtime {
+    const v = o.runtime;
+    if (v === 'claude' || v === 'codex') return v;
+    this.issues.push(`${at}.runtime is not a runtime`);
+    return 'claude';
+  }
+
+  model(v: unknown, at: string): ModelSelection {
+    const o = this.object(v, at);
+    const effort = this.optionalString(o, 'effort', at);
+    return { runtime: this.runtime(o, at), model: this.string(o, 'model', at), ...(effort !== undefined && { effort }) };
+  }
+
+  settings(v: unknown, at: string): SessionSettings {
+    const o = this.object(v, at);
+    // The types forbid it, but a spread through `SessionSettings` or a cast still compiles (C-07).
+    if ('mcp' in o) this.issues.push(`${at} carries an MCP mount, which is never stored`);
+    if (typeof o.readOnly !== 'boolean') this.issues.push(`${at}.readOnly is not a boolean`);
+    const instructions = this.optionalString(o, 'instructions', at);
+    return { model: this.model(o.model, `${at}.model`), readOnly: o.readOnly === true, ...(instructions !== undefined && { instructions }) };
+  }
+
+  entry(v: unknown, at: string): DispatchEntry {
+    const o = this.object(v, at);
+    if (o.kind === 'insert') {
+      const expectedTurnRef = this.optionalString(o, 'expectedTurnRef', at);
+      return { kind: 'insert', ...(expectedTurnRef !== undefined && { expectedTurnRef }) };
+    }
+    if (o.kind !== 'new-turn') this.issues.push(`${at}.kind is not an entry kind`);
+    return { kind: 'new-turn', ...(o.model !== undefined && { model: this.model(o.model, `${at}.model`) }) };
+  }
+}
+
+const PAYLOAD_KINDS: readonly PayloadKind[] = ['handoff', 'peer-message', 'transfer', 'user-message'];
+
+const rebuild = (input: AcceptInput): { input: AcceptInput } | { issues: string[] } => {
+  const r = new Rebuild();
+  const top = r.object(input, 'input');
+  const target = r.target(top.target);
+  const countIn = top.count === undefined ? undefined : r.object(top.count, 'count');
+  const limit = countIn?.limit;
+  if (limit !== undefined && typeof limit !== 'number') r.issues.push('count.limit is not a number');
+  if (typeof top.proposalRevision !== 'number') r.issues.push('proposalRevision is not a number');
+  const sourceCallRef = r.optionalString(top, 'sourceCallRef', 'input');
+  const base = {
+    operationId: r.string(top, 'operationId', 'input') as OperationId,
+    ...(sourceCallRef !== undefined && { sourceCallRef }),
+    payloadHash: r.string(top, 'payloadHash', 'input'),
+    proposalRevision: top.proposalRevision as number,
+    target,
+    at: r.string(top, 'at', 'input'),
+    ...(countIn !== undefined && { count: { key: r.string(countIn, 'key', 'count'), ...(typeof limit === 'number' && { limit }) } }),
+  };
+  let built: AcceptInput;
+  if (top.kind === 'provision') {
+    const spec = r.object(top.spec, 'spec');
+    const preallocatedRef = r.optionalString(spec, 'preallocatedRef', 'spec');
+    built = {
+      ...base,
+      kind: 'provision',
+      spec: {
+        runtime: r.runtime(spec, 'spec'),
+        sessionId: r.string(spec, 'sessionId', 'spec') as SessionId,
+        cwd: r.string(spec, 'cwd', 'spec'),
+        ...r.settings(spec, 'spec'),
+        ...(preallocatedRef !== undefined && { preallocatedRef }),
+      },
+    };
+  } else {
+    const context = r.object(top.context, 'context');
+    const kind = PAYLOAD_KINDS.find((k) => k === top.kind);
+    if (kind === undefined) r.issues.push('input.kind is not a delivery kind');
+    built = {
+      ...base,
+      kind: kind ?? 'user-message',
+      payload: r.string(top, 'payload', 'input'),
+      context: {
+        runtime: r.runtime(context, 'context'),
+        cwd: r.string(context, 'cwd', 'context'),
+        entry: r.entry(context.entry, 'context.entry'),
+        session: r.settings(context.session, 'context.session'),
+      },
+    };
+  }
+  // Last line of defence: the data as it will be serialised carries no `mcp` key anywhere.
+  if (r.issues.length === 0 && hasKey(JSON.parse(JSON.stringify(built)), 'mcp')) r.issues.push('the delivery carries an MCP mount, which is never stored');
+  return r.issues.length > 0 ? { issues: r.issues } : { input: built };
+};
+
 export class DeliveryService {
   /** Operations whose single runtime call is running in this process. */
   private readonly inFlight = new Set<OperationId>();
@@ -85,7 +264,10 @@ export class DeliveryService {
    * anything is a conflict. Nothing is dispatched; the caller decides when (a handoff waits for the
    * target's turn to end).
    */
-  async accept(input: AcceptInput): Promise<AcceptOutcome> {
+  async accept(given: AcceptInput): Promise<AcceptOutcome> {
+    const rebuilt = rebuild(given);
+    if ('issues' in rebuilt) return { status: 'invalid', issues: rebuilt.issues };
+    const { input } = rebuilt;
     const issues = await this.acceptIssues(input);
     if (issues.length > 0) return { status: 'invalid', issues };
     try {
@@ -173,8 +355,6 @@ export class DeliveryService {
   }
 
   private async acceptIssues(input: AcceptInput): Promise<string[]> {
-    const parsed = DeliveryTargetSchema.safeParse(input.target);
-    if (!parsed.success) return parsed.error.issues.map((i) => `target: ${i.message}`);
     const issues: string[] = deliveryTargetIssues(undefined, input.target);
     if (input.kind === 'provision') {
       if (input.target.provision?.operationId !== input.operationId) issues.push('a provision describes itself in target.provision');
@@ -216,6 +396,7 @@ export class DeliveryService {
         // The persisted payload, never a caller's copy.
         text: record.payload,
         entry: options.entry ?? record.context.entry,
+        ...(options.origin !== undefined && { origin: options.origin }),
         ...(timeoutMs !== undefined && { timeoutMs }),
       });
     } catch (error) {

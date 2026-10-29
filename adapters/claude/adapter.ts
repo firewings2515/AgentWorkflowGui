@@ -33,6 +33,7 @@ import type {
   DispatchResult,
   HistoryRequest,
   HistoryResult,
+  McpMount,
   ModelChangeTiming,
   NativeSessionInfo,
   PermissionHandle,
@@ -82,13 +83,15 @@ export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
   /** The SDK functions; `claudeAgentSdk` from ./sdk in production, a fake in tests. */
   sdk: ClaudeSdk;
   /**
-   * Origin stamped on a dispatched message (`SDKUserMessage.origin`). Peer and handoff payloads should be
-   * `peer` (R-03, SP-05), typed input `human`. The port's DispatchRequest does not say which one it is,
-   * so the layer above maps it; without this the message goes unattributed, which Claude treats as not
-   * human (fail closed).
+   * Origin stamped on a dispatched message (`SDKUserMessage.origin`). By default it follows
+   * `DispatchRequest.origin`: the user's own input is `human`, peer and handoff payloads are `peer`
+   * (R-03, SP-05), and anything else goes unattributed, which Claude treats as not human (fail closed).
    */
   dispatchOrigin?: (request: DispatchRequest) => WireOrigin | undefined;
-  /** Origin of a user message shown in events and history (defaults to `user`). */
+  /**
+   * Origin of a user message shown in events and history, for one this adapter did not dispatch itself
+   * (a dispatched one keeps `DispatchRequest.origin`). Defaults to `user`.
+   */
   userOrigin?: (info: { sessionId: SessionId; clientMessageId: string }) => MessageOrigin;
   /**
    * Starts a session's claude.exe; the GUI passes one that starts it inside the session's Job (T013,
@@ -199,6 +202,22 @@ const within = <T>(promise: Promise<T>, ms: number): Promise<{ value: T } | unde
   ]).finally(() => clearTimeout(timer));
 };
 
+/**
+ * `SDKUserMessage.origin` for a payload (R-03, SP-05): only the user's own input is `human`; a message from
+ * another session is `peer` and never counts as the user's approval; anything else stays unattributed.
+ */
+const wireOrigin = (origin: MessageOrigin | undefined): WireOrigin | undefined => {
+  switch (origin?.kind) {
+    case 'user':
+      return { kind: 'human' };
+    case 'peer':
+    case 'handoff':
+      return { kind: 'peer', from: origin.fromSessionId };
+    default:
+      return undefined;
+  }
+};
+
 /** `hold` is set exactly while held, so it goes when the request is answered or withdrawn. */
 const withoutHold = (request: PermissionRequest): PermissionRequest => {
   const copy = { ...request };
@@ -213,6 +232,8 @@ export class ClaudeAdapter implements RuntimeAdapter {
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   private readonly sessions = new Map<string, LiveSession>();
   private readonly dispatched = new Set<string>();
+  /** Origin of each payload this adapter dispatched, by its uuid, for the user message it becomes. */
+  private readonly origins = new Map<string, MessageOrigin>();
 
   constructor(private readonly options: ClaudeAdapterOptions) {}
 
@@ -327,8 +348,9 @@ export class ClaudeAdapter implements RuntimeAdapter {
       }
     }
     // Computed before the attempt is taken, so a throwing callback leaves nothing half done.
-    const origin = this.options.dispatchOrigin?.(req);
+    const origin = this.options.dispatchOrigin ? this.options.dispatchOrigin(req) : wireOrigin(req.origin);
     for (const k of keys) this.dispatched.add(k);
+    if (req.origin !== undefined) this.origins.set(attempt.clientMessageId, req.origin);
 
     if (req.entry.kind === 'new-turn' && req.entry.model) {
       try {
@@ -564,13 +586,16 @@ export class ClaudeAdapter implements RuntimeAdapter {
   /** SP-04 isolation and R-08 permissions are fixed; only cwd, model, instructions and MCP vary. */
   private queryOptions(
     cwd: string,
-    settings: Pick<SessionSettings, 'readOnly'> & Partial<Pick<SessionSettings, 'model' | 'instructions'>>,
+    settings: Pick<SessionSettings, 'readOnly'> & Partial<Pick<SessionSettings, 'model' | 'instructions'>> & { mcp?: McpMount | undefined },
     how: { sessionId?: string; resume?: string },
     hook: (raw: unknown, toolUseId: string | undefined, o: { signal: AbortSignal }) => Promise<WireHookOutput>,
     sessionId?: SessionId,
   ): WireQueryOptions {
     const effort = toEffort(settings.model?.effort);
-    const mcpServers = sessionId === undefined ? undefined : this.options.mcpServers?.({ sessionId, cwd });
+    const configured = sessionId === undefined ? undefined : this.options.mcpServers?.({ sessionId, cwd });
+    // The GUI MCP server with this start's token (R-03) wins over a configured server of the same name.
+    const gui: Record<string, WireMcpServer> | undefined = settings.mcp && { gui: { type: 'http', url: settings.mcp.url, headers: { Authorization: `Bearer ${settings.mcp.token}` } } };
+    const mcpServers = configured || gui ? { ...configured, ...gui } : undefined;
     const spawn = sessionId === undefined ? undefined : this.options.spawnProcess?.({ sessionId });
     return {
       cwd,
@@ -1141,7 +1166,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
   }
 
   private userOrigin(sessionId: SessionId, clientMessageId: string): MessageOrigin {
-    return this.options.userOrigin?.({ sessionId, clientMessageId }) ?? { kind: 'user' };
+    return this.origins.get(clientMessageId) ?? this.options.userOrigin?.({ sessionId, clientMessageId }) ?? { kind: 'user' };
   }
 
   private timeOf(iso: string | undefined): Timestamp {

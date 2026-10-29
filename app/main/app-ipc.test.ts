@@ -4,7 +4,8 @@ import { fixtureSnapshot } from '../../contracts/fixtures/snapshot';
 import { COMMAND_CHANNEL, EVENT_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
 import { readSnapshot, registerAppIpc, runCommand, SNAPSHOT_UNAVAILABLE, UNKNOWN_REQUEST_ID, type EventTarget } from './app-ipc';
 import { EventBus } from './event-bus';
-import { createFakeFacade, type AppFacade } from './facade';
+import type { AppFacade } from './facade';
+import { createFakeFacade } from './testing/fake-facade';
 import type { IpcSenderEvent, TrustedSender } from './ipc-guard';
 
 const electron = vi.hoisted(() => ({ handlers: new Map<string, (event: unknown, ...args: unknown[]) => unknown>() }));
@@ -70,7 +71,7 @@ describe('sender checks', () => {
 describe('snapshot', () => {
   it('returns a Snapshot that matches the contract and carries the bus seq', async () => {
     const { call, bus } = setup();
-    const first = Snapshot.parse(call(SNAPSHOT_CHANNEL, trustedEvent));
+    const first = Snapshot.parse(await call(SNAPSHOT_CHANNEL, trustedEvent));
     expect(first.seq).toBe(fixtureSnapshot.seq);
 
     await call(COMMAND_CHANNEL, trustedEvent, {
@@ -80,26 +81,26 @@ describe('snapshot', () => {
       parentId: null,
       expectedRevision: 2,
     });
-    const second = Snapshot.parse(call(SNAPSHOT_CHANNEL, trustedEvent));
+    const second = Snapshot.parse(await call(SNAPSHOT_CHANNEL, trustedEvent));
     expect(second.seq).toBe(bus.seq);
     expect(second.seq).toBe(first.seq + 1);
   });
 
   describe('when no valid Snapshot can be produced', () => {
     const MARKER = 'SENSITIVE_INPUT_MARKER';
-    const capture = (facade: AppFacade) => {
+    const capture = async (facade: AppFacade) => {
       const log = vi.fn();
       let thrown: unknown;
       try {
-        readSnapshot(facade, log);
+        await readSnapshot(facade, log);
       } catch (error) {
         thrown = error;
       }
       return { log, thrown };
     };
 
-    it('throws fixed text and keeps a private-path exception out of the renderer and the log', () => {
-      const { log, thrown } = capture({
+    it('throws fixed text and keeps a private-path exception out of the renderer and the log', async () => {
+      const { log, thrown } = await capture({
         snapshot: () => {
           throw new Error('cannot read C:/Users/someone/' + MARKER + '/state.db');
         },
@@ -111,16 +112,16 @@ describe('snapshot', () => {
       expect(String(log.mock.calls[0]?.[0])).not.toContain('someone');
     });
 
-    it('throws fixed text and keeps IDs from an invalid Snapshot out of the renderer and the log', () => {
+    it('throws fixed text and keeps IDs from an invalid Snapshot out of the renderer and the log', async () => {
       const broken = { ...fixtureSnapshot, schemaVersion: '0.0.1', workflows: [{ ...fixtureSnapshot.workflows[0], id: MARKER, nodes: MARKER }] } as unknown as Snapshot;
-      const { log, thrown } = capture({ snapshot: () => broken, execute: vi.fn() });
+      const { log, thrown } = await capture({ snapshot: () => broken, execute: vi.fn() });
       expect(thrown).toEqual(new Error(SNAPSHOT_UNAVAILABLE));
       expect(log).toHaveBeenCalledTimes(1);
       expect(String(log.mock.calls[0]?.[0])).not.toContain(MARKER);
       expect(String(log.mock.calls[0]?.[0])).toContain('schemaVersion');
     });
 
-    it('rejects the snapshot call with the fixed text through the IPC handler', () => {
+    it('rejects the snapshot call with the fixed text through the IPC handler', async () => {
       vi.spyOn(console, 'error').mockImplementation(() => undefined);
       const { call } = setup({
         facade: {
@@ -130,7 +131,7 @@ describe('snapshot', () => {
           execute: vi.fn(),
         },
       });
-      expect(() => call(SNAPSHOT_CHANNEL, trustedEvent)).toThrow(SNAPSHOT_UNAVAILABLE);
+      await expect(call(SNAPSHOT_CHANNEL, trustedEvent)).rejects.toThrow(SNAPSHOT_UNAVAILABLE);
     });
   });
 });
@@ -140,7 +141,7 @@ describe('commands', () => {
     const { call, facade } = setup();
     const result = CommandResult.parse(await call(COMMAND_CHANNEL, trustedEvent, setPreferences('req-ok')));
     expect(result).toEqual({ ok: true, requestId: 'req-ok', created: [] });
-    expect(facade.snapshot().preferences.theme).toBe('light');
+    expect((await facade.snapshot()).preferences.theme).toBe('light');
   });
 
   it('answers unsupported for a valid command the fake does not implement', async () => {
@@ -268,7 +269,7 @@ describe('event forwarding', () => {
 
   it('lets a renderer resume: events after the Snapshot seq continue from it', async () => {
     const { call, sent } = setup();
-    const before = Snapshot.parse(call(SNAPSHOT_CHANNEL, trustedEvent));
+    const before = Snapshot.parse(await call(SNAPSHOT_CHANNEL, trustedEvent));
     await call(COMMAND_CHANNEL, trustedEvent, { type: 'session.reparent', requestId: 'r1', sessionId: 's-research', parentId: null, expectedRevision: 2 });
     expect(sent[0]?.envelope.seq).toBe(before.seq + 1);
   });

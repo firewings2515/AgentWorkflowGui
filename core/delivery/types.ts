@@ -6,6 +6,7 @@ import type {
   DeliveryEvidence,
   DeliveryState,
   DeliveryTarget,
+  MessageOrigin,
   NativeRef,
   OperationId,
   PayloadHash,
@@ -55,7 +56,10 @@ export interface DeliveryServiceOptions {
 
 export type AcceptOutcome =
   | AcceptResult
-  /** Rejected before the store: the hash does not match the payload, or the target contradicts itself. */
+  /**
+   * Rejected before the store: the hash does not match the payload, the target contradicts itself, or the
+   * input carries an MCP mount that must never be stored (C-07).
+   */
   | { status: 'invalid'; issues: string[] }
   /** The store could not confirm its commit. Accept again with the same operationId to find out. */
   | { status: 'commit-uncertain'; detail: string };
@@ -71,6 +75,11 @@ export interface DispatchOptions {
   /** The caller's view of the bound native session, re-checked by the claim; defaults to the stored one. */
   expectedNativeSessionRef?: string;
   timeoutMs?: number;
+  /**
+   * Who the payload comes from, handed to the adapter as `DispatchRequest.origin` (R-03: peer and handoff
+   * payloads are marked as not from the user). Absent means the user. Ignored for a provision.
+   */
+  origin?: MessageOrigin;
 }
 
 /** Why the runtime was not called. The delivery is unchanged unless `commit-uncertain` says otherwise. */

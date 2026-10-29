@@ -29,6 +29,7 @@ import type {
   HistoryEntry,
   HistoryRequest,
   HistoryResult,
+  McpMount,
   ModelChangeTiming,
   NativeSessionInfo,
   PermissionHandle,
@@ -57,6 +58,7 @@ import {
   toTurn,
   toUserMessage,
 } from './mapping';
+import { envelope, unwrap } from './origin';
 import { buildPermissionRequest, decisionToWire, type PermissionKind, permissionKindOf, refusalToWire } from './permissions';
 import {
   ISOLATION_CONFIG,
@@ -101,8 +103,8 @@ export interface CodexAdapterOptions extends RuntimeAdapterHooks {
   spawnOptions?: SpawnOptions;
   clientInfo?: { name: string; title: string; version: string };
   /**
-   * Origin of user messages seen in the thread. Peer and handoff messages arrive as plain user input in
-   * Codex; the layer above knows them by the clientMessageId it dispatched. Defaults to `user`.
+   * Origin of user messages seen in the thread that this adapter cannot tell itself: a payload it
+   * dispatched keeps `DispatchRequest.origin`, and a stored one shows it in its envelope. Defaults to `user`.
    */
   userOrigin?: (info: { sessionId: SessionId; clientMessageId: string | null }) => Message['origin'];
   now?: () => Date;
@@ -265,6 +267,8 @@ export class CodexAdapter implements RuntimeAdapter {
   private readonly liveChildTurns = new Set<string>();
   private readonly permissions = new Map<string, PermissionEntry>();
   private readonly dispatched = new Set<string>();
+  /** Origin of each payload this adapter dispatched, by clientMessageId, for the user message it becomes. */
+  private readonly origins = new Map<string, Message['origin']>();
   private stderrTail = '';
 
   constructor(private readonly options: CodexAdapterOptions) {}
@@ -301,12 +305,26 @@ export class CodexAdapter implements RuntimeAdapter {
       onStderr: (text) => (this.stderrTail = (this.stderrTail + text).slice(-8192)),
       onProtocolNoise: (detail, line) => this.log('debug', `protocol: ${detail}`, line.slice(0, 500)),
     });
-    const result = await this.request('initialize', {
-      clientInfo: this.options.clientInfo ?? { name: 'agent-workflow-gui', title: 'AgentWorkflowGui', version: '0.1.0' },
-      // thread/backgroundTerminals/* is experimental (CR-7, spike review-followup §1).
-      capabilities: { experimentalApi: true },
-    });
-    this.conn.notify('initialized');
+    const conn = this.conn;
+    let result: unknown;
+    try {
+      result = await this.request('initialize', {
+        clientInfo: this.options.clientInfo ?? { name: 'agent-workflow-gui', title: 'AgentWorkflowGui', version: '0.1.0' },
+        // thread/backgroundTerminals/* is experimental (CR-7, spike review-followup §1).
+        capabilities: { experimentalApi: true },
+      });
+    } catch (error) {
+      // Drop the failed connection so the next start spawns a fresh app-server (T013 review P2).
+      if (this.conn === conn) this.conn = undefined;
+      if (conn.running) {
+        this.closing = true;
+        conn.kill();
+        await Promise.race([conn.exited, new Promise((resolve) => setTimeout(resolve, 2000).unref())]);
+        this.closing = false;
+      }
+      throw error;
+    }
+    conn.notify('initialized');
     const r = isObject(result) ? result : {};
     this.info = {
       userAgent: typeof r.userAgent === 'string' ? r.userAgent : '',
@@ -554,6 +572,9 @@ export class CodexAdapter implements RuntimeAdapter {
       return { state: 'unknown', reason: 'rejected', written: false, detail: 'no running turn is known to insert into; nothing was sent' };
     }
     for (const k of keys) this.dispatched.add(k);
+    // Codex takes all input as the user's: anything else is named in a text envelope (R-03).
+    const text = envelope(req.text, req.origin);
+    if (req.origin !== undefined) this.origins.set(attempt.clientMessageId, req.origin);
 
     const timeoutMs = req.timeoutMs ?? this.options.dispatchTimeoutMs ?? 30_000;
     const method = entry.kind === 'new-turn' ? 'turn/start' : 'turn/steer';
@@ -562,7 +583,7 @@ export class CodexAdapter implements RuntimeAdapter {
         entry.kind === 'new-turn'
           ? await this.sendTurnStart(
               binding,
-              { threadId, text: req.text, clientUserMessageId: attempt.clientMessageId, ...opt('model', model?.model), ...opt('effort', model?.effort) },
+              { threadId, text, clientUserMessageId: attempt.clientMessageId, ...opt('model', model?.model), ...opt('effort', model?.effort) },
               timeoutMs,
             )
           : await this.request(
@@ -570,7 +591,7 @@ export class CodexAdapter implements RuntimeAdapter {
               {
                 threadId,
                 expectedTurnId,
-                input: [{ type: 'text', text: req.text, text_elements: [] }],
+                input: [{ type: 'text', text, text_elements: [] }],
                 clientUserMessageId: attempt.clientMessageId,
               },
               timeoutMs,
@@ -908,11 +929,13 @@ export class CodexAdapter implements RuntimeAdapter {
     return model;
   }
 
-  private settingsOf(options: { readOnly: boolean; instructions?: string | undefined }, model: ModelSelection): ThreadSettings {
+  private settingsOf(options: { readOnly: boolean; instructions?: string | undefined; mcp?: McpMount | undefined }, model: ModelSelection): ThreadSettings {
     return {
       sandbox: options.readOnly ? 'read-only' : 'workspace-write',
       model: model.model,
       ...opt('developerInstructions', options.instructions === '' ? undefined : options.instructions),
+      // The GUI MCP server with this start's token (R-03); thread config only, never logged or stored here.
+      ...(options.mcp && { config: { 'mcp_servers.gui.url': options.mcp.url, 'mcp_servers.gui.http_headers': { Authorization: `Bearer ${options.mcp.token}` } } }),
     };
   }
 
@@ -1175,8 +1198,12 @@ export class CodexAdapter implements RuntimeAdapter {
   private messageOf(p: Placement, item: WireItem, at: Timestamp): Message | undefined {
     if (item.type === 'agentMessage') return toAgentMessage(p, item, at);
     if (item.type === 'userMessage') {
-      const origin = this.options.userOrigin?.({ sessionId: p.sessionId, clientMessageId: item.clientId ?? null }) ?? { kind: 'user' };
-      return toUserMessage(p, item, origin, at);
+      const message = toUserMessage(p, item, { kind: 'user' }, at);
+      // A payload that is not from the user went out in an envelope (R-03): show its text and its origin.
+      const opened = unwrap(message.text);
+      const dispatched = item.clientId ? this.origins.get(item.clientId) : undefined;
+      const origin = dispatched ?? opened?.origin ?? this.options.userOrigin?.({ sessionId: p.sessionId, clientMessageId: item.clientId ?? null }) ?? { kind: 'user' };
+      return { ...message, origin, text: opened?.text ?? message.text };
     }
     return undefined;
   }
@@ -1520,10 +1547,12 @@ const withoutHold = (request: PermissionRequest): PermissionRequest => {
 const clipOutput = (output: string, max: number): { output: string; truncated: boolean } =>
   output.length > max ? { output: output.slice(-max), truncated: true } : { output, truncated: false };
 
-/** The dispatched payload is one text input; the stored message must be exactly that text. */
-const sameText = (content: unknown, text: string): boolean =>
-  Array.isArray(content) &&
-  content.length === 1 &&
-  isObject(content[0]) &&
-  content[0].type === 'text' &&
-  content[0].text === text;
+/**
+ * The dispatched payload is one text input; the stored message must be exactly that text, or that text in
+ * the origin envelope it went out in (the request does not say which origin it had).
+ */
+const sameText = (content: unknown, text: string): boolean => {
+  if (!Array.isArray(content) || content.length !== 1 || !isObject(content[0]) || content[0].type !== 'text' || typeof content[0].text !== 'string') return false;
+  const stored = content[0].text;
+  return stored === text || unwrap(stored)?.text === text;
+};
