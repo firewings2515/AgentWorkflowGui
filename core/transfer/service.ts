@@ -36,8 +36,11 @@ const fail = (requestId: Failure['requestId'], code: Failure['code'], message: s
   mayHaveSideEffects: flags.mayHaveSideEffects ?? false,
 });
 
-/** A transfer's payloads come from the GUI, never from the user (the delivery service refuses that). */
-const FROM_GUI: MessageOrigin = { kind: 'system' };
+/**
+ * Who a transfer's payloads come from (G-1): the transfer and its source session, never the user (the
+ * delivery service refuses that). The note request in the source session names that session itself.
+ */
+const originOf = (p: Pick<TransferProposal, 'id' | 'sourceSessionId'>): MessageOrigin => ({ kind: 'transfer', fromSessionId: p.sourceSessionId, transferId: p.id });
 
 const sameModel = (a: ModelSelection, b: ModelSelection) => a.runtime === b.runtime && a.model === b.model && a.effort === b.effort;
 const errorName = (error: unknown) => (error instanceof Error ? error.name : 'non-error thrown');
@@ -232,7 +235,7 @@ export class TransferService implements TransferHooks {
     let note = await this.store.get(op);
     if (note === undefined) {
       const ref = await sessions.nativeSessionOf(source.id);
-      const context = await sessions.payloadContext(source.id, FROM_GUI);
+      const context = await sessions.payloadContext(source.id, originOf(p));
       if (ref === undefined || context === undefined) return;
       const accepted = await sessions.delivery.accept({
         kind: 'transfer',
@@ -272,7 +275,9 @@ export class TransferService implements TransferHooks {
   /** The draft's real content, bound to the source's content version now (at its turn boundary). */
   private async complete(p: TransferProposal, source: LogicalSession, noteTurn: string | undefined): Promise<void> {
     const history = await this.history(source);
-    const digest = digestOf(history.entries, source.title.trim().length > 0 ? source.title : `Continue the work of session ${source.id}`);
+    // A session a transfer created has no message of the user's: its goal is that transfer's.
+    const inherited = (await this.repos.transfers.list()).find((t) => t.createdSessionId === source.id)?.content.goal;
+    const digest = digestOf(history.entries, inherited ?? (source.title.trim().length > 0 ? source.title : `Continue the work of session ${source.id}`));
     let note = digest.note;
     if (p.content.noteSource === 'agent') {
       const stored = entriesOf(await this.repos.conversations.get(source.id));
@@ -359,7 +364,7 @@ export class TransferService implements TransferHooks {
       }
       // b. Its creation, recorded but not dispatched yet; c. the payload, waiting for it (CR2 §3).
       const target = await sessions.payloadTarget(targetId);
-      const context = await sessions.payloadContext(targetId, FROM_GUI);
+      const context = await sessions.payloadContext(targetId, originOf(p));
       if (target === undefined || context === undefined) return 'storage';
       const accepted = await sessions.delivery.accept({
         kind: 'transfer',

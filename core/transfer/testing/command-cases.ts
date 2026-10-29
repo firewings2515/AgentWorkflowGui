@@ -65,8 +65,8 @@ export const commandCases = (backend: string, make: () => Promise<World>) =>
         w.notes.set(s, 'Goal: calc. Done: add. Not done: subtract.');
         expect(await prepare(w, s, T, { noteSource: 'agent' })).toMatchObject({ ok: true });
         const request = await w.store.get(noteOperationOf(T));
-        expect(request).toMatchObject({ kind: 'transfer', delivery: { state: 'sent' }, context: { origin: { kind: 'system' } } });
-        expect(dispatches(w).at(-1)).toMatchObject({ text: NOTE_REQUEST, origin: { kind: 'system' } });
+        expect(request).toMatchObject({ kind: 'transfer', delivery: { state: 'sent' }, context: { origin: { kind: 'transfer', fromSessionId: s, transferId: T } } });
+        expect(dispatches(w).at(-1)).toMatchObject({ text: NOTE_REQUEST, origin: { kind: 'transfer', fromSessionId: s, transferId: T } });
         const p = await proposal(w, T);
         expect(p.state).toBe('awaiting-confirmation');
         expect(p.content).toMatchObject({ noteSource: 'agent', note: 'Goal: calc. Done: add. Not done: subtract.' });
@@ -100,7 +100,10 @@ export const commandCases = (backend: string, make: () => Promise<World>) =>
         const { created: made, delivered } = toTarget(w);
         expect(made).toBe(1);
         expect(delivered).toHaveLength(1);
-        expect(delivered[0]!.origin).toEqual({ kind: 'system' });
+        expect(delivered[0]!.origin).toEqual({ kind: 'transfer', fromSessionId: s, transferId: T });
+        // The runtime's echo is stored in the new session as a message from the transfer, not from the user (G-1).
+        const shown = (await w.repositories.conversations.get(target)).messages.filter((m) => m.role === 'user');
+        expect(shown).toMatchObject([{ role: 'user', origin: { kind: 'transfer', fromSessionId: s, transferId: T }, text: delivered[0]!.text }]);
         expect(delivered[0]!.text).toContain('## Goal\nImplement add() and subtract() in calc.js.');
         expect(delivered[0]!.text).toContain(`claude session (${s})`);
         // The same confirmation again does nothing twice.
@@ -122,6 +125,23 @@ export const commandCases = (backend: string, make: () => Promise<World>) =>
         expect(await confirm(w, T, p.revision)).toMatchObject({ ok: false, code: 'stale_revision' });
         expect(toTarget(w)).toEqual({ created: 0, delivered: [] });
         expect(await w.repositories.sessions.get(target)).toBeUndefined();
+      });
+    });
+
+    describe('a chain of transfers', () => {
+      it('the session a transfer created is transferred back with that goal, its frame named and not repeated', async () => {
+        const w = await make();
+        const s = await source(w);
+        await ready(w, s);
+        expect(await confirm(w, T)).toMatchObject({ ok: true });
+        const back = TransferId.parse('tr-back');
+        expect(await prepare(w, target, back, { target: CLAUDE })).toMatchObject({ ok: true });
+        const p = await proposal(w, back);
+        expect(p).toMatchObject({ state: 'awaiting-confirmation', sourceSessionId: target, content: { goal: 'Implement add() and subtract() in calc.js.' } });
+        expect(p.content.note).toContain(`(Work transferred in from session ${s}, transfer ${T})`);
+        expect(p.content.note).not.toContain('## Goal');
+        expect(await confirm(w, back)).toMatchObject({ ok: true });
+        expect((await w.repositories.sessions.get(targetSessionOf(back)))?.derivedFromSessionId).toBe(target);
       });
     });
 

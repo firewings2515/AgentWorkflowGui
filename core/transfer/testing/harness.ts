@@ -112,6 +112,11 @@ const wire = (adapter: FakeAdapter, w: World): FakeAdapter => {
       result = { ...result, nativeRef: { ...result.nativeRef, turnRef: id } };
       void Promise.resolve().then(() => {
         w.emitTurn(sessionId, id, 'running');
+        // The runtime echoes what it received, with the origin it was dispatched with (both adapters do).
+        adapter.emit({
+          type: 'message.completed',
+          message: { id: MessageId.parse(request.attempt.clientMessageId), sessionId, turnId: TurnId.parse(id), role: 'user', origin: request.origin ?? { kind: 'user' }, text: request.text, attachments: [], createdAt: now() },
+        });
         const note = w.notes.get(sessionId);
         if (note !== undefined && request.text.includes(NOTE_REQUEST)) {
           adapter.emit({

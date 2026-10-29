@@ -48,6 +48,9 @@ const messageLine = (m: Message): string | undefined => {
     case 'peer':
     case 'handoff':
       return `Message from session ${m.origin.fromSessionId}: ${clip(m.text, MESSAGE_LIMIT)}`;
+    case 'transfer':
+      // The frame that started this session, or the GUI's own note request: named, not repeated.
+      return m.origin.fromSessionId === m.sessionId ? undefined : `(Work transferred in from session ${m.origin.fromSessionId}, transfer ${m.origin.transferId})`;
     default:
       return undefined;
   }

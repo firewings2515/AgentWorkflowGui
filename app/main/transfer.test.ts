@@ -22,7 +22,7 @@ import {
   TransferId,
   TurnId,
 } from '../../contracts';
-import type { PermissionHandle, RuntimeAdapter } from '../../core/ports';
+import type { DispatchRequest, PermissionHandle, RuntimeAdapter } from '../../core/ports';
 import { FakeAdapter } from '../../core/sessions/testing/fake-adapter';
 import { entriesOf, NOTE_REQUEST, targetSessionOf } from '../../core/transfer';
 import { type Backend, type BackendProcessHost, startBackend } from './backend';
@@ -112,7 +112,7 @@ const start = async (script: Script): Promise<Started> => {
         void Promise.resolve().then(() => {
           const note = script.notes.get(sessionId);
           const reply = note !== undefined && request.text === NOTE_REQUEST ? note : 'On it.';
-          emitTurn(adapter, sessionId, turnId, [], reply);
+          emitTurn(adapter, sessionId, turnId, [], reply, request);
         });
       }
       return result;
@@ -145,9 +145,15 @@ const start = async (script: Script): Promise<Started> => {
 };
 
 /** One turn of a session as its runtime reports it: running, its items, its reply, completed. */
-const emitTurn = (adapter: FakeAdapter, sessionId: SessionId, turnId: string, items: { kind: 'file' | 'test' }[], reply: string) => {
+const emitTurn = (adapter: FakeAdapter, sessionId: SessionId, turnId: string, items: { kind: 'file' | 'test' }[], reply: string, echo?: DispatchRequest) => {
   const turn = TurnId.parse(turnId);
   adapter.emit({ type: 'turn.updated', turn: { id: turn, sessionId, state: 'running', startedAt: at() } });
+  // The runtime echoes what it received, with the origin it was dispatched with (both adapters do).
+  if (echo !== undefined)
+    adapter.emit({
+      type: 'message.completed',
+      message: { id: MessageId.parse(echo.attempt.clientMessageId), sessionId, turnId: turn, role: 'user', origin: echo.origin ?? { kind: 'user' }, text: echo.text, attachments: [], createdAt: at() },
+    });
   for (const item of items) {
     const t = at();
     adapter.emit({
@@ -232,8 +238,13 @@ describe('cross-tool transfer in the backend (T023)', () => {
     expect(codex).toHaveLength(1);
     expect(codex[0]!.started).toHaveLength(1);
     expect(codex[0]!.dispatched).toHaveLength(1);
-    expect(codex[0]!.dispatched[0]).toMatchObject({ origin: { kind: 'system' }, entry: { kind: 'new-turn' } });
+    expect(codex[0]!.dispatched[0]).toMatchObject({ origin: { kind: 'transfer', fromSessionId: source, transferId: T }, entry: { kind: 'new-turn' } });
     expect(codex[0]!.dispatched[0]!.text).toContain('## Current test output\n$ npm test');
+    // The new session shows the transfer content as a message from the transfer (G-1), stored by SQLite.
+    expect(snap.messages.filter((m) => m.sessionId === targetSessionOf(T) && m.role === 'user')).toMatchObject([
+      { origin: { kind: 'transfer', fromSessionId: source, transferId: T }, text: codex[0]!.dispatched[0]!.text },
+    ]);
+    expect(s.logs.filter((l) => l.includes('failed'))).toEqual([]);
     expect(s.envelopes.filter((e) => e.event.type === 'transfer.updated').length).toBeGreaterThan(2);
     // No MCP token in the database, the log or what was pushed (C-07).
     const tokens = s.adapters.flatMap((a) => [...a.started, ...a.resumed]).flatMap((o) => (o.mcp === undefined ? [] : [o.mcp.token]));
@@ -258,8 +269,12 @@ describe('cross-tool transfer in the backend (T023)', () => {
     let p = await proposalOf(s, T);
     expect(p).toMatchObject({ state: 'awaiting-confirmation', content: { noteSource: 'agent', note: 'Done: add(). Not done: subtract(). Evidence: npm test, 4 passing.' } });
     const codex = s.adapters.find((a) => a.runtime === 'codex')!;
-    expect(codex.dispatched.at(-1)).toMatchObject({ text: NOTE_REQUEST, origin: { kind: 'system' } });
+    expect(codex.dispatched.at(-1)).toMatchObject({ text: NOTE_REQUEST, origin: { kind: 'transfer', fromSessionId: source, transferId: T } });
     expect(s.adapters.find((a) => a.runtime === 'claude')?.started ?? []).toHaveLength(0);
+    // The note request shows in the source as a message from the transfer, naming the source itself (G-1).
+    expect((await snapshot(s)).messages.filter((m) => m.sessionId === source && m.text === NOTE_REQUEST)).toMatchObject([
+      { role: 'user', origin: { kind: 'transfer', fromSessionId: source, transferId: T } },
+    ]);
     expect(await s.run({ type: 'transfer.confirm', requestId: rid(), transferId: T, expectedRevision: p.revision })).toMatchObject({ ok: true });
     await settle();
     p = await proposalOf(s, T);
