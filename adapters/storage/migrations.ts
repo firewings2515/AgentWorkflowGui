@@ -1,6 +1,7 @@
 // Schema migrations (T007). Each migration runs once, in order, inside the same transaction that records
 // it in `schema_migration`; a database written by a newer app is refused instead of being guessed at.
 import type { DatabaseSync } from 'node:sqlite';
+import { TARGET_SESSION_V7 } from './delivery-target-query';
 import { committed, unchanged, writeTransaction } from './transaction';
 
 export interface Migration {
@@ -291,6 +292,11 @@ CREATE TABLE project (
 ) STRICT;
 `;
 
+/** v7: target lookup, including the NULL bucket of unbound/undecidable targets (T029, C-20). */
+const storage06V7 = `
+CREATE INDEX delivery_by_target ON delivery (${TARGET_SESSION_V7}, accepted_ms);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
@@ -298,6 +304,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 4, name: 'storage-0.5', sql: storage05V4 },
   { version: 5, name: 'storage-0.5-review', sql: storageReviewV5 },
   { version: 6, name: 'contracts-0.6', sql: contracts06V6 },
+  { version: 7, name: 'storage-0.6', sql: storage06V7 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;
