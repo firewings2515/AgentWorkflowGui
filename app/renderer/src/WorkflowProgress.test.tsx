@@ -9,6 +9,8 @@ function singleTask() {
   const data = structuredClone(fixtureSnapshot);
   const instance = data.instances[0]!;
   instance.tasks = [instance.tasks[0]!];
+  instance.mergeQueue = [];
+  instance.taskPlans = [];
   instance.tasks[0]!.reworkCount = 2;
   instance.template.reworkLimit = 3;
   // The current template can change or disappear without changing the running instance.

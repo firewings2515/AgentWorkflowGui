@@ -7,7 +7,7 @@
 // its own provision, the frame a `transfer` payload waiting for it, and the request for the source agent's
 // note another `transfer` payload. All of a proposal's steps run in one queue per proposal, so a cancel is
 // ordered with them, and every step can be redone after a restart on the same fixed IDs.
-import type { AppEvent, CommandResult, LogicalSession, MessageOrigin, ModelSelection, PayloadHash, Timestamp, TransferId, TransferProposal } from '../../contracts';
+import type { AppEvent, CommandResult, LogicalSession, MessageOrigin, ModelSelection, PayloadHash, Timestamp, TransferCancelReason, TransferId, TransferProposal } from '../../contracts';
 import type { DeliveryEscalation, PayloadDelivery } from '../delivery';
 import type { HistoryEntry, StoredDelivery } from '../ports';
 import type { CommandOf, SessionService, TransferCommand, TransferHooks } from '../sessions';
@@ -388,7 +388,7 @@ export class TransferService implements TransferHooks {
 
   private async supersede(p: TransferProposal): Promise<void> {
     await this.stopDeliveries(p, SUPERSEDED);
-    await this.end(p, 'cancelled', SUPERSEDED);
+    await this.end(p, 'cancelled', SUPERSEDED, 'source-changed');
   }
 
   private async markStale(p: TransferProposal): Promise<void> {
@@ -520,13 +520,16 @@ export class TransferService implements TransferHooks {
    * Saves the proposal as cancelled or failed with the next revision. `failed` needs a payload that never
    * crossed the dispatch boundary (contracts); one that did is recorded as cancelled instead.
    */
-  private async end(p: TransferProposal, state: 'cancelled' | 'failed', message: string): Promise<TransferProposal | 'stale'> {
+  private async end(p: TransferProposal, state: 'cancelled' | 'failed', message: string, reason: TransferCancelReason = 'user'): Promise<TransferProposal | 'stale'> {
     const dispatched = p.delivery !== undefined && (p.delivery.attempts.length > 0 || p.delivery.state !== 'pending');
     const failed = state === 'failed' && p.approvedRevision !== undefined && !dispatched;
     const base = { ...p, revision: p.revision + 1 };
     delete base.failure;
     delete base.cancelledAt;
-    const next: TransferProposal = failed ? { ...base, state: 'failed', failure: { message } } : { ...base, state: 'cancelled', cancelledAt: this.options.now() };
+    delete base.cancelReason;
+    // A failure that cannot be recorded as failed (its payload crossed the boundary) is cancelled as `failed`.
+    const cancelReason = state === 'failed' ? 'failed' : reason;
+    const next: TransferProposal = failed ? { ...base, state: 'failed', failure: { message } } : { ...base, state: 'cancelled', cancelledAt: this.options.now(), cancelReason };
     const saved = await this.repos.transfers.update(next, p.revision);
     if (saved.status === 'stale') return 'stale';
     this.ended.add(p.id);

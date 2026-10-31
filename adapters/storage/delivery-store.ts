@@ -308,6 +308,23 @@ export class SqliteDeliveryStore implements DeliveryStore {
     );
   }
 
+  listByTarget(sessionId: SessionId): Promise<StoredDelivery[]> {
+    return this.run(() =>
+      readTransaction(this.db, () =>
+        (this.db
+          // Only a row whose target names another session by a nonempty text sessionId is left out unread.
+          // Every other row (this session's, an unbound target, anything that cannot say whose it is) is
+          // loaded, so a damaged one fails closed and is never taken for "no work" (T028 r1 P1-3, r2, r3).
+          .prepare(
+            "SELECT * FROM delivery WHERE CASE WHEN NOT json_valid(target) THEN 1 WHEN json_type(target) = 'object' AND json_type(target, '$.sessionId') = 'text' AND json_extract(target, '$.sessionId') <> '' THEN json_extract(target, '$.sessionId') = ? ELSE 1 END ORDER BY accepted_ms, rowid",
+          )
+          .all(sessionId) as unknown as DeliveryRow[])
+          .map((row) => this.load(row))
+          .filter((record) => record.target.sessionId === sessionId),
+      ),
+    );
+  }
+
   recordOutcome(operationId: OperationId, outcome: OperationOutcome): Promise<WriteResult> {
     return this.run(() => writeTransaction<WriteResult>(this.db, () => {
       const row = this.row(operationId);

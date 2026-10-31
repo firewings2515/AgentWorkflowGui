@@ -25,7 +25,7 @@ describe('T025 application integration', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Workflow' }));
     const sidebar = within(screen.getByRole('complementary', { name: 'Session 清單' }));
     fireEvent.click(sidebar.getByRole('button', { name: /^登入功能（root）/ }));
-    fireEvent.click(screen.getByRole('button', { name: '待處理 2 件' }));
+    fireEvent.click(screen.getByRole('button', { name: '待處理 3 件' }));
     expect(screen.getByRole('region', { name: '升級待處理項目' })).toBeTruthy();
     expect(screen.getByText('由你決定，不是 root 的 AI')).toBeTruthy();
     expect(fake.bridge.send).not.toHaveBeenCalled();
@@ -56,13 +56,13 @@ describe('T025 application integration', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Workflow' }));
     const sidebar = within(screen.getByRole('complementary', { name: 'Session 清單' }));
     fireEvent.click(sidebar.getByRole('button', { name: /^登入功能（root）/ }));
-    expect(sidebar.getByRole('button', { name: /^登入功能（root）.*待處理 2 件/ })).toBeTruthy();
+    expect(sidebar.getByRole('button', { name: /^登入功能（root）.*待處理 3 件/ })).toBeTruthy();
     const transcript = screen.getByLabelText('登入功能（root） 對話');
     fireEvent.scroll(transcript, { target: { scrollTop: 900 } });
     act(() => fake.emit({ schemaVersion: CONTRACTS_VERSION, seq: fake.data.snapshot.seq + 1, event: { type: 'escalation.updated', escalation: Escalation.parse({ ...fake.data.snapshot.escalations[0], id: 'new-escalation', title: '新的待處理項目' }) } }));
-    const indicator = screen.getByRole('button', { name: '待處理 3 件' });
+    const indicator = screen.getByRole('button', { name: '待處理 4 件' });
     expect(indicator.closest('.transcript')).toBeNull();
-    expect(sidebar.getByRole('button', { name: /^登入功能（root）.*待處理 3 件/ })).toBeTruthy();
+    expect(sidebar.getByRole('button', { name: /^登入功能（root）.*待處理 4 件/ })).toBeTruthy();
     fireEvent.click(indicator);
     expect(transcript.scrollTop).toBe(0);
     const summary = screen.getByText('展開／收合待處理項目');
@@ -71,7 +71,7 @@ describe('T025 application integration', () => {
     expect(screen.getByRole('article', { name: '新的待處理項目' })).toBeTruthy();
     fireEvent.click(summary);
     expect(summary.closest('details')!.open).toBe(false);
-    expect(screen.getByRole('button', { name: '待處理 3 件' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '待處理 4 件' })).toBeTruthy();
     expect(fake.bridge.send).not.toHaveBeenCalled();
   });
 
@@ -80,7 +80,7 @@ describe('T025 application integration', () => {
     await screen.findByText('IPC 已連線');
     fireEvent.click(screen.getByRole('button', { name: 'Workflow' }));
     fireEvent.click(within(screen.getByRole('complementary', { name: 'Session 清單' })).getByRole('button', { name: /^登入功能（root）/ }));
-    fireEvent.click(screen.getByRole('button', { name: '待處理 2 件' }));
+    fireEvent.click(screen.getByRole('button', { name: '待處理 3 件' }));
     const workspaceA = screen.getByRole('region', { name: '工作區 view-1' });
     const cardA = within(within(workspaceA).getByRole('article', { name: '要求執行 git push' }));
     fireEvent.change(cardA.getByLabelText('回覆說明（選填）'), { target: { value: 'A 的決定' } });

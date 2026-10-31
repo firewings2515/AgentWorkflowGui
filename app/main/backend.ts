@@ -120,6 +120,8 @@ export const damagedFacade = (reason: string, location: string): AppFacade => ({
     peerMessages: [],
     escalations: [],
     transfers: [],
+    projects: [],
+    locks: [],
     preferences: { theme: 'dark' },
   }),
   execute: (command: Command) => failure(command.requestId, 'storage_failed', STORAGE_DAMAGED),
@@ -341,6 +343,9 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         peerMessages: data.peerMessages,
         escalations: data.escalations,
         transfers: data.transfers,
+        projects: data.projects,
+        // File locks (R-07) live in memory; the lock table comes with T033.
+        locks: [],
         preferences: data.preferences,
       };
     },

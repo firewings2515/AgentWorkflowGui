@@ -3,7 +3,7 @@ import { z } from 'zod';
 import {
   DeliveryRecord, DeliveryTarget, Handoff, HandoffId, InstanceId, MessageOrigin, ModelSelection,
   NodeId, OperationId, OperationOutcome, PayloadHash, PeerMessage, PeerMessageId, Revision,
-  Runtime, SessionId, TaskId, Timestamp, deliveryTargetIssues,
+  Runtime, SessionId, TaskId, Timestamp, WritePolicy, deliveryTargetIssues,
 } from '../../contracts';
 import type { StoredDelivery } from '../../core/ports';
 import { checkRecord, InvalidRecordError, readRecord, StoredDataError } from './codec';
@@ -15,7 +15,7 @@ const damaged = (problems: string[], writing: boolean): never => {
   throw writing ? new InvalidRecordError('delivery', problems) : new StoredDataError('delivery', problems);
 };
 
-const settings = { model: ModelSelection, readOnly: z.boolean(), instructions: z.string().optional() };
+const settings = { model: ModelSelection, readOnly: z.boolean(), writePolicy: WritePolicy.optional(), instructions: z.string().optional() };
 const handoff = z.strictObject({
   handoffId: HandoffId, instanceId: InstanceId, taskId: TaskId, fromNodeId: NodeId,
   toNodeId: NodeId, fromSessionId: SessionId, ruleId: z.string().min(1), rework: z.boolean(),

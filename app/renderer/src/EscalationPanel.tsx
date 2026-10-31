@@ -8,6 +8,7 @@ import type { RendererState, RendererStore } from './renderer-store';
 const groups: Record<EscalationKind, string> = {
   permission: '權限', confirmation: '確認', 'delivery-unknown': '結果未知', 'limit-exceeded': '超過上限',
   'no-rule-matched': '沒有規則符合', 'setup-failed': '初始化失敗', 'merge-failed': '合併失敗',
+  'round-blocked': '匯流受阻', 'lock-timeout': '等待檔案鎖逾時', 'unlocked-write': '未上鎖的寫入',
 };
 
 function ReferenceDetails({ escalation, snapshot }: { escalation: Escalation; snapshot: Snapshot }) {

@@ -494,6 +494,7 @@ describe('snapshot data and reopening', () => {
       handoffs: [],
       peerMessages: [],
       transfers: [],
+      projects: [],
     });
   });
 

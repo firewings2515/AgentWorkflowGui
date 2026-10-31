@@ -58,6 +58,8 @@ it('opens a node session from the progress page in the original pane without run
   const buildGraph = vi.spyOn(graphAdapter, 'toCanvas');
   const instance = fake.data.snapshot.instances[0]!;
   instance.tasks = [instance.tasks[0]!];
+  instance.mergeQueue = [];
+  instance.taskPlans = [];
   render(<App />); await screen.findByText('IPC 已連線');
   fireEvent.click(screen.getByRole('button', { name: '＋ 新增 tab' }));
   fireEvent.click(screen.getByRole('button', { name: 'Workflow' }));

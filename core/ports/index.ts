@@ -4,3 +4,5 @@ export * from './delivery';
 export * from './process';
 export * from './policy';
 export * from './repository';
+export * from './git';
+export * from './locks';

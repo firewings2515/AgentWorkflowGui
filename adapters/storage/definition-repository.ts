@@ -1,7 +1,7 @@
 // Agents and workflow templates (T015): one row per ID, edited by compare-and-set on `revision`
 // (DATA_RUNTIME §1). The stored record always carries the row's revision, so reading needs no second source.
 import type { z } from 'zod';
-import { AgentDefinition, WorkflowTemplate, type AgentId, type Revision, type WorkflowId } from '../../contracts';
+import { AgentDefinition, ProjectSettings, WorkflowTemplate, type AgentId, type ProjectId, type Revision, type WorkflowId } from '../../contracts';
 import type { DefinitionRepository, DeleteResult, SaveResult } from '../../core/ports';
 import { StoredDataError, checkRecord, readRecord, run, type StorageContext } from './codec';
 import { committed, unchanged, writeTransaction } from './transaction';
@@ -14,7 +14,7 @@ interface Row {
 export class SqliteDefinitionRepository<T extends { id: string; revision: number }, Id extends string> implements DefinitionRepository<T, Id> {
   constructor(
     private readonly ctx: StorageContext,
-    private readonly table: 'agent' | 'workflow',
+    private readonly table: 'agent' | 'workflow' | 'project',
     private readonly schema: z.ZodType<T>,
   ) {}
 
@@ -81,3 +81,4 @@ export class SqliteDefinitionRepository<T extends { id: string; revision: number
 
 export const agentRepository = (ctx: StorageContext) => new SqliteDefinitionRepository<AgentDefinition, AgentId>(ctx, 'agent', AgentDefinition);
 export const workflowRepository = (ctx: StorageContext) => new SqliteDefinitionRepository<WorkflowTemplate, WorkflowId>(ctx, 'workflow', WorkflowTemplate);
+export const projectRepository = (ctx: StorageContext) => new SqliteDefinitionRepository<ProjectSettings, ProjectId>(ctx, 'project', ProjectSettings);

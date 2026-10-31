@@ -21,6 +21,7 @@ import type {
   SessionId,
   SessionItem,
   Turn,
+  WritePolicy,
 } from '../../contracts';
 
 /** Events an adapter emits; all are AppEvent members, so the layer above can forward them as they are. */
@@ -76,6 +77,12 @@ export interface SessionSettings {
   model: ModelSelection;
   /** Read-only nodes (R-04 writePolicy). Never wider than the runtime's workspace sandbox (R-08). */
   readOnly: boolean;
+  /**
+   * The node's write policy (C-23), when it is not plain write / read-only: `exec-only` runs commands but
+   * edits no file itself, and has `readOnly: true`. Absent (settings stored before 0.6) means `readOnly`
+   * decides alone. `readOnly` is always `writePolicy !== 'write'` when both are given.
+   */
+  writePolicy?: WritePolicy;
   instructions?: string;
 }
 

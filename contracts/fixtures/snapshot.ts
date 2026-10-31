@@ -1,7 +1,9 @@
 // Fake data for building the UI before the backend exists (T002, T004). All names are fictional.
 // Covers: ordinary and workflow sessions, a session with native sub-agents, items and permission
-// requests, artifacts, a cross-tool transfer (done) and one awaiting confirmation, a multi-task workflow
-// instance with handoffs, cross-session messages (one with unknown delivery), and escalations.
+// requests, artifacts, a cross-tool transfer (done), one awaiting confirmation and one cancelled, a multi-task
+// workflow instance with handoffs, its task lists and merge queue (merged, conflict, testing, a worktree left
+// to clean up), a same-folder run whose join node waits for the second of two read-only reviewers (CR-4), a
+// project, a file lock with a waiter (R-07), cross-session messages (one with unknown delivery), and escalations.
 import type { z } from 'zod';
 import { CONTRACTS_VERSION } from '../common';
 import type { DeliveryRecord } from '../delivery';
@@ -68,6 +70,41 @@ const workflowDefault: z.input<typeof WorkflowTemplate> = {
   updatedAt: t('09:30'),
 };
 
+/** Same-folder fan-out to two read-only reviewers, joined by a node that waits for both (R-04, CR-4). */
+const workflowReviewPair: z.input<typeof WorkflowTemplate> = {
+  schemaVersion: v,
+  id: 'wf-review-pair',
+  revision: 0,
+  name: '雙重 Review → 彙整',
+  description: 'Claude 與 Codex 各自 review，彙整後回報 root',
+  reworkLimit: 1,
+  isolation: 'same-folder',
+  nodes: [
+    { id: 'n-lead', kind: 'agent', label: '分派', agentId: 'agent-planner', model: claudeOpus, writePolicy: 'read-only', isRoot: true, position: { x: 0, y: 120 },
+      inputRules: [{ id: 'in-user', condition: '使用者要 review 的範圍' }],
+      outputRules: [
+        { id: 'out-claude', condition: '開始 review', payload: '範圍與重點', target: node('n-rev-claude') },
+        { id: 'out-codex', condition: '開始 review', payload: '範圍與重點', target: node('n-rev-codex') },
+      ] },
+    { id: 'n-rev-claude', kind: 'agent', label: 'Review（Claude）', agentId: 'agent-reviewer', model: claudeSonnet, writePolicy: 'read-only', position: { x: 260, y: 40 },
+      inputRules: [{ id: 'in-scope', condition: '來自分派' }],
+      outputRules: [{ id: 'out-findings', condition: 'review 完成', payload: '問題清單', target: node('n-summary') }] },
+    { id: 'n-rev-codex', kind: 'agent', label: 'Review（Codex）', agentId: 'agent-reviewer', model: codexAstra, writePolicy: 'read-only', position: { x: 260, y: 200 },
+      inputRules: [{ id: 'in-scope', condition: '來自分派' }],
+      outputRules: [{ id: 'out-findings', condition: 'review 完成', payload: '問題清單', target: node('n-summary') }] },
+    { id: 'n-summary', kind: 'agent', label: '彙整', agentId: 'agent-reviewer', model: claudeSonnet, writePolicy: 'read-only', position: { x: 520, y: 120 },
+      inputRules: [{ id: 'in-findings', condition: '兩邊的 review 結果', waitForAllUpstream: true, waitTimeoutMs: 1_800_000 }],
+      outputRules: [{ id: 'out-report', condition: '彙整完成', payload: '合併後的問題清單', target: root }] },
+  ],
+  edges: [
+    { source: 'n-lead', target: 'n-rev-claude' },
+    { source: 'n-lead', target: 'n-rev-codex' },
+    { source: 'n-rev-claude', target: 'n-summary' },
+    { source: 'n-rev-codex', target: 'n-summary' },
+  ],
+  updatedAt: t('09:40'),
+};
+
 export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
   schemaVersion: v,
   seq: 42,
@@ -77,7 +114,7 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
     { schemaVersion: v, id: 'agent-reviewer', revision: 1, name: 'Review Agent', description: '只提問題，不改程式碼', instructions: '問題分 P1／P2，附位置與理由。', updatedAt: t('09:10') },
     { schemaVersion: v, id: 'agent-tester', revision: 1, name: '測試 Agent', description: '執行測試並回報', instructions: '不改原始碼，只執行指令。', updatedAt: t('09:15') },
   ],
-  workflows: [workflowDefault],
+  workflows: [workflowDefault, workflowReviewPair],
   modelOptions: [
     { runtime: 'claude', model: 'claude-opus-5-5', displayName: 'Opus 5.5', efforts: claudeEfforts, defaultEffort: 'high' },
     { runtime: 'claude', model: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5', efforts: claudeEfforts, defaultEffort: 'high', isDefault: true },
@@ -107,6 +144,15 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
     { id: 's-wf-build-b', revision: 2, kind: 'workflow', title: '實作：Session 儲存', agent: { id: 'agent-builder', revision: 2 }, requestedModel: codexAstra,
       observedModel: { source: 'rerouted', from: 'gpt-6-astra', to: 'gpt-6-luna', reason: '暫時容量不足', observedAt: t('11:25') }, activity: 'running', cwd: 'E:/work/.awg/wt/t2', folderScope: task('E:/work/.awg/wt/t2'), parentId: 's-wf-root',
       workflow: { instanceId: 'inst-login', nodeId: 'n-build', taskId: 'task-b' }, createdAt: t('11:12'), updatedAt: t('11:30') },
+    { id: 's-docs-lead', revision: 2, kind: 'workflow', title: '文件 review（root）', agent: { id: 'agent-planner', revision: 1 }, requestedModel: claudeOpus,
+      observedModel: { source: 'per-message', model: 'claude-opus-5-5', observedAt: t('12:01') }, activity: 'idle', cwd: 'E:/work/docs', folderScope: own('E:/work/docs', true),
+      workflow: { instanceId: 'inst-docs', nodeId: 'n-lead' }, createdAt: t('12:00'), updatedAt: t('12:02') },
+    { id: 's-docs-rev-claude', revision: 2, kind: 'workflow', title: 'Review（Claude）：文件', agent: { id: 'agent-reviewer', revision: 1 }, requestedModel: claudeSonnet,
+      observedModel: { source: 'per-message', model: 'claude-sonnet-5-5', observedAt: t('12:10') }, activity: 'idle', cwd: 'E:/work/docs', folderScope: own('E:/work/docs', true), parentId: 's-docs-lead',
+      workflow: { instanceId: 'inst-docs', nodeId: 'n-rev-claude', taskId: 'task-docs' }, createdAt: t('12:03'), updatedAt: t('12:10') },
+    { id: 's-docs-rev-codex', revision: 1, kind: 'workflow', title: 'Review（Codex）：文件', agent: { id: 'agent-reviewer', revision: 1 }, requestedModel: codexAstra,
+      observedModel: { source: 'configured', model: 'gpt-6-astra', observedAt: t('12:04') }, activity: 'running', cwd: 'E:/work/docs', folderScope: own('E:/work/docs', true), parentId: 's-docs-lead',
+      workflow: { instanceId: 'inst-docs', nodeId: 'n-rev-codex', taskId: 'task-docs' }, createdAt: t('12:03'), updatedAt: t('12:04') },
   ],
   messages: [
     { id: 'm1', sessionId: 's-plan-notes', role: 'user', origin: { kind: 'user' }, text: '先整理成草稿，不要開始執行。', createdAt: t('10:00') },
@@ -157,12 +203,43 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
   instances: [
     {
       id: 'inst-login', revision: 4, workflowId: 'wf-default', workflowRevision: 3, template: workflowDefault, title: '登入功能', rootSessionId: 's-wf-root', state: 'running', crossToolConsentAt: t('11:00'),
+      projectId: 'proj-demo', targetBranch: 'main', taskLimit: 3,
       tasks: [
-        { id: 'task-a', instanceId: 'inst-login', title: '表單驗證', dependsOn: [], status: 'running', currentNodeId: 'n-review', worktree: { path: 'E:/work/.awg/wt/t1', branch: 'task/t1' }, reworkCount: 0 },
-        { id: 'task-b', instanceId: 'inst-login', title: 'Session 儲存', dependsOn: [], status: 'running', currentNodeId: 'n-build', worktree: { path: 'E:/work/.awg/wt/t2', branch: 'task/t2' }, reworkCount: 0 },
+        { id: 'task-a', instanceId: 'inst-login', title: '表單驗證', dependsOn: [], status: 'running', currentNodeId: 'n-review', worktree: { path: 'E:/work/.awg/wt/t1', branch: 'task/t1', baseCommit: '3f9a1c2' },
+          setup: { state: 'succeeded', command: 'npm ci', startedAt: t('11:08'), endedAt: t('11:09'), exitCode: 0, outputTail: 'added 812 packages in 41s' }, reworkCount: 0 },
+        { id: 'task-b', instanceId: 'inst-login', title: 'Session 儲存', dependsOn: [], status: 'running', currentNodeId: 'n-build', worktree: { path: 'E:/work/.awg/wt/t2', branch: 'task/t2', baseCommit: '3f9a1c2' },
+          setup: { state: 'succeeded', command: 'npm ci', startedAt: t('11:08'), endedAt: t('11:10'), exitCode: 0, outputTail: 'added 812 packages in 44s' }, reworkCount: 0 },
         { id: 'task-c', instanceId: 'inst-login', title: '登入頁 UI', dependsOn: ['task-a'], status: 'pending', reworkCount: 0 },
+        { id: 'task-d', instanceId: 'inst-login', title: '錯誤訊息文字', dependsOn: [], status: 'merged', worktree: { path: 'E:/work/.awg/wt/t4', branch: 'task/t4', baseCommit: '3f9a1c2', cleanup: 'pending-cleanup' },
+          reworkCount: 0, completedAt: t('11:24') },
+        { id: 'task-e', instanceId: 'inst-login', title: '記住我', dependsOn: [], status: 'blocked', blockedReason: 'merge-conflict', currentNodeId: 'n-build', worktree: { path: 'E:/work/.awg/wt/t5', branch: 'task/t5', baseCommit: '3f9a1c2' }, reworkCount: 1 },
+        { id: 'task-f', instanceId: 'inst-login', title: '登入失敗鎖定', dependsOn: [], status: 'merging', currentNodeId: 'n-merge', worktree: { path: 'E:/work/.awg/wt/t6', branch: 'task/t6', baseCommit: '3f9a1c2' }, reworkCount: 0 },
+      ],
+      mergeQueue: [
+        { taskId: 'task-d', attempt: 0, seq: 0, state: 'merged', integration: { path: 'E:/work/.awg/wt/i1', branch: 'integ/t4', cleanup: 'removed' }, baseCommit: '3f9a1c2', mergedCommit: '8d2e4b1',
+          test: { command: 'npm test', exitCode: 0, passed: true, outputTail: 'Tests  1910 passed', endedAt: t('11:23') }, enqueuedAt: t('11:18'), endedAt: t('11:24') },
+        { taskId: 'task-e', attempt: 0, seq: 1, state: 'conflict', integration: { path: 'E:/work/.awg/wt/i2', branch: 'integ/t5', cleanup: 'removed' }, baseCommit: '8d2e4b1',
+          conflictFiles: ['src/auth/session.ts', 'src/auth/session.test.ts'], detail: '合併衝突，已退回實作', enqueuedAt: t('11:25'), endedAt: t('11:26') },
+        { taskId: 'task-f', attempt: 0, seq: 2, state: 'testing', integration: { path: 'E:/work/.awg/wt/i3', branch: 'integ/t6' }, baseCommit: '8d2e4b1', mergedCommit: 'c71f0a9', enqueuedAt: t('11:27') },
+      ],
+      // `out-tasks` is root's `tasks` rule (O-07); the template above gets it with the editor's support (T034).
+      taskPlans: [
+        { id: 'plan-1', fromSessionId: 's-wf-root', sourceCallRef: 'toolu_root_tasks_1', ruleId: 'out-tasks', state: 'created', escalationId: 'esc-2',
+          items: [{ key: 'a', title: '表單驗證' }, { key: 'b', title: 'Session 儲存' }, { key: 'c', title: '登入頁 UI', dependsOn: ['a'] }],
+          created: [{ key: 'a', taskId: 'task-a' }, { key: 'b', taskId: 'task-b' }, { key: 'c', taskId: 'task-c' }], createdAt: t('11:05'), decidedAt: t('11:06') },
+        { id: 'plan-2', fromSessionId: 's-wf-root', sourceCallRef: 'toolu_root_tasks_2', ruleId: 'out-tasks', state: 'awaiting-confirmation', escalationId: 'esc-4',
+          items: [{ key: 'g', title: '第三方登入' }, { key: 'h', title: '第三方登入文件', dependsOn: ['g'] }], createdAt: t('11:32') },
       ],
       createdAt: t('11:00'),
+    },
+    {
+      id: 'inst-docs', revision: 3, workflowId: 'wf-review-pair', workflowRevision: 0, template: workflowReviewPair, title: '文件 review', rootSessionId: 's-docs-lead', state: 'running', crossToolConsentAt: t('12:00'),
+      tasks: [{ id: 'task-docs', instanceId: 'inst-docs', title: '文件 review', dependsOn: [], status: 'running', currentNodeId: 'n-rev-codex', reworkCount: 0 }],
+      rounds: [
+        { taskId: 'task-docs', nodeId: 'n-summary', round: 1, expectedUpstream: ['n-rev-claude', 'n-rev-codex'], arrived: [{ fromNodeId: 'n-rev-claude', handoffId: 'h-6' }],
+          state: 'waiting', deadline: t('12:33'), openedAt: t('12:03') },
+      ],
+      createdAt: t('12:00'),
     },
   ],
   handoffs: [
@@ -178,6 +255,18 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
       payload: '請實作 session 儲存。', payloadHash: hash('c'), proposalRevision: 1, round: 0,
       target: { sessionId: 's-wf-build-b', nativeSessionRef: 'thread-build-b', provision: { operationId: 'op-h3-target', bindingKey: 'inst-login/n-build/task-b', state: 'sent', nativeSessionRef: 'thread-build-b', preallocated: false } },
       delivery: sentDelivery(3, t('11:12'), 'thread-build-b', 'turn-native-b1'), acceptedAt: t('11:07') },
+    { id: 'h-4', operationId: 'op-h4', sourceCallRef: 'toolu_docs_lead_1', instanceId: 'inst-docs', taskId: 'task-docs', fromNodeId: 'n-lead', toNodeId: 'n-rev-claude', fromSessionId: 's-docs-lead', ruleId: 'out-claude',
+      payload: '請 review docs/ 下的安裝說明。', payloadHash: hash('1'), proposalRevision: 0, round: 1,
+      target: { sessionId: 's-docs-rev-claude', nativeSessionRef: uuid(104), provision: { operationId: 'op-h4-target', bindingKey: 'inst-docs/n-rev-claude/task-docs', state: 'sent', nativeSessionRef: uuid(104), preallocated: true } },
+      delivery: sentDelivery(7, t('12:03'), uuid(104)), acceptedAt: t('12:03') },
+    { id: 'h-5', operationId: 'op-h5', sourceCallRef: 'toolu_docs_lead_2', instanceId: 'inst-docs', taskId: 'task-docs', fromNodeId: 'n-lead', toNodeId: 'n-rev-codex', fromSessionId: 's-docs-lead', ruleId: 'out-codex',
+      payload: '請 review docs/ 下的安裝說明。', payloadHash: hash('2'), proposalRevision: 0, round: 1,
+      target: { sessionId: 's-docs-rev-codex', nativeSessionRef: 'thread-docs-codex', provision: { operationId: 'op-h5-target', bindingKey: 'inst-docs/n-rev-codex/task-docs', state: 'sent', nativeSessionRef: 'thread-docs-codex', preallocated: false } },
+      delivery: sentDelivery(8, t('12:04'), 'thread-docs-codex', 'turn-native-dc1'), acceptedAt: t('12:03') },
+    // Counted for the round; the join node starts once the Codex review arrives too.
+    { id: 'h-6', operationId: 'op-h6', sourceCallRef: 'toolu_docs_rev_claude_1', instanceId: 'inst-docs', taskId: 'task-docs', fromNodeId: 'n-rev-claude', toNodeId: 'n-summary', fromSessionId: 's-docs-rev-claude', ruleId: 'out-findings',
+      payload: '安裝說明缺少 Windows 長路徑設定。', payloadHash: hash('3'), proposalRevision: 0, round: 1, expectedUpstream: ['n-rev-claude', 'n-rev-codex'],
+      target: {}, delivery: { state: 'pending', attempts: [] }, acceptedAt: t('12:10') },
   ],
   peerMessages: [
     { id: 'pm-1', operationId: 'op-pm1', sourceCallRef: 'toolu_research_send_1', fromSessionId: 's-research', toSessionId: 's-plan-notes', toNativeSessionRef: uuid(100), text: '三個重點已整理在 refs/summary.md。', payloadHash: hash('d'), entry: 'new-turn',
@@ -192,6 +281,8 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
       state: 'approved', resolvedBy: 'user', createdAt: t('11:05'), resolvedAt: t('11:06') },
     { id: 'esc-3', instanceId: 'inst-login', rootSessionId: 's-wf-root', fromSessionId: 's-wf-root', kind: 'delivery-unknown', title: '訊息送達結果未知',
       detail: '送往「實作：Session 儲存」時 app-server 斷線，歷史中查不到相同 clientMessageId；未自動重送。', ref: { kind: 'peerMessage', peerMessageId: 'pm-2' }, state: 'open', createdAt: t('11:31') },
+    { id: 'esc-4', instanceId: 'inst-login', rootSessionId: 's-wf-root', fromSessionId: 's-wf-root', kind: 'confirmation', title: '確認新的 task 清單', detail: '2 個 task，第三方登入文件依賴第三方登入',
+      ref: { kind: 'taskPlan', taskPlanId: 'plan-2' }, state: 'open', createdAt: t('11:32') },
   ],
   transfers: [
     { id: 'tr-1', operationId: 'op-tr1', revision: 1, sourceSessionId: 's-plan-notes', sourceRevision: 3, target: codexAstra,
@@ -202,6 +293,17 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
     { id: 'tr-2', operationId: 'op-tr2', revision: 0, sourceSessionId: 's-research', sourceRevision: 2, target: codexAstra,
       content: { goal: '把整理好的重點交給 Codex 實作', note: '已完成：refs/a.md。未完成：refs/b.md。', noteSource: 'agent', diff: '', testOutput: '' }, payloadHash: hash('0'),
       state: 'awaiting-confirmation', createdAt: t('10:21') },
+    { id: 'tr-3', operationId: 'op-tr3', revision: 2, sourceSessionId: 's-plan-notes', sourceRevision: 3, target: codexAstra,
+      content: { goal: '把規劃草稿交給 Codex', note: '已完成：方案比較。', noteSource: 'gui-digest', diff: '', testOutput: '' }, payloadHash: hash('4'),
+      state: 'cancelled', approvedRevision: 1, approvedAt: t('10:33'), cancelledAt: t('10:34'), cancelReason: 'source-changed', createdAt: t('10:32') },
+  ],
+  projects: [
+    { schemaVersion: v, id: 'proj-demo', revision: 0, name: 'demo', rootPath: 'E:/work', defaultBranch: 'main', commands: { setup: 'npm ci', test: 'npm test', shell: 'powershell' }, updatedAt: t('09:20') },
+  ],
+  // Two ordinary sessions share E:/work/demo (same-folder mode): the Claude one waits for the file (R-07).
+  locks: [
+    { path: 'e:/work/demo/refs/summary.md', holderSessionId: 's-research', holderTurnId: 'turn-r1', acquiredAt: t('10:20'),
+      waiters: [{ sessionId: 's-plan-notes', via: 'wait_for_file', since: t('10:25'), deadline: t('10:35') }] },
   ],
   preferences: { theme: 'dark' },
 };

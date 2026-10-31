@@ -4,7 +4,6 @@ import { describe, expect, it } from 'vitest';
 import type { z } from 'zod';
 import {
   AppEvent,
-  CONTRACTS_VERSION,
   Escalation,
   Handoff,
   issueRule,
@@ -33,10 +32,6 @@ const ruleIssues = (schema: z.ZodType, input: unknown) => {
 const ok = (schema: z.ZodType, input: unknown) => schema.safeParse(input).success;
 
 describe('contracts 0.5', () => {
-  it('is version 0.5.0', () => {
-    expect(CONTRACTS_VERSION).toBe('0.5.0');
-  });
-
   it('C-03: a session may carry its native binding', () => {
     const session = pick(fixtureSnapshotInput.sessions, 0);
     expect(ok(LogicalSession, { ...session, nativeSessionRef: 'thread-1' })).toBe(true);

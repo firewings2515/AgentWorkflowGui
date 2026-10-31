@@ -275,12 +275,29 @@ UPDATE transfer_proposal SET body = json_set(body, '$.provision', json_patch(
   WHERE json_type(body, '$.provision') = 'object';
 `;
 
+/**
+ * v6: records written under contracts 0.5 read under 0.6 (T028). Agents, workflow templates and the template
+ * pinned in each instance carry the contracts version. Everything else new in 0.6 is optional or has a
+ * default. Projects (C-17) are saved like the definitions. Indexes and the other 0.6 tables come with T029.
+ */
+const contracts06V6 = `
+UPDATE agent SET body = json_set(body, '$.schemaVersion', '0.6.0') WHERE json_extract(body, '$.schemaVersion') = '0.5.0';
+UPDATE workflow SET body = json_set(body, '$.schemaVersion', '0.6.0') WHERE json_extract(body, '$.schemaVersion') = '0.5.0';
+UPDATE workflow_instance SET body = json_set(body, '$.template.schemaVersion', '0.6.0') WHERE json_extract(body, '$.template.schemaVersion') = '0.5.0';
+CREATE TABLE project (
+  id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK (revision >= 0),
+  body TEXT NOT NULL
+) STRICT;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
   { version: 3, name: 'contracts-0.5', sql: contracts05V3 },
   { version: 4, name: 'storage-0.5', sql: storage05V4 },
   { version: 5, name: 'storage-0.5-review', sql: storageReviewV5 },
+  { version: 6, name: 'contracts-0.6', sql: contracts06V6 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;

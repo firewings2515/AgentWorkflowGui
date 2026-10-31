@@ -190,7 +190,7 @@ describe('the workflow engine in the backend (T024)', () => {
     expect(await call(s, review, 'handoff', { ruleId: 'done', target: { kind: 'root' }, content: 'Approved.' })).toMatchObject({ status: 'accepted' });
     // Not connected: implement has no edge to plan. create_tasks waits for batch 5.
     expect(await call(s, impl, 'handoff', { ruleId: 'to-review', target: { kind: 'node', nodeId: PLAN }, content: 'x' })).toMatchObject({ status: 'rejected', rejection: { reason: 'not-connected' } });
-    expect(await call(s, ROOT, 'create_tasks', { tasks: [{ key: 'a', title: 'A' }] })).toMatchObject({ status: 'rejected', rejection: { reason: 'unsupported' } });
+    expect(await call(s, ROOT, 'create_tasks', { ruleId: 'split', tasks: [{ key: 'a', title: 'A' }] })).toMatchObject({ status: 'rejected', rejection: { reason: 'unsupported' } });
 
     const snap = await snapshot(s);
     const [instance] = snap.instances;
