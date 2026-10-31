@@ -79,6 +79,7 @@ describe('review r1', () => {
       (path) => (path.toLowerCase() === 'e:\\work\\.gitignore' ? '[z-a]\n*.log\n' : undefined),
       (folder) => folder.toLowerCase() === REPO,
       (m) => logs.push(m),
+      () => ({ close: () => undefined }),
     );
     expect(ignore.isIgnored('E:\\work\\z.txt')).toBe(false);
     expect(ignore.isIgnored('E:\\work\\a.log')).toBe(true);
@@ -112,5 +113,38 @@ describe('review r1', () => {
     files['e:\\main\\.git\\info\\exclude'] = '';
     ignore.changed('E:\\main\\.git\\info\\exclude');
     expect(ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt')).toBe(false);
+  });
+});
+
+describe('review r2', () => {
+  it('P2 a change of the common info/exclude, outside the workspace, is seen by its own watch', () => {
+    const files: Record<string, string> = {
+      'e:\\wt\\one\\.git': 'gitdir: E:/main/.git/worktrees/one\n',
+      'e:\\main\\.git\\worktrees\\one\\commondir': '../..\n',
+      'e:\\main\\.git\\info\\exclude': 'scratch/\n',
+    };
+    const watched: { folder: string; onChange: (filename: string | null) => void; closed: boolean }[] = [];
+    const ignore = new GitIgnoreRules(
+      (path) => files[path.toLowerCase()],
+      (folder) => folder.toLowerCase() === 'e:\\wt\\one',
+      () => undefined,
+      (folder, onChange) => {
+        const entry = { folder, onChange, closed: false };
+        watched.push(entry);
+        return { close: () => (entry.closed = true) };
+      },
+    );
+    expect(ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt')).toBe(true);
+    expect(watched.map((w) => w.folder.toLowerCase())).toEqual(['e:\\main\\.git\\info']);
+    files['e:\\main\\.git\\info\\exclude'] = '';
+    // Another file in that folder changes nothing; the exclude does.
+    watched[0]!.onChange('attributes');
+    expect(ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt')).toBe(true);
+    watched[0]!.onChange('exclude');
+    expect(ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt')).toBe(false);
+    // One watch per folder, closed on exit.
+    expect(watched).toHaveLength(1);
+    ignore.close();
+    expect(watched[0]!.closed).toBe(true);
   });
 });

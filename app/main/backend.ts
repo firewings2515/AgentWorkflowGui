@@ -331,6 +331,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     const left: OwnedProcess[] = await host.listOwned().catch(() => []);
     for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
     watchers.stopAll();
+    ignored.close();
     return damaged(error);
   }
 
@@ -407,6 +408,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       const left: OwnedProcess[] = await host.listOwned().catch(() => []);
       for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
       watchers.stopAll();
+      ignored.close();
       db.close();
     })();
     return closing;

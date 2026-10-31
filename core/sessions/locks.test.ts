@@ -215,3 +215,36 @@ describe('review r1 (session service)', () => {
     expect(locksOf(w)).toEqual([expect.objectContaining({ path: 'e:\\real\\project\\new\\a.txt', holderSessionId: b })]);
   });
 });
+
+describe('review r2 (session service)', () => {
+  it('P1 a recheck through the gate keeps the 1000 ms hold limit: refused and escalated by 1000 ms', async () => {
+    const w = await world({ locks: true, holdMs: 1000 });
+    const { sessionId: a } = await created(w, 'codex', 'session-a');
+    const { sessionId: b } = await created(w, 'codex', 'session-b');
+    const { sessionId: c } = await created(w, 'codex', 'session-c');
+    let target = 'old';
+    w.realPath = (p) => {
+      const linked = p.replace(/^E:\\work\\project\\link/i, `E:\\real\\project\\${target}`);
+      return linked.startsWith('E:\\work') ? linked.replace('E:\\work', 'E:\\real') : linked.startsWith('E:\\real') ? linked : null;
+    };
+    codexWrite(w, a, 'E:\\work\\project\\old\\a.txt');
+    codexWrite(w, c, 'E:\\work\\project\\new\\a.txt');
+    await settle();
+    const held = codexWrite(w, b, 'E:\\work\\project\\link\\a.txt');
+    await settle();
+    expect(held.holdState).toMatchObject({ reason: 'file-lock', lockPath: 'e:\\real\\project\\old\\a.txt' });
+    w.clock.advance(900);
+    target = 'new';
+    turnEnd(w, a);
+    await settle();
+    // Decided again by the policy, held now for C's lock, with the first limit.
+    expect(held.decision).toBeUndefined();
+    expect(held.holdState).toMatchObject({ reason: 'file-lock', lockPath: 'e:\\real\\project\\new\\a.txt', until: '2026-10-29T01:00:01.000Z' });
+    w.clock.advance(100);
+    await settle();
+    expect(held.decision).toMatchObject({ outcome: 'decline' });
+    expect([...w.repositories.escalationRecords.values()].filter((e) => e.kind === 'lock-timeout')).toEqual([
+      expect.objectContaining({ fromSessionId: b, ref: expect.objectContaining({ holderSessionId: c }) as unknown }),
+    ]);
+  });
+});

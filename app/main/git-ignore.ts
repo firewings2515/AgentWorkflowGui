@@ -8,7 +8,7 @@
 // negation, leading / middle `/` anchoring, trailing `/` for folders, `*`, `?`, `**` and `[...]`,
 // case-insensitive like git on Windows. A pattern that cannot be read (e.g. `[z-a]`) is left out, never
 // thrown. Not read: the global excludes file (`core.excludesFile`; main session's ruling, a known limit).
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, watch } from 'node:fs';
 import { win32 } from 'node:path';
 
 interface Rule {
@@ -77,11 +77,31 @@ const decide = (rules: readonly Rule[], relative: string, isDir: boolean): boole
 
 const key = (path: string) => path.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
 
+/** Watches one folder (not below it); `undefined` when it cannot be watched. */
+export type WatchFolder = (folder: string, onChange: (filename: string | null) => void) => { close(): void } | undefined;
+
+const watchFolder: WatchFolder = (folder, onChange) => {
+  try {
+    const watcher = watch(folder, { persistent: false }, (_event, filename) => onChange(filename));
+    // A watch that fails later counts as a change: the rules are read again.
+    watcher.on('error', () => onChange(null));
+    return watcher;
+  } catch {
+    return undefined;
+  }
+};
+
 export class GitIgnoreRules {
   /** Rules of each folder's `.gitignore` by folder key; an empty list when it has none. */
   private readonly folders = new Map<string, Rule[]>();
   /** The repository root of each folder asked about (null: not in a repository). */
   private readonly roots = new Map<string, string | null>();
+  /**
+   * The `info` folder of every git dir whose `exclude` was read, watched on its own: it is often outside
+   * the session's workspace (a linked worktree's common git dir, or a workspace below the repository
+   * root), where the workspace watcher never sees it change (T033 r2 P2).
+   */
+  private readonly infoWatchers = new Map<string, { close(): void } | undefined>();
 
   constructor(
     private readonly read: (path: string) => string | undefined = (path) => {
@@ -100,7 +120,20 @@ export class GitIgnoreRules {
       }
     },
     private readonly log: (message: string) => void = () => undefined,
+    private readonly watchInfoFolder: WatchFolder = watchFolder,
   ) {}
+
+  /** Stops the `info` folder watches (on exit). */
+  close(): void {
+    for (const watcher of this.infoWatchers.values()) {
+      try {
+        watcher?.close();
+      } catch {
+        // Gone already.
+      }
+    }
+    this.infoWatchers.clear();
+  }
 
   /** Never throws (it runs on every watcher event): anything unexpected ignores nothing. */
   isIgnored(path: string): boolean {
@@ -164,6 +197,7 @@ export class GitIgnoreRules {
     if (rules === undefined) {
       const file = `${this.commonGitDir(root)}\\info\\exclude`;
       rules = parseGitignore(this.read(file) ?? '', () => this.bad(file));
+      this.watchInfo(win32.dirname(file));
       this.folders.set(cacheKey, rules);
     }
     return rules;
@@ -180,6 +214,24 @@ export class GitIgnoreRules {
     const gitDir = win32.resolve(root, pointer);
     const common = this.read(`${gitDir}\\commondir`)?.trim();
     return common === undefined || common === '' ? gitDir : win32.resolve(gitDir, common);
+  }
+
+  /**
+   * Watches an `info` folder once: its `exclude` changing drops every cached exclude. A folder that cannot
+   * be watched (missing, no access) is a known limit: a change of its exclude then counts after the next
+   * start, or once the workspace watcher reports it.
+   */
+  private watchInfo(folder: string): void {
+    const k = key(folder);
+    if (this.infoWatchers.has(k)) return;
+    const dropExcludes = () => {
+      for (const c of [...this.folders.keys()]) if (c.endsWith('#exclude')) this.folders.delete(c);
+    };
+    const watcher = this.watchInfoFolder(folder, (filename) => {
+      if (filename === null || key(filename) === 'exclude') dropExcludes();
+    });
+    if (watcher === undefined) this.log('[locks] a git info folder cannot be watched; a change of its exclude counts after the next start');
+    this.infoWatchers.set(k, watcher);
   }
 
   /** A pattern left out: said once per file until it is read again. */

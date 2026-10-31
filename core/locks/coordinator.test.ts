@@ -698,3 +698,87 @@ describe('review r1', () => {
     expect(escalations.filter((e) => e.path === fk(SEEN)).length).toBe(n + 1);
   });
 });
+
+// Review r2 (Astra): regression tests from the reviewer's repros.
+describe('review r2', () => {
+  const C = 'sess-c' as SessionId;
+
+  it('P1 a recheck keeps the hold limit of the request: refused and escalated at 1000 ms, not later', async () => {
+    const { clock, locks, links, escalations } = setup({ holdMs: 1000 });
+    locks.track(session(C));
+    links.set('E:\\work\\link', 'E:\\work\\old');
+    void locks.approve(handle(write(A, ['E:\\work\\old\\a.txt'], { claude: true })), approve, session(A));
+    void locks.approve(handle(write(C, ['E:\\work\\new\\a.txt'], { claude: true })), approve, session(C));
+    const req = write(B, ['E:\\work\\link\\a.txt']);
+    locks.observe(fileItem(req, 'proposed'));
+    const hd = handle(req);
+    let step = locks.approve(hd, approve, session(B), locks.pathsOf(req, session(B)));
+    clock.advance(900);
+    links.set('E:\\work\\link', 'E:\\work\\new');
+    locks.stopped(A);
+    expect(await step).toBe('recheck');
+    // The gate decides again, for the file the link names now (C holds it).
+    step = locks.approve(hd, approve, session(B), locks.pathsOf(req, session(B)));
+    expect(step).toBeInstanceOf(Promise);
+    expect(hd.holds.at(-1)).toMatchObject({ until: '2026-10-31T00:00:01.000Z' });
+    clock.advance(100);
+    expect(await step).toBe('refused');
+    await flush();
+    expect(escalations).toEqual([expect.objectContaining({ kind: 'lock-timeout', sessionId: B, holderSessionId: C })]);
+  });
+
+  it('P1 changing the link again and again never extends the hold', async () => {
+    const { clock, locks, links } = setup({ holdMs: 1000 });
+    locks.track(session(C));
+    links.set('E:\\work\\link', 'E:\\work\\old');
+    const req = write(B, ['E:\\work\\link\\a.txt']);
+    locks.observe(fileItem(req, 'proposed'));
+    const hd = handle(req);
+    let holder = A;
+    void locks.approve(handle(write(A, ['E:\\work\\old\\a.txt'], { claude: true })), approve, session(A));
+    let step = locks.approve(hd, approve, session(B), locks.pathsOf(req, session(B)));
+    for (const [target, next] of [
+      ['new', C],
+      ['old', A],
+    ] as const) {
+      clock.advance(400);
+      void locks.approve(handle(write(next, [`E:\\work\\${target}\\a.txt`], { claude: true })), approve, session(next));
+      links.set('E:\\work\\link', `E:\\work\\${target}`);
+      locks.stopped(holder);
+      holder = next;
+      expect(await step).toBe('recheck');
+      step = locks.approve(hd, approve, session(B), locks.pathsOf(req, session(B)));
+    }
+    clock.advance(200);
+    expect(await step).toBe('refused');
+  });
+
+  it('P2 a file only read (no watcher event before) and then deleted is escalated', async () => {
+    const { locks, files, escalations } = setup();
+    locks.observe(turnRun(A, T1));
+    void locks.approve(handle(read(A, F, 'read-r2')), approve, session(A));
+    locks.observe({ type: 'item.updated', item: { id: 'read-r2', sessionId: A, turnId: T1, kind: 'toolCall', tool: 'Read', summary: 'Read', state: 'completed', startedAt: AT, endedAt: AT } as SessionItem });
+    files.delete(fk(F));
+    locks.fileChanged(A, F);
+    await flush();
+    expect(escalations).toEqual([expect.objectContaining({ kind: 'unlocked-write', path: fk(F) })]);
+  });
+
+  it('P2 a path that was a folder and is now a file is a file when it is deleted', async () => {
+    const { locks, files, escalations } = setup();
+    locks.observe(turnRun(A, T1));
+    const P = 'E:\\work\\thing';
+    files.set(fk(P), 'directory');
+    locks.fileChanged(A, P);
+    files.set(fk(P), h(4));
+    locks.fileChanged(A, P);
+    await flush();
+    const before = escalations.length;
+    locks.escalationClosed(`esc-${String(escalations.length)}` as never);
+    files.delete(fk(P));
+    locks.fileChanged(A, P);
+    await flush();
+    expect(escalations.length).toBe(before + 1);
+    expect(escalations.at(-1)).toMatchObject({ path: fk(P) });
+  });
+});

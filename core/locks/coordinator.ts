@@ -121,14 +121,24 @@ export class LockCoordinator {
   private readonly sessions = new Map<SessionId, Tracked>();
   /** Paths of each file-change item as announced (Codex `item/started`, Claude's tool call). */
   private readonly itemPaths = new Map<string, { paths: string[]; cwd: string }>();
-  /** Paths seen to be folders (a folder event, or the parent of a changed path): their deletion is nobody's write. */
-  private readonly folders = new Map<string, true>();
+  /**
+   * What each path was last confirmed to be (T033 r2 P2): a file (a watcher event with its content, a Read,
+   * a write's result) or a folder (a folder event, or the parent of a changed path). A later confirmation
+   * replaces it. Deciding a deletion: a folder's is nobody's write on a file; an unknown path's is not
+   * escalated.
+   */
+  private readonly kinds = new Map<string, 'file' | 'folder'>();
   private readonly writes = new Map<string, PendingWrite>();
   /** Claude Reads approved and not finished: the file's hash right before the read. */
   private readonly reads = new Map<string, { path: string; before: FileState }>();
   private readonly background = new Map<SessionId, { commands: Set<string>; tasks: Set<string> }>();
   /** Held Codex approvals waiting for a lock, by request: to cancel when the runtime withdraws one. */
   private readonly waiting = new Map<string, { sessionId: SessionId; path: string; waiter: LockWaiter }>();
+  /**
+   * When each held Codex approval was first held, and its limit: kept across `recheck`, so deciding a
+   * request again never gives it a new full wait (T033 r2 P1). Gone once the request is answered.
+   */
+  private readonly holds = new Map<string, { since: Timestamp; deadline: Timestamp }>();
   /** The last content seen of each path (a write's result or a watcher event), so a repeat is no change. */
   private readonly seen = new Map<string, FileState>();
   /** Open unlocked-write escalations by path: one at a time per file. */
@@ -274,6 +284,11 @@ export class LockCoordinator {
         const hash = toHash(read.before) ?? toHash(after);
         // No hash (too large, unreadable): nothing to check against, and an older read no longer holds.
         if (hash !== undefined) this.table.recordRead(item.sessionId, read.path, hash);
+        // Read: it is a file, and what it holds is known (for a later deletion or change; T033 r2 P2).
+        if (hash !== undefined) {
+          this.rememberKind(read.path, 'file');
+          if (!this.seen.has(read.path)) this.remember(read.path, hash);
+        }
         else this.table.forgetRead(item.sessionId, read.path);
         return;
       }
@@ -290,6 +305,7 @@ export class LockCoordinator {
           const wait = this.waiting.get(event.request.id);
           if (wait !== undefined) this.table.cancelWait(wait.sessionId, wait.path, wait.waiter);
         }
+        if (event.request.state === 'withdrawn' || event.request.state === 'answered') this.holds.delete(itemKey(event.request.sessionId, event.request.id));
         return;
       case 'runtime.exited':
         for (const sessionId of event.sessionIds) this.release(sessionId, 'runtime-exited');
@@ -367,16 +383,17 @@ export class LockCoordinator {
     const state = this.options.hashFile(path);
     if (state === 'unreadable') return;
     if (state === 'directory') {
-      this.rememberFolder(path);
+      this.rememberKind(path, 'folder');
       return;
     }
     // The parent of a changed path is a folder.
-    this.rememberFolder(parentOf(path));
+    this.rememberKind(parentOf(path), 'folder');
+    if (state !== 'missing') this.rememberKind(path, 'file');
     const locked = this.table.list().some((l) => l.path === path);
     // Gone: a folder's deletion is nobody's write on a file; and when what was there is unknown, it is not
-    // escalated (T033 r1 P1-10). A locked path, or one seen as a file, was a file.
-    if (state === 'missing' && !locked && (this.folders.has(path) || toHash(this.seen.get(path) ?? 'missing') === undefined)) {
-      this.folders.delete(path);
+    // escalated (T033 r1 P1-10). A locked path, or one last confirmed as a file, was a file.
+    if (state === 'missing' && !locked && this.kinds.get(path) !== 'file') {
+      this.kinds.delete(path);
       this.remember(path, state);
       return;
     }
@@ -473,9 +490,19 @@ export class LockCoordinator {
 
   /** Holds a Codex approval until every file can be taken, or refuses and escalates past the limit. */
   private async holdForLock(handle: PermissionHandle, decision: PermissionDecision, session: LogicalSession, paths: string[]): Promise<LockStep> {
+    const key = itemKey(session.id, handle.request.id);
+    const now = this.options.now();
+    const hold = this.holds.get(key) ?? { since: now, deadline: later(now, this.options.holdMs ?? DEFAULT_HOLD_MS) };
+    this.holds.set(key, hold);
+    const step = await this.holdUntil(handle, decision, session, paths, hold);
+    // Decided again (`recheck`): the same request keeps its first limit.
+    if (step !== 'recheck') this.holds.delete(key);
+    return step;
+  }
+
+  private async holdUntil(handle: PermissionHandle, decision: PermissionDecision, session: LogicalSession, paths: string[], hold: { since: Timestamp; deadline: Timestamp }): Promise<LockStep> {
     const { request } = handle;
-    const since = this.options.now();
-    const deadline = later(since, this.options.holdMs ?? DEFAULT_HOLD_MS);
+    const { since, deadline } = hold;
     for (;;) {
       const lock = this.blocking(session.id, paths);
       if (lock === undefined) {
@@ -588,6 +615,7 @@ export class LockCoordinator {
   }
 
   private ended(write: PendingWrite, path: string, outcome: WriteOutcome): void {
+    if (outcome.kind === 'written') this.rememberKind(path, 'file');
     if (outcome.kind === 'written') this.remember(path, outcome.hash);
     else if (outcome.kind === 'deleted') this.remember(path, 'missing');
     this.table.writeEnded(write.sessionId, path, outcome);
@@ -595,12 +623,12 @@ export class LockCoordinator {
     if (!write.readsSeen) this.table.forgetRead(write.sessionId, path);
   }
 
-  /** Bounded like `seen`. */
-  private rememberFolder(path: string): void {
+  /** Bounded like `seen`; the newest confirmation of a path wins. */
+  private rememberKind(path: string, kind: 'file' | 'folder'): void {
     if (path === '') return;
-    this.folders.delete(path);
-    this.folders.set(path, true);
-    if (this.folders.size > 10_000) this.folders.delete(this.folders.keys().next().value!);
+    this.kinds.delete(path);
+    this.kinds.set(path, kind);
+    if (this.kinds.size > 10_000) this.kinds.delete(this.kinds.keys().next().value!);
   }
 
   /** Bounded: the oldest paths are forgotten first (a forgotten one only means its next event is checked). */
@@ -642,6 +670,7 @@ export class LockCoordinator {
   private release(sessionId: SessionId, reason: 'stopped' | 'runtime-exited' | 'closed'): void {
     for (const [key, write] of [...this.writes]) if (write.sessionId === sessionId) this.writes.delete(key);
     for (const key of [...this.reads.keys()]) if (key.startsWith(`${sessionId}\n`)) this.reads.delete(key);
+    for (const key of [...this.holds.keys()]) if (key.startsWith(`${sessionId}\n`)) this.holds.delete(key);
     this.background.delete(sessionId);
     this.table.releaseAll(sessionId, reason);
   }

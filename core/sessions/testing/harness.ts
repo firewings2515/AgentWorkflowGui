@@ -58,6 +58,8 @@ export interface World {
 export interface WorldOptions {
   /** Same-folder file locks (T033) on the service; off by default. */
   locks?: boolean;
+  /** The locks' Codex hold limit (default 5 minutes). */
+  holdMs?: number;
 }
 
 const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, previous?: World, o: WorldOptions = {}): World => {
@@ -93,7 +95,8 @@ const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, pre
     store,
     policy,
     publish: (event) => world.events.push(event),
-    now: () => '2026-10-29T01:00:00.000Z',
+    // The lock tests move the clock; everything else sees it stand still at its start.
+    now: () => clock.now(),
     uuid,
     hashPayload: hashOf,
     resolveRealPath: (path) => world.realPath(path),
@@ -115,7 +118,9 @@ const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, pre
     },
     log: (message) => world.logs.push(message),
     sleep: (ms) => world.sleeper(ms),
-    ...(o.locks === true && { locks: { hashFile: (path: string) => files.get(path.toLowerCase()) ?? 'missing', setTimer: clock.setTimer } }),
+    ...(o.locks === true && {
+      locks: { hashFile: (path: string) => files.get(path.toLowerCase()) ?? 'missing', setTimer: clock.setTimer, ...(o.holdMs !== undefined && { holdMs: o.holdMs }) },
+    }),
   });
   world.run = (command) => world.service.execute(command);
   world.restart = () => build(repositories, store, world, o);
