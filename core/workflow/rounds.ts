@@ -145,8 +145,23 @@ const blockOf = (template: WorkflowTemplate, own: readonly Handoff[], round: Joi
     const sent = facts.sentTo(member);
     if (sent !== undefined && !sent.has(round.nodeId)) return { blockedReason: 'upstream-cancelled', blockedUpstream: upstream };
   }
-  if (round.deadline !== undefined && Date.parse(facts.now) >= Date.parse(round.deadline)) return { blockedReason: 'timeout' };
   return undefined;
+};
+
+/**
+ * When everything a round expects had arrived: the acceptance of its last expected arrival, from the records,
+ * so a round written late (a restart between the arrival and the round) keeps when it really completed
+ * (r2-P1-3, r2-P2). Undefined while something is missing.
+ */
+const completedAt = (own: readonly Handoff[], round: JoinRound): Timestamp | undefined => {
+  let last: Timestamp | undefined;
+  for (const upstream of round.expectedUpstream) {
+    const arrived = round.arrived.find((a) => a.fromNodeId === upstream);
+    const at = arrived === undefined ? undefined : own.find((h) => h.id === arrived.handoffId)?.acceptedAt;
+    if (at === undefined) return undefined;
+    if (last === undefined || at > last) last = at;
+  }
+  return last;
 };
 
 const plus = (at: Timestamp, ms: number): Timestamp => new Date(Date.parse(at) + ms).toISOString();
@@ -180,10 +195,16 @@ export const deriveRounds = (template: WorkflowTemplate, taskId: TaskId, handoff
   for (const round of rounds) {
     if (round.state !== 'waiting') continue;
     const block = blockOf(template, own, round, facts);
+    const complete = completedAt(own, round);
+    const deadline = round.deadline === undefined ? undefined : Date.parse(round.deadline);
     if (block !== undefined) {
       Object.assign(round, { state: 'blocked', ...block, settledAt: facts.now, escalationId: facts.escalationIdOf(round) });
-    } else if (round.expectedUpstream.every((n) => round.arrived.some((a) => a.fromNodeId === n))) {
-      Object.assign(round, { state: 'ready', settledAt: facts.now });
+    } else if (deadline !== undefined && Date.parse(complete ?? facts.now) >= deadline) {
+      // Past the limit before everything arrived (whenever this check runs): timed out at the limit.
+      Object.assign(round, { state: 'blocked', blockedReason: 'timeout', settledAt: round.deadline, escalationId: facts.escalationIdOf(round) });
+    } else if (complete !== undefined) {
+      // Ready when the last expected arrival came, also when written later (r2-P1-3, r2-P2).
+      Object.assign(round, { state: 'ready', settledAt: complete });
     }
   }
   return rounds;

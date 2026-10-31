@@ -85,7 +85,8 @@ interface Group {
   turnId?: string;
 }
 
-const groupKeyOf = (instanceId: InstanceId, taskId: TaskId, sessionId: SessionId) => JSON.stringify([instanceId, taskId, sessionId]);
+/** One group per source turn (r2-P1-1): `turn` is the turn the call came in with, or a token for a call without one. */
+const groupKeyOf = (instanceId: InstanceId, taskId: TaskId, sessionId: SessionId, turn: string) => JSON.stringify([instanceId, taskId, sessionId, turn]);
 const roundKeyOf = (instanceId: InstanceId, r: Pick<JoinRound, 'taskId' | 'nodeId' | 'round'>) => JSON.stringify([instanceId, r.taskId, r.nodeId, r.round]);
 
 /** What the MCP server tells a tool handler about the call (adapters/mcp-server `DeliveryCallContext`). */
@@ -393,7 +394,10 @@ export class WorkflowEngine implements WorkflowHooks {
     // joins the caller's open fan-out or opens a new one. A waiting node counts rounds, not arrivals.
     const handoffs = await this.repos.handoffs.listByInstance(instance.id);
     const arrival = waitsForAll(to);
-    const groupKey = groupKeyOf(instance.id, taskId, caller.id);
+    // The fan-out of the turn the call came in with: a call of the next turn never joins a group still
+    // waiting for calls of the previous one (r2-P1-1). A confirmed handoff is a group of its own.
+    const turnId = call.turnAtCall === undefined ? undefined : await call.turnAtCall;
+    const groupKey = groupKeyOf(instance.id, taskId, caller.id, call.confirmed !== undefined ? `confirmed:${ctx.operationId}` : (turnId ?? 'no-turn'));
     const fresh = nextRound(handoffs, instance.rounds, taskId, this.openRounds(instance.id, taskId));
     // The work the caller was on when it called; a confirmed handoff keeps the one its call had (r1-P1-1).
     const lineage = call.confirmed !== undefined ? handoffs.find((h) => h.id === call.confirmed?.lineageId) : lineageOf(handoffs, taskId, from.id);
@@ -464,7 +468,7 @@ export class WorkflowEngine implements WorkflowHooks {
         throw new Error('accepting the handoff could not be confirmed');
     }
     // The caller's fan-out takes it in its own turn; with no turn of its own running, nothing else can join.
-    if (!arrival) await this.joinGroup({ instanceId: instance.id, taskId, sessionId: caller.id, round }, groupKey, call.turnAtCall);
+    if (!arrival) this.joinGroup({ instanceId: instance.id, taskId, sessionId: caller.id, round, ...(turnId !== undefined && { turnId }) }, groupKey);
     const reworkCount = accepted.counts?.find((c) => c.key === reworkKey(instance.id, taskId))?.count;
     // A task held at a blocked round stays held (the user decides it).
     await this.updateTask(instance.id, taskId, (t) => ({ ...t, status: t.status === 'blocked' ? 'blocked' : 'running', currentNodeId: to.id, ...(reworkCount !== undefined && { reworkCount }) }));
@@ -488,12 +492,8 @@ export class WorkflowEngine implements WorkflowHooks {
    * group closes once that turn has ended and no call of the caller is on its way; with no turn (a handoff the
    * user confirmed later, say), as soon as nothing else of the caller is.
    */
-  private async joinGroup(group: Omit<Group, 'turnId'>, key: string, turnAtCall: Promise<string | undefined> | undefined): Promise<void> {
-    if (this.groups.has(key)) return;
-    const opened: Group = { ...group };
-    this.groups.set(key, opened);
-    const turnId = await turnAtCall;
-    if (turnId !== undefined) opened.turnId = turnId;
+  private joinGroup(group: Group, key: string): void {
+    if (!this.groups.has(key)) this.groups.set(key, group);
   }
 
   /** Rounds of a task whose fan-out is still open: their expected set is not fixed yet. */
@@ -616,7 +616,7 @@ export class WorkflowEngine implements WorkflowHooks {
     const { instanceId } = session.workflow;
     await this.serial(`instance:${instanceId}`, async () => {
       await this.closeEndedGroups(sessionId);
-      await this.syncNow(instanceId);
+      await this.syncSafely(instanceId);
     });
   }
 
@@ -1185,6 +1185,9 @@ export class WorkflowEngine implements WorkflowHooks {
         continue;
       }
       const sessionId = member.target.sessionId;
+      // A handoff call of the branch node still on its way may yet reach the waiting node: until it is in,
+      // nothing about that node's turn or destinations decides the round (r2-P1-2).
+      if ((this.inFlight.get(sessionId) ?? 0) > 0) continue;
       const last = member.delivery.attempts.at(-1);
       const turnRef = last?.state === 'sent' ? last.nativeRef.turnRef : undefined;
       if (turnRef !== undefined) {

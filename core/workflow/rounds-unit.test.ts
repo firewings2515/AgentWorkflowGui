@@ -99,6 +99,10 @@ describe('T031 round rules', () => {
     expect(round).toMatchObject({ state: 'waiting', openedAt: at(first), deadline: at(first + 100) });
     expect(deriveRounds(timed, TASK, waiting, [round!], facts({}, at(first + 99)))[0]?.state).toBe('waiting');
     expect(deriveRounds(timed, TASK, waiting, [round!], facts({}, at(first + 100)))[0]).toMatchObject({ state: 'blocked', blockedReason: 'timeout' });
+    // Complete within the limit but written after it (r2-P1-3): ready, settled when the last one arrived (r2-P2).
+    const complete = [...waiting, h(RB, JOIN, 1)];
+    const late = Date.parse(complete[3]!.acceptedAt) - Date.UTC(2026, 9, 31);
+    expect(deriveRounds(timed, TASK, complete, [], facts({}, at(first + 500)))[0]).toMatchObject({ state: 'ready', settledAt: at(late) });
     // Written only after the limit passed (a crash between the acceptance and the round): blocked at once.
     expect(deriveRounds(timed, TASK, waiting, [], facts({}, at(first + 500)))[0]).toMatchObject({ state: 'blocked', blockedReason: 'timeout' });
   });
