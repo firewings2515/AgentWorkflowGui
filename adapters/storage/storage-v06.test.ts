@@ -10,6 +10,7 @@ import type { DeliveryStore } from '../../core/ports';
 import { MemoryDeliveryStore } from '../../core/delivery/testing/memory-store';
 import { fixtureSnapshotInput } from '../../contracts/fixtures/snapshot';
 import { openDatabase } from './database';
+import { StoredDataError } from './codec';
 import { SqliteDeliveryStore } from './delivery-store';
 import { MIGRATIONS, migrate } from './migrations';
 import { createRepositories } from './repositories';
@@ -168,11 +169,16 @@ describe('T028 r2', () => {
       await store.accept(payloadInput({ operationId: op('op-unbound'), target: {} }));
       expect(await store.listByTarget(SessionId.parse('session-target'))).toEqual([]);
       await store.accept(payloadInput());
-      for (const damaged of ['null', '{"sessionId":42}', '[]']) {
+      // r3 P1: also an empty sessionId, and objects without one that are not a valid unbound target.
+      for (const damaged of ['{', 'null', '{"sessionId":42}', '[]', '{"sessionId":""}', '{"nativeSessionRef":42}', '{"provision":null}']) {
         db.prepare('UPDATE delivery SET target = ? WHERE operation_id = ?').run(damaged, 'op-1');
-        await expect(store.listByTarget(SessionId.parse('session-target'))).rejects.toThrow();
-        await expect(store.listByTarget(SessionId.parse('anyone'))).rejects.toThrow();
+        await expect(store.listByTarget(SessionId.parse('session-target'))).rejects.toThrow(StoredDataError);
+        await expect(store.listByTarget(SessionId.parse('anyone'))).rejects.toThrow(StoredDataError);
       }
+      // Another session's record is still left out, and this session's is found.
+      db.prepare('UPDATE delivery SET target = ? WHERE operation_id = ?').run('{"sessionId":"session-other","nativeSessionRef":"thread-B"}', 'op-1');
+      expect(await store.listByTarget(SessionId.parse('session-target'))).toEqual([]);
+      expect((await store.listByTarget(SessionId.parse('session-other'))).map((r) => r.operationId)).toEqual(['op-1']);
     } finally {
       db.close();
     }
