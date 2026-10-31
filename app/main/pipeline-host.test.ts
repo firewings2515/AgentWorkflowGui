@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WindowsProcessHost } from '../../adapters/process';
-import { jobCommandRunner, shellCommand, worktreeFiles } from './pipeline-host';
+import { isPipelineFolder, jobCommandRunner, shellCommand, worktreeFiles } from './pipeline-host';
 
 const folders: string[] = [];
 const hosts: WindowsProcessHost[] = [];
@@ -63,6 +63,18 @@ describe.skipIf(process.platform !== 'win32')('pipeline commands (T032)', () => 
   it('shell lines: PowerShell without a profile or input; cmd with /d /s /c', () => {
     expect(shellCommand({ command: 'npm ci', shell: 'powershell' })).toEqual({ command: 'powershell.exe', args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', 'npm ci'] });
     expect(shellCommand({ command: 'npm ci', shell: 'cmd' })).toEqual({ command: 'cmd.exe', args: ['/d', '/s', '/c', 'npm ci'] });
+  });
+});
+
+describe('pipeline folders (T032 live run 1)', () => {
+  it('a path inside a pipeline worktree is one; the repository, .awg itself and look-alikes are not', () => {
+    expect(isPipelineFolder('C:\\ws\\.awg\\wt\\t-1a2b\\greet.js')).toBe(true);
+    expect(isPipelineFolder('C:\\ws\\.awg\\wt\\m-1a2b')).toBe(true);
+    expect(isPipelineFolder('C:/ws/.AWG/WT/t-1/node_modules/x.js')).toBe(true);
+    expect(isPipelineFolder('C:\\ws\\greet.js')).toBe(false);
+    expect(isPipelineFolder('C:\\ws\\.awg\\wt')).toBe(false);
+    expect(isPipelineFolder('C:\\ws\\x.awg\\wt\\t-1\\a.js')).toBe(false);
+    expect(isPipelineFolder('C:\\ws\\.awg\\other\\t-1\\a.js')).toBe(false);
   });
 });
 

@@ -34,7 +34,7 @@ import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { hashFile, setTimer } from './file-hash';
 import { GitIgnoreRules } from './git-ignore';
-import { jobCommandRunner, worktreeFiles } from './pipeline-host';
+import { isPipelineFolder, jobCommandRunner, worktreeFiles } from './pipeline-host';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
 
 /** What the main process needs from its process host: the port plus the spawn the adapters use (T013). */
@@ -306,7 +306,9 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     },
     sleep,
     // Same-folder file locks (T033, R-07): in memory only, so a restart starts with none.
-    locks: { hashFile: (path) => hashFile(path), setTimer, isIgnored: (path) => ignored.isIgnored(path) },
+    // T032: the task pipeline's worktrees (`<repo>\.awg\wt\*`) are no same-folder work: inside one, git's own
+    // root is the worktree, so the repository's `info/exclude` line for `.awg` does not reach them.
+    locks: { hashFile: (path) => hashFile(path), setTimer, isIgnored: (path) => isPipelineFolder(path) || ignored.isIgnored(path) },
     listModels,
     isRuntimeAvailable: (runtime) => runtime === 'claude' || options.codexExecutable !== undefined || options.createAdapter !== undefined,
     onSessionOpened: (sessionId) => {

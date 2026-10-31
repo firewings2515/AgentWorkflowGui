@@ -434,6 +434,27 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect(w.git.fileAt(main(w), 'a.txt')).toBe('a\n');
     });
 
+    it('a merge quicker than the turn that handed the task on: cleanup waits for that turn to end instead of cutting it off (live run 1)', async () => {
+      const w = await begin(make);
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      const impl = await implOf(w, t.a!);
+      // The agent hands off in the middle of a turn that goes on afterwards.
+      w.holding.add(impl);
+      w.emitTurn(impl, 'busy-after-handoff', 'running');
+      w.open.set(impl, 'busy-after-handoff');
+      await settle();
+      await finish(w, t.a!, { 'a.txt': 'a\n' });
+      await until(async () => (await statusOf(w, t.a!)) === 'merged', 'merged');
+      await settle();
+      expect((await taskOf(w, t.a!)).worktree?.cleanup).toBe('active');
+      expect(w.closed).not.toContain(impl);
+      await w.finishTurn(impl);
+      await until(async () => (await taskOf(w, t.a!)).worktree?.cleanup === 'removed', 'removed after the turn');
+      expect(w.closed).toContain(impl);
+    });
+
     it('a worktree held by a process is left pending cleanup; task.retryCleanup finishes it', async () => {
       const w = await begin(make);
       const t = await made(w, [item('a', 'A')]);

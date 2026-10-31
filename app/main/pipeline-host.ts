@@ -74,6 +74,12 @@ export const jobCommandRunner = (host: Pick<BackendProcessHost, 'spawn' | 'close
   },
 });
 
+/**
+ * Whether a path is inside a worktree the task pipeline made (`<repo>\.awg\wt\<name>\...`, the only place the
+ * git adapter makes them). Changes there are worktree work, never same-folder work (R-07 locks).
+ */
+export const isPipelineFolder = (path: string): boolean => /(^|[\\/])\.awg[\\/]wt[\\/][^\\/]+([\\/]|$)/i.test(path);
+
 /** Folders on disk: whether one exists, and the top-level entries a setup made (by their creation time). */
 export const worktreeFiles: WorktreeFiles = {
   exists: (path) => existsSync(path),

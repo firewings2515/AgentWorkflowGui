@@ -1053,9 +1053,15 @@ export class TaskPipeline {
 
   /** A session's turn ended: if it resolves a conflict, the merge queue looks at it. */
   async turnEnded(sessionId: SessionId): Promise<void> {
-    if (!isResolverSession(sessionId)) return;
     const session = await this.repos.sessions.get(sessionId);
-    if (session?.kind === 'workflow') this.kick(session.workflow.instanceId);
+    if (session?.kind !== 'workflow') return;
+    const { instanceId, taskId } = session.workflow;
+    if (isResolverSession(sessionId)) this.kick(instanceId);
+    // A merged task whose cleanup waited for this turn (`cleanupMerged`).
+    const instance = taskId === undefined ? undefined : await this.repos.instances.get(instanceId);
+    const task = instance?.tasks.find((t) => t.id === taskId);
+    const merged = instance?.mergeQueue.find((m) => m.taskId === taskId && m.state === 'merged');
+    if (task?.status === 'merged' && merged !== undefined && (task.worktree?.cleanup === 'active' || merged.integration?.cleanup === 'active')) await this.cleanupMerged(instanceId, merged);
   }
 
   private async closeResolver(instanceId: InstanceId, m: MergeAttempt): Promise<void> {
@@ -1082,8 +1088,12 @@ export class TaskPipeline {
     const attempt = instance === undefined ? undefined : TaskPipeline.findAttempt(instance, m);
     const task = instance?.tasks.find((t) => t.id === m.taskId);
     if (instance === undefined || (task?.worktree?.cleanup !== 'active' && attempt?.integration?.cleanup !== 'active')) return;
+    const sessions = await this.sessionsOf(instance, m.taskId);
+    // A session may still be in the turn that handed the task on (the merge can be quicker than its turn): the
+    // cleanup waits for that turn to end (`turnEnded`, or a restart) rather than cut it off (T032 live run 1).
+    for (const sessionId of sessions) if (await this.deps.sessions.mainTurnRunning(sessionId)) return;
     // The GUI's own processes in the folders end first (SP-07 G1).
-    await this.closeRuntimes(await this.sessionsOf(instance, m.taskId));
+    await this.closeRuntimes(sessions);
     await this.stopCommands(instanceId, m.taskId);
     await this.cleanupTask(instanceId, m.taskId, true);
     await this.cleanupIntegration(instanceId, m, true);
