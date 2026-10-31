@@ -4,6 +4,7 @@
 // callers in this process cannot interleave inside one, and `BEGIN IMMEDIATE` serialises other
 // connections and processes.
 import type { DatabaseSync } from 'node:sqlite';
+import { DELIVERY_BY_TARGET_SQL } from './delivery-target-query';
 import type {
   AttemptId,
   ClientMessageId,
@@ -315,9 +316,7 @@ export class SqliteDeliveryStore implements DeliveryStore {
           // Only a row whose target names another session by a nonempty text sessionId is left out unread.
           // Every other row (this session's, an unbound target, anything that cannot say whose it is) is
           // loaded, so a damaged one fails closed and is never taken for "no work" (T028 r1 P1-3, r2, r3).
-          .prepare(
-            "SELECT * FROM delivery WHERE CASE WHEN NOT json_valid(target) THEN 1 WHEN json_type(target) = 'object' AND json_type(target, '$.sessionId') = 'text' AND json_extract(target, '$.sessionId') <> '' THEN json_extract(target, '$.sessionId') = ? ELSE 1 END ORDER BY accepted_ms, rowid",
-          )
+          .prepare(DELIVERY_BY_TARGET_SQL)
           .all(sessionId) as unknown as DeliveryRow[])
           .map((row) => this.load(row))
           .filter((record) => record.target.sessionId === sessionId),
