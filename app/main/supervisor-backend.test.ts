@@ -83,17 +83,29 @@ const start = async () => {
   await run({ type: 'agent.save', requestId: rid(), agent: agent(), expectedRevision: null });
   await run({ type: 'session.create', requestId: rid(), sessionId, kind: 'ordinary', agentId: agent().id, model: { runtime: 'codex', model: 'codex-m' }, cwd: dir });
   await settle();
-  const adapter = adapters.get(sessionId)!;
+  // The session's adapter now: each opening gets its own (T036 r2 P1-1).
+  const current = () => adapters.get(sessionId)!;
   const send = async (text: string) => {
     const s = await backend.repositories.sessions.get(sessionId);
     const out = await run({ type: 'session.send', requestId: rid(), sessionId, messageId: MessageId.parse(`t036-${text}`), expectedRevision: s!.revision, text, attachments: [] });
     // The turn the ack named ends.
+    const adapter = current();
     const id = TurnId.parse(`turn-${String(adapter.dispatched.length)}`);
     adapter.emit({ type: 'turn.updated', turn: { id, sessionId, state: 'completed', startedAt: new Date(ms).toISOString(), endedAt: new Date(ms).toISOString() } });
     await settle();
     return out;
   };
-  return { backend, host, adapter, sessionId, logs, send, advance: (by: number) => (ms += by) };
+  return {
+    backend,
+    host,
+    get adapter() {
+      return current();
+    },
+    sessionId,
+    logs,
+    send,
+    advance: (by: number) => (ms += by),
+  };
 };
 
 describe('the idle supervisor in the backend (T036)', () => {

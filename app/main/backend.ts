@@ -243,18 +243,18 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     // The detail argument is left out: it can hold transcript text or protocol lines.
     if (level === 'warn') log(`[${runtime}] ${message}`);
   };
-  let claude: RuntimeAdapter | undefined;
+  // A new adapter for every opening of a session, Claude included (T036 r2 P1-1): the late end of an earlier opening
+  // (its stream ending, its exit) then comes from an adapter that no longer serves the session, and is told apart.
   const createAdapter: AdapterFactory =
     options.createAdapter ??
     ((runtime, sessionId, hooks) => {
       if (runtime === 'claude') {
-        claude ??= new ClaudeAdapter({
+        return new ClaudeAdapter({
           sdk: claudeAgentSdk,
           onPermissionRequest: (handle) => hooks.onPermissionRequest(handle),
           spawnProcess: ({ sessionId: id }) => claudeProcessSpawn(host, id),
           log: adapterLog('claude'),
         });
-        return claude;
       }
       const command = options.codexExecutable;
       if (command === undefined) throw new Error('Codex is not available');
@@ -266,8 +266,9 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       });
     });
   const hooks = { onPermissionRequest: (handle: PermissionHandle) => (ref.service === undefined ? Promise.reject(new Error('not ready')) : ref.service.onPermissionRequest(handle)) };
-  // T035: the Claude adapter the model probe ran on (the shared one). The exit closes it even when no Claude
-  // session ever ran, so a probe's claude.exe is ended and its temp folder removed before the GUI goes.
+  // T035: the Claude adapter the model probe ran on (its own since T036; an injected factory may still share one). The
+  // exit closes it even when no Claude session ever ran, so a probe's claude.exe is ended and its temp folder removed
+  // before the GUI goes.
   let claudeProbeAdapter: RuntimeAdapter | undefined;
   let probesStopped = false;
   const listModels =
@@ -277,8 +278,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       if (probesStopped) throw new Error('the application is closing');
       // Listed outside any session: Codex in a Job of its own, ended right after.
       const probeId = `models-${runtime}` as SessionId;
-      // Claude's adapter is the one all sessions share, so it keeps the service's hooks; the Codex probe
-      // has an app-server of its own, where nothing can be allowed.
+      // Claude's probe keeps the service's hooks (an injected factory may hand it the adapter sessions share); the
+      // Codex probe has an app-server of its own, where nothing can be allowed.
       const probeHooks = runtime === 'claude' ? hooks : { onPermissionRequest: (h: PermissionHandle) => h.answer({ outcome: 'decline', decidedBy: 'policy', at: now() }) };
       const adapter = createAdapter(runtime, probeId, probeHooks);
       if (runtime === 'claude') claudeProbeAdapter = adapter;

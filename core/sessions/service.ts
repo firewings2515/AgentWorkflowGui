@@ -405,9 +405,13 @@ export class SessionService {
       },
       onClosed: (sessionId) => {
         this.locks?.closed(sessionId);
+        // The released opening reports no turn end any more, whether or not its exit event comes (T036 r2).
+        this.ackedTurns.delete(sessionId);
+        this.handoffTurns.delete(sessionId);
         return options.onSessionClosed?.(sessionId);
       },
       onEvent: (event) => this.record(event),
+      log: (message) => this.log(message),
       ...(options.sleep !== undefined && { sleep: (ms: number) => this.options.sleep!(ms) }),
     });
     // A transfer's claim is refused when its gate's view went out of date, decided synchronously in the call
@@ -1926,7 +1930,7 @@ export class SessionService {
     const outcome: DispatchOutcome = await this.delivery.dispatch(operationId, options);
     if (outcome.status === 'sent') {
       const sent = await this.store.get(operationId);
-      this.followAckedTurn(sent?.target.sessionId, outcome.nativeRef.turnRef);
+      // Its ack's turn was followed before `sent` was written, if its opening can still report it (T036 r1/r2).
       this.expectEcho(sent, outcome.attemptId);
       await this.settled(operationId, outcome.attemptId);
     }
@@ -2186,11 +2190,17 @@ export class SessionService {
    * write does: the runtime named it, so it runs until it is seen to end (or the runtime exits).
    */
   private async recordSentFollowing(store: DeliveryStore, ...args: Parameters<DeliveryStore['recordSent']>): ReturnType<DeliveryStore['recordSent']> {
-    const [operationId, , nativeRef] = args;
+    const [operationId, attemptId, nativeRef] = args;
+    // Only an attempt this process dispatched to the opening that is open now (T036 r2 P1-2): a reconcile after a
+    // restart, or of an opening released since, names a turn whose end will never be reported. Asked right away, in
+    // the same step as the dispatch's own answer.
+    const opening = this.runtimes.dispatchedTo(attemptId);
+    if (opening === undefined || !this.runtimes.isOpen(opening.ref, opening.generation)) return store.recordSent(...args);
     const sessionId = (await store.get(operationId))?.target.sessionId;
-    // A turn stored as ended (a reconcile after a restart names an old one) is not waited for.
+    // A turn already stored as ended is not waited for.
     const stored = sessionId === undefined || nativeRef.turnRef === undefined ? undefined : (await this.repos.conversations.get(sessionId)).turns.find((t) => t.id === nativeRef.turnRef);
-    if (stored === undefined || stored.state === 'running') this.followAckedTurn(sessionId, nativeRef.turnRef);
+    // Looked at again after the reads: an opening released meanwhile reports nothing more.
+    if ((stored === undefined || stored.state === 'running') && this.runtimes.isOpen(opening.ref, opening.generation)) this.followAckedTurn(sessionId, nativeRef.turnRef);
     return store.recordSent(...args);
   }
 

@@ -11,6 +11,9 @@ import {
   activityOf,
   adapterOf,
   AT,
+  closesOf,
+  resumedOf,
+  textsOf,
   created,
   endLastTurn,
   exchange,
@@ -56,16 +59,15 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
         const a = await created(w, runtime);
         await exchange(w, runtime, a, 'first');
         const before = (await w.repositories.sessions.get(a))!;
-        const adapter = adapterOf(w, runtime, a);
 
         await idleFor(w, IDLE_MS - 1);
         expect(isOpen(w, a)).toBe(true);
-        expect(adapter.closedSessions).toEqual([]);
+        expect(closesOf(w, runtime, a)).toEqual([]);
 
         await idleFor(w, 1);
         // R-14: the adapter's own close (Claude interrupts then closes, Codex closes stdin), then the Job.
-        expect(adapter.closedSessions).toHaveLength(1);
-      expect(w.closed).toEqual([a]);
+        expect(closesOf(w, runtime, a)).toHaveLength(1);
+        expect(w.closed).toEqual([a]);
         expect(isOpen(w, a)).toBe(false);
         const after = (await w.repositories.sessions.get(a))!;
         expect(after.activity).toBe('closed');
@@ -74,9 +76,10 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
 
         const result = await send(w, a, 'second');
         expect(result.ok).toBe(true);
-        expect(adapter.resumed).toHaveLength(1);
-        expect(adapter.resumed[0]).toMatchObject({ sessionId: a, cwd: CWD, nativeSessionRef: await w.service.nativeSessionOf(a) });
-        expect(adapter.dispatched.map((d) => d.text)).toEqual(['first', 'second']);
+        // A Codex session gets a new adapter (app-server) for its new opening (T036 r2 P1-1).
+        expect(resumedOf(w, runtime, a)).toHaveLength(1);
+        expect(resumedOf(w, runtime, a)[0]).toMatchObject({ sessionId: a, cwd: CWD, nativeSessionRef: await w.service.nativeSessionOf(a) });
+        expect(textsOf(w, runtime, a)).toEqual(['first', 'second']);
         expect(await activityOf(w, a)).toBe('idle');
       });
     }
@@ -330,7 +333,7 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
     };
 
     it('a message ahead of the close in the session queue cancels it; nothing is resumed', async () => {
-      const { w, a, adapter } = await idleOne();
+      const { w, a } = await idleOne();
       // The command enters the session's queue first, then the close (both in the same step).
       const revision = (await w.repositories.sessions.get(a))!.revision;
       const sending = w.run({ type: 'session.send', requestId: rid(), sessionId: a, messageId: 'sup-m-ahead' as never, expectedRevision: revision, text: 'just in time', attachments: [] });
@@ -338,15 +341,15 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       expect((await sending).ok).toBe(true);
       await ticking;
       await settle();
-      expect(adapter.closedSessions).toEqual([]);
-      expect(adapter.resumed).toEqual([]);
-      expect(adapter.dispatched.map((d) => d.text)).toEqual(['hello', 'just in time']);
+      expect(closesOf(w, 'codex', a)).toEqual([]);
+      expect(resumedOf(w, 'codex', a)).toEqual([]);
+      expect(textsOf(w, 'codex', a)).toEqual(['hello', 'just in time']);
       // Cancelled by the message itself, before any fact was read (not by the turn it then started).
       expect(w.logs.filter((l) => l.includes('is not idle'))).toEqual([]);
     });
 
     it('a message behind a close that is checking waits for it, then resumes the session once', async () => {
-      const { w, a, adapter } = await idleOne();
+      const { w, a } = await idleOne();
       const b = await created(w, 'codex', 'session-b');
       const held = gate();
       w.storeGate = held.promise;
@@ -355,14 +358,14 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       // A peer's send_message: it goes through the target's queue, behind the close.
       const sending = w.service.sendMessage({ to: a, content: 'queued behind' }, { caller: b, operationId: OperationId.parse('peer-behind'), sourceCallRef: 'call-behind' });
       await settle();
-      expect(adapter.dispatched).toHaveLength(1);
+      expect(textsOf(w, 'codex', a)).toHaveLength(1);
       w.storeGate = undefined;
       held.open();
       await ticking;
       expect(await sending).toMatchObject({ status: 'accepted', delivery: 'sent' });
-      expect(adapter.closedSessions).toHaveLength(1);
-      expect(adapter.resumed).toHaveLength(1);
-      expect(adapter.dispatched.map((d) => d.text)).toEqual(['hello', 'queued behind']);
+      expect(closesOf(w, 'codex', a)).toHaveLength(1);
+      expect(resumedOf(w, 'codex', a)).toHaveLength(1);
+      expect(textsOf(w, 'codex', a)).toEqual(['hello', 'queued behind']);
       expect(await activityOf(w, a)).toBe('idle');
     });
 
@@ -378,7 +381,7 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       held.open();
       await ticking;
       await settle();
-      expect(adapter.closedSessions).toEqual([]);
+      expect(closesOf(w, 'codex', a)).toEqual([]);
       expect(isOpen(w, a)).toBe(true);
     });
 
@@ -388,32 +391,35 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       adapter.closeGate = held.promise;
       const ticking = w.supervisor.tick();
       await settle();
-      expect(adapter.closedSessions).toHaveLength(1);
+      expect(closesOf(w, 'codex', a)).toHaveLength(1);
       // Accepted now and dispatched straight away, as a user's retry is: not through the session's queue.
       const op = await pending(w, a, 'codex', 'retried');
       const dispatching = w.service.delivery.dispatch(op);
       await settle();
-      expect(adapter.dispatched).toHaveLength(1);
-      expect(adapter.resumed).toEqual([]);
+      expect(textsOf(w, 'codex', a)).toHaveLength(1);
+      expect(resumedOf(w, 'codex', a)).toEqual([]);
       held.open();
       await ticking;
       const outcome = await dispatching;
       await settle();
       expect(outcome.status).toBe('sent');
       expect(await stateOf(w, op)).toBe('sent');
-      expect(adapter.resumed).toHaveLength(1);
-      expect(adapter.dispatched.map((d) => d.text)).toEqual(['hello', 'retried']);
+      expect(resumedOf(w, 'codex', a)).toHaveLength(1);
+      expect(textsOf(w, 'codex', a)).toEqual(['hello', 'retried']);
       expect(isOpen(w, a)).toBe(true);
       expect(await activityOf(w, a)).toBe('idle');
     });
 
     it('two deliveries to a closed session resume it once and are each sent once', async () => {
-      const { w, a, adapter } = await idleOne();
+      const { w, a } = await idleOne();
       await w.supervisor.tick();
       await settle();
       expect(isOpen(w, a)).toBe(false);
       const held = gate();
-      adapter.resumeGate = held.promise;
+      // The resume of the next opening (a new adapter) is held.
+      w.onNewAdapter = (next) => {
+        next.resumeGate = held.promise;
+      };
       const one = await pending(w, a, 'codex', 'one');
       const two = await pending(w, a, 'codex', 'two');
       const both = Promise.all([w.service.delivery.dispatch(one), w.service.delivery.dispatch(two)]);
@@ -421,8 +427,8 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       held.open();
       const outcomes = await both;
       expect(outcomes.map((o) => o.status)).toEqual(['sent', 'sent']);
-      expect(adapter.resumed).toHaveLength(1);
-      expect(adapter.dispatched.map((d) => d.text).sort()).toEqual(['hello', 'one', 'two']);
+      expect(resumedOf(w, 'codex', a)).toHaveLength(1);
+      expect(textsOf(w, 'codex', a).sort()).toEqual(['hello', 'one', 'two']);
     });
 
     it('the task pipeline closing the same runtime at the same time closes it once', async () => {
@@ -436,7 +442,7 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       held.open();
       await Promise.all([ticking, other]);
       await settle();
-      expect(adapter.closedSessions).toHaveLength(1);
+      expect(closesOf(w, 'codex', a)).toHaveLength(1);
       expect(w.closed).toEqual([a]);
     });
 
@@ -501,7 +507,7 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       expect(w.closed).toEqual([a]);
       expect(isOpen(w, a)).toBe(false);
       expect((await send(w, a, 'after the deadline')).ok).toBe(true);
-      expect(adapter.resumed).toHaveLength(1);
+      expect(resumedOf(w, 'codex', a)).toHaveLength(1);
       expect(isOpen(w, a)).toBe(true);
       const mounts = w.mounts.filter((m) => m === a).length;
       // The old close returns now: the new opening keeps its runtime, token and Job.
@@ -538,6 +544,72 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
     });
   });
 
+  describe(`idle supervisor: review r2 sequences (${name})`, () => {
+    for (const runtime of ['codex', 'claude'] as const) {
+      it(`P1-1: a late exit of the earlier ${runtime} opening leaves the session resumed since alone`, async () => {
+        // Claude as the main process gives it: a new adapter per opening.
+        const w = await make({ claudePerSession: true });
+        const a = await created(w, runtime);
+        await exchange(w, runtime, a);
+        w.clock.advance(IDLE_MS);
+        const old = adapterOf(w, runtime, a);
+        const held = gate();
+        old.closeGate = held.promise;
+        // The graceful close does not return in time: the session is released by force.
+        w.sleeper = () => Promise.resolve();
+        await w.supervisor.tick();
+        await settle();
+        expect(w.closed).toEqual([a]);
+        expect((await send(w, a, 'after the deadline')).ok).toBe(true);
+        const fresh = adapterOf(w, runtime, a);
+        expect(fresh).not.toBe(old);
+        expect(await w.service.mainTurnRunning(a)).toBe(true);
+        // The earlier opening's stream ends only now: its exit and its activity come late.
+        old.emit({ type: 'runtime.exited', runtime, sessionIds: [a], expected: true, code: null, signal: null, at: AT });
+        old.emit({ type: 'session.activity', sessionId: a, activity: 'closed', at: AT });
+        held.open();
+        await settle();
+        expect(isOpen(w, a)).toBe(true);
+        expect(w.closed).toEqual([a]);
+        expect(await w.service.mainTurnRunning(a)).toBe(true);
+        expect(await activityOf(w, a)).toBe('idle');
+        expect(w.logs.some((l) => l.includes('late exit of an earlier opening'))).toBe(true);
+        // The new opening's own exit still counts.
+        fresh.emit({ type: 'runtime.exited', runtime, sessionIds: [a], expected: false, code: 1, signal: null, at: AT });
+        await settle();
+        expect(isOpen(w, a)).toBe(false);
+        expect(w.closed).toEqual([a, a]);
+      });
+    }
+
+    it('P1-2: after a restart, a reconcile that names a turn never stored leaves no turn running', async () => {
+      const w = await make();
+      const a = await created(w, 'codex');
+      await exchange(w, 'codex', a, 'before');
+      // No ack, and nothing this process can find: the outcome stays unknown (CR-2).
+      adapterOf(w, 'codex', a).dispatchModes = ['lost'];
+      expect(await send(w, a, 'lost one')).toMatchObject({ ok: false, code: 'unknown_outcome' });
+      const [record] = (await w.store.listByState('unknown')).filter((r) => r.kind === 'user-message');
+      const attempt = record!.delivery.attempts.at(-1)!;
+      const ref = (await w.service.nativeSessionOf(a))!;
+      // The GUI dies before the turn's events were stored; the runtime did take the message.
+      const w2 = w.restart();
+      w2.onNewAdapter = (next) => {
+        next.history.set(attempt.clientMessageId, { ref, text: 'lost one' });
+        next.reconcileTurn = 'turn-never-stored';
+      };
+      await w2.service.start();
+      await settle();
+      expect(await stateOf(w2, record!.operationId)).toBe('sent');
+      expect(await w2.service.mainTurnRunning(a)).toBe(false);
+      await exchange(w2, 'codex', a, 'after the restart');
+      expect(await w2.service.mainTurnRunning(a)).toBe(false);
+      await idleFor(w2, IDLE_MS);
+      expect(isOpen(w2, a)).toBe(false);
+      expect(w2.logs.some((l) => l.includes('turn-acked'))).toBe(false);
+    });
+  });
+
   describe(`idle supervisor: crashes (${name})`, () => {
     it('a crash while closing: after the restart the session is closed and resumes once in its folder', async () => {
       const w = await make();
@@ -566,10 +638,13 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       await exchange(w, 'codex', a, 'before');
       await idleFor(w, IDLE_MS);
       const adapter = w.codex.get(a)!;
-      adapter.resumeGate = new Promise<void>(() => undefined);
+      // The next opening's adapter never answers its resume.
+      w.onNewAdapter = (next) => {
+        next.resumeGate = new Promise<void>(() => undefined);
+      };
       void send(w, a, 'during resume');
       await settle();
-      expect(adapter.resumed).toHaveLength(1);
+      expect(resumedOf(w, 'codex', a)).toHaveLength(1);
       const w2 = w.restart();
       const report = await w2.service.start();
       await settle();

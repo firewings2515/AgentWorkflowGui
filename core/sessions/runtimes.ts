@@ -3,6 +3,12 @@
 // each session starts in that session's Job. Which adapter serves a session is decided by the injected
 // factory; this router only keeps track of it, by GUI session and by native session ref.
 //
+// Each opening of a session (start or resume) has a generation (T036 r1 P1-2) and, once released, its adapter is
+// retired: the next opening asks the factory again (T036 r2 P1-1). An exit or activity event from an adapter that no
+// longer serves the session is the late end of an earlier opening and is not passed on, so it never releases a
+// later one. This holds only for a factory that hands out a new adapter per call; one shared by several openings
+// cannot be told apart, so the main process gives every opening its own (Claude included).
+//
 // The GUI MCP server is mounted here and nowhere else: every start and resume asks for a new mount (the
 // old token stops working) and passes it in the port's `mcp` option, so nothing stored ever carries it
 // (C-07, R-03).
@@ -44,11 +50,15 @@ export interface SessionRuntimesOptions {
   onEvent(event: RuntimeEvent): void;
   /** Resolves after `ms`: bounds the waits of closing (core has no timers). Without it they are unbounded. */
   sleep?(ms: number): Promise<void>;
+  /** Diagnostics: fixed text and IDs only. */
+  log?(message: string): void;
 }
 
 interface Entry {
   runtime: Runtime;
   adapter: Promise<RuntimeAdapter>;
+  /** The adapter itself, once the factory made it. */
+  instance?: RuntimeAdapter;
 }
 
 /**
@@ -81,6 +91,12 @@ export class SessionRuntimes {
   /** Resumes under way, by GUI session, and graceful closes under way, by native ref and opening (T036 single-flight). */
   private readonly resuming = new Map<SessionId, Promise<NativeSessionInfo>>();
   private readonly closingRefs = new Map<string, { generation: number; run: Promise<{ forced: boolean }> }>();
+  /** The adapter of each session's latest opening (T036 r2 P1-1): events from any other are an earlier opening's. */
+  private readonly served = new Map<SessionId, RuntimeAdapter>();
+  /** Adapters of released openings, closed with the rest on exit. */
+  private readonly retired = new Set<RuntimeAdapter>();
+  /** Attempts dispatched in this process, with the opening they went to (T036 r2 P1-2). */
+  private readonly dispatchedIn = new Map<string, { ref: string; generation: number }>();
   private readonly started = new WeakSet<RuntimeAdapter>();
   private readonly subscribed = new WeakSet<RuntimeAdapter>();
   private readonly views: Record<Runtime, RuntimeAdapter>;
@@ -143,8 +159,13 @@ export class SessionRuntimes {
 
   /** The runtime host of these sessions ended: they are no longer open. */
   markExited(sessionIds: readonly SessionId[]): void {
-    // The next use creates the session's adapter again, so a Codex host that died is not reused.
-    for (const sessionId of sessionIds) this.entries.delete(sessionId);
+    // The next use creates the session's adapter again, so a Codex host that died is not reused; an adapter of a
+    // newer opening that is coming up meanwhile stays (T036 r2 P1-1).
+    for (const sessionId of sessionIds) {
+      const entry = this.entries.get(sessionId);
+      const served = this.served.get(sessionId);
+      if (entry !== undefined && (entry.instance === undefined || served === undefined || entry.instance === served)) this.retire(sessionId, entry);
+    }
     for (const [ref, generation] of [...this.open]) {
       const sessionId = this.refs.get(ref);
       if (sessionId !== undefined && sessionIds.includes(sessionId)) void this.releaseOpen(ref, sessionId, generation);
@@ -206,7 +227,7 @@ export class SessionRuntimes {
         await this.options.onClosed?.(sessionId);
         return info;
       }
-      this.opened(info);
+      this.opened(info, adapter);
       return info;
     })();
     this.inflight.add(run);
@@ -267,6 +288,9 @@ export class SessionRuntimes {
     if (underway !== undefined && underway.generation === generation) return underway.done;
     if (this.open.get(nativeSessionRef) !== generation) return Promise.resolve();
     this.open.delete(nativeSessionRef);
+    // Its adapter is done with (T036 r2 P1-1): the next opening gets a new one, so this one's late events are told apart.
+    const entry = this.entries.get(sessionId);
+    if (entry?.instance !== undefined && entry.instance === this.served.get(sessionId)) this.retire(sessionId, entry);
     const mark: { generation: number; sessionId: SessionId; done: Promise<void> } = {
       generation,
       sessionId,
@@ -315,7 +339,51 @@ export class SessionRuntimes {
         // It never started; nothing to close.
       }
     }
+    // Retired ones too: an earlier opening whose close did not finish may still hold its process (T036 r2 P1-1).
+    for (const adapter of this.retired) adapters.add(adapter);
     await Promise.allSettled([...adapters].map((a) => a.close(timeoutMs)));
+  }
+
+  /** The session's adapter is not used for it again; it is closed on exit with the others. */
+  private retire(sessionId: SessionId, entry: Entry): void {
+    if (this.entries.get(sessionId) === entry) this.entries.delete(sessionId);
+    if (entry.instance !== undefined) this.retired.add(entry.instance);
+  }
+
+  /**
+   * The opening `attemptId` was dispatched to in this process, or undefined (T036 r2 P1-2): only an attempt whose
+   * opening is still open can have its turn seen to end. Asked once per attempt.
+   */
+  dispatchedTo(attemptId: string): { ref: string; generation: number } | undefined {
+    const sent = this.dispatchedIn.get(attemptId);
+    this.dispatchedIn.delete(attemptId);
+    return sent;
+  }
+
+  /**
+   * An adapter's event (T036 r2 P1-1): an exit or activity of a session that adapter no longer serves is the late end
+   * of an earlier opening, logged and dropped; every other event goes on (an earlier opening's turns and items ending
+   * are still its history).
+   */
+  private received(adapter: RuntimeAdapter, event: RuntimeEvent): void {
+    const stale = (sessionId: SessionId) => {
+      const served = this.served.get(sessionId);
+      return served !== undefined && served !== adapter;
+    };
+    let passed: RuntimeEvent = event;
+    if (event.type === 'runtime.exited') {
+      const late = event.sessionIds.filter(stale);
+      if (late.length > 0) {
+        this.options.log?.(`[runtimes] a late exit of an earlier opening of ${late.join(', ')} was ignored`);
+        const current = event.sessionIds.filter((id) => !stale(id));
+        if (current.length === 0) return;
+        passed = { ...event, sessionIds: current };
+      }
+    } else if (event.type === 'session.activity' && stale(event.sessionId)) {
+      this.options.log?.(`[runtimes] a late activity of an earlier opening of ${event.sessionId} was ignored`);
+      return;
+    }
+    for (const out of this.redactor.events(passed)) this.options.onEvent(out);
   }
 
   /** An adapter that came up after closing began: closed again, and its session's Job ended. */
@@ -345,15 +413,15 @@ export class SessionRuntimes {
       if (existing.runtime !== runtime) return Promise.reject(new Error(`session ${sessionId} runs on ${existing.runtime}, not ${runtime}`));
       return existing.adapter;
     }
+    const entry: Entry = { runtime, adapter: Promise.resolve(undefined as never) };
     const adapter = (async () => {
       const created = this.options.createAdapter(runtime, sessionId);
+      entry.instance = created;
       if (!this.subscribed.has(created)) {
         this.subscribed.add(created);
         // Runtime errors and output can quote the mount (e.g. a failed MCP connection): redacted here, before anything stores or shows it.
-        // Deltas are held back until no token can be split across them (r2-P1-2).
-        created.subscribe((event) => {
-          for (const out of this.redactor.events(event)) this.options.onEvent(out);
-        });
+        // Deltas are held back until no token can be split across them (r2-P1-2). Each event is known by the adapter it came from (T036 r2 P1-1).
+        created.subscribe((event) => this.received(created, event));
       }
       if (!this.started.has(created)) {
         await created.start();
@@ -365,7 +433,7 @@ export class SessionRuntimes {
       }
       return created;
     })();
-    const entry: Entry = { runtime, adapter };
+    entry.adapter = adapter;
     this.entries.set(sessionId, entry);
     adapter.catch(() => {
       if (this.entries.get(sessionId) === entry) this.entries.delete(sessionId);
@@ -373,9 +441,10 @@ export class SessionRuntimes {
     return adapter;
   }
 
-  private opened(info: NativeSessionInfo): void {
+  private opened(info: NativeSessionInfo, adapter: RuntimeAdapter): void {
     this.refs.set(info.nativeSessionRef, info.sessionId);
     this.open.set(info.nativeSessionRef, ++this.generations);
+    this.served.set(info.sessionId, adapter);
     this.options.onOpened?.(info.sessionId, info.cwd);
     // R-12: Codex reports its configured model only here (start or resume), never in an event (T021).
     if (info.model.source !== 'unknown') this.options.onEvent({ type: 'model.observed', sessionId: info.sessionId, observed: info.model, at: info.model.observedAt });
@@ -408,7 +477,11 @@ export class SessionRuntimes {
         }),
       dispatchOnce: async (request: DispatchRequest): Promise<DispatchResult> => {
         const adapter = this.open.has(request.nativeSessionRef) ? await this.adapterOf(request.nativeSessionRef) : undefined;
-        return adapter === undefined ? notRunning(`native session ${request.nativeSessionRef} is not open`) : adapter.dispatchOnce(request);
+        if (adapter === undefined) return notRunning(`native session ${request.nativeSessionRef} is not open`);
+        // The opening it goes to, for whether its ack's turn can still end (T036 r2 P1-2).
+        const generation = this.open.get(request.nativeSessionRef);
+        if (generation !== undefined) this.dispatchedIn.set(request.attempt.attemptId, { ref: request.nativeSessionRef, generation });
+        return adapter.dispatchOnce(request);
       },
       reconcile: async (request: ReconcileRequest): Promise<ReconcileResult> => {
         const adapter = await reader(request.nativeSessionRef);

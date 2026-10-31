@@ -15,6 +15,8 @@ import type {
   PermissionHandle,
   PermissionPolicy,
   PolicyDecision,
+  ReconcileRequest,
+  ReconcileResult,
   ResumeSessionOptions,
   StartSessionOptions,
 } from '../../ports';
@@ -25,6 +27,7 @@ import { IdleSupervisor } from '../supervisor';
 
 export const IDLE_MS = 60_000;
 let uuids = 0;
+let turns = 0;
 export const AT = '2026-10-29T01:00:00.000Z';
 
 /**
@@ -43,8 +46,18 @@ export class HoldingAdapter extends FakeAdapter {
   override async dispatchOnce(request: DispatchRequest): Promise<DispatchResult> {
     const result = await super.dispatchOnce(request);
     if (result.state !== 'sent') return result;
-    this.lastTurn = `${request.nativeSessionRef}:turn-${String(this.dispatched.length)}`;
+    // Unique across adapters too: a session's next opening has an adapter of its own.
+    this.lastTurn = `${request.nativeSessionRef}:turn-${String(++turns)}`;
     return { ...result, nativeRef: { ...result.nativeRef, turnRef: this.lastTurn } };
+  }
+
+  /** When set, a reconcile that finds the message also names this turn (as a runtime's stored history can). */
+  reconcileTurn: string | undefined;
+
+  override async reconcile(request: ReconcileRequest): Promise<ReconcileResult> {
+    const result = await super.reconcile(request);
+    if (result.state !== 'sent' || this.reconcileTurn === undefined) return result;
+    return { ...result, nativeRef: { ...result.nativeRef, turnRef: this.reconcileTurn } };
   }
 
   /** Runs as a resume starts (e.g. the folder goes, the runtime fails to start). */
@@ -79,7 +92,10 @@ export const gate = () => {
 export interface SupWorld {
   repositories: AppRepositories;
   store: DeliveryStore;
+  /** Each Codex session's latest adapter. */
   codex: Map<string, HoldingAdapter>;
+  /** Every adapter made for each session, oldest first (one per opening; not the shared Claude one). */
+  all: Map<string, HoldingAdapter[]>;
   claude: HoldingAdapter;
   service: SessionService;
   supervisor: IdleSupervisor;
@@ -103,6 +119,8 @@ export interface SupWorld {
   holdNextSessionGet: Promise<void> | undefined;
   /** Every MCP mount handed out, by session. */
   mounts: SessionId[];
+  /** Called with every new adapter before it is used (e.g. to hold the resume of a session's next opening). */
+  onNewAdapter: ((adapter: HoldingAdapter) => void) | undefined;
   /** The exit and close deadlines (SessionServiceOptions.sleep); by default they never pass. */
   sleeper: (ms: number) => Promise<void>;
   run(command: Command): Promise<CommandResult>;
@@ -112,6 +130,8 @@ export interface SupWorld {
 export interface SupWorldOptions {
   maxOpen?: number;
   locks?: boolean;
+  /** A new Claude adapter per opening, as the main process gives, instead of one shared adapter. */
+  claudePerSession?: boolean;
 }
 
 const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: SupWorldOptions, previous?: SupWorld): SupWorld => {
@@ -120,6 +140,7 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
     holdNextRecordSent: undefined as Promise<void> | undefined,
     holdNextSessionGet: undefined as Promise<void> | undefined,
     codex: new Map<string, HoldingAdapter>(),
+    all: new Map<string, HoldingAdapter[]>(),
     clock: previous?.clock ?? new ManualClock(AT),
     events: [] as AppEvent[],
     closed: [] as SessionId[],
@@ -189,10 +210,15 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
     uuid: () => `00000000-0000-4000-8036-${(++uuids).toString(16).padStart(12, '0')}`,
     hashPayload: hashOf,
     resolveRealPath: realPath,
+    // Codex: a new adapter per opening (the router asks again after each release). Claude: one shared adapter, or
+    // with `claudePerSession` a new one per opening as the main process gives (T036 r2 P1-1).
     createAdapter: (runtime: Runtime, sessionId: SessionId) => {
-      if (runtime === 'claude') return world.claude;
-      const adapter = new HoldingAdapter('codex', onPermission);
-      world.codex.set(sessionId, adapter);
+      if (runtime === 'claude' && o.claudePerSession !== true) return world.claude;
+      const adapter = new HoldingAdapter(runtime, onPermission);
+      if (runtime === 'claude') world.claude = adapter;
+      else world.codex.set(sessionId, adapter);
+      world.all.set(sessionId, [...(world.all.get(sessionId) ?? []), adapter]);
+      world.onNewAdapter?.(adapter);
       return adapter;
     },
     mountMcp: (sessionId) => {
@@ -236,7 +262,17 @@ export const settle = async () => {
 let requests = 0;
 export const rid = () => RequestId.parse(`sup-r-${String(++requests)}`);
 
-export const adapterOf = (w: SupWorld, runtime: Runtime, sessionId: SessionId): HoldingAdapter => (runtime === 'claude' ? w.claude : w.codex.get(sessionId)!);
+/** The session's latest adapter. */
+export const adapterOf = (w: SupWorld, runtime: Runtime, sessionId: SessionId): HoldingAdapter =>
+  w.all.get(sessionId)?.at(-1) ?? (runtime === 'claude' ? w.claude : w.codex.get(sessionId)!);
+/** Every adapter that served the session, oldest first. */
+export const adaptersOf = (w: SupWorld, runtime: Runtime, sessionId: SessionId): HoldingAdapter[] => w.all.get(sessionId) ?? [adapterOf(w, runtime, sessionId)];
+/** Every resume of the session, across its adapters. */
+export const resumedOf = (w: SupWorld, runtime: Runtime, sessionId: SessionId) => adaptersOf(w, runtime, sessionId).flatMap((a) => a.resumed);
+/** The texts dispatched to the session, across its adapters, in order. */
+export const textsOf = (w: SupWorld, runtime: Runtime, sessionId: SessionId) => adaptersOf(w, runtime, sessionId).flatMap((a) => a.dispatched.map((d) => d.text));
+/** Every graceful close of the session, across its adapters. */
+export const closesOf = (w: SupWorld, runtime: Runtime, sessionId: SessionId) => adaptersOf(w, runtime, sessionId).flatMap((a) => a.closedSessions);
 
 /** A session created and provisioned in CWD. */
 export const created = async (w: SupWorld, runtime: Runtime = 'codex', id = 'session-a', cwd = CWD): Promise<SessionId> => {
