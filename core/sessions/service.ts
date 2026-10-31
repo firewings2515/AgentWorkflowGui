@@ -95,6 +95,16 @@ export interface WorkflowHooks {
    * to anything else. Every other user message is `deliver`.
    */
   userMessageFate(record: StoredDelivery): Promise<'deliver' | 'wait' | 'cancel'>;
+  /**
+   * Ending a run and retrying a cleanup (T032, C-22); undefined when the engine does not take them (they are then
+   * `unsupported`, as without hooks).
+   */
+  execute?(command: CommandOf<'workflow.complete' | 'workflow.cancel' | 'task.retryCleanup'>): Promise<CommandResult> | undefined;
+  /**
+   * Why the user may not send to this session now (R-06: a merged task's session once its worktree is removed,
+   * or a session whose folder is gone), or undefined when it may.
+   */
+  sessionAccess?(sessionId: SessionId): Promise<string | undefined>;
 }
 
 export type TransferCommand = CommandOf<'transfer.prepare' | 'transfer.confirm' | 'transfer.cancel'>;
@@ -465,8 +475,10 @@ export class SessionService {
       state: 'open',
     })) {
       // Nothing in this process holds the request or the message waiting for confirmation any more. A
-      // report's question is not held anywhere: the report itself was delivered, so it stays for the user.
-      if (escalation.kind === 'permission' || (escalation.kind === 'confirmation' && escalation.ref?.kind !== 'report')) await this.closeEscalation(escalation, 'resolved');
+      // report's question is not held anywhere: the report itself was delivered, so it stays for the user; a
+      // task list is stored with the run (TaskPlan, O-07), so its question stays too (T032).
+      const kept = escalation.ref?.kind === 'report' || escalation.ref?.kind === 'taskPlan';
+      if (escalation.kind === 'permission' || (escalation.kind === 'confirmation' && !kept)) await this.closeEscalation(escalation, 'resolved');
     }
     // A message accepted before a crash but never written is written now (r1-P1-8).
     for (const state of ['pending', 'unknown'] as const) {
@@ -697,11 +709,11 @@ export class SessionService {
         this.options.publish({ type: 'project.updated', project: saved.record });
         return ok(command.requestId, { revision: saved.record.revision });
       }
-      // Ending a run and the task pipeline come with T032 (contracts 0.6).
+      // Ending a run and the task pipeline (T032): the workflow engine's, when attached.
       case 'workflow.complete':
       case 'workflow.cancel':
       case 'task.retryCleanup':
-        return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
+        return this.workflow?.execute?.(command) ?? fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
     }
   }
 
@@ -755,6 +767,11 @@ export class SessionService {
     if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
     if (session.revision !== expectedRevision) return fail(requestId, 'stale_revision', 'The session has changed since it was loaded', { retryable: true });
     if (attachments.length > 0) return fail(requestId, 'unsupported', 'Attachments are not available yet');
+    // A workflow session the engine keeps read only (T032, R-06): said plainly, never resumed in a folder that is gone.
+    if (session.kind === 'workflow') {
+      const refused = await this.workflow?.sessionAccess?.(sessionId);
+      if (refused !== undefined) return fail(requestId, 'invalid_transition', refused);
+    }
     return this.sendUserMessage(requestId, session, messageId, text);
   }
 
@@ -1297,8 +1314,13 @@ export class SessionService {
     taskId?: TaskId;
     cwd: string;
     parentId?: SessionId;
+    /**
+     * The cwd is a worktree the task pipeline made for this session's task (T032): its folder scope says so
+     * (`task-worktree`), so it is not same-folder work (R-07 locks). Absent: `session-cwd`, as before.
+     */
+    worktree?: boolean;
   }): Promise<'created' | 'exists' | 'taken' | 'unresolvable' | 'closing'> {
-    const { sessionId, instance, nodeId, taskId, cwd, parentId } = input;
+    const { sessionId, instance, nodeId, taskId, cwd, parentId, worktree } = input;
     const node = instance.template.nodes.find((n) => n.id === nodeId);
     if (node?.kind !== 'agent') return 'taken';
     // An existing session is this one only when everything the node gives it is the same (T024 r2-P1-4):
@@ -1330,7 +1352,7 @@ export class SessionService {
       observedModel: { source: 'unknown' },
       activity: 'closed',
       cwd,
-      folderScope: { source: 'session-cwd', workspaceRoot: root, writableRoots: node.writePolicy === 'write' ? [root] : [], readableRoots: [] },
+      folderScope: { source: worktree === true ? 'task-worktree' : 'session-cwd', workspaceRoot: root, writableRoots: node.writePolicy === 'write' ? [root] : [], readableRoots: [] },
       ...(parentId !== undefined && { parentId }),
       createdAt: at,
       updatedAt: at,
@@ -1437,6 +1459,31 @@ export class SessionService {
   }
 
   // ---- transfers (T023) -----------------------------------------------------------------------------
+
+  /**
+   * Ends a workflow session's runtime before the pipeline removes its folder (T032, SP-07 G1): the adapter's own
+   * graceful close (R-14) with `timeoutMs` counted from this call, not from the session's turn in its queue; past
+   * it the session is released by force (`onSessionClosed` ends its Job). Returns once the runtime is released and
+   * `onSessionClosed` has run (r1 P1-5). Only workflow sessions; anything else is left alone.
+   */
+  async closeWorkflowRuntime(sessionId: SessionId, timeoutMs = 5000): Promise<void> {
+    const session = await this.repos.sessions.get(sessionId);
+    if (session?.kind !== 'workflow') return;
+    const ref = await this.binding(sessionId);
+    if (ref === undefined) return;
+    // Not open: closed already, or a release under way (another closer), which is waited for (r2 P1-3).
+    if (!this.runtimes.isOpen(ref)) return this.runtimes.forceRelease(ref);
+    const graceful = this.runtimes.closeSession(ref, timeoutMs).then(
+      () => true,
+      () => true,
+    );
+    const ended = this.options.sleep === undefined ? await graceful : await Promise.race([graceful, this.options.sleep(timeoutMs).then(() => false)]);
+    // Past the deadline: released by force, or the release the graceful close began is waited for, whichever it is;
+    // either way this returns once `onSessionClosed` has finished (its Job ended, r2 P1-3).
+    if (!ended || this.runtimes.isOpen(ref)) await this.runtimes.forceRelease(ref);
+    // The record follows in the session's queue; the runtime is already gone.
+    if (!this.closed) void this.serial(sessionKey(sessionId), () => this.setActivity(sessionId, 'closed')).catch(() => undefined);
+  }
 
   /** Whether the session's own turn runs, by the stored turns (an old event cannot undo them): its turn boundary. */
   async mainTurnRunning(sessionId: SessionId): Promise<boolean> {

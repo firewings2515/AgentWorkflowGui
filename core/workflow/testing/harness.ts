@@ -24,10 +24,13 @@ import {
 } from '../../../contracts';
 import { hashOf } from '../../delivery/testing/fixtures';
 import { MemoryDeliveryStore } from '../../delivery/testing/memory-store';
-import type { AppRepositories, DeliveryStore, McpMount, PermissionPolicy, PolicyDecision, StoredDelivery } from '../../ports';
+import type { WorktreeFiles } from '../../pipeline';
+import type { AppRepositories, DeliveryStore, GitPort, McpMount, PermissionPolicy, PolicyDecision, StoredDelivery } from '../../ports';
 import { SessionService } from '../../sessions';
 import { FakeAdapter } from '../../sessions/testing/fake-adapter';
 import { MemoryRepositories } from '../../sessions/testing/memory-repositories';
+import { FakeCommands, FakeFiles } from '../../pipeline/testing/fakes';
+import { MemoryGit } from '../../pipeline/testing/memory-git';
 import { WorkflowEngine } from '../engine';
 
 export const CWD = 'E:\\work\\project';
@@ -191,6 +194,8 @@ export const rid = () => RequestId.parse(`r-${++requests}`);
 let ticks = 0;
 let skipped = 0;
 const now = () => new Date(Date.UTC(2026, 9, 29, 1, 0, 0, ++ticks + skipped)).toISOString();
+/** The harness clock (setup outputs are recorded with it, T032). */
+export const clock = () => now();
 export const advanceClock = (ms: number) => {
   skipped += ms;
 };
@@ -224,6 +229,12 @@ export interface World {
   timers: Set<{ at: string; fn: () => void }>;
   /** Runs the timers that are due by the clock (see `advanceClock`). */
   fireTimers(): void;
+  /** The task pipeline's git, commands and folders (T032): kept across a restart, like the disk. */
+  git: MemoryGit;
+  commands: FakeCommands;
+  files: FakeFiles;
+  /** Sessions whose runtime the pipeline closed before removing a folder. */
+  closed: SessionId[];
 }
 
 let turns = 0;
@@ -259,7 +270,13 @@ const withTurns = (adapter: FakeAdapter, w: World, codexSession?: SessionId): Fa
   return adapter;
 };
 
-const build = (repositories: AppRepositories, store: DeliveryStore, previous?: World): World => {
+/** A real git and real folders for the pipeline instead of the memory ones (T032 integration tests). */
+export interface RealFolders {
+  git: GitPort;
+  files: WorktreeFiles;
+}
+
+const build = (repositories: AppRepositories, store: DeliveryStore, previous?: World, real?: RealFolders): World => {
   const world = {
     repositories,
     store,
@@ -272,7 +289,12 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     silent: previous?.silent ?? new Set<SessionId>(),
     open: new Map<SessionId, string>(),
     timers: new Set<{ at: string; fn: () => void }>(),
+    closed: [] as SessionId[],
   } as unknown as World;
+  world.git = previous?.git ?? new MemoryGit();
+  if (previous === undefined) world.git.init(CWD, { 'README.md': 'readme\n', 'src/app.txt': 'app\n' });
+  world.commands = previous?.commands ?? new FakeCommands();
+  world.files = previous?.files ?? new FakeFiles(world.git);
   const schedule = (at: string, fn: () => void) => {
     const timer = { at, fn };
     world.timers.add(timer);
@@ -287,6 +309,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     }
   };
   const policy: PermissionPolicy = { evaluate: () => world.decide() };
+  const resolveReal = (path: string) => (real !== undefined ? path : path.startsWith('E:\\work') ? path.replace('E:\\work', 'E:\\real') : null);
   let mounts = 0;
   world.claude = withTurns(new FakeAdapter('claude', (handle) => world.service.onPermissionRequest(handle)), world);
   world.service = new SessionService({
@@ -300,7 +323,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     now,
     uuid,
     hashPayload: hashOf,
-    resolveRealPath: (path) => (path.startsWith('E:\\work') ? path.replace('E:\\work', 'E:\\real') : null),
+    resolveRealPath: (path) => resolveReal(path),
     createAdapter: (runtime: Runtime, sessionId: SessionId) => {
       if (runtime === 'claude') return world.claude;
       const adapter = withTurns(new FakeAdapter('codex', (handle) => world.service.onPermissionRequest(handle)), world, sessionId);
@@ -316,7 +339,25 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     log: (message) => world.logs.push(message),
     sleep: () => new Promise<void>(() => undefined),
   });
-  world.engine = new WorkflowEngine({ sessions: world.service, publish: (event) => world.events.push(event), now, uuid, hashPayload: hashOf, schedule, log: (m) => world.logs.push(m) });
+  world.engine = new WorkflowEngine({
+    sessions: world.service,
+    publish: (event) => world.events.push(event),
+    now,
+    uuid,
+    hashPayload: hashOf,
+    schedule,
+    pipeline: {
+      git: real?.git ?? world.git,
+      commands: world.commands,
+      files: real?.files ?? world.files,
+      resolveRealPath: (path) => resolveReal(path),
+      closeRuntime: (sessionId) => {
+        world.closed.push(sessionId);
+        return world.service.closeWorkflowRuntime(sessionId);
+      },
+    },
+    log: (m) => world.logs.push(m),
+  });
   world.service.attachWorkflow(world.engine);
   world.emitTurn = (sessionId, turnId, state) => {
     const adapter = adapterOf(world, sessionId);
@@ -335,7 +376,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
   };
   world.run = (command) => world.service.execute(command);
   world.restart = async () => {
-    const next = build(repositories, store, world);
+    const next = build(repositories, store, world, real);
     await next.service.start();
     await next.engine.recover();
     return next;
@@ -349,8 +390,8 @@ export const world = async (workflow: WorkflowTemplate = template()): Promise<Wo
 };
 
 /** The same world on other storage (the SQLite repositories and store in app/main's tests, r2). */
-export const worldOn = async (repositories: AppRepositories, store: DeliveryStore, workflow: WorkflowTemplate = template()): Promise<World> => {
-  const w = build(repositories, store);
+export const worldOn = async (repositories: AppRepositories, store: DeliveryStore, workflow: WorkflowTemplate = template(), real?: RealFolders): Promise<World> => {
+  const w = build(repositories, store, undefined, real);
   for (const a of agents()) await w.repositories.agents.save(a, null);
   await w.repositories.workflows.save(workflow, null);
   return w;

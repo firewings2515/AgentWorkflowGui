@@ -34,6 +34,7 @@ import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { hashFile, setTimer } from './file-hash';
 import { GitIgnoreRules } from './git-ignore';
+import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
 
 /** What the main process needs from its process host: the port plus the spawn the adapters use (T013). */
@@ -305,7 +306,13 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     },
     sleep,
     // Same-folder file locks (T033, R-07): in memory only, so a restart starts with none.
-    locks: { hashFile: (path) => hashFile(path), setTimer, isIgnored: (path) => ignored.isIgnored(path) },
+    // T032: a worktree the task pipeline made (`<repo>\.awg\wt\<name>`, one it recorded) is no same-folder work:
+    // inside one, git's own root is the worktree, so the repository's `info/exclude` line for `.awg` does not reach it.
+    locks: {
+      hashFile: (path) => hashFile(path),
+      setTimer,
+      isIgnored: (path) => (isPipelineFolder(path) && ref.workflow?.pipeline?.ownsPath(path) === true) || ignored.isIgnored(path),
+    },
     listModels,
     isRuntimeAvailable: (runtime) => runtime === 'claude' || options.codexExecutable !== undefined || options.createAdapter !== undefined,
     onSessionOpened: (sessionId) => {
@@ -325,7 +332,24 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   });
   ref.service = service;
   // T024: workflow.start, the workflow tools and workflow escalations; it reaches storage through the service.
-  const workflow = new WorkflowEngine({ sessions: service, publish: (event) => void bus.publish(event), now, uuid, hashPayload: sha256, schedule: scheduleAt(now), log });
+  // T032: the task pipeline's worktrees, setup and test commands and merge queue. Before a folder is removed, the
+  // runtime of a session working in it is closed by the service (R-14), then its Job.
+  const git = options.createGit?.() ?? new GitAdapter();
+  const workflow = new WorkflowEngine({
+    sessions: service,
+    publish: (event) => void bus.publish(event),
+    now,
+    uuid,
+    hashPayload: sha256,
+    schedule: scheduleAt(now),
+    pipeline: {
+      git,
+      commands: jobCommandRunner(host, { log }),
+      files: gitWorktreeFiles(),
+      resolveRealPath: (path) => options.resolveRealPath(path),
+    },
+    log,
+  });
   service.attachWorkflow(workflow);
   ref.workflow = workflow;
   // T023: transfer.prepare / confirm / cancel; it reaches storage and runtimes through the service too.
@@ -438,7 +462,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     transfer,
     repositories,
     mcp,
-    git: options.createGit?.() ?? new GitAdapter(),
+    git,
     async unfinishedWork() {
       const work = await service.unfinishedWork();
       const owned = await host.listOwned().catch(() => []);
