@@ -345,16 +345,6 @@ export class TaskPipeline {
     if (instance === undefined || plan?.state !== 'awaiting-confirmation') return;
     const escalation = await this.repos.escalations.get(plan.escalationId ?? taskPlanEscalationId(plan.id));
     if (escalation === undefined || escalation.state === 'open') return;
-    // Closed by the system (the session service closes open confirmations at its start): the list is still
-    // stored and the user has not decided, so the question is asked again (O-07).
-    if (escalation.state === 'resolved' && !ended(instance)) {
-      const reopened: Escalation = { ...escalation, state: 'open' };
-      delete reopened.resolvedAt;
-      delete reopened.resolvedBy;
-      await this.repos.escalations.upsert(reopened);
-      this.deps.publish({ type: 'escalation.updated', escalation: reopened });
-      return;
-    }
     const approved = escalation.state === 'approved' && !ended(instance);
     const at = this.deps.now();
     await this.mutate(instanceId, (current) => {

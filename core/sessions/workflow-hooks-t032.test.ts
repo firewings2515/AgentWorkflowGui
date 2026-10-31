@@ -3,7 +3,8 @@
 // workflow session's runtime for the pipeline. Ordinary sessions, and a service without workflow hooks, behave
 // as before.
 import { describe, expect, it } from 'vitest';
-import { InstanceId, MessageId, OperationId, TaskId } from '../../contracts';
+import { type Escalation, EscalationId, HandoffId, InstanceId, MessageId, OperationId, TaskId } from '../../contracts';
+import { createTasks, pipelineTemplate, project } from '../pipeline/testing/t032-cases';
 import type { WorkflowHooks } from './service';
 import { ROOT, started, world as workflowWorld } from '../workflow/testing/harness';
 import { created, rid, session, settle, world } from './testing/harness';
@@ -79,6 +80,32 @@ describe('T032 workflow hooks of the session service', () => {
     const result = await w.run({ type: 'session.send', requestId: rid(), sessionId: ROOT, messageId: MessageId.parse('m-ro'), expectedRevision: root!.revision, text: 'more', attachments: [] });
     expect(result).toMatchObject({ ok: false, code: 'invalid_transition', message: 'This task was merged; its sessions can only be viewed.' });
     expect(await w.store.get(OperationId.parse('user-message:m-ro'))).toBeUndefined();
+  });
+
+  it('a restart keeps a task list waiting for the user open, and still closes other confirmations nobody holds', async () => {
+    const w = await workflowWorld(pipelineTemplate({ confirm: true }));
+    await w.repositories.projects.save(project(), null);
+    await started(w);
+    const asked = await createTasks(w, [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }], 'call-keep');
+    if (asked.status !== 'awaiting-confirmation') throw new Error('not asked');
+    const stale: Escalation = {
+      id: EscalationId.parse('wf-confirm:op-held'),
+      instanceId: InstanceId.parse('run-1'),
+      rootSessionId: ROOT,
+      fromSessionId: ROOT,
+      kind: 'confirmation',
+      title: 'A handoff waits for your confirmation',
+      detail: 'held in memory only',
+      ref: { kind: 'handoff', handoffId: HandoffId.parse('handoff-op-held') },
+      state: 'open',
+      createdAt: '2026-10-29T00:00:00.000Z',
+    };
+    await w.repositories.escalations.upsert(stale);
+    const r = await w.restart();
+    expect(await r.repositories.escalations.get(asked.escalationId)).toMatchObject({ state: 'open' });
+    expect((await r.repositories.escalations.get(asked.escalationId))?.resolvedAt).toBeUndefined();
+    expect(await r.repositories.escalations.get(stale.id)).toMatchObject({ state: 'resolved', resolvedBy: 'system' });
+    expect(await r.run({ type: 'escalation.respond', requestId: rid(), escalationId: asked.escalationId, decision: 'approve' })).toMatchObject({ ok: true });
   });
 
   it('closeWorkflowRuntime closes a workflow session gracefully through its adapter, and leaves ordinary sessions alone', async () => {

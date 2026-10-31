@@ -475,8 +475,10 @@ export class SessionService {
       state: 'open',
     })) {
       // Nothing in this process holds the request or the message waiting for confirmation any more. A
-      // report's question is not held anywhere: the report itself was delivered, so it stays for the user.
-      if (escalation.kind === 'permission' || (escalation.kind === 'confirmation' && escalation.ref?.kind !== 'report')) await this.closeEscalation(escalation, 'resolved');
+      // report's question is not held anywhere: the report itself was delivered, so it stays for the user; a
+      // task list is stored with the run (TaskPlan, O-07), so its question stays too (T032).
+      const kept = escalation.ref?.kind === 'report' || escalation.ref?.kind === 'taskPlan';
+      if (escalation.kind === 'permission' || (escalation.kind === 'confirmation' && !kept)) await this.closeEscalation(escalation, 'resolved');
     }
     // A message accepted before a crash but never written is written now (r1-P1-8).
     for (const state of ['pending', 'unknown'] as const) {
