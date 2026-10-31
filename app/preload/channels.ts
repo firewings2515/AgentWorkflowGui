@@ -7,3 +7,5 @@ export const SNAPSHOT_CHANNEL = 'app:snapshot';
 export const COMMAND_CHANNEL = 'app:command';
 /** Main -> renderer: one EventEnvelope per push (send). */
 export const EVENT_CHANNEL = 'app:event';
+/** Renderer -> main: one FolderRequest (C-24), answered with a FolderResult (invoke). */
+export const FOLDER_CHANNEL = 'app:folder';

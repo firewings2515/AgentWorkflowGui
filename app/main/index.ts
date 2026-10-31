@@ -1,12 +1,14 @@
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { app, BrowserWindow, dialog, Menu, nativeTheme, shell } from 'electron';
 import { WindowsProcessHost } from '../../adapters/process';
 import type { Theme } from '../../contracts';
-import { APP_INFO_CHANNEL } from '../preload/channels';
+import { APP_INFO_CHANNEL, FOLDER_CHANNEL } from '../preload/channels';
 import { registerAppIpc } from './app-ipc';
 import { type Backend, type DamagedBackend, startBackend } from './backend';
 import { resolveCodexExecutable } from './codex-exe';
 import { EventBus } from './event-bus';
+import { handleFolderRequest } from './folders';
 import { handleTrusted } from './ipc';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
 import { resolveRealPath } from './real-path';
@@ -130,6 +132,20 @@ void app.whenReady().then(async () => {
     getEventTarget: () => (mainWindow === null || mainWindow.isDestroyed() ? null : mainWindow.webContents),
     isTrustedUrl,
   });
+  const facade = backend.facade;
+  handleTrusted(FOLDER_CHANNEL, getTrustedSender, (raw: unknown) =>
+    handleFolderRequest(raw, {
+      snapshot: () => facade.snapshot(),
+      dataFolder: app.getPath('userData'),
+      pickFolder: async (title) => {
+        const options = { title: title ?? '選擇資料夾', properties: ['openDirectory' as const] };
+        const picked = mainWindow === null ? await dialog.showOpenDialog(options) : await dialog.showOpenDialog(mainWindow, options);
+        return picked.canceled ? null : (picked.filePaths[0] ?? null);
+      },
+      openPath: (path) => shell.openPath(path),
+      exists: existsSync,
+    }),
+  );
   if (backend.status === 'ready') {
     const saved = await Promise.resolve(backend.facade.snapshot()).catch(() => undefined);
     if (saved !== undefined) applyTheme(saved.preferences.theme);

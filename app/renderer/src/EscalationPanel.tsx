@@ -3,6 +3,8 @@ import { Command, RequestId } from '../../../contracts';
 import type { Escalation, EscalationKind, PermissionRequest, SessionId, Snapshot } from '../../../contracts';
 import { commandFeedback } from './command-feedback';
 import { ElicitationFields } from './ElicitationFields';
+import { MergeDetails, RoundDetails, TaskPlanDetails } from './PipelineDetails';
+import { LockWaits } from './LockWaits';
 import type { RendererState, RendererStore } from './renderer-store';
 
 const groups: Record<EscalationKind, string> = {
@@ -14,6 +16,20 @@ const groups: Record<EscalationKind, string> = {
 function ReferenceDetails({ escalation, snapshot }: { escalation: Escalation; snapshot: Snapshot }) {
   const ref = escalation.ref;
   if (!ref || ref.kind === 'permission') return null;
+  const instance = snapshot.instances.find(i => i.id === escalation.instanceId);
+  if (ref.kind === 'taskPlan') {
+    const plan = instance?.taskPlans.find(p => p.id === ref.taskPlanId);
+    return instance && plan ? <TaskPlanDetails instance={instance} plan={plan} /> : null;
+  }
+  if (ref.kind === 'round') {
+    const round = instance?.rounds.find(r => r.taskId === ref.taskId && r.nodeId === ref.nodeId && r.round === ref.round);
+    if (instance && round) return <RoundDetails instance={instance} round={round} />;
+  }
+  if (ref.kind === 'merge') {
+    const merge = instance?.mergeQueue.find(m => m.taskId === ref.taskId && m.attempt === ref.attempt);
+    if (merge) return <MergeDetails merge={merge} />;
+  }
+  if (ref.kind === 'lock') return <><p>檔案：<code>{ref.path}</code> · 當時持有者：{ref.holderSessionId ?? '無記錄'} · 等待／寫入者：{ref.sessionId}</p><LockWaits snapshot={snapshot} sessionId={ref.sessionId} /></>;
   let content: string | undefined;
   switch (ref.kind) {
     case 'message': content = snapshot.messages.find(item => item.id === ref.messageId)?.text; break;
@@ -40,8 +56,16 @@ function EscalationCard({ escalation, permission, snapshot, store, ipcState }: {
   const activity = Object.values(ipcState?.commands ?? {}).filter(item => 'escalationId' in item.command && item.command.escalationId === escalation.id).at(-1);
   const accepted = !!activity?.result?.ok && !(activity.command.type === 'delivery.resolve' && activity.command.decision === 'wait');
   const permissionUnavailable = escalation.kind === 'permission' && (!permission || !['pending', 'held'].includes(permission.state));
+  const taskPlanId = escalation.ref?.kind === 'taskPlan' ? escalation.ref.taskPlanId : undefined;
+  const plan = snapshot.instances.find(i => i.id === escalation.instanceId)?.taskPlans.find(p => p.id === taskPlanId);
+  const planUnavailable = taskPlanId === undefined ? undefined
+    : !plan ? 'Task 清單尚未齊全，無法回覆。請重新讀取資料。'
+    : plan.state === 'declined' ? '此 task 清單已拒絕，不再等待確認，無法再次回覆。'
+    : plan.state === 'created' ? '此 task 清單已建立 task，不再等待確認，無法再次回覆。'
+    : plan.escalationId !== escalation.id ? '此 task 清單的確認項目已變更，與目前項目不符，無法回覆。請重新讀取資料。'
+    : undefined;
   const disabled = !store || ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || permissionUnavailable
-    || store.isBlocked(type, target) || accepted;
+    || !!planUnavailable || store.isBlocked(type, target) || accepted;
   const respond = (decision: 'approve' | 'decline') => {
     if (disabled) return;
     let answer: unknown;
@@ -74,6 +98,7 @@ function EscalationCard({ escalation, permission, snapshot, store, ipcState }: {
       {permission.elicitation?.mode === 'url' && <><p>{permission.elicitation.message}</p><p>請先自行確認此網址的內容，再決定是否核准：</p><code>{permission.elicitation.url}</code></>}
     </div>}
     <ReferenceDetails escalation={escalation} snapshot={snapshot} />
+    {planUnavailable && <p role="status" className="command-warning">{planUnavailable}</p>}
     {permissionUnavailable && <p role="status" className="command-warning">權限請求已撤回、已處理或資料尚未齊全，無法回覆。請重新讀取資料。</p>}
     <form onSubmit={event => event.preventDefault()} onKeyDown={event => {
       if (event.key === 'Enter' && (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement)) event.preventDefault();

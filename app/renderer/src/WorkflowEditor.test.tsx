@@ -28,6 +28,20 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('T019 Workflow editor', () => {
+  it('offers tasks only at root, applies staged choices without a graph edge and keeps confirmation opt-in', async () => {
+    const repository = createWorkflowRepository([template]); render(<Harness repository={repository} />);
+    selectNode('規劃 · root');
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Output 2 目的地' }).value).toBe('tasks');
+    expect(screen.getByRole<HTMLInputElement>('checkbox', { name: 'Output 2 經 root 請使用者確認' }).checked).toBe(true);
+    fireEvent.change(screen.getByRole('combobox', { name: 'Output 1 目的地' }), { target: { value: 'tasks' } });
+    selectNode('實作');
+    expect(screen.queryByRole('option', { name: '拆分 task' })).toBeNull();
+    click('儲存 Workflow'); click('套用所有目的地'); click('儲存 Workflow');
+    await screen.findByText(/已儲存/);
+    expect(repository.getSnapshot()[0]!.nodes[0]!.outputRules[0]!.target).toEqual({ kind: 'tasks' });
+    expect(repository.getSnapshot()[0]!.edges).toEqual(template.edges);
+    expect(WorkflowTemplate.safeParse(repository.getSnapshot()[0]).success).toBe(true);
+  });
   it('only adds the selected manual connection after an explicit button action', async () => {
     const repository = createWorkflowRepository([template]);
     render(<Harness repository={repository} />);
@@ -149,7 +163,7 @@ describe('T019 Workflow editor', () => {
     expect(screen.queryByText(/項 Output 目的地尚未套用/)).toBeNull();
     click('儲存 Workflow');
     await screen.findByText(/已儲存/);
-    expect(repository.getSnapshot()[0]!.nodes[0]!.outputRules).toEqual([]);
+    expect(repository.getSnapshot()[0]!.nodes[0]!.outputRules).toEqual(template.nodes[0]!.outputRules.filter(rule => rule.target.kind === 'tasks'));
   });
 
   it('does not repair graph structure when an ordinary field select changes', () => {
@@ -187,11 +201,11 @@ describe('T019 Workflow editor', () => {
     click('確認刪除');
     selectNode('規劃 · root');
     click('＋ 新增 Output 規則');
-    change('Output 1 什麼情況', '交接');
-    const target = screen.getByRole('combobox', { name: 'Output 1 目的地' });
+    change('Output 2 什麼情況', '交接');
+    const target = screen.getByRole('combobox', { name: 'Output 2 目的地' });
     const apply = (value: string) => {
       fireEvent.change(target, { target: { value } });
-      click('套用 Output 1 目的地');
+      click('套用 Output 2 目的地');
     };
     apply('node:n-build');
     expect(screen.getByText('連線（6）')).toBeTruthy();
@@ -203,7 +217,7 @@ describe('T019 Workflow editor', () => {
     apply('root');
     expect(screen.getByText('連線（6）')).toBeTruthy();
     click('儲存 Workflow');
-    await waitFor(() => expect(repository.getSnapshot()[0]!.nodes[0]!.outputRules[0]!.target).toEqual({ kind: 'root' }));
+    await waitFor(() => expect(repository.getSnapshot()[0]!.nodes[0]!.outputRules[1]!.target).toEqual({ kind: 'root' }));
     expect(repository.getSnapshot()[0]!.edges).toContainEqual({ source: 'n-plan', target: 'n-build' });
   });
 
@@ -254,10 +268,10 @@ describe('T019 Workflow editor', () => {
     change('Input 2 收到什麼／如何處理', '等待分支完成');
     fireEvent.click(screen.getByRole('checkbox', { name: 'Input 2 等所有上游到齊' }));
     click('＋ 新增 Output 規則');
-    change('Output 2 什麼情況', '可以合併');
-    expect(within(screen.getByRole('combobox', { name: 'Output 2 目的地' })).getByRole('option', { name: 'Review（已連線）' })).toBeTruthy();
-    fireEvent.change(screen.getByRole('combobox', { name: 'Output 2 目的地' }), { target: { value: 'node:n-merge' } });
-    click('套用 Output 2 目的地');
+    change('Output 3 什麼情況', '可以合併');
+    expect(within(screen.getByRole('combobox', { name: 'Output 3 目的地' })).getByRole('option', { name: 'Review（已連線）' })).toBeTruthy();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Output 3 目的地' }), { target: { value: 'node:n-merge' } });
+    click('套用 Output 3 目的地');
     click('儲存 Workflow');
     await screen.findByText(/已儲存/);
     const saved = repository.getSnapshot()[0]!;
@@ -315,7 +329,7 @@ describe('T019 Workflow editor', () => {
     expect(document.activeElement).toBe(within(screen.getByRole('navigation', { name: '圖形選取' })).getByRole('button', { name: '實作 → Review' }));
     click('儲存 Workflow');
     await screen.findByText(/已儲存/);
-    expect(repository.getSnapshot()[0]?.nodes[0]?.outputRules).toHaveLength(0);
+    expect(repository.getSnapshot()[0]?.nodes[0]?.outputRules).toEqual(template.nodes[0]!.outputRules.filter(rule => rule.target.kind === 'tasks'));
   });
 
   it('selects and moves a real canvas node with keys; Delete acts on the focused node', async () => {

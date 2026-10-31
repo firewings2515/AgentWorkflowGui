@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { RequestId, SessionId } from '../../../contracts';
 import type { Command, CommandResult, Snapshot } from '../../../contracts';
 import { blocksResubmit, commandFeedback } from './command-feedback';
+import { FolderButton } from './FolderButton';
 import type { RendererState, RendererStore } from './renderer-store';
 
 type CreateCommand = Extract<Command, { type: 'session.create' }>;
@@ -59,6 +60,7 @@ export function SessionCreate({ snapshot, store, ipcState, draft, onDraft, onOpe
           {snapshot.modelOptions.filter(item => !item.hidden).map(item => <option key={`${item.runtime}:${item.model}`} value={`${item.runtime}:${item.model}`}>{item.displayName} · {item.runtime}</option>)}
         </select></label>
         <label>工作資料夾<input required value={cwd} onChange={event => onDraft({ ...draft, cwd: event.target.value })} placeholder="輸入完整資料夾路徑" /></label>
+        <FolderButton disabled={disabled} onPick={cwd => onDraft({ ...draft, cwd })} />
         <label>上層 session（可選）<select value={parentId} onChange={event => onDraft({ ...draft, parentId: event.target.value })}>
           <option value="">無上層 session</option>
           {parentId && !parent && <option value={parentId}>上層 session 已不存在</option>}

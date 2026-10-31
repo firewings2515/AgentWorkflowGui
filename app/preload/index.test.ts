@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { EventEnvelope } from '../../contracts';
+import { type EventEnvelope, FolderRequest } from '../../contracts';
 import type { AwgBridge } from './bridge-types';
-import { APP_INFO_CHANNEL, COMMAND_CHANNEL, EVENT_CHANNEL, SNAPSHOT_CHANNEL } from './channels';
+import { APP_INFO_CHANNEL, COMMAND_CHANNEL, EVENT_CHANNEL, FOLDER_CHANNEL, SNAPSHOT_CHANNEL } from './channels';
 
 type Listener = (event: unknown, envelope: EventEnvelope) => void;
 
@@ -37,7 +37,8 @@ beforeEach(() => {
 describe('preload bridge', () => {
   it('exposes exactly the typed API and no ipcRenderer', async () => {
     const bridge = await loadBridge();
-    expect(Object.keys(bridge).sort()).toEqual(['getAppInfo', 'onEvent', 'send', 'snapshot']);
+    expect(Object.keys(bridge).sort()).toEqual(['folders', 'getAppInfo', 'onEvent', 'send', 'snapshot']);
+    expect(Object.keys(bridge.folders ?? {})).toEqual(['request']);
     expect(electron.exposed.size).toBe(1);
   });
 
@@ -51,6 +52,14 @@ describe('preload bridge', () => {
     await bridge.send(command);
 
     expect(electron.invoke.mock.calls).toEqual([[SNAPSHOT_CHANNEL], [APP_INFO_CHANNEL], [COMMAND_CHANNEL, command]]);
+  });
+
+  it('routes folder requests to their own channel (C-24)', async () => {
+    const bridge = await loadBridge();
+    electron.invoke.mockResolvedValue('answer');
+    const request = FolderRequest.parse({ type: 'folder.open', requestId: 'r', target: { kind: 'app-data' } });
+    await bridge.folders?.request(request);
+    expect(electron.invoke.mock.calls).toEqual([[FOLDER_CHANNEL, request]]);
   });
 
   it('hands listeners the envelope only, and cancels cleanly', async () => {

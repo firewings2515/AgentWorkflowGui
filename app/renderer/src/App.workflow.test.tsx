@@ -38,7 +38,8 @@ describe('T025 application integration', () => {
     await screen.findByRole('heading', { name: '資料損壞，所有操作已停用' });
     expect(screen.getByText('sessions.invalid-json')).toBeTruthy();
     expect(screen.getByText('E:\\資料\\awg.sqlite')).toBeTruthy();
-    expect(screen.getAllByRole('button')).toHaveLength(2);
+    expect(screen.getAllByRole('button')).toHaveLength(3);
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '在檔案總管開啟' }).disabled).toBe(true);
     expect(screen.getByRole('button', { name: '應用程式選單' })).toBeTruthy();
     expect(screen.getByRole<HTMLSelectElement>('combobox', { name: '外觀主題' }).disabled).toBe(true);
     expect(document.documentElement.dataset.theme).toBe(theme);

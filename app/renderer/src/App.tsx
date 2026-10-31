@@ -6,6 +6,7 @@ import { SessionWorkspace } from './SessionWorkspace';
 import type { Selection } from './SessionWorkspace';
 import { initialWorkspace, workspaceReducer } from './workbench-state';
 import { WorkflowProgress } from './WorkflowProgress';
+import { FolderButton } from './FolderButton';
 import { TransferDialog } from './TransferDialog';
 import type { TransferPreview } from './TransferDialog';
 import { readTheme, THEME_KEY, type Theme } from './theme';
@@ -175,6 +176,7 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
   if (snapshot.app.status === 'damaged') return <div className="connection-screen damaged-screen">
     {header}<section role="alert"><h2>資料損壞，所有操作已停用</h2>
       <p>請保留資料庫並交由維護人員檢查。</p><dl><dt>原因代碼</dt><dd><code>{snapshot.app.reason}</code></dd><dt>資料庫位置</dt><dd><code>{snapshot.app.location}</code></dd></dl>
+      <FolderButton target={{ kind: 'app-data' }} />
     </section>
     <button disabled={!store || ipcState?.connection === 'loading'} onClick={() => void store?.reconnect()}>重新讀取資料</button>
     {ipcState?.connection === 'loading' && <p role="status">正在重新讀取資料…</p>}
@@ -225,7 +227,7 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
       <WorkflowEditor repository={workflowRepository} demo={workflowDemo} agents={agentOptions} models={snapshot.modelOptions} selectedId={page?.id === 'workflow' ? entityId : ''} visible={page?.id === 'workflow'} onSelect={id => navigate(`/workflows/${encodeURIComponent(id)}/edit`)} />
       {page?.id === 'start' && <WorkflowStart snapshot={snapshot} store={store} ipcState={ipcState} onOpen={id => { navigate('/workbench'); openSession(id); }} />}
       {page?.id === 'create' && <SessionCreate snapshot={snapshot} store={store} ipcState={ipcState} draft={createDraft} onDraft={setCreateDraft} onOpen={id => { setCreateDraft({ agentId: '', modelKey: '', cwd: '', parentId: '' }); navigate('/workbench'); openSession(id); }} />}
-      {page?.id === 'progress' && <WorkflowProgress snapshot={snapshot} instanceId={entityId} onOpen={openProgressSession} onBack={() => {
+      {page?.id === 'progress' && <WorkflowProgress snapshot={snapshot} instanceId={entityId} store={store} ipcState={ipcState} onOpen={openProgressSession} onBack={() => {
           navigate('/workbench');
           if (returnAnchor.current) { const anchor = returnAnchor.current; openSession(anchor.sessionId, anchor.viewId); }
         }} />}

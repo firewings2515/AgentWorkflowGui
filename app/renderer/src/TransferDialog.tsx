@@ -87,7 +87,7 @@ export function TransferDialog({ snapshot, preview, store, ipcState, onClose, on
         <p>提案狀態：<Status value={proposal.state} /> · 版本 {proposal.revision} · 來源版本 {proposal.sourceRevision}</p>
         <p className="transfer-route">目標：{proposal.target.runtime} · {proposal.target.model} · {proposal.target.effort ?? '未指定 effort'}</p>
         {proposal.state === 'stale' && <p role="alert" className="command-warning">此提案已過期，舊內容不可確認。請取消舊提案，再重新產生並審閱內容。</p>}
-        {proposal.state === 'cancelled' && <p>此提案已取消；已記錄的建立與送達結果仍保留如下。</p>}
+        {proposal.state === 'cancelled' && <p>{proposal.cancelReason ? ({ user: '使用者已取消此提案。', 'source-changed': '來源已變更，請重新產生並審閱轉交預覽。', failed: '轉交失敗，提案已取消。' })[proposal.cancelReason] : '此提案已取消；未記錄取消原因。'}已記錄的建立與送達結果仍保留如下。</p>}
         {proposal.state === 'failed' && <p role="alert">目標建立失敗，工作保留在來源 session。{proposal.failure?.message}</p>}
         <ProposalContent key={`${proposal.id}:${proposal.revision}:${proposal.payloadHash}`} proposal={proposal} canConfirm={!disabled && !confirmAttempted && !cancelAccepted} onConfirm={() => {
           if (disabled || confirmAttempted || cancelAccepted || proposal.state !== 'awaiting-confirmation') return;

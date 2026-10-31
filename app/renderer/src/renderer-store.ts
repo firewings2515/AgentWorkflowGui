@@ -101,6 +101,7 @@ export function applyEnvelope(state: RendererState, envelope: EventEnvelope): Re
 }
 
 export function commandTarget(command: Command): string {
+  if (command.type === 'task.retryCleanup') return `task:${JSON.stringify([command.instanceId, command.taskId])}`;
   if ('nativeTaskId' in command) return `nativeTask:${JSON.stringify([command.sessionId, command.nativeTaskId])}`;
   if ('sessionId' in command) return `session:${command.sessionId}`;
   if ('agent' in command) return `agent:${command.agent.id}`;

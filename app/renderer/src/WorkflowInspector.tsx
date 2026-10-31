@@ -13,12 +13,14 @@ function OutputDestination({ workflow, node, rule, ruleIndex, inputProps, choice
 }) {
   const current = destinationValue(rule.target);
   const value = choice ?? current;
+  const canSplit = node.kind === 'agent' && node.isRoot;
   return <>
     <select {...inputProps} value={value} onChange={event => onChoice(event.target.value)}>
-      {value !== 'root' && !workflow.nodes.some(item => `node:${item.id}` === value && item.id !== node.id) && <option value={value}>目的地節點已不存在，請重新選取</option>}
+      {value !== 'root' && !(value === 'tasks' && canSplit) && !workflow.nodes.some(item => `node:${item.id}` === value && item.id !== node.id) && <option value={value} disabled>目的地已不可用，請重新選取</option>}
+      {canSplit && <option value="tasks">拆分 task</option>}
       <option value="root">回報 root</option>{workflow.nodes.filter(item => item.id !== node.id).map(item => <option key={item.id} value={`node:${item.id}`}>{item.label}{workflow.edges.some(edge => edge.source === node.id && edge.target === item.id) ? '（已連線）' : '（套用時自動連線）'}</option>)}
     </select>
-    <button type="button" onClick={() => onApply(value === 'root' ? { kind: 'root' } : { kind: 'node', nodeId: NodeId.parse(value.slice(5)) })}>套用 Output {ruleIndex + 1} 目的地</button>
+    <button type="button" disabled={value === 'tasks' && !canSplit} onClick={() => onApply(value === 'root' ? { kind: 'root' } : value === 'tasks' ? { kind: 'tasks' } : { kind: 'node', nodeId: NodeId.parse(value.slice(5)) })}>套用 Output {ruleIndex + 1} 目的地</button>
     {value !== current && <p className="muted">目的地尚未套用；切換節點會保留選擇，儲存前需套用或放棄。</p>}
   </>;
 }

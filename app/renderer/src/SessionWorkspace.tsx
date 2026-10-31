@@ -10,6 +10,7 @@ import { commandFeedback } from './command-feedback';
 import type { RendererStore, RendererState } from './renderer-store';
 import { sessionBlocksSend, sessionCanInterrupt } from './renderer-store';
 import { EscalationPanel, openEscalations } from './EscalationPanel';
+import { LockWaits } from './LockWaits';
 
 export interface Selection { agentId: AgentId; model: ModelSelection }
 export interface WorkspaceProps {
@@ -44,6 +45,7 @@ function Transcript({ snapshot, session, view, visible, onContext, store, ipcSta
     if (visible) onContext({ scrollTop: event.currentTarget.scrollTop });
   }}>
     <div className="transcript-heading"><span>對話紀錄</span><span>{store ? '目前快照' : '示意快照'}</span></div>
+    <LockWaits snapshot={snapshot} sessionId={session.id} />
     {openEscalations(snapshot, session.id).length > 0 && <details className="pending-panel" id={`${view.id}-pending`} ref={pendingPanel} key={session.id}>
       <summary>展開／收合待處理項目</summary>
       <div className="pending-panel-scroll"><EscalationPanel snapshot={snapshot} sessionId={session.id} store={store} ipcState={ipcState} /></div>
@@ -126,11 +128,13 @@ export function SessionWorkspace(props: WorkspaceProps) {
               return <option key={`${model.runtime}:${model.model}`} value={`${model.runtime}:${model.model}`} disabled={crossToolLocked}>{model.displayName} · {model.runtime}{crossToolLocked ? '（workflow 的 node 不能換工具）' : ''}</option>;
             })}</select></label>
           </div>
+          <details className="composer-help"><summary>模型狀態與切換說明</summary>
           {session.kind === 'workflow' && <p id={`${view.id}-agent-lock`} className="composer-note">Workflow Agent 已鎖定；更換 Agent 請建立新 Workflow，由轉接 Agent 協助接手。</p>}
           {session.kind === 'workflow' && <p id={`${view.id}-model-lock`} className="composer-note">workflow 的 node 不能換工具；僅能選擇同一工具的 Model。</p>}
           <p className="composer-note">{selection ? '示意選擇，尚未套用。' : observedModelText(session)} {chosen.model.runtime === 'codex' ? 'Model 於下一個 turn 生效。' : 'Model 於下一次模型呼叫生效。'}</p>
+          </details>
           <label className="sr-only" htmlFor={`${view.id}-draft`}>傳訊息給 {session.title}</label>
-          <textarea id={`${view.id}-draft`} value={context.draft} onChange={event => onContext({ draft: event.target.value })} placeholder={`傳訊息給 ${session.title}…`} rows={3} />
+          <textarea id={`${view.id}-draft`} value={context.draft} onChange={event => onContext({ draft: event.target.value })} placeholder={`傳訊息給 ${session.title}…`} rows={2} />
           <div className="composer-actions"><Menu label="新增附件" shortcut actions={[{ label: 'Add files or photos', hint: 'Ctrl+U', onSelect: () => attach('files') }, { label: 'Add folder', onSelect: () => attach('folder') }]}>＋</Menu>
             <span className="composer-target">附件／訊息目標：{session.title}</span>
             {canInterrupt && <button type="button" disabled={!props.store || props.ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || interruptBlocked} onClick={() => {

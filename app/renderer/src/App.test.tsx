@@ -17,6 +17,17 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('T004 工作台外殼', () => {
+  it('keeps composer help collapsed and the draft compact without hiding model selectors', () => {
+    render(<App />);
+    const help = pane().getByText('模型狀態與切換說明').closest('details')!;
+    expect(help.open).toBe(false);
+    expect(draft().rows).toBe(2);
+    expect(pane().getByRole('combobox', { name: 'Model' })).toBeTruthy();
+    fireEvent.change(draft(), { target: { value: '保留草稿' } });
+    fireEvent.click(pane().getByText('模型狀態與切換說明'));
+    expect(help.open).toBe(true);
+    expect(draft().value).toBe('保留草稿');
+  });
   it('renders fixture conversation, artifacts and a single default workspace', () => {
     render(<App />);
     expect(screen.getByText(APP_NAME)).toBeTruthy();

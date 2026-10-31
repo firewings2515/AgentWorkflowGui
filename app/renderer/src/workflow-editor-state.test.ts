@@ -49,7 +49,7 @@ describe('T019 domain / canvas boundary', () => {
   it('deletes a connection and its referring rules, and deletes nodes without dangling endpoints', () => {
     const edge = template.edges[0]!;
     const withoutEdge = removeGraphSelection(template, { kind: 'edge', ...edge });
-    expect(withoutEdge.nodes[0]!.outputRules).toHaveLength(0);
+    expect(withoutEdge.nodes[0]!.outputRules).toEqual(template.nodes[0]!.outputRules.filter(rule => rule.target.kind === 'tasks'));
     expect(WorkflowTemplate.safeParse(withoutEdge).success).toBe(true);
     const withoutNode = removeGraphSelection(template, { kind: 'node', id: 'n-build' });
     expect(withoutNode.edges.every(edge => edge.source !== 'n-build' && edge.target !== 'n-build')).toBe(true);

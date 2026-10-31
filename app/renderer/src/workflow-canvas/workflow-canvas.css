@@ -1,6 +1,10 @@
 .workflow-canvas { min-height: 180px; flex: 1; position: relative; }
 .workflow-canvas .react-flow {
   --xy-background-color: var(--panel);
+  --xy-node-background-color: var(--surface);
+  --xy-node-color: var(--text);
+  --xy-node-border: 1px solid var(--line);
+  --xy-node-border-selected: 1px solid var(--accent);
   --xy-background-pattern-dots-color: var(--line);
   --xy-edge-stroke: var(--muted);
   --xy-edge-stroke-selected: var(--accent);

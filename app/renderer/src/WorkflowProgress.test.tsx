@@ -91,13 +91,14 @@ describe('T026 單 task 進度', () => {
     expect(screen.getByText(/目前節點：實作/)).toBeTruthy();
   });
 
-  it('does not substitute another instance or silently select a task in unsupported multi-task instances', () => {
+  it('does not substitute another instance and exposes task selection for multiple tasks', () => {
     const props = { snapshot: fixtureSnapshot, onOpen: vi.fn(), onBack: vi.fn() };
     const view = render(<WorkflowProgress {...props} instanceId="missing" />);
     expect(screen.getByRole('heading', { name: '找不到指定的 Workflow 執行群組' })).toBeTruthy();
     expect(screen.queryByRole('region', { name: '唯讀流程圖' })).toBeNull();
     view.rerender(<WorkflowProgress {...props} instanceId={fixtureSnapshot.instances[0]!.id} />);
-    expect(screen.getByText(/目前進度頁僅支援單一 task/)).toBeTruthy();
+    expect(screen.getByRole('region', { name: '群組 task 清單' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '表單驗證 · task-a' }).getAttribute('aria-pressed')).toBe('true');
     view.rerender(<WorkflowProgress {...props} snapshot={{ ...fixtureSnapshot, instances: [{ ...fixtureSnapshot.instances[0]!, tasks: [] }] }} instanceId={fixtureSnapshot.instances[0]!.id} />);
     expect(screen.getByText(/尚無 task 資料/)).toBeTruthy();
   });
@@ -109,6 +110,15 @@ describe('T026 單 task 進度', () => {
     const logs = within(screen.getByRole('region', { name: '各 node 的 session 與日誌' }));
     expect(logs.getByText('已有交接紀錄，尚無 session 資料')).toBeTruthy();
     expect(logs.queryByRole('button', { name: '開啟 實作：表單驗證' })).toBeNull();
+  });
+
+  it('shows a first task arriving after an empty instance without requiring an unavailable selector', () => {
+    const data = singleTask(); const instance = data.instances[0]!;
+    const props = { instanceId: instance.id, onOpen: vi.fn(), onBack: vi.fn() };
+    const view = render(<WorkflowProgress {...props} snapshot={{ ...data, instances: [{ ...instance, tasks: [] }] }} />);
+    expect(screen.getByText(/尚無 task 資料/)).toBeTruthy();
+    view.rerender(<WorkflowProgress {...props} snapshot={data} />);
+    expect(screen.getByRole('region', { name: '唯讀流程圖' })).toBeTruthy();
   });
 
   it('allows only the instance root without a task binding; never uses ordinary or other-task sessions', () => {
