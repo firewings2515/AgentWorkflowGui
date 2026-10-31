@@ -82,6 +82,8 @@ export interface TaskPipelineOptions {
   files: WorktreeFiles;
   /** Ends a session's runtime gracefully before its folder is removed (SP-07 G1); absent: left to the removal. */
   closeRuntime?(sessionId: SessionId): Promise<void>;
+  /** Links resolved (as the lock check sees paths), so `ownsPath` knows a worktree by either spelling. */
+  resolveRealPath?(path: string): string | null;
 }
 
 interface Deps extends TaskPipelineOptions {
@@ -135,6 +137,8 @@ const sameItems = (a: readonly TaskPlanItem[], b: readonly TaskPlanItem[]) =>
 export class TaskPipeline {
   /** Worktrees this process saw made or taken up again: the others are checked once with `createWorktree`. */
   private readonly made = new Set<string>();
+  /** Every worktree folder the pipeline recorded (task and integration), by path key: `ownsPath`. */
+  private readonly folders = new Set<string>();
   /** Instances whose merge queue is being worked (one runner each); `again` asks it to look once more. */
   private readonly runners = new Map<InstanceId, { again: boolean }>();
   /** Setup and test commands running, by task (killed when the run is cancelled). */
@@ -154,6 +158,33 @@ export class TaskPipeline {
 
   private get git(): GitPort {
     return this.deps.git;
+  }
+
+  /**
+   * Whether a path is inside a worktree the pipeline recorded (a task's or a merge attempt's). Synchronous, for
+   * the same-folder lock check (R-07): such a folder is worktree work, never same-folder work.
+   */
+  ownsPath(path: string): boolean {
+    const key = pathKey(path);
+    for (const folder of this.folders) if (key === folder || key.startsWith(`${folder}\\`)) return true;
+    return false;
+  }
+
+  private remember(instance: WorkflowInstance): void {
+    for (const task of instance.tasks) if (task.worktree !== undefined) this.own(task.worktree.path);
+    for (const m of instance.mergeQueue) if (m.integration !== undefined) this.own(m.integration.path);
+  }
+
+  /** Records a worktree folder as the pipeline's, as written and with its links resolved. */
+  private own(path: string): void {
+    this.folders.add(pathKey(path));
+    let real: string | null = null;
+    try {
+      real = this.deps.resolveRealPath?.(path) ?? null;
+    } catch {
+      // Not there yet: the spelling as written is known.
+    }
+    if (real !== null) this.folders.add(pathKey(real));
   }
 
   // ---- the instance's repository ------------------------------------------------------------------
@@ -424,11 +455,14 @@ export class TaskPipeline {
       if (worktree?.baseCommit === undefined) return { failed: 'the worktree could not be recorded' };
     }
     const ref = { repo, path: worktree.path, branch: worktree.branch };
+    this.own(ref.path);
     if (worktree.cleanup !== 'active') return { failed: 'the task worktree was removed' };
     if (this.made.has(pathKey(ref.path))) return { ref };
     const made = await this.git.createWorktree(ref, worktree.baseCommit ?? '');
     if (made.status === 'failed') return { failed: made.detail };
     this.made.add(pathKey(ref.path));
+    // Its links resolve now that it exists.
+    this.own(ref.path);
     return { ref };
   }
 
@@ -682,6 +716,7 @@ export class TaskPipeline {
       return true;
     }
     const integ = await integrationRef(this.deps.hash, repo, instance.id, next.taskId, next.attempt);
+    this.own(integ.path);
     await this.mutate(instance.id, (current) => {
       const m = TaskPipeline.findAttempt(current, next);
       if (m?.state !== 'queued' || current.mergeQueue.some((x) => activeMergeStates.includes(x.state))) return undefined;
@@ -698,6 +733,7 @@ export class TaskPipeline {
     if (integ === undefined || task === undefined || m.baseCommit === undefined) return this.failAttempt(instance.id, m, 'the attempt lost its worktrees', 'merging');
     const made = await this.git.createWorktree(integ, m.baseCommit);
     if (made.status === 'failed') return this.failAttempt(instance.id, m, `the integration worktree could not be made: ${made.detail}`, 'merging');
+    this.own(integ.path);
     const status = await this.git.status(integ).catch((error: unknown) => errorText(error));
     if (typeof status === 'string') return this.failAttempt(instance.id, m, `the integration worktree cannot be read: ${status}`, 'merging');
     if (status.merging) return this.toResolving(instance.id, m, status.conflictFiles);
@@ -740,7 +776,7 @@ export class TaskPipeline {
     const integ = await this.integRef(instance, m);
     if (impl === undefined || integ === undefined) return this.resolutionFailed(instance.id, m, 'no node of the task can resolve a conflict');
     const sessionId = await resolverSessionIdOf(this.deps.hash, instance.id, m.taskId, m.attempt);
-    const made = await this.deps.sessions.createWorkflowSession({ sessionId, instance, nodeId: impl.id, taskId: m.taskId, cwd: integ.path, parentId: instance.rootSessionId });
+    const made = await this.deps.sessions.createWorkflowSession({ sessionId, instance, nodeId: impl.id, taskId: m.taskId, cwd: integ.path, parentId: instance.rootSessionId, worktree: true });
     if (made !== 'created' && made !== 'exists') return this.resolutionFailed(instance.id, m, `the session that resolves the conflict could not be made (${made})`);
     const operationId = await resolveOperationOf(this.deps.hash, instance.id, m.taskId, m.attempt);
     if ((await this.store.get(operationId)) === undefined) {
@@ -1389,6 +1425,7 @@ export class TaskPipeline {
    */
   async recover(): Promise<void> {
     for (const instance of await this.repos.instances.list()) {
+      this.remember(instance);
       if (ended(instance)) {
         if (instance.endedAt !== undefined) await this.afterEnd(instance).catch((error: unknown) => this.deps.log(`[pipeline] finishing the end of ${instance.id} failed (${errorText(error)})`));
         continue;

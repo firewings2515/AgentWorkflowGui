@@ -1314,8 +1314,13 @@ export class SessionService {
     taskId?: TaskId;
     cwd: string;
     parentId?: SessionId;
+    /**
+     * The cwd is a worktree the task pipeline made for this session's task (T032): its folder scope says so
+     * (`task-worktree`), so it is not same-folder work (R-07 locks). Absent: `session-cwd`, as before.
+     */
+    worktree?: boolean;
   }): Promise<'created' | 'exists' | 'taken' | 'unresolvable' | 'closing'> {
-    const { sessionId, instance, nodeId, taskId, cwd, parentId } = input;
+    const { sessionId, instance, nodeId, taskId, cwd, parentId, worktree } = input;
     const node = instance.template.nodes.find((n) => n.id === nodeId);
     if (node?.kind !== 'agent') return 'taken';
     // An existing session is this one only when everything the node gives it is the same (T024 r2-P1-4):
@@ -1347,7 +1352,7 @@ export class SessionService {
       observedModel: { source: 'unknown' },
       activity: 'closed',
       cwd,
-      folderScope: { source: 'session-cwd', workspaceRoot: root, writableRoots: node.writePolicy === 'write' ? [root] : [], readableRoots: [] },
+      folderScope: { source: worktree === true ? 'task-worktree' : 'session-cwd', workspaceRoot: root, writableRoots: node.writePolicy === 'write' ? [root] : [], readableRoots: [] },
       ...(parentId !== undefined && { parentId }),
       createdAt: at,
       updatedAt: at,

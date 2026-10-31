@@ -75,6 +75,11 @@ describe('pipeline folders (T032 live run 1)', () => {
     expect(isPipelineFolder('C:\\ws\\.awg\\wt')).toBe(false);
     expect(isPipelineFolder('C:\\ws\\x.awg\\wt\\t-1\\a.js')).toBe(false);
     expect(isPipelineFolder('C:\\ws\\.awg\\other\\t-1\\a.js')).toBe(false);
+    // Only names the git adapter would make (T030 SAFE_NAME): no device names, no trailing dot, no leading dot.
+    expect(isPipelineFolder('C:\\ws\\.awg\\wt\\con\\a.js')).toBe(false);
+    expect(isPipelineFolder('C:\\ws\\.awg\\wt\\t-1.\\a.js')).toBe(false);
+    expect(isPipelineFolder('C:\\ws\\.awg\\wt\\.hidden\\a.js')).toBe(false);
+    expect(isPipelineFolder(`C:\\ws\\.awg\\wt\\${'x'.repeat(65)}\\a.js`)).toBe(false);
   });
 });
 

@@ -306,9 +306,13 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     },
     sleep,
     // Same-folder file locks (T033, R-07): in memory only, so a restart starts with none.
-    // T032: the task pipeline's worktrees (`<repo>\.awg\wt\*`) are no same-folder work: inside one, git's own
-    // root is the worktree, so the repository's `info/exclude` line for `.awg` does not reach them.
-    locks: { hashFile: (path) => hashFile(path), setTimer, isIgnored: (path) => isPipelineFolder(path) || ignored.isIgnored(path) },
+    // T032: a worktree the task pipeline made (`<repo>\.awg\wt\<name>`, one it recorded) is no same-folder work:
+    // inside one, git's own root is the worktree, so the repository's `info/exclude` line for `.awg` does not reach it.
+    locks: {
+      hashFile: (path) => hashFile(path),
+      setTimer,
+      isIgnored: (path) => (isPipelineFolder(path) && ref.workflow?.pipeline?.ownsPath(path) === true) || ignored.isIgnored(path),
+    },
     listModels,
     isRuntimeAvailable: (runtime) => runtime === 'claude' || options.codexExecutable !== undefined || options.createAdapter !== undefined,
     onSessionOpened: (sessionId) => {
@@ -342,6 +346,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       git,
       commands: jobCommandRunner(host, { log }),
       files: worktreeFiles,
+      resolveRealPath: (path) => options.resolveRealPath(path),
     },
     log,
   });

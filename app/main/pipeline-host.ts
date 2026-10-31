@@ -74,11 +74,22 @@ export const jobCommandRunner = (host: Pick<BackendProcessHost, 'spawn' | 'close
   },
 });
 
+/** A worktree's name below `.awg\wt`, as the git adapter allows it (T030 `SAFE_NAME`; no trailing dot). */
+const SAFE_NAME = /^(?!(?:con|prn|aux|nul|com\d|lpt\d)(?:\.|$))[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/i;
+
 /**
- * Whether a path is inside a worktree the task pipeline made (`<repo>\.awg\wt\<name>\...`, the only place the
- * git adapter makes them). Changes there are worktree work, never same-folder work (R-07 locks).
+ * Whether a path has the shape of a pipeline worktree or something inside one: `<repo>\.awg\wt\<name>[\...]`
+ * with `<name>` a name the git adapter would make (T030). The caller also asks the pipeline whether it made it.
  */
-export const isPipelineFolder = (path: string): boolean => /(^|[\\/])\.awg[\\/]wt[\\/][^\\/]+([\\/]|$)/i.test(path);
+export const isPipelineFolder = (path: string): boolean => {
+  const parts = path.split(/[\\/]+/);
+  for (let i = 0; i + 2 < parts.length; i++) {
+    if (parts[i]?.toLowerCase() !== '.awg' || parts[i + 1]?.toLowerCase() !== 'wt') continue;
+    const name = parts[i + 2] ?? '';
+    if (SAFE_NAME.test(name) && !name.endsWith('.')) return true;
+  }
+  return false;
+};
 
 /** Folders on disk: whether one exists, and the top-level entries a setup made (by their creation time). */
 export const worktreeFiles: WorktreeFiles = {

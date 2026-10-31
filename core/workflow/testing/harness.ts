@@ -309,6 +309,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     }
   };
   const policy: PermissionPolicy = { evaluate: () => world.decide() };
+  const resolveReal = (path: string) => (real !== undefined ? path : path.startsWith('E:\\work') ? path.replace('E:\\work', 'E:\\real') : null);
   let mounts = 0;
   world.claude = withTurns(new FakeAdapter('claude', (handle) => world.service.onPermissionRequest(handle)), world);
   world.service = new SessionService({
@@ -322,7 +323,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     now,
     uuid,
     hashPayload: hashOf,
-    resolveRealPath: (path) => (real !== undefined ? path : path.startsWith('E:\\work') ? path.replace('E:\\work', 'E:\\real') : null),
+    resolveRealPath: (path) => resolveReal(path),
     createAdapter: (runtime: Runtime, sessionId: SessionId) => {
       if (runtime === 'claude') return world.claude;
       const adapter = withTurns(new FakeAdapter('codex', (handle) => world.service.onPermissionRequest(handle)), world, sessionId);
@@ -349,6 +350,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
       git: real?.git ?? world.git,
       commands: world.commands,
       files: real?.files ?? world.files,
+      resolveRealPath: (path) => resolveReal(path),
       closeRuntime: (sessionId) => {
         world.closed.push(sessionId);
         return world.service.closeWorkflowRuntime(sessionId);

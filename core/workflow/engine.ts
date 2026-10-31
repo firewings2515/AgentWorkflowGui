@@ -759,8 +759,9 @@ export class WorkflowEngine implements WorkflowHooks {
     }
     // The task's worktree with worktree isolation (T032), else root's folder; the source that created it is its parent (WB-01).
     const current = this.pipeline === undefined ? undefined : await repos.instances.get(instance.id);
-    const cwd = (current === undefined ? undefined : this.pipeline?.cwdOf(current, taskId)) ?? root.cwd;
-    const made = await this.options.sessions.createWorkflowSession({ sessionId, instance, nodeId: node.id, taskId, cwd, parentId: caller.id });
+    const worktree = current === undefined ? undefined : this.pipeline?.cwdOf(current, taskId);
+    const cwd = worktree ?? root.cwd;
+    const made = await this.options.sessions.createWorkflowSession({ sessionId, instance, nodeId: node.id, taskId, cwd, parentId: caller.id, ...(worktree !== undefined && { worktree: true }) });
     return made === 'created' || made === 'exists' ? sessionId : undefined;
   }
 
