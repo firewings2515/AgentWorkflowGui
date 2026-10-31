@@ -278,3 +278,36 @@ describe('atWork (one definition for release and the unlocked-write scope)', () 
     expect(take(A, F, T1, null).status).toBe('acquired');
   });
 });
+
+describe('review r1 P1-5: joined waits keep their own deadlines', () => {
+  it('a 1 s wait joined to a 600 s one ends after 1 s; the long one keeps waiting', async () => {
+    const { clock, table, take, waiter } = setup();
+    take(A);
+    const long = table.wait(F, waiter(B, 600_000));
+    const short = table.wait(F, waiter(B, 1000));
+    expect(table.list()[0]!.waiters).toEqual([expect.objectContaining({ deadline: '2026-10-31T00:00:01.000Z' })]);
+    clock.advance(1001);
+    expect(await short).toEqual({ status: 'timeout' });
+    let settled = false;
+    void long.then(() => (settled = true));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(table.list()[0]!.waiters).toEqual([expect.objectContaining({ deadline: '2026-10-31T00:10:00.000Z' })]);
+    table.writeEnded(A, F, { kind: 'failed' });
+    table.turnEnded(A, T1);
+    expect(await long).toEqual({ status: 'free' });
+  });
+
+  it('cancels only the call it names', async () => {
+    const { table, take, waiter } = setup();
+    take(A);
+    const w1 = waiter(B);
+    const one = table.wait(F, w1);
+    const two = table.wait(F, waiter(B));
+    table.cancelWait(B, F, w1);
+    expect(await one).toEqual({ status: 'cancelled' });
+    expect(table.list()[0]!.waiters).toHaveLength(1);
+    table.cancelWait(B, F);
+    expect(await two).toEqual({ status: 'cancelled' });
+  });
+});

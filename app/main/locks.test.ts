@@ -90,6 +90,13 @@ const create = async (s: Started, id: string) => {
   return sessionId;
 };
 
+/** Codex's item/started for patch-1, which comes before its approval request (SP-06 W2). */
+const announce = (s: Started, sessionId: SessionId, file: string) =>
+  s.adapters.get(sessionId)!.emit({
+    type: 'item.updated',
+    item: { id: 'patch-1' as never, sessionId, turnId: 'turn-a' as never, kind: 'fileChange', changes: [{ path: file, change: 'update' }], state: 'proposed', startedAt: '2026-10-31T00:00:00.000Z' },
+  });
+
 const callWait = async (s: Started, sessionId: SessionId, path: string) => {
   const mount = s.adapters.get(sessionId)!.started.at(-1)!.mcp!;
   const client = new Client({ name: 'node', version: '0.0.0' });
@@ -107,6 +114,7 @@ describe('same-folder locks in the backend (R-07)', () => {
     writeFileSync(file, 'line 1\n');
     const a = await create(s, 'session-a');
     const b = await create(s, 'session-b');
+    announce(s, a, file);
     const held = s.adapters.get(a)!.ask(permissionRequest(a, { kind: 'fileChange', itemId: 'patch-1' as never, turnId: 'turn-a' as never, summary: 'patch', paths: [file] }));
     await settle();
     expect(held.decision).toMatchObject({ outcome: 'approve' });
@@ -129,6 +137,7 @@ describe('same-folder locks in the backend (R-07)', () => {
     const file = join(dir, 'shared.txt');
     writeFileSync(file, 'line 1\n');
     const a = await create(s, 'session-a');
+    announce(s, a, file);
     s.adapters.get(a)!.ask(permissionRequest(a, { kind: 'fileChange', itemId: 'patch-1' as never, turnId: 'turn-a' as never, summary: 'patch', paths: [file] }));
     await settle();
     // The patch fails: nothing of A's was applied, and a shell then writes the file.
@@ -151,7 +160,7 @@ describe('hashFile', () => {
     writeFileSync(file, 'abc');
     expect(hashFile(file)).toBe('sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
     expect(hashFile(join(dir, 'missing.txt'))).toBe('missing');
-    expect(hashFile(dir)).toBe('unreadable');
+    expect(hashFile(dir)).toBe('directory');
   });
 });
 

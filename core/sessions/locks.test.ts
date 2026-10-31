@@ -168,3 +168,50 @@ describe('same-folder locks in the session service (R-07)', () => {
     expect(await waiting).toEqual({ status: 'free' });
   });
 });
+
+describe('review r1 (session service)', () => {
+  it('P1-3 two concurrent approvals of one escalation: one answers, the other is refused, and the lock is released after the write', async () => {
+    const { w, b } = await two();
+    w.decide = () => ({ action: 'escalate', rule: 'write-outside-scope', reason: 'fixed' });
+    const held = codexWrite(w, b);
+    await settle();
+    const escalation = [...w.repositories.escalationRecords.values()].find((e) => e.kind === 'permission')!;
+    const [one, other] = await Promise.all([
+      w.run({ type: 'escalation.respond', requestId: rid(), escalationId: escalation.id, decision: 'approve' }),
+      w.run({ type: 'escalation.respond', requestId: rid(), escalationId: escalation.id, decision: 'approve' }),
+    ]);
+    expect([one.ok, other.ok].sort()).toEqual([false, true]);
+    expect(held.decision).toMatchObject({ outcome: 'approve', decidedBy: 'user' });
+    expect(locksOf(w)).toEqual([expect.objectContaining({ holderSessionId: b, writing: 1 })]);
+    w.codex.get(b)!.emit({
+      type: 'item.updated',
+      item: { id: held.request.itemId!, sessionId: b, turnId: held.request.turnId!, kind: 'fileChange', changes: [{ path: FILE, change: 'update' }], state: 'applied', startedAt: AT, endedAt: AT } as SessionItem,
+    } as never);
+    turnEnd(w, b);
+    await settle();
+    expect(locksOf(w)).toEqual([]);
+  });
+
+  it('P1-2 a write held while its link changed is decided by the policy again, for the file it now names', async () => {
+    const { w, a, b } = await two();
+    // E:\work\project\link points at E:\real\project\old, later at E:\real\project\new.
+    let target = 'old';
+    w.realPath = (p) => {
+      const linked = p.replace(/^E:\\work\\project\\link/i, `E:\\real\\project\\${target}`);
+      return linked.startsWith('E:\\work') ? linked.replace('E:\\work', 'E:\\real') : linked.startsWith('E:\\real') ? linked : null;
+    };
+    codexWrite(w, a, 'E:\\work\\project\\old\\a.txt');
+    await settle();
+    const asked = w.contexts.length;
+    const held = codexWrite(w, b, 'E:\\work\\project\\link\\a.txt');
+    await settle();
+    expect(held.holdState).toMatchObject({ reason: 'file-lock', lockPath: 'e:\\real\\project\\old\\a.txt' });
+    target = 'new';
+    turnEnd(w, a);
+    await settle();
+    // Decided again: the policy was asked a second time, and the lock is on the file the link names now.
+    expect(w.contexts.length).toBe(asked + 2);
+    expect(held.decision).toMatchObject({ outcome: 'approve', decidedBy: 'policy' });
+    expect(locksOf(w)).toEqual([expect.objectContaining({ path: 'e:\\real\\project\\new\\a.txt', holderSessionId: b })]);
+  });
+});

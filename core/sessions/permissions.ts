@@ -66,8 +66,13 @@ export interface PermissionGateOptions {
 export type RespondResult = 'answered' | 'not-found' | 'not-open' | 'gone';
 
 export class PermissionGate {
-  /** Held requests by their escalation, until the user answers or the runtime withdraws them. */
-  private readonly held = new Map<EscalationId, PermissionHandle>();
+  /**
+   * Held requests by their escalation, until the user answers or the runtime withdraws them, with the lock
+   * keys their decision was made for (same-folder writes; T033 r1 P1-2).
+   */
+  private readonly held = new Map<EscalationId, { handle: PermissionHandle; decidedFor?: string[] | undefined }>();
+  /** Escalations an answer is being given for: a second answer meanwhile finds nothing to answer (T033 r1 P1-3). */
+  private readonly answering = new Set<EscalationId>();
 
   constructor(private readonly options: PermissionGateOptions) {}
 
@@ -92,11 +97,24 @@ export class PermissionGate {
       handle.answer(this.policyDecision('decline', locked));
       return;
     }
+    await this.decide(handle, session);
+  }
+
+  /**
+   * The policy's decision and what follows it. Run again when the locks find that a write's files resolve
+   * elsewhere than when it was decided (`recheck`, a junction changed while it waited): the old decision
+   * is not reused (T033 r1 P1-2).
+   */
+  private async decide(handle: PermissionHandle, session: LogicalSession): Promise<void> {
+    const { request } = handle;
+    // The files the decision is for, resolved at the same moment as the policy's view of them.
+    const decidedFor = this.options.locks?.pathsOf(request, session);
     const decision: PolicyDecision = this.options.policy.evaluate(request, this.context(session));
     if (decision.action === 'approve') {
       if (this.declinedForClosing(handle)) return;
       // The policy's approval stands; the lock may only make it wait or refuse it (R-07).
-      const step = await this.approve(handle, this.policyDecision('approve'), session);
+      const step = await this.approve(handle, this.policyDecision('approve'), session, decidedFor);
+      if (step === 'recheck') return this.decide(handle, session);
       if (step === 'approved' && (request.kind === 'command' || request.kind === 'fileChange')) {
         this.options.written.add(session.id, request.paths, request.cwd ?? session.cwd);
       }
@@ -122,7 +140,7 @@ export class PermissionGate {
       await this.close(escalation, 'resolved');
       return;
     }
-    this.held.set(escalation.id, handle);
+    this.held.set(escalation.id, { handle, decidedFor });
     if (!handle.hold({ reason: 'awaiting-user', escalationId: escalation.id }, { matchedRule: decision.rule })) {
       // Withdrawn while the escalation was being written: nothing is left to decide.
       this.held.delete(escalation.id);
@@ -142,7 +160,22 @@ export class PermissionGate {
     },
   ): Promise<RespondResult> {
     if (escalation.state !== 'open') return 'not-open';
-    const handle = this.held.get(escalation.id);
+    // One answer per escalation, decided synchronously: a second one while this one awaits is refused.
+    if (this.answering.has(escalation.id)) return 'not-open';
+    this.answering.add(escalation.id);
+    try {
+      return await this.answerEscalation(escalation, input);
+    } finally {
+      this.answering.delete(escalation.id);
+    }
+  }
+
+  private async answerEscalation(
+    escalation: Escalation,
+    input: { decision: 'approve' | 'decline'; note?: string | undefined; content?: PermissionDecision['content'] },
+  ): Promise<RespondResult> {
+    const entry = this.held.get(escalation.id);
+    const handle = entry?.handle;
     if (handle !== undefined && this.declinedForClosing(handle)) {
       this.held.delete(escalation.id);
       await this.close(escalation, 'resolved');
@@ -164,7 +197,7 @@ export class PermissionGate {
     }
     // The user's approval goes through the locks like the policy's (R-07): a held write is answered later.
     let step: LockStep | Promise<LockStep> = 'gone';
-    if (handle !== undefined && input.decision === 'approve' && session !== undefined) step = this.approve(handle, decision, session);
+    if (handle !== undefined && input.decision === 'approve' && session !== undefined) step = this.approve(handle, decision, session, entry?.decidedFor);
     else if (handle?.answer(decision) === true) step = input.decision === 'approve' ? 'approved' : 'refused';
     this.held.delete(escalation.id);
     if (step === 'gone') {
@@ -174,17 +207,23 @@ export class PermissionGate {
     }
     const { request } = handle!;
     const written = () => this.options.written.add(request.sessionId, request.paths, request.cwd ?? session?.cwd ?? '');
-    if (input.decision === 'approve' && (request.kind === 'command' || request.kind === 'fileChange')) {
-      if (step === 'approved') written();
-      else if (step !== 'refused') void step.then((s) => s === 'approved' && written());
-    }
+    // Its files resolve elsewhere than when the user was asked: decided again from the policy, which may ask
+    // the user again (T033 r1 P1-2). A failure there declines it (fail closed).
+    const again = () =>
+      void this.decide(handle!, session!).catch(() => handle!.answer(this.policyDecision('decline', 'the permission check failed')));
+    const follow = (s: LockStep) => {
+      if (s === 'recheck') again();
+      else if (s === 'approved' && (request.kind === 'command' || request.kind === 'fileChange')) written();
+    };
+    if (typeof step === 'string') follow(step);
+    else void step.then(follow);
     await this.close(escalation, input.decision === 'approve' ? 'approved' : 'declined');
     return 'answered';
   }
 
   /** A request the runtime withdrew: its open escalation is closed by the system. */
   async withdrawn(request: PermissionRequest): Promise<void> {
-    for (const [id, handle] of this.held) {
+    for (const [id, { handle }] of this.held) {
       if (handle.request.id !== request.id || handle.request.sessionId !== request.sessionId) continue;
       this.held.delete(id);
       const escalation = await this.options.repositories.escalations.get(id);
@@ -222,14 +261,14 @@ export class PermissionGate {
   }
 
   /** Answers an approval, through the locks when there are any. */
-  private approve(handle: PermissionHandle, decision: PermissionDecision, session: LogicalSession): LockStep | Promise<LockStep> {
-    if (this.options.locks !== undefined) return this.options.locks.approve(handle, decision, session);
+  private approve(handle: PermissionHandle, decision: PermissionDecision, session: LogicalSession, decidedFor?: string[]): LockStep | Promise<LockStep> {
+    if (this.options.locks !== undefined) return this.options.locks.approve(handle, decision, session, decidedFor);
     return handle.answer(decision) ? 'approved' : 'gone';
   }
 
   /** Held requests of a session, e.g. to show them on exit. */
   heldFor(sessionId: SessionId): PermissionRequest[] {
-    return [...this.held.values()].filter((h) => h.request.sessionId === sessionId).map((h) => h.request);
+    return [...this.held.values()].filter(({ handle }) => handle.request.sessionId === sessionId).map(({ handle }) => handle.request);
   }
 
   private async close(escalation: Escalation, state: 'approved' | 'declined' | 'resolved'): Promise<void> {

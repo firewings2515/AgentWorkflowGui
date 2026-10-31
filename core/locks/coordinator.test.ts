@@ -104,7 +104,9 @@ const bgCommand = (sessionId: SessionId, id: string, state: 'running' | 'complet
   item: { id, sessionId, kind: 'command', command: 'sleep 9', cwd: ROOT, background: true, state, output: '', outputTruncated: false, startedAt: AT, ...(state !== 'running' && { endedAt: AT }) } as SessionItem,
 });
 
-const setup = (o: { holdMs?: number } = {}) => {
+const setup = (o: { holdMs?: number; announce?: boolean } = {}) => {
+  // Links: a path resolves through this map (prefix → real prefix), changeable while a write waits.
+  const links = new Map<string, string>();
   const clock = new ManualClock(AT);
   const files = new Map<string, FileState>([
     [fk(F), h(1)],
@@ -116,7 +118,10 @@ const setup = (o: { holdMs?: number } = {}) => {
     now: clock.now,
     setTimer: clock.setTimer,
     hashFile: (path) => files.get(fk(path)) ?? 'missing',
-    resolveRealPath: (p) => p,
+    resolveRealPath: (p) => {
+      for (const [from, to] of links) if (p.toLowerCase().startsWith(from.toLowerCase())) return to + p.slice(from.length);
+      return p;
+    },
     escalate: (e) => {
       escalations.push(e);
       return Promise.resolve(`esc-${String(escalations.length)}` as never);
@@ -124,10 +129,17 @@ const setup = (o: { holdMs?: number } = {}) => {
     publish: (l) => published.push(l),
     ...(o.holdMs !== undefined && { holdMs: o.holdMs }),
   });
+  // Codex announces a change's files with item/started before it asks (SP-06 W2): the tests ask the same way.
+  const approveAsCodex = locks.approve.bind(locks);
+  locks.approve = (hd, decision, s, decidedFor) => {
+    const r = hd.request;
+    if (o.announce !== false && r.kind === 'fileChange' && r.tool === undefined && r.paths.length > 0) locks.observe(fileItem(r, 'proposed'));
+    return approveAsCodex(hd, decision, s, decidedFor);
+  };
   locks.track(session(A));
   locks.track(session(B));
   const lockOf = (path: string) => locks.list().find((l) => l.path === fk(path));
-  return { clock, files, escalations, published, locks, lockOf };
+  return { clock, files, escalations, published, locks, lockOf, links };
 };
 
 const flush = async () => {
@@ -314,7 +326,7 @@ describe('Codex writes (held approval, SP-06 W3)', () => {
   });
 
   it('locks the files the item announced, not the grant root of the request', () => {
-    const { locks, lockOf } = setup();
+    const { locks, lockOf } = setup({ announce: false });
     const req = { ...write(B, [F]), paths: [F, ROOT] };
     locks.observe(fileItem(write(B, [F], { itemId: req.itemId! }), 'proposed'));
     void locks.approve(handle(req), approve, session(B));
@@ -323,7 +335,7 @@ describe('Codex writes (held approval, SP-06 W3)', () => {
   });
 
   it('refuses a change whose files are not known (fail closed)', () => {
-    const { locks } = setup();
+    const { locks } = setup({ announce: false });
     const hd = handle({ ...write(B, []), paths: [] });
     expect(locks.approve(hd, approve, session(B))).toBe('refused');
   });
@@ -504,7 +516,9 @@ describe('unlocked writes: what git ignores, and the at-work scope', () => {
     expect(escalations).toEqual([]);
     const OUT = 'E:\\work\\out\\main.js';
     files.set(fk(OUT), h(1));
-    void locks.approve(handle(write(A, [OUT])), approve, session(A));
+    const outWrite = write(A, [OUT]);
+    locks.observe(fileItem(outWrite, 'proposed'));
+    void locks.approve(handle(outWrite), approve, session(A));
     locks.observe(fileItem(write(A, [OUT], { itemId: 'none' }), 'failed'));
     // A's write never reported its end; it ends with the turn, then background work keeps the lock.
     locks.observe(bgCommand(A, 'bg-9', 'running'));
@@ -525,5 +539,162 @@ describe('unlocked writes: what git ignores, and the at-work scope', () => {
     locks.fileChanged(A, F);
     await flush();
     expect(escalations.map((e) => e.path)).toEqual([fk(G)]);
+  });
+});
+
+// Review r1 (Astra): one regression test per finding, built from the reviewer's repro.
+describe('review r1', () => {
+  it('P1-1 a Codex request with only its grant root and no item is refused, and no folder is locked', () => {
+    const { locks, lockOf } = setup({ announce: false });
+    void locks.approve(handle(write(A, ['E:\\work\\a.txt'], { claude: true })), approve, session(A));
+    const hd = handle({ ...write(B, []), paths: [ROOT] });
+    expect(locks.approve(hd, approve, session(B))).toBe('refused');
+    expect(hd.answers[0]!.reason).toContain('files of this change are not known');
+    expect(lockOf(ROOT)).toBeUndefined();
+    expect(locks.list().map((l) => l.path)).toEqual(['e:\\work\\a.txt']);
+  });
+
+  it('P1-2 a held write whose link changed while it waited is decided again, not let through on the old file', async () => {
+    const { locks, links, lockOf } = setup();
+    links.set('E:\\work\\link', 'E:\\work\\old');
+    void locks.approve(handle(write(A, ['E:\\work\\old\\a.txt'], { claude: true })), approve, session(A));
+    const req = write(B, ['E:\\work\\link\\a.txt']);
+    locks.observe(fileItem(req, 'proposed'));
+    const decidedFor = locks.pathsOf(req, session(B));
+    expect(decidedFor).toEqual(['e:\\work\\old\\a.txt']);
+    const hd = handle(req);
+    const step = locks.approve(hd, approve, session(B), decidedFor);
+    expect(hd.holds).toHaveLength(1);
+    links.set('E:\\work\\link', 'E:\\work\\new');
+    locks.stopped(A);
+    expect(await step).toBe('recheck');
+    expect(hd.answers).toEqual([]);
+    expect(lockOf('E:\\work\\old\\a.txt')).toBeUndefined();
+    expect(lockOf('E:\\work\\new\\a.txt')).toBeUndefined();
+    // The same before any wait: a decision made for other files is not used.
+    expect(locks.approve(handle(req), approve, session(B), decidedFor)).toBe('recheck');
+  });
+
+  it('P1-3 a second approval of an answered request neither replaces nor removes its write', () => {
+    const { locks, lockOf } = setup();
+    const req = write(B, [F]);
+    const first = handle(req);
+    expect(locks.approve(first, approve, session(B))).toBe('approved');
+    // The same request again (e.g. a second escalation.respond) with a handle that can no longer answer.
+    const again = handle(req);
+    again.open = false;
+    expect(locks.approve(again, approve, session(B))).toBe('gone');
+    expect(lockOf(F)!.writing).toBe(1);
+    locks.observe(fileItem(req, 'applied'));
+    locks.observe(turnEnd(B, TB));
+    expect(lockOf(F)).toBeUndefined();
+  });
+
+  it('P1-4 a git-ignore check that throws never escapes the watcher path', () => {
+    const clock = new ManualClock(AT);
+    const locks = new LockCoordinator({
+      now: clock.now,
+      setTimer: clock.setTimer,
+      hashFile: () => h(1),
+      resolveRealPath: (p) => p,
+      escalate: () => Promise.resolve(undefined),
+      publish: () => undefined,
+      isIgnored: () => {
+        throw new SyntaxError('Range out of order in character class');
+      },
+    });
+    locks.track(session(A));
+    locks.observe(turnRun(A, T1));
+    expect(() => locks.fileChanged(A, F)).not.toThrow();
+  });
+
+  it('P1-5 a Codex hold ends at its own limit even when the session already waits longer for the file', async () => {
+    const { clock, locks, escalations } = setup({ holdMs: 1000 });
+    void locks.approve(handle(write(A, [F])), approve, session(A));
+    const longWait = locks.waitForFile({ path: F, timeoutMs: 600_000 }, B);
+    const hd = handle(write(B, [F]));
+    const step = locks.approve(hd, approve, session(B));
+    clock.advance(1001);
+    expect(await step).toBe('refused');
+    await flush();
+    expect(escalations).toEqual([expect.objectContaining({ kind: 'lock-timeout', sessionId: B })]);
+    let settled = false;
+    void longWait.then(() => (settled = true));
+    await flush();
+    expect(settled).toBe(false);
+  });
+
+  it('P1-6 a failed tool that changed one of its files ends that file as written, the other as not', async () => {
+    const { locks, files, lockOf, escalations } = setup();
+    locks.observe(turnRun(B, TB));
+    const req = write(B, [F, G]);
+    void locks.approve(handle(req), approve, session(B));
+    files.set(fk(F), h(5));
+    locks.observe(fileItem(req, 'failed'));
+    expect(lockOf(F)!.lastWrite).toEqual({ kind: 'written', hash: h(5) });
+    expect(lockOf(G)!.lastWrite).toBeUndefined();
+    // Its own change, seen by the watcher: not an unlocked write.
+    locks.fileChanged(B, F);
+    await flush();
+    expect(escalations).toEqual([]);
+  });
+
+  it('P1-7 a watcher event through an alias is the locked file itself', async () => {
+    const { locks, files, links, lockOf, escalations } = setup();
+    links.set('E:\\work\\alias', 'E:\\work\\real');
+    const REAL = 'E:\\work\\real\\a.txt';
+    files.set(fk(REAL), h(1));
+    locks.observe(turnRun(A, T1));
+    void locks.approve(handle(write(A, ['E:\\work\\alias\\a.txt'], { claude: true })), approve, session(A));
+    expect(lockOf(REAL)).toMatchObject({ writing: 1 });
+    files.set(fk(REAL), h(2));
+    locks.fileChanged(A, 'E:\\work\\alias\\a.txt');
+    locks.fileChanged(A, REAL);
+    await flush();
+    expect(escalations).toEqual([]);
+  });
+
+  it('P1-8 a file read small and grown past the hash limit still locks, without a read check', () => {
+    const { locks, files, lockOf } = setup();
+    void locks.approve(handle(read(A, F, 'read-big')), approve, session(A));
+    locks.observe({ type: 'item.updated', item: { id: 'read-big', sessionId: A, turnId: T1, kind: 'toolCall', tool: 'Read', summary: 'Read', state: 'completed', startedAt: AT, endedAt: AT } as SessionItem });
+    files.set(fk(F), 'unreadable');
+    const hd = handle(write(A, [F], { claude: true }));
+    expect(locks.approve(hd, approve, session(A))).toBe('approved');
+    expect(lockOf(F)).toMatchObject({ holderSessionId: A, writing: 1 });
+  });
+
+  it('P1-10 a deleted folder is no unlocked write; a deleted file seen as a file is', async () => {
+    const { locks, files, escalations } = setup();
+    locks.observe(turnRun(A, T1));
+    const DIR = 'E:\\work\\newdir';
+    files.set(fk(DIR), 'directory');
+    locks.fileChanged(A, DIR);
+    files.delete(fk(DIR));
+    locks.fileChanged(A, DIR);
+    // Never seen: what was there is unknown, so it is not escalated.
+    locks.fileChanged(A, 'E:\\work\\unknown.txt');
+    // A folder known as the parent of a changed path, deleted with its file.
+    files.set(fk('E:\\work\\d2\\x.txt'), h(1));
+    locks.fileChanged(A, 'E:\\work\\d2\\x.txt');
+    await flush();
+    const before = escalations.length;
+    files.delete(fk('E:\\work\\d2\\x.txt'));
+    locks.fileChanged(A, 'E:\\work\\d2');
+    await flush();
+    expect(escalations.length).toBe(before);
+    expect(escalations.map((e) => e.path)).not.toContain(fk(DIR));
+    expect(escalations.map((e) => e.path)).not.toContain(fk('E:\\work\\unknown.txt'));
+    // A file seen before, then deleted by a shell: escalated.
+    const SEEN = 'E:\\work\\seen.txt';
+    files.set(fk(SEEN), h(3));
+    locks.fileChanged(A, SEEN);
+    await flush();
+    const n = escalations.filter((e) => e.path === fk(SEEN)).length;
+    locks.escalationClosed(`esc-${String(escalations.length)}` as never);
+    files.delete(fk(SEEN));
+    locks.fileChanged(A, SEEN);
+    await flush();
+    expect(escalations.filter((e) => e.path === fk(SEEN)).length).toBe(n + 1);
   });
 });

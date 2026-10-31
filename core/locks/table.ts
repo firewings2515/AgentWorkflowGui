@@ -16,11 +16,20 @@ export interface LockTableOptions {
   log?(message: string): void;
 }
 
-/** One session's wait for one path; a second wait of the same session joins it (waiters are distinct). */
-interface Wait {
+/** One call of `wait`: its own deadline and timer (T033 r1 P1-5). */
+interface Listener {
   waiter: LockWaiter;
-  listeners: ((result: WaitResult) => void)[];
+  resolve: (result: WaitResult) => void;
   cancelTimer: () => void;
+}
+
+/**
+ * One session's waits for one path. A second wait of the same session joins it, so `waiters` stays
+ * distinct, but keeps its own deadline: each call ends at its own deadline at the latest.
+ */
+interface Wait {
+  sessionId: SessionId;
+  listeners: Listener[];
 }
 
 interface Entry {
@@ -111,29 +120,35 @@ export class MemoryLockTable implements FileLockTable {
     const remaining = Date.parse(waiter.deadline) - Date.parse(this.options.now());
     if (!(remaining > 0)) return Promise.resolve({ status: 'timeout' });
     return new Promise<WaitResult>((resolve) => {
-      const joined = lock.waits.find((w) => w.waiter.sessionId === waiter.sessionId);
-      if (joined !== undefined) {
-        joined.listeners.push(resolve);
-        return;
+      let wait = lock.waits.find((w) => w.sessionId === waiter.sessionId);
+      if (wait === undefined) {
+        wait = { sessionId: waiter.sessionId, listeners: [] };
+        lock.waits.push(wait);
       }
-      const wait: Wait = { waiter, listeners: [resolve], cancelTimer: () => undefined };
-      lock.waits.push(wait);
-      wait.cancelTimer = this.options.setTimer(remaining, () => {
-        this.endWait(path, wait, { status: 'timeout' });
+      const joined = wait;
+      const listener: Listener = { waiter, resolve, cancelTimer: () => undefined };
+      joined.listeners.push(listener);
+      listener.cancelTimer = this.options.setTimer(remaining, () => {
+        this.endListener(path, joined, listener, { status: 'timeout' });
         this.changed();
       });
       this.changed();
     });
   }
 
-  /** Ends the session's waits (for `path`, or all) as `cancelled`: its request went, or its call was aborted. */
-  cancelWait(sessionId: SessionId, path?: string): void {
+  /**
+   * Ends the session's waits as `cancelled` (its request went, its call was aborted, it stopped): for
+   * `path`, or all; only the call that passed `waiter` when it is given.
+   */
+  cancelWait(sessionId: SessionId, path?: string, waiter?: LockWaiter): void {
     let any = false;
-    for (const lock of this.locks.values()) {
+    for (const lock of [...this.locks.values()]) {
       if (path !== undefined && lock.path !== path) continue;
-      for (const wait of lock.waits.filter((w) => w.waiter.sessionId === sessionId)) {
-        this.endWait(lock.path, wait, { status: 'cancelled' });
-        any = true;
+      for (const wait of lock.waits.filter((w) => w.sessionId === sessionId)) {
+        for (const listener of wait.listeners.filter((l) => waiter === undefined || l.waiter === waiter)) {
+          this.endListener(lock.path, wait, listener, { status: 'cancelled' });
+          any = true;
+        }
       }
     }
     if (any) this.changed();
@@ -170,7 +185,7 @@ export class MemoryLockTable implements FileLockTable {
   releaseAll(sessionId: SessionId, reason: ReleaseReason): void {
     let held = 0;
     for (const lock of [...this.locks.values()]) {
-      for (const wait of lock.waits.filter((w) => w.waiter.sessionId === sessionId)) this.endWait(lock.path, wait, { status: 'cancelled' });
+      for (const wait of lock.waits.filter((w) => w.sessionId === sessionId)) this.endWait(lock.path, wait, { status: 'cancelled' });
       if (lock.holderSessionId !== sessionId) continue;
       // Its writes in progress end as failed: nothing more of them is expected.
       lock.writing = 0;
@@ -253,12 +268,22 @@ export class MemoryLockTable implements FileLockTable {
     for (const wait of [...lock.waits]) this.endWait(lock.path, wait, { status: 'free' }, lock);
   }
 
+  /** Ends every call of a session's wait. */
   private endWait(path: string, wait: Wait, result: WaitResult, from?: Entry): void {
+    for (const listener of [...wait.listeners]) this.endListener(path, wait, listener, result, from);
     const lock = from ?? this.locks.get(path);
     if (lock !== undefined) lock.waits = lock.waits.filter((w) => w !== wait);
-    wait.cancelTimer();
-    for (const listener of wait.listeners) listener(result);
-    wait.listeners = [];
+  }
+
+  /** Ends one call; the session's wait goes with its last call. */
+  private endListener(path: string, wait: Wait, listener: Listener, result: WaitResult, from?: Entry): void {
+    if (!wait.listeners.includes(listener)) return;
+    wait.listeners = wait.listeners.filter((l) => l !== listener);
+    listener.cancelTimer();
+    listener.resolve(result);
+    if (wait.listeners.length > 0) return;
+    const lock = from ?? this.locks.get(path);
+    if (lock !== undefined) lock.waits = lock.waits.filter((w) => w !== wait);
   }
 
   /**
@@ -268,7 +293,7 @@ export class MemoryLockTable implements FileLockTable {
   private cycleThrough(waiter: SessionId, holder: SessionId): SessionId[] | undefined {
     const waitsFor = new Map<SessionId, SessionId[]>();
     for (const lock of this.locks.values()) {
-      for (const w of lock.waits) waitsFor.set(w.waiter.sessionId, [...(waitsFor.get(w.waiter.sessionId) ?? []), lock.holderSessionId]);
+      for (const w of lock.waits) waitsFor.set(w.sessionId, [...(waitsFor.get(w.sessionId) ?? []), lock.holderSessionId]);
     }
     const seen = new Set<SessionId>();
     // `trail`: the sessions from `holder` to `at`; the cycle is the waiter followed by the trail.
@@ -305,5 +330,6 @@ const view = (lock: Entry): FileLock => ({
   waitingForBackground: lock.waitingForBackground,
   writing: lock.writing,
   ...(lock.lastWrite !== undefined && { lastWrite: lock.lastWrite }),
-  waiters: lock.waits.map((w) => w.waiter),
+  // One per session (contracts): the call that ends first, so the shown deadline is the one that comes first.
+  waiters: lock.waits.map((w) => [...w.listeners].sort((a, b) => Date.parse(a.waiter.deadline) - Date.parse(b.waiter.deadline))[0]!.waiter),
 });

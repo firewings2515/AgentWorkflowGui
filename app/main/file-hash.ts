@@ -13,22 +13,24 @@ const MISSING = new Set(['ENOENT', 'ENOTDIR']);
 export const MAX_HASHED_BYTES = 16 * 1024 * 1024;
 
 export interface HashFs {
-  size(path: string): { size: number; isFile: boolean };
+  size(path: string): { size: number; isFile: boolean; isDirectory?: boolean };
   read(path: string): Buffer;
 }
 
 const nodeFs: HashFs = {
   size: (path) => {
     const s = statSync(path);
-    return { size: s.size, isFile: s.isFile() };
+    return { size: s.size, isFile: s.isFile(), isDirectory: s.isDirectory() };
   },
   read: (path) => readFileSync(path),
 };
 
 export const hashFile = (path: string, fs: HashFs = nodeFs, max = MAX_HASHED_BYTES): FileState => {
   try {
-    const { size, isFile } = fs.size(path);
-    // A folder, or too large to read on the main process.
+    const { size, isFile, isDirectory } = fs.size(path);
+    // A folder is told apart: its deletion later is nobody's write on a file (T033 r1 P1-10).
+    if (isDirectory === true) return 'directory';
+    // Not a plain file, or too large to read on the main process.
     if (!isFile || size > max) return 'unreadable';
     return `sha256:${createHash('sha256').update(fs.read(path)).digest('hex')}`;
   } catch (error) {

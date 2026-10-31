@@ -3,9 +3,11 @@
 // each folder's `.gitignore` (and the repository's `.git\info\exclude`) is read once and kept until the
 // watcher reports a change of it; no `git check-ignore` is run.
 //
-// Supported: the `.gitignore` files from the repository root down to the file's folder and `info/exclude`,
-// with comments, `!` negation, leading / middle `/` anchoring, trailing `/` for folders, `*`, `?`, `**` and
-// `[...]`, case-insensitive like git on Windows. Not read: the global excludes file (`core.excludesFile`).
+// Supported: the `.gitignore` files from the repository root down to the file's folder and `info/exclude`
+// (of the common git dir in a linked worktree, whose `.git` is a `gitdir:` file), with comments, `!`
+// negation, leading / middle `/` anchoring, trailing `/` for folders, `*`, `?`, `**` and `[...]`,
+// case-insensitive like git on Windows. A pattern that cannot be read (e.g. `[z-a]`) is left out, never
+// thrown. Not read: the global excludes file (`core.excludesFile`; main session's ruling, a known limit).
 import { readFileSync, statSync } from 'node:fs';
 import { win32 } from 'node:path';
 
@@ -42,7 +44,8 @@ const globSource = (glob: string): string => {
   return out;
 };
 
-export const parseGitignore = (text: string): Rule[] => {
+/** `onBad`: called once per pattern that cannot be compiled; that pattern is left out (T033 r1 P1-4). */
+export const parseGitignore = (text: string, onBad?: () => void): Rule[] => {
   const rules: Rule[] = [];
   for (const raw of text.split(/\r?\n/)) {
     let line = raw.replace(/(?<!\\)\s+$/, '');
@@ -55,8 +58,12 @@ export const parseGitignore = (text: string): Rule[] => {
     // A slash at the start or in the middle anchors the pattern to the .gitignore's folder.
     const anchored = line.includes('/');
     if (line.startsWith('/')) line = line.slice(1);
-    const source = globSource(line);
-    rules.push({ negate, dirOnly, regex: new RegExp(anchored ? `^${source}$` : `(?:^|/)${source}$`, 'i') });
+    try {
+      const source = globSource(line);
+      rules.push({ negate, dirOnly, regex: new RegExp(anchored ? `^${source}$` : `(?:^|/)${source}$`, 'i') });
+    } catch {
+      onBad?.();
+    }
   }
   return rules;
 };
@@ -92,10 +99,21 @@ export class GitIgnoreRules {
         return false;
       }
     },
+    private readonly log: (message: string) => void = () => undefined,
   ) {}
 
-  /** Whether git ignores the file `path` (absolute): the file, or a folder above it inside its repository. */
+  /** Never throws (it runs on every watcher event): anything unexpected ignores nothing. */
   isIgnored(path: string): boolean {
+    try {
+      return this.check(path);
+    } catch (error) {
+      this.log(`[locks] the git ignore rules could not be read (${error instanceof Error ? error.name : 'non-error thrown'}); nothing is ignored`);
+      return false;
+    }
+  }
+
+  /** Whether git ignores the file `path` (absolute): the file, or a folder above it inside its repository. */
+  private check(path: string): boolean {
     const file = key(path);
     const root = this.repoRoot(win32.dirname(file));
     if (root === null || file === root) return false;
@@ -112,7 +130,10 @@ export class GitIgnoreRules {
   changed(path: string): void {
     const file = key(path);
     if (win32.basename(file) === '.gitignore') this.folders.delete(win32.dirname(file));
-    if (file.endsWith('\\.git\\info\\exclude')) this.folders.delete(`${file}#exclude`);
+    // Any info/exclude (the repository's own, or a linked worktree's common git dir), and a .git file.
+    if (file.endsWith('\\info\\exclude') || win32.basename(file) === '.git' || win32.basename(file) === 'commondir') {
+      for (const k of [...this.folders.keys()]) if (k.endsWith('#exclude')) this.folders.delete(k);
+    }
     // A repository made or removed below a folder changes where roots are.
     if (win32.basename(file) === '.git') this.roots.clear();
   }
@@ -131,20 +152,39 @@ export class GitIgnoreRules {
   private rulesOf(folder: string): Rule[] {
     let rules = this.folders.get(folder);
     if (rules === undefined) {
-      rules = parseGitignore(this.read(`${folder}\\.gitignore`) ?? '');
+      rules = parseGitignore(this.read(`${folder}\\.gitignore`) ?? '', () => this.bad(`${folder}\\.gitignore`));
       this.folders.set(folder, rules);
     }
     return rules;
   }
 
   private excludeOf(root: string): Rule[] {
-    const cacheKey = `${root}\\.git\\info\\exclude#exclude`;
+    const cacheKey = `${root}#exclude`;
     let rules = this.folders.get(cacheKey);
     if (rules === undefined) {
-      rules = parseGitignore(this.read(`${root}\\.git\\info\\exclude`) ?? '');
+      const file = `${this.commonGitDir(root)}\\info\\exclude`;
+      rules = parseGitignore(this.read(file) ?? '', () => this.bad(file));
       this.folders.set(cacheKey, rules);
     }
     return rules;
+  }
+
+  /**
+   * The git dir whose `info/exclude` applies: `<root>\.git`, or in a linked worktree (`.git` is a file
+   * `gitdir: <dir>`) that dir's `commondir`, the main repository's git dir (T033 r1 P1-9).
+   */
+  private commonGitDir(root: string): string {
+    const own = `${root}\\.git`;
+    const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(this.read(own) ?? '')?.[1];
+    if (pointer === undefined) return own;
+    const gitDir = win32.resolve(root, pointer);
+    const common = this.read(`${gitDir}\\commondir`)?.trim();
+    return common === undefined || common === '' ? gitDir : win32.resolve(gitDir, common);
+  }
+
+  /** A pattern left out: said once per file until it is read again. */
+  private bad(file: string): void {
+    this.log(`[locks] a pattern in ${win32.basename(file)} cannot be read and is left out`);
   }
 
   private repoRoot(folder: string): string | null {

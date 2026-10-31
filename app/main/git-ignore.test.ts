@@ -68,3 +68,49 @@ describe('GitIgnoreRules', () => {
     expect(parseGitignore('\\#notcomment')[0]!.regex.test('#notcomment')).toBe(true);
   });
 });
+
+describe('review r1', () => {
+  it('P1-4 a pattern that cannot be compiled ([z-a]) is left out with one warning, never thrown', () => {
+    let bad = 0;
+    expect(() => parseGitignore('[z-a]\n*.log\n', () => bad++)).not.toThrow();
+    expect(bad).toBe(1);
+    const logs: string[] = [];
+    const ignore = new GitIgnoreRules(
+      (path) => (path.toLowerCase() === 'e:\\work\\.gitignore' ? '[z-a]\n*.log\n' : undefined),
+      (folder) => folder.toLowerCase() === REPO,
+      (m) => logs.push(m),
+    );
+    expect(ignore.isIgnored('E:\\work\\z.txt')).toBe(false);
+    expect(ignore.isIgnored('E:\\work\\a.log')).toBe(true);
+    expect(ignore.isIgnored('E:\\work\\b.txt')).toBe(false);
+    // Read once, so said once.
+    expect(logs).toHaveLength(1);
+  });
+
+  it('P1-4 a reader that throws ignores nothing and does not throw', () => {
+    const ignore = new GitIgnoreRules(
+      () => {
+        throw new Error('EACCES');
+      },
+      () => true,
+      () => undefined,
+    );
+    expect(() => ignore.isIgnored('E:\\work\\a.txt')).not.toThrow();
+    expect(ignore.isIgnored('E:\\work\\a.txt')).toBe(false);
+  });
+
+  it("P1-9 a linked worktree uses the common git dir's info/exclude", () => {
+    const files: Record<string, string> = {
+      'e:\\wt\\one\\.git': 'gitdir: E:/main/.git/worktrees/one\n',
+      'e:\\main\\.git\\worktrees\\one\\commondir': '../..\n',
+      'e:\\main\\.git\\info\\exclude': 'scratch/\n',
+    };
+    const ignore = new GitIgnoreRules((path) => files[path.toLowerCase()], (folder) => folder.toLowerCase() === 'e:\\wt\\one');
+    expect(ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt')).toBe(true);
+    expect(ignore.isIgnored('E:\\wt\\one\\src\\x.txt')).toBe(false);
+    // The common exclude changes: read again.
+    files['e:\\main\\.git\\info\\exclude'] = '';
+    ignore.changed('E:\\main\\.git\\info\\exclude');
+    expect(ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt')).toBe(false);
+  });
+});

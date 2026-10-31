@@ -24,9 +24,12 @@ import type { PermissionHandle, RuntimeEvent, WaitResult, WriteOutcome } from '.
 import { foldPath, isIgnoredChange, isInside, lockPath } from './paths';
 import { MemoryLockTable } from './table';
 
-/** A file as `hashFile` finds it: its hash, gone, or not a file that can be read (a folder, no access). */
+/**
+ * A path as `hashFile` finds it: a file's hash, gone, a folder, or a file that cannot be read (no access,
+ * opened exclusively, or above the size limit).
+ */
 // eslint-disable-next-line @typescript-eslint/no-redundant-type-constituents -- a PayloadHash is `sha256:<hex>`, never one of these words
-export type FileState = PayloadHash | 'missing' | 'unreadable';
+export type FileState = PayloadHash | 'missing' | 'directory' | 'unreadable';
 
 export interface LockEscalation {
   kind: 'lock-timeout' | 'unlocked-write';
@@ -79,6 +82,8 @@ interface PendingWrite {
    * (SP-06 W4), and a read check would only refuse its next patch after anyone else's change (V-24 run 1).
    */
   readsSeen: boolean;
+  /** Each file as it was when the write began, to tell what a failed tool actually left (T033 r1 P1-6). */
+  before: Map<string, FileState>;
 }
 
 /** The part of an AbortSignal used here (core's lib has no DOM types). */
@@ -88,8 +93,12 @@ export interface AbortLike {
   removeEventListener(type: 'abort', listener: () => void): void;
 }
 
-/** What a lock step did: approved and answered, refused (answered with a decline), or the request was gone. */
-export type LockStep = 'approved' | 'refused' | 'gone';
+/**
+ * What a lock step did: approved and answered, refused (answered with a decline), the request was gone,
+ * or `recheck`: its files resolve to other files than the ones the decision was made for (a junction or
+ * link changed meanwhile), so nothing was answered and the caller decides again (T033 r1 P1-2).
+ */
+export type LockStep = 'approved' | 'refused' | 'gone' | 'recheck';
 
 const DEFAULT_HOLD_MS = 5 * 60_000;
 const DEFAULT_WAIT_MS = 2 * 60_000;
@@ -97,8 +106,13 @@ const DEFAULT_WAIT_MS = 2 * 60_000;
 /** Claude's PreToolUse requests carry the tool name; Codex requests have none (contracts). */
 const isClaude = (request: PermissionRequest) => request.tool !== undefined;
 const itemKey = (sessionId: SessionId, itemId: string) => `${sessionId}\n${itemId}`;
-const toHash = (state: FileState): PayloadHash | undefined => (state === 'missing' || state === 'unreadable' ? undefined : state);
+const toHash = (state: FileState): PayloadHash | undefined => (state === 'missing' || state === 'directory' || state === 'unreadable' ? undefined : state);
+const samePaths = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((p, i) => p === b[i]);
 const later = (at: Timestamp, ms: number): Timestamp => new Date(Date.parse(at) + ms).toISOString();
+const parentOf = (path: string) => {
+  const cut = path.lastIndexOf('\\');
+  return cut <= 0 ? '' : path.slice(0, cut);
+};
 
 export const isWriteRequest = (request: PermissionRequest): boolean => request.kind === 'fileChange';
 
@@ -106,13 +120,15 @@ export class LockCoordinator {
   readonly table: MemoryLockTable;
   private readonly sessions = new Map<SessionId, Tracked>();
   /** Paths of each file-change item as announced (Codex `item/started`, Claude's tool call). */
-  private readonly itemPaths = new Map<string, string[]>();
+  private readonly itemPaths = new Map<string, { paths: string[]; cwd: string }>();
+  /** Paths seen to be folders (a folder event, or the parent of a changed path): their deletion is nobody's write. */
+  private readonly folders = new Map<string, true>();
   private readonly writes = new Map<string, PendingWrite>();
   /** Claude Reads approved and not finished: the file's hash right before the read. */
   private readonly reads = new Map<string, { path: string; before: FileState }>();
   private readonly background = new Map<SessionId, { commands: Set<string>; tasks: Set<string> }>();
   /** Held Codex approvals waiting for a lock, by request: to cancel when the runtime withdraws one. */
-  private readonly waiting = new Map<string, { sessionId: SessionId; path: string }>();
+  private readonly waiting = new Map<string, { sessionId: SessionId; path: string; waiter: LockWaiter }>();
   /** The last content seen of each path (a write's result or a watcher event), so a repeat is no change. */
   private readonly seen = new Map<string, FileState>();
   /** Open unlocked-write escalations by path: one at a time per file. */
@@ -124,7 +140,7 @@ export class LockCoordinator {
       now: () => options.now(),
       setTimer: (ms, fn) => options.setTimer(ms, fn),
       // Build output, node_modules and the like are nobody's work on a file (main session's G8 ruling).
-      inSameFolderScope: (path) => this.suspects(path).length > 0 && options.isIgnored?.(path) !== true,
+      inSameFolderScope: (path) => this.suspects(path).length > 0 && !this.ignored(path),
       ...(options.log !== undefined && { log: (m: string) => options.log!(m) }),
     });
     this.table.subscribe((locks) => options.publish(locks));
@@ -165,18 +181,30 @@ export class LockCoordinator {
    * who holds it; a Codex one is held until the lock frees, then every file is acquired again (read check
    * included), and refused and escalated past its limit (R-07). Synchronous unless it has to wait.
    */
-  approve(handle: PermissionHandle, decision: PermissionDecision, session: LogicalSession): LockStep | Promise<LockStep> {
+  approve(handle: PermissionHandle, decision: PermissionDecision, session: LogicalSession, decidedFor?: readonly string[]): LockStep | Promise<LockStep> {
     const { request } = handle;
     this.track(session);
     if (!LockCoordinator.sameFolder(session)) return this.answer(handle, decision);
     if (request.kind === 'permissions' && request.tool === 'Read' && request.itemId !== undefined) return this.approveRead(handle, decision, session);
     if (!isWriteRequest(request)) return this.answer(handle, decision);
     const paths = this.writePaths(request, session);
-    if (paths.length === 0) return this.refuse(handle, 'AgentWorkflowGui: the files of this change are not known, so they cannot be locked (same-folder mode)');
+    // No file is known (a Codex request with only its grant root, no item announced): nothing is let
+    // through, and a folder is never taken for a file lock (T033 r1 P1-1).
+    if (paths.length === 0) return this.refuse(handle, 'AgentWorkflowGui: the files of this change are not known, so they cannot be locked (same-folder mode); the change was declined');
+    if (decidedFor !== undefined && !samePaths(paths, decidedFor)) return 'recheck';
     const step = this.tryWrite(handle, decision, session, paths);
     if (step !== 'held') return step;
     if (isClaude(request)) return this.refuse(handle, this.heldMessage(this.blocking(session.id, paths)!));
     return this.holdForLock(handle, decision, session, paths);
+  }
+
+  /**
+   * The lock keys a write request resolves to now, for the decision made at the same moment: `approve`
+   * compares them again before it takes any lock. Undefined when nothing would be locked.
+   */
+  pathsOf(request: PermissionRequest, session: LogicalSession): string[] | undefined {
+    if (!isWriteRequest(request) || !LockCoordinator.sameFolder(session)) return undefined;
+    return this.writePaths(request, session);
   }
 
   /** Every runtime event, synchronously as it arrives and before it is stored (no await in between). */
@@ -195,7 +223,7 @@ export class LockCoordinator {
           if (write.sessionId !== turn.sessionId || write.nativeTaskId !== undefined) continue;
           if (write.turnId !== undefined && write.turnId !== turn.id) continue;
           this.writes.delete(key);
-          for (const path of write.paths) this.table.writeEnded(write.sessionId, path, { kind: 'failed' });
+          for (const path of write.paths) this.ended(write, path, this.leftBy(write, path));
         }
         this.table.turnEnded(turn.sessionId, turn.id);
         return;
@@ -206,7 +234,8 @@ export class LockCoordinator {
         if (item.kind === 'fileChange') {
           const cwd = this.sessions.get(item.sessionId)?.cwd ?? '';
           if (item.state === 'proposed') {
-            this.itemPaths.set(key, [...new Set(item.changes.flatMap((c) => [c.path, ...(c.movePath !== undefined ? [c.movePath] : [])]).map((p) => this.key(p, cwd)))]);
+            // Kept as written: resolved again each time they are used, so a link changed meanwhile counts.
+            this.itemPaths.set(key, { paths: item.changes.flatMap((c) => [c.path, ...(c.movePath !== undefined ? [c.movePath] : [])]), cwd });
             return;
           }
           this.itemPaths.delete(key);
@@ -222,8 +251,9 @@ export class LockCoordinator {
               else if (change.change !== 'delete') outcomes.set(from, this.outcomeNow(from));
             }
           }
-          // A file of the write the item does not name (or a declined / failed item): nothing applied to it.
-          for (const path of write.paths) this.ended(write, path, outcomes.get(path) ?? { kind: 'failed' });
+          // A file the item does not name, or a failed item: what the tool actually left (port: a tool that
+          // failed after writing some files ends each with what it left). A declined one ran nothing.
+          for (const path of write.paths) this.ended(write, path, outcomes.get(path) ?? (item.state === 'declined' ? { kind: 'failed' } : this.leftBy(write, path)));
           return;
         }
         if (item.kind === 'command') {
@@ -258,7 +288,7 @@ export class LockCoordinator {
       case 'permission.updated':
         if (event.request.state === 'withdrawn') {
           const wait = this.waiting.get(event.request.id);
-          if (wait !== undefined) this.table.cancelWait(wait.sessionId, wait.path);
+          if (wait !== undefined) this.table.cancelWait(wait.sessionId, wait.path, wait.waiter);
         }
         return;
       case 'runtime.exited':
@@ -282,7 +312,7 @@ export class LockCoordinator {
   /** The GUI began closing: every wait ends, and its held request is declined. */
   beginClose(): void {
     this.closing = true;
-    for (const wait of [...this.waiting.values()]) this.table.cancelWait(wait.sessionId, wait.path);
+    for (const wait of [...this.waiting.values()]) this.table.cancelWait(wait.sessionId, wait.path, wait.waiter);
   }
 
   /** `wait_for_file` of `sessionId` (R-07): the lock is free, was not there, or the wait timed out and was escalated. */
@@ -293,7 +323,7 @@ export class LockCoordinator {
     const path = this.key(input.path, session.cwd);
     const since = this.options.now();
     const waiter: LockWaiter = { sessionId, via: 'wait_for_file', since, deadline: later(since, input.timeoutMs ?? this.options.waitMs ?? DEFAULT_WAIT_MS) };
-    const abort = () => this.table.cancelWait(sessionId, path);
+    const abort = () => this.table.cancelWait(sessionId, path, waiter);
     signal?.addEventListener('abort', abort, { once: true });
     let result: WaitResult;
     try {
@@ -322,10 +352,34 @@ export class LockCoordinator {
    * while a same-folder session works in that folder. `watcher`: the session whose watch saw it.
    */
   fileChanged(watcher: SessionId, changedPath: string): void {
-    const path = foldPath(changedPath);
+    try {
+      this.checkChange(watcher, changedPath);
+    } catch (error) {
+      // Never out into the watcher (T033 r1 P1-4): a change that cannot be checked is only logged.
+      this.options.log?.(`[locks] a folder change could not be checked (${error instanceof Error ? error.name : 'non-error thrown'})`);
+    }
+  }
+
+  private checkChange(watcher: SessionId, changedPath: string): void {
+    // The same key as acquire, links resolved, so an alias of a locked file is that file (T033 r1 P1-7).
+    const path = this.key(changedPath, '');
     if (isIgnoredChange(path)) return;
     const state = this.options.hashFile(path);
     if (state === 'unreadable') return;
+    if (state === 'directory') {
+      this.rememberFolder(path);
+      return;
+    }
+    // The parent of a changed path is a folder.
+    this.rememberFolder(parentOf(path));
+    const locked = this.table.list().some((l) => l.path === path);
+    // Gone: a folder's deletion is nobody's write on a file; and when what was there is unknown, it is not
+    // escalated (T033 r1 P1-10). A locked path, or one seen as a file, was a file.
+    if (state === 'missing' && !locked && (this.folders.has(path) || toHash(this.seen.get(path) ?? 'missing') === undefined)) {
+      this.folders.delete(path);
+      this.remember(path, state);
+      return;
+    }
     // Several sessions watch one folder, and one write fires several events: only a new content counts.
     if (this.seen.get(path) === state) return;
     this.remember(path, state);
@@ -372,11 +426,17 @@ export class LockCoordinator {
     const at = this.options.now();
     const turnId = request.turnId ?? (request.nativeTaskId === undefined ? this.table.turnOf(session.id) : undefined);
     const started: string[] = [];
+    const before = new Map<string, FileState>();
     const undo = () => {
       for (const path of started) this.table.writeEnded(session.id, path, { kind: 'failed' });
     };
     for (const path of paths) {
-      const result = this.table.acquire({ path, sessionId: session.id, ...(turnId !== undefined && { turnId }), at }, toHash(this.options.hashFile(path)));
+      const state = this.options.hashFile(path);
+      before.set(path, state);
+      // Too large or unreadable: no read check is possible, and an older read no longer holds; it still
+      // locks (T033 r1 P1-8).
+      if (state === 'unreadable' || state === 'directory') this.table.forgetRead(session.id, path);
+      const result = this.table.acquire({ path, sessionId: session.id, ...(turnId !== undefined && { turnId }), at }, toHash(state));
       if (result.status === 'acquired' || result.status === 'held-by-self') {
         started.push(path);
         continue;
@@ -390,12 +450,19 @@ export class LockCoordinator {
       return 'held';
     }
     const key = itemKey(session.id, request.itemId ?? request.id);
+    // Answered once already (e.g. two user approvals of one escalation): its write is the one recorded,
+    // and this one must neither replace nor remove it (T033 r1 P1-3).
+    if (this.writes.has(key)) {
+      undo();
+      return 'gone';
+    }
     this.writes.set(key, {
       sessionId: session.id,
       paths: started,
       ...(turnId !== undefined && { turnId }),
       ...(request.nativeTaskId !== undefined && { nativeTaskId: request.nativeTaskId }),
       readsSeen: isClaude(request),
+      before,
     });
     if (this.answer(handle, decision) === 'approved') return 'approved';
     // The runtime withdrew it meanwhile: nothing will be written.
@@ -416,8 +483,9 @@ export class LockCoordinator {
       } else {
         if (this.closing) return this.refuse(handle, 'the GUI is closing');
         if (!handle.hold({ reason: 'file-lock', until: deadline, lockPath: lock.path })) return 'gone';
-        this.waiting.set(request.id, { sessionId: session.id, path: lock.path });
-        const result = await this.table.wait(lock.path, { sessionId: session.id, via: 'codex-approval', permissionRequestId: request.id, since, deadline });
+        const waiter: LockWaiter = { sessionId: session.id, via: 'codex-approval', permissionRequestId: request.id, since, deadline };
+        this.waiting.set(request.id, { sessionId: session.id, path: lock.path, waiter });
+        const result = await this.table.wait(lock.path, waiter);
         this.waiting.delete(request.id);
         if (this.closing) return this.refuse(handle, 'the GUI is closing');
         if (result.status === 'cancelled') return this.refuse(handle, 'AgentWorkflowGui: the wait for a file lock was cancelled');
@@ -432,6 +500,9 @@ export class LockCoordinator {
         if (step !== 'gone') void this.escalateWait(session.id, lock?.path ?? paths[0]!, lock?.holderSessionId, { status: 'timeout' }, request.id);
         return step;
       }
+      // The files may resolve elsewhere now (a junction changed while it waited): then the decision made
+      // for the old ones does not hold, and the caller decides again (T033 r1 P1-2).
+      if (!samePaths(this.writePaths(request, session), paths)) return 'recheck';
       // Free now: every file is taken again, its read check included, as if the request had just come.
       const step = this.tryWrite(handle, decision, session, paths);
       if (step !== 'held') return step;
@@ -485,11 +556,15 @@ export class LockCoordinator {
     );
   }
 
-  /** The files a write request names, as lock keys: the item's own list when it was announced (not `grantRoot`). */
+  /**
+   * The files a write request names, as lock keys resolved now: Claude's tool input names them; for Codex
+   * only the item `item/started` announced does, never the request's paths, which may be a grant root (a
+   * folder). Empty when no file is known.
+   */
   private writePaths(request: PermissionRequest, session: LogicalSession): string[] {
-    const cwd = request.cwd ?? session.cwd;
+    if (isClaude(request)) return [...new Set(request.paths.map((p) => this.key(p, request.cwd ?? session.cwd)))];
     const announced = request.itemId !== undefined ? this.itemPaths.get(itemKey(session.id, request.itemId)) : undefined;
-    return announced ?? [...new Set(request.paths.map((p) => this.key(p, cwd)))];
+    return announced === undefined ? [] : [...new Set(announced.paths.map((p) => this.key(p, announced.cwd)))];
   }
 
   private key(path: string, cwd: string): string {
@@ -500,8 +575,16 @@ export class LockCoordinator {
     const state = this.options.hashFile(path);
     if (state === 'missing') return { kind: 'deleted' };
     // Applied but unreadable now: nothing to compare later changes with, so it counts as not applied.
-    if (state === 'unreadable') return { kind: 'failed' };
+    if (state === 'unreadable' || state === 'directory') return { kind: 'failed' };
     return { kind: 'written', hash: state };
+  }
+
+  /** What a write that did not report its result left of `path`: nothing when the file is as it was before. */
+  private leftBy(write: PendingWrite, path: string): WriteOutcome {
+    const before = write.before.get(path);
+    const now = this.options.hashFile(path);
+    if (now === before || now === 'unreadable' || now === 'directory') return { kind: 'failed' };
+    return now === 'missing' ? { kind: 'deleted' } : { kind: 'written', hash: now };
   }
 
   private ended(write: PendingWrite, path: string, outcome: WriteOutcome): void {
@@ -510,6 +593,14 @@ export class LockCoordinator {
     this.table.writeEnded(write.sessionId, path, outcome);
     // The table takes the holder's write as its read; only for a session whose reads the GUI sees.
     if (!write.readsSeen) this.table.forgetRead(write.sessionId, path);
+  }
+
+  /** Bounded like `seen`. */
+  private rememberFolder(path: string): void {
+    if (path === '') return;
+    this.folders.delete(path);
+    this.folders.set(path, true);
+    if (this.folders.size > 10_000) this.folders.delete(this.folders.keys().next().value!);
   }
 
   /** Bounded: the oldest paths are forgotten first (a forgotten one only means its next event is checked). */
@@ -526,6 +617,15 @@ export class LockCoordinator {
       this.background.set(sessionId, work);
     }
     return work;
+  }
+
+  /** Whether git ignores the path; a rule that fails to answer ignores nothing. */
+  private ignored(path: string): boolean {
+    try {
+      return this.options.isIgnored?.(path) === true;
+    } catch {
+      return false;
+    }
   }
 
   /** Same-folder sessions at work (`MemoryLockTable.atWork`) whose folder holds `path`. */

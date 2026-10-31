@@ -201,12 +201,17 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   };
   const mcp = await GuiMcpServer.start({ handlers, log: (message) => log(`[mcp] ${message}`) });
   // What git ignores is no unlocked write (T033); its rules are read again when the watcher sees them change.
-  const ignored = new GitIgnoreRules();
+  const ignored = new GitIgnoreRules(undefined, undefined, log);
   const watchers = new WorkspaceWatchers(
     {
       changed: (sessionId, root, path) => {
-        ignored.changed(path);
-        ref.service?.workspaceChanged(sessionId, root, path);
+        // Nothing here may throw into fs.watch's callback (T033 r1 P1-4).
+        try {
+          ignored.changed(path);
+          ref.service?.workspaceChanged(sessionId, root, path);
+        } catch (error) {
+          log(`[watch] a change of ${sessionId} could not be handled (${describe(error)})`);
+        }
       },
       failed: (sessionId, root) => ref.service?.workspaceWatchFailed(sessionId, root),
     },
