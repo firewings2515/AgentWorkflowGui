@@ -194,8 +194,8 @@ describe('handoff (R-04 steps 1-7)', () => {
 
     await w.repositories.sessions.create({ ...(await w.repositories.sessions.get(ROOT))!, id: SessionId.parse('plain'), kind: 'ordinary' } as never);
     expect(await handoff(w, SessionId.parse('plain'), toImpl)).toMatchObject({ status: 'rejected', rejection: { reason: 'not-in-workflow' } });
-    expect(await w.engine.createTasks({ ruleId: 'split', tasks: [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }] }, { caller: ROOT })).toMatchObject({ status: 'rejected', rejection: { reason: 'unsupported' } });
-    expect(await w.engine.createTasks({ ruleId: 'split', tasks: [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }] }, { caller: SessionId.parse('plain') })).toMatchObject({
+    expect(await w.engine.createTasks({ ruleId: 'split', tasks: [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }] }, { caller: ROOT, sourceCallRef: 'call-split' })).toMatchObject({ status: 'rejected', rejection: { reason: 'no-matching-rule' } });
+    expect(await w.engine.createTasks({ ruleId: 'split', tasks: [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }] }, { caller: SessionId.parse('plain'), sourceCallRef: 'call-plain' })).toMatchObject({
       status: 'rejected',
       rejection: { reason: 'not-in-workflow' },
     });

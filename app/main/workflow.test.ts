@@ -188,9 +188,9 @@ describe('the workflow engine in the backend (T024)', () => {
     expect(await call(s, review, 'handoff', { ruleId: 'rework', target: { kind: 'node', nodeId: IMPL }, content: 'Validate the email.' })).toMatchObject({ status: 'accepted' });
     expect(await call(s, impl, 'handoff', { ruleId: 'to-review', target: { kind: 'node', nodeId: REVIEW }, content: 'Validation added.' })).toMatchObject({ status: 'accepted' });
     expect(await call(s, review, 'handoff', { ruleId: 'done', target: { kind: 'root' }, content: 'Approved.' })).toMatchObject({ status: 'accepted' });
-    // Not connected: implement has no edge to plan. create_tasks waits for batch 5.
+    // Not connected: implement has no edge to plan. create_tasks needs a tasks rule of root, which this template has not (T032).
     expect(await call(s, impl, 'handoff', { ruleId: 'to-review', target: { kind: 'node', nodeId: PLAN }, content: 'x' })).toMatchObject({ status: 'rejected', rejection: { reason: 'not-connected' } });
-    expect(await call(s, ROOT, 'create_tasks', { ruleId: 'split', tasks: [{ key: 'a', title: 'A' }] })).toMatchObject({ status: 'rejected', rejection: { reason: 'unsupported' } });
+    expect(await call(s, ROOT, 'create_tasks', { ruleId: 'split', tasks: [{ key: 'a', title: 'A' }] })).toMatchObject({ status: 'rejected', rejection: { reason: 'no-matching-rule' } });
 
     const snap = await snapshot(s);
     const [instance] = snap.instances;

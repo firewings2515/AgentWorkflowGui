@@ -29,9 +29,10 @@ import { permissionPolicy } from '../../core/policy';
 import type { AppRepositories, GitPort, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter } from '../../core/ports';
 import { Redactor, SessionService } from '../../core/sessions';
 import { TransferService } from '../../core/transfer';
-import { WorkflowEngine } from '../../core/workflow';
+import { executeCommand, WorkflowEngine } from '../../core/workflow';
 import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
+import { jobCommandRunner, worktreeFiles } from './pipeline-host';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
 
 /** What the main process needs from its process host: the port plus the spawn the adapters use (T013). */
@@ -309,7 +310,26 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   });
   ref.service = service;
   // T024: workflow.start, the workflow tools and workflow escalations; it reaches storage through the service.
-  const workflow = new WorkflowEngine({ sessions: service, publish: (event) => void bus.publish(event), now, uuid, hashPayload: sha256, schedule: scheduleAt(now), log });
+  // T032: the task pipeline's worktrees, setup and test commands and merge queue. Before a folder is removed,
+  // the runtime of a session working in it is ended with its Job (the service has no single-session close).
+  const git = options.createGit?.() ?? new GitAdapter();
+  const workflow = new WorkflowEngine({
+    sessions: service,
+    publish: (event) => void bus.publish(event),
+    now,
+    uuid,
+    hashPayload: sha256,
+    schedule: scheduleAt(now),
+    pipeline: {
+      git,
+      commands: jobCommandRunner(host, { log }),
+      files: worktreeFiles,
+      closeRuntime: async (sessionId) => {
+        await host.closeJob(sessionId);
+      },
+    },
+    log,
+  });
   service.attachWorkflow(workflow);
   ref.workflow = workflow;
   // T023: transfer.prepare / confirm / cancel; it reaches storage and runtimes through the service too.
@@ -380,7 +400,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     async execute(command: Command): Promise<CommandResult> {
       if (closing !== undefined) return failure(command.requestId, 'runtime_unavailable', 'The application is closing');
       try {
-        return await service.execute(command);
+        // T032: ending a run and retrying a cleanup are the workflow engine's; a merged task's sessions are read only.
+        return await executeCommand(service, workflow, command);
       } catch (error) {
         log(`[backend] ${command.type} failed (${describe(error)})`);
         const storage = error instanceof Error && (error.name === 'StoredDataError' || error.name === 'InvalidRecordError');
@@ -420,7 +441,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     transfer,
     repositories,
     mcp,
-    git: options.createGit?.() ?? new GitAdapter(),
+    git,
     async unfinishedWork() {
       const work = await service.unfinishedWork();
       const owned = await host.listOwned().catch(() => []);

@@ -38,6 +38,7 @@ import {
   type WorkflowTask,
 } from '../../contracts';
 import type { DeliveryService } from '../delivery';
+import { type GuiHandoff, isResolverSession, resolverBriefing, TaskPipeline, type TaskPipelineOptions } from '../pipeline';
 import type { AppRepositories, DeliveryStore, HandoffMeta, StoredDelivery } from '../ports';
 import type { CommandOf, SessionService, WorkflowHooks, WorkflowSession } from '../sessions';
 import { type AgentNode, agentNodes, briefing, handoffCounts, handoffText, hasEdge, isRework, nodeOf, reportText, reworkKey, rootNode, runtimesOf, sameTarget, taskProgress } from './graph';
@@ -69,6 +70,8 @@ export interface WorkflowEngineOptions {
    * comes early or twice does no harm: the round is checked against `now`.
    */
   schedule(at: Timestamp, fn: () => void): () => void;
+  /** The task pipeline's git, commands and files (T032); without it a run carries one task in its folder. */
+  pipeline?: TaskPipelineOptions;
   log?(message: string): void;
 }
 
@@ -119,6 +122,7 @@ const SHUTTING_DOWN = rejected('shutting-down', 'the GUI is closing');
 const NOT_IN_WORKFLOW = rejected('not-in-workflow', 'this tool works in workflow sessions only');
 const RESEND_MISMATCH = rejected('resend-mismatch', 'this operation carries another handoff');
 const NOT_OWNER = rejected('not-owner', 'this operation belongs to another call');
+const RESOLVER_ONLY = rejected('invalid-input', 'this session resolves a merge conflict: end your turn when it is resolved (or cannot be), and the GUI takes it from there');
 
 /** Report operation IDs say whether the report asked for the user's confirmation (r1-P1-7). */
 const REPORT = 'report-';
@@ -165,6 +169,12 @@ interface Planned {
   content: string;
 }
 
+/** A handoff to the merge node (T032): the task joins the merge queue; nothing is delivered to a session. */
+interface MergePlanned extends Omit<Planned, 'to'> {
+  merge: true;
+  to: Extract<WorkflowTemplate['nodes'][number], { kind: 'merge' }>;
+}
+
 export class WorkflowEngine implements WorkflowHooks {
   private readonly queues = new Map<string, Promise<unknown>>();
   private readonly confirmations = new Map<EscalationId, PendingHandoff>();
@@ -179,7 +189,29 @@ export class WorkflowEngine implements WorkflowHooks {
   /** Instances with a round check queued and not started yet (one more is queued when asked while one runs). */
   private readonly syncQueued = new Set<InstanceId>();
 
-  constructor(private readonly options: WorkflowEngineOptions) {}
+  /** Tasks, worktrees and the merge queue (T032). */
+  readonly pipeline: TaskPipeline | undefined;
+
+  constructor(private readonly options: WorkflowEngineOptions) {
+    this.pipeline =
+      options.pipeline === undefined
+        ? undefined
+        : new TaskPipeline({
+            ...options.pipeline,
+            sessions: options.sessions,
+            publish: (event) => options.publish(event),
+            now: () => options.now(),
+            hash: (text) => options.hashPayload(text),
+            log: (message) => this.options.log?.(message),
+            host: {
+              serial: (instanceId, fn) => this.serial(`instance:${instanceId}`, fn),
+              openOnce: (base, fields) => this.openOnce(base, fields),
+              closeEscalation: (escalation, state, by) => this.close(escalation, state, by),
+              guiHandoff: (input) => this.guiHandoff(input),
+              wakeTask: (instanceId, taskId) => this.wakeTask(instanceId, taskId),
+            },
+          });
+  }
 
   private get repos(): AppRepositories {
     return this.options.sessions.storage.repositories;
@@ -282,7 +314,11 @@ export class WorkflowEngine implements WorkflowHooks {
       wrote = true;
     }
     const at = this.options.now();
-    const task: WorkflowTask = { id: taskIdOf(instanceId), instanceId, title, dependsOn: [], status: 'running', currentNodeId: root.id, reworkCount: 0 };
+    // With worktrees every task comes from root's `create_tasks` (T032); a same-folder run starts with one.
+    const tasks: WorkflowTask[] =
+      template.isolation === 'worktree' && this.pipeline !== undefined
+        ? []
+        : [{ id: taskIdOf(instanceId), instanceId, title, dependsOn: [], status: 'running', currentNodeId: root.id, reworkCount: 0 }];
     const created: WorkflowInstance = instance ?? {
       id: instanceId,
       revision: 0,
@@ -294,7 +330,7 @@ export class WorkflowEngine implements WorkflowHooks {
       ...(crossToolConsent && { crossToolConsentAt: at }),
       template,
       taskLimit: 3,
-      tasks: [task],
+      tasks,
       rounds: [],
       mergeQueue: [],
       taskPlans: [],
@@ -353,6 +389,7 @@ export class WorkflowEngine implements WorkflowHooks {
       if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
       const caller = await this.repos.sessions.get(ctx.caller);
       if (caller?.kind !== 'workflow') return NOT_IN_WORKFLOW;
+      if (isResolverSession(caller.id)) return RESOLVER_ONLY;
       return await this.serial(`instance:${caller.workflow.instanceId}`, () => this.handoffNow(caller, input, ctx, { turnAtCall }));
     } catch (error) {
       if (this.options.sessions.isClosing() || isClosedError(error)) return SHUTTING_DOWN;
@@ -380,17 +417,31 @@ export class WorkflowEngine implements WorkflowHooks {
     }
     const planned = await this.plan(caller, input);
     if ('status' in planned) return planned;
-    const { instance, taskId, from, to } = planned;
+    const { taskId, from } = planned;
+    let { instance } = planned;
 
     // A task stopped at a limit hands off nowhere, root included, until the user deals with it (R-05,
     // r1-P1-1); a resend of an earlier handoff of it gets the same answer (r2-P1-1). A task stopped at a
     // blocked round still takes handoffs (a late upstream is kept for the user's decision) and holds them.
+    // A task stopped at its setup or merge is the pipeline's to answer (T032).
     const task = instance.tasks.find((t) => t.id === taskId);
-    if (task?.status === 'blocked' && task.blockedReason !== 'round-blocked') return this.stillBlocked(instance, taskId, caller);
+    if (task?.status === 'blocked' && (task.blockedReason === 'limit-exceeded' || task.blockedReason === 'delivery-unknown' || task.blockedReason === undefined)) {
+      return this.stillBlocked(instance, taskId, caller);
+    }
+    if ('merge' in planned) return this.toMerge(caller, planned, input, ctx, confirmed);
+    const { to } = planned;
 
     // A resend: the same call after a restart (same sourceCallRef) or a `retryOf` (same operationId, CR2 §4).
     const known = (await this.store.get(ctx.operationId)) ?? (await this.store.findBySourceCallRef(ctx.sourceCallRef));
     if (known !== undefined) return this.resent(known, caller, planned);
+
+    // The task's worktree is made the first time, and a writing node's changes are committed (T032, R-06).
+    if (this.pipeline !== undefined) {
+      const refused = await this.pipeline.beforeHandoff(instance, taskId, from, to);
+      if (refused !== undefined) return refused;
+      instance = (await this.repos.instances.get(instance.id)) ?? instance;
+      planned.instance = instance;
+    }
 
     // Its round (CR-4): an arrival at a waiting node counts in the round of its sender's work; anything else
     // joins the caller's open fan-out or opens a new one. A waiting node counts rounds, not arrivals.
@@ -475,14 +526,133 @@ export class WorkflowEngine implements WorkflowHooks {
     // The caller's fan-out takes it in its own turn; with no turn of its own running, nothing else can join.
     if (!arrival) this.joinGroup({ instanceId: instance.id, taskId, sessionId: caller.id, round, ...(turnId !== undefined && { turnId }) }, groupKey);
     const reworkCount = accepted.counts?.find((c) => c.key === reworkKey(instance.id, taskId))?.count;
-    // A task held at a blocked round stays held (the user decides it).
-    await this.updateTask(instance.id, taskId, (t) => ({ ...t, status: t.status === 'blocked' ? 'blocked' : 'running', currentNodeId: to.id, ...(reworkCount !== undefined && { reworkCount }) }));
+    // A task held at a blocked round stays held (the user decides it); one not started yet waits to start (T032).
+    await this.updateTask(instance.id, taskId, (t) => ({
+      ...t,
+      status: t.status === 'blocked' || t.status === 'pending' ? t.status : 'running',
+      currentNodeId: to.id,
+      ...(reworkCount !== undefined && { reworkCount }),
+    }));
     await this.publishHandoff(handoffId);
     await this.syncSafely(instance.id);
     // The caller handed its task on: a slot of its node may have come free for another task (R-06).
     if (concurrencyOf(from) !== undefined) this.wakeNode(instance.id, from.id);
+    // Root gave a task its work: it may start now (dependencies, the run's limit, T032).
+    if (this.pipeline !== undefined && task?.status === 'pending') await this.pipeline.admitNow(instance.id);
+    // A task not started yet gets nothing delivered (its session is not even started, T032).
+    if (!(await this.deliverableNow(instance.id, taskId, to))) return { status: 'accepted', handoffId, operationId: ctx.operationId, delivery: 'pending' };
     const delivery = await this.deliver(ctx.operationId, targetSessionId, handoffId);
     return { status: 'accepted', handoffId, operationId: ctx.operationId, delivery };
+  }
+
+  /** Whether a handoff of the task to this node may be dispatched now, as far as the pipeline is concerned (T032). */
+  private async deliverableNow(instanceId: InstanceId, taskId: TaskId, to: WorkflowTemplate['nodes'][number] | undefined): Promise<boolean> {
+    if (this.pipeline === undefined || (to?.kind === 'agent' && to.isRoot)) return true;
+    const instance = await this.repos.instances.get(instanceId);
+    return instance !== undefined && this.pipeline.deliverable(instance, taskId);
+  }
+
+  /**
+   * A handoff to the merge node (T032, R-06): the task joins the merge queue, its changes committed first. A
+   * resend finds the task already queued (or merged) and gets the same answer; nothing goes to a session.
+   */
+  private async toMerge(caller: WorkflowSession, planned: MergePlanned, input: HandoffToolInput, ctx: HandoffCallContext, confirmed: boolean): Promise<HandoffToolResult> {
+    const { instance, taskId, from, to } = planned;
+    if (this.pipeline === undefined) return rejected('unsupported', 'merge nodes come with task pipelining');
+    const accepted: HandoffToolResult = { status: 'accepted', handoffId: handoffIdOf(ctx.operationId), operationId: ctx.operationId, delivery: 'sent' };
+    const task = instance.tasks.find((t) => t.id === taskId);
+    if (task?.status === 'awaiting-merge' || task?.status === 'merging' || task?.status === 'merged') return accepted;
+    if (planned.requiresUserConfirmation && !confirmed) return this.askConfirmation(instance, caller, planned, input, ctx, undefined, undefined);
+    const refused = await this.pipeline.beforeHandoff(instance, taskId, from, to);
+    if (refused !== undefined) return refused;
+    await this.pipeline.enqueue((await this.repos.instances.get(instance.id)) ?? instance, taskId, to);
+    // The caller handed its task on: a slot of its node may have come free for another task (R-06).
+    if (concurrencyOf(from) !== undefined) this.wakeNode(instance.id, from.id);
+    return accepted;
+  }
+
+  /**
+   * A handoff the GUI makes for the merge node (T032): a task given back to its implementation node (counted
+   * as rework, R-05) or a merged task reported to root. Its operation is named after the attempt, so doing it
+   * again finds the first one. Sent by root's session, the run's own.
+   */
+  private guiHandoff(input: GuiHandoff): Promise<'accepted' | 'duplicate' | 'limit-exceeded' | 'failed'> {
+    return this.serial(`instance:${input.instanceId}`, async () => {
+      const instance = await this.repos.instances.get(input.instanceId);
+      const root = instance === undefined ? undefined : await this.repos.sessions.get(instance.rootSessionId);
+      if (instance === undefined || root?.kind !== 'workflow' || instance.state === 'completed' || instance.state === 'cancelled') return 'failed';
+      const known = await this.store.get(input.operationId);
+      if (known !== undefined) {
+        if (known.delivery.state === 'pending' && known.target.sessionId !== undefined && (await this.deliverableNow(instance.id, input.taskId, input.to))) {
+          await this.deliver(input.operationId, known.target.sessionId, handoffIdOf(input.operationId));
+        }
+        return 'duplicate';
+      }
+      const { taskId, to } = input;
+      const handoffs = await this.repos.handoffs.listByInstance(instance.id);
+      const rework = isRework(handoffs, taskId, to.id);
+      const { counts, current } = handoffCounts(instance, handoffs, taskId, to, rework);
+      const over = input.count ? current.find((c) => c.limit !== undefined && c.count >= c.limit) : undefined;
+      if (over !== undefined) {
+        await this.limitReached(instance, taskId, root, to, over.key, over.what, over.limit ?? 0);
+        return 'limit-exceeded';
+      }
+      const targetSessionId = await this.nodeSession(instance, to, taskId, root);
+      if (targetSessionId === undefined) return 'failed';
+      const handoffId = handoffIdOf(input.operationId);
+      const target = await this.options.sessions.payloadTarget(targetSessionId);
+      const context = await this.options.sessions.payloadContext(targetSessionId, { kind: 'handoff', fromSessionId: root.id, handoffId });
+      if (target === undefined || context === undefined) return 'failed';
+      const payload = handoffText(input.from, input.ruleId, taskId, input.content);
+      const accepted = await this.delivery.accept({
+        kind: 'handoff',
+        operationId: input.operationId,
+        sourceCallRef: input.operationId,
+        sender: root.id,
+        payloadHash: await this.options.hashPayload(payload),
+        payload,
+        proposalRevision: instance.workflowRevision,
+        target,
+        at: this.options.now(),
+        context,
+        ...(input.count && { counts }),
+        handoff: {
+          handoffId,
+          instanceId: instance.id,
+          taskId,
+          fromNodeId: input.from.id,
+          toNodeId: to.id,
+          fromSessionId: root.id,
+          ruleId: input.ruleId,
+          rework,
+          round: nextRound(handoffs, instance.rounds, taskId, this.openRounds(instance.id, taskId)),
+        },
+      });
+      if (accepted.status === 'limit-exceeded') {
+        const what = current.find((c) => c.key === accepted.key)?.what ?? 'receive';
+        await this.limitReached(instance, taskId, root, to, accepted.key, what, accepted.limit);
+        return 'limit-exceeded';
+      }
+      if (accepted.status !== 'accepted' && accepted.status !== 'duplicate') {
+        this.log(`the merge node's handoff of ${taskId} was not accepted (${accepted.status})`);
+        return 'failed';
+      }
+      const reworkCount = accepted.status === 'accepted' ? accepted.counts?.find((c) => c.key === reworkKey(instance.id, taskId))?.count : undefined;
+      if (reworkCount !== undefined) await this.updateTask(instance.id, taskId, (t) => ({ ...t, reworkCount }));
+      await this.publishHandoff(handoffId);
+      await this.syncSafely(instance.id);
+      if (await this.deliverableNow(instance.id, taskId, to)) await this.deliver(input.operationId, targetSessionId, handoffId);
+      return accepted.status;
+    });
+  }
+
+  /** A task that started (T032): the handoffs that waited for it go now, one per target session (SP-05). */
+  private async wakeTask(instanceId: InstanceId, taskId: TaskId): Promise<void> {
+    const sessions = new Set<SessionId>();
+    for (const handoff of await this.repos.handoffs.listByInstance(instanceId)) {
+      if (handoff.taskId === taskId && handoff.delivery.state === 'pending' && handoff.outcome === undefined && handoff.target.sessionId !== undefined) sessions.add(handoff.target.sessionId);
+    }
+    for (const sessionId of sessions) await this.deliverQueued(sessionId);
   }
 
   /** The handoff's payload: an arrival at a waiting node names its round, from what its record stores (CR-4). */
@@ -523,7 +693,7 @@ export class WorkflowEngine implements WorkflowHooks {
   }
 
   /** The checks of R-04 step 2 that need nothing counted: the caller's task, its rule and the edge. */
-  private async plan(caller: WorkflowSession, input: HandoffToolInput): Promise<Planned | HandoffToolResult> {
+  private async plan(caller: WorkflowSession, input: HandoffToolInput): Promise<Planned | MergePlanned | HandoffToolResult> {
     const instance = await this.repos.instances.get(caller.workflow.instanceId);
     if (instance === undefined) return rejected('unknown-target', 'no such workflow run');
     if (instance.state === 'completed' || instance.state === 'cancelled') return rejected('invalid-input', 'this workflow run has ended');
@@ -533,8 +703,11 @@ export class WorkflowEngine implements WorkflowHooks {
     // A node works on its own task; root, which has none, names it or means the run's one task.
     const own = caller.workflow.taskId;
     if (own !== undefined && input.taskId !== undefined && input.taskId !== own) return rejected('invalid-input', 'a node hands off its own task only');
-    const taskId = own ?? input.taskId ?? instance.tasks[0]?.id;
-    if (taskId === undefined || !instance.tasks.some((t) => t.id === taskId)) return rejected('unknown-target', 'no such task');
+    // Root names the task when the run has several (T032); with one, that one.
+    const taskId = own ?? input.taskId ?? (instance.tasks.length === 1 ? instance.tasks[0]?.id : undefined);
+    if (taskId === undefined && instance.tasks.length === 0) return rejected('unknown-target', 'this run has no task yet: create the tasks with create_tasks first');
+    if (taskId === undefined) return rejected('invalid-input', 'this run has several tasks: name the task (taskId) this handoff is for');
+    if (!instance.tasks.some((t) => t.id === taskId)) return rejected('unknown-target', 'no such task');
     // The edge first (R-04 step 2), so a target the graph does not connect is named as such (V-23).
     if (input.target.kind === 'node') {
       if (nodeOf(template, input.target.nodeId) === undefined) return rejected('unknown-target', 'no such node');
@@ -547,8 +720,9 @@ export class WorkflowEngine implements WorkflowHooks {
     if (toId === from.id) return rejected('invalid-input', 'a node cannot hand off to itself');
     const to = nodeOf(template, toId);
     if (to === undefined) return rejected('unknown-target', 'no such node');
-    if (to.kind !== 'agent') return rejected('unsupported', 'merge nodes come with task pipelining');
-    return { instance, taskId, from, to, ruleId: rule.id, requiresUserConfirmation: rule.requiresUserConfirmation, content: input.content };
+    const base = { instance, taskId, from, ruleId: rule.id, requiresUserConfirmation: rule.requiresUserConfirmation, content: input.content };
+    if (to.kind !== 'agent') return this.pipeline === undefined ? rejected('unsupported', 'merge nodes come with task pipelining') : { ...base, merge: true, to };
+    return { ...base, to };
   }
 
   /** A known operation: the same handoff from the same caller is a duplicate; anything else is refused. */
@@ -581,8 +755,10 @@ export class WorkflowEngine implements WorkflowHooks {
       const bound = await repos.instances.bindNodeSession(key, fresh);
       sessionId = bound.status === 'exists' ? bound.sessionId : fresh;
     }
-    // Same folder as root in batch 4 (no worktree); the source that created it is its parent (WB-01).
-    const made = await this.options.sessions.createWorkflowSession({ sessionId, instance, nodeId: node.id, taskId, cwd: root.cwd, parentId: caller.id });
+    // The task's worktree with worktree isolation (T032), else root's folder; the source that created it is its parent (WB-01).
+    const current = this.pipeline === undefined ? undefined : await repos.instances.get(instance.id);
+    const cwd = (current === undefined ? undefined : this.pipeline?.cwdOf(current, taskId)) ?? root.cwd;
+    const made = await this.options.sessions.createWorkflowSession({ sessionId, instance, nodeId: node.id, taskId, cwd, parentId: caller.id });
     return made === 'created' || made === 'exists' ? sessionId : undefined;
   }
 
@@ -607,6 +783,8 @@ export class WorkflowEngine implements WorkflowHooks {
    */
   turnEnded(sessionId: SessionId): void {
     // The fan-outs of that turn close first (their expected sets are fixed), then what is queued goes.
+    // A session resolving a merge conflict ended its one turn: the merge queue looks at its work (T032).
+    void this.pipeline?.turnEnded(sessionId).catch((error: unknown) => this.log(`checking the merge after a turn of ${sessionId} failed (${errorName(error)})`));
     void this.afterTurn(sessionId)
       .catch((error: unknown) => this.log(`checking the rounds after a turn of ${sessionId} failed (${errorName(error)})`))
       .then(() => this.deliverQueued(sessionId))
@@ -727,12 +905,30 @@ export class WorkflowEngine implements WorkflowHooks {
     if (message !== undefined) this.options.publish({ type: 'peerMessage.updated', message });
   }
 
-  /** `create_tasks` comes with task pipelining (batch 5). */
-  async createTasks(_input: CreateTasksToolInput, ctx: { caller: SessionId }): Promise<CreateTasksToolResult> {
-    if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
-    const caller = await this.repos.sessions.get(ctx.caller).catch(() => undefined);
-    if (caller?.kind !== 'workflow') return NOT_IN_WORKFLOW;
-    return rejected('unsupported', 'create_tasks is not available in this version: a run carries one task');
+  /** `create_tasks` (T032, R-06, O-07): root splits the work into tasks; the user confirms first when root's rule says so. */
+  async createTasks(input: CreateTasksToolInput, ctx: { caller: SessionId; sourceCallRef: string }): Promise<CreateTasksToolResult> {
+    try {
+      if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
+      const caller = await this.repos.sessions.get(ctx.caller).catch(() => undefined);
+      if (caller?.kind !== 'workflow') return NOT_IN_WORKFLOW;
+      const pipeline = this.pipeline;
+      if (pipeline === undefined) return rejected('unsupported', 'create_tasks is not available in this version: a run carries one task');
+      return await this.serial(`instance:${caller.workflow.instanceId}`, () => pipeline.createTasks(caller, input, ctx.sourceCallRef));
+    } catch (error) {
+      if (this.options.sessions.isClosing() || isClosedError(error)) return SHUTTING_DOWN;
+      throw error;
+    }
+  }
+
+  /** `workflow.complete`, `workflow.cancel` and `task.retryCleanup` (T032); undefined without the pipeline. */
+  execute(command: CommandOf<'workflow.complete' | 'workflow.cancel' | 'task.retryCleanup'>): Promise<CommandResult> | undefined {
+    if (this.pipeline === undefined) return undefined;
+    return command.type === 'task.retryCleanup' ? this.pipeline.retryCleanup(command) : this.pipeline.end(command);
+  }
+
+  /** Why the user may not send to this session now (a task merged and cleaned up, a folder gone; R-06), or undefined. */
+  sessionAccess(sessionId: SessionId): Promise<string | undefined> {
+    return this.pipeline?.sessionAccess(sessionId) ?? Promise.resolve(undefined);
   }
 
   // ---- escalations ----------------------------------------------------------------------------------
@@ -741,6 +937,8 @@ export class WorkflowEngine implements WorkflowHooks {
   async respond(escalation: Escalation, command: CommandOf<'escalation.respond'>): Promise<CommandResult | undefined> {
     const { requestId, decision } = command;
     if (escalation.instanceId === undefined) return undefined;
+    const pipelined = await this.pipeline?.respond(escalation, command);
+    if (pipelined !== undefined) return pipelined;
     if (escalation.kind === 'confirmation' && escalation.ref?.kind === 'handoff') {
       const pending = this.confirmations.get(escalation.id);
       this.confirmations.delete(escalation.id);
@@ -858,6 +1056,8 @@ export class WorkflowEngine implements WorkflowHooks {
     if (instance === undefined || instance.state === 'completed' || instance.state === 'cancelled') return false;
     if (instance.tasks.find((t) => t.id === meta.taskId)?.status === 'blocked') return false;
     const to = nodeOf(instance.template, meta.toNodeId);
+    // A task not started yet (or no longer at work) gets nothing; root still hears about it (T032).
+    if (this.pipeline !== undefined && !(to?.kind === 'agent' && to.isRoot) && !this.pipeline.deliverable(instance, meta.taskId)) return false;
     const handoffs = await this.repos.handoffs.listByInstance(instance.id);
     // A handoff stored before T031 (round 0) belongs to no round and goes as T024 sent it (r1-P1-6).
     if (waitsForAll(to) && meta.round !== LEGACY_ROUND) {
@@ -916,7 +1116,10 @@ export class WorkflowEngine implements WorkflowHooks {
   private wakeNode(instanceId: InstanceId, nodeId: NodeId): void {
     void (async () => {
       const sessions = new Set<SessionId>();
+      const instance = this.pipeline === undefined ? undefined : await this.repos.instances.get(instanceId);
       for (const handoff of await this.repos.handoffs.listByInstance(instanceId)) {
+        // A task not started yet is left alone: dispatching would start its session (T032).
+        if (instance !== undefined && !this.pipeline?.deliverable(instance, handoff.taskId)) continue;
         if (handoff.toNodeId === nodeId && handoff.delivery.state === 'pending' && handoff.outcome === undefined && handoff.target.sessionId !== undefined) sessions.add(handoff.target.sessionId);
       }
       for (const sessionId of sessions) await this.deliverQueued(sessionId);
@@ -956,7 +1159,7 @@ export class WorkflowEngine implements WorkflowHooks {
     return rejected('no-matching-rule', 'no output rule of this node has this ruleId and target');
   }
 
-  private async askConfirmation(instance: WorkflowInstance, caller: WorkflowSession, planned: Planned, input: HandoffToolInput, ctx: HandoffCallContext, lineageId: Handoff['id'] | undefined, turnId: string | undefined): Promise<HandoffToolResult> {
+  private async askConfirmation(instance: WorkflowInstance, caller: WorkflowSession, planned: Planned | MergePlanned, input: HandoffToolInput, ctx: HandoffCallContext, lineageId: Handoff['id'] | undefined, turnId: string | undefined): Promise<HandoffToolResult> {
     const id = handoffConfirmationId(ctx.operationId);
     const escalation: Escalation = {
       id,
@@ -1022,9 +1225,13 @@ export class WorkflowEngine implements WorkflowHooks {
 
   /** `WorkflowHooks.briefing`: the node's rules, task and limits, from the instance's pinned template. */
   async briefing(session: WorkflowSession): Promise<string | undefined> {
+    if (isResolverSession(session.id)) return resolverBriefing();
     const instance = await this.repos.instances.get(session.workflow.instanceId);
     const node = instance === undefined ? undefined : nodeOf(instance.template, session.workflow.nodeId);
     if (instance === undefined || node?.kind !== 'agent') return undefined;
+    // A run that has tasks to split or worktrees to work in is told so (T032); a one-task run as before.
+    const pipelined = this.pipeline !== undefined && (instance.template.isolation === 'worktree' || rootNode(instance.template).outputRules.some((r) => r.target.kind === 'tasks'));
+    if (pipelined) return briefing(instance, node, session.workflow.taskId, true);
     return briefing(instance, node, session.workflow.taskId ?? instance.tasks[0]?.id);
   }
 
@@ -1050,6 +1257,8 @@ export class WorkflowEngine implements WorkflowHooks {
       const handoffs = await this.repos.handoffs.listByInstance(instance.id);
       const root = rootNode(instance.template);
       for (const task of instance.tasks) {
+        // Where a task in or past the merge queue stands is the pipeline's record, not its last handoff (T032).
+        if (task.status === 'awaiting-merge' || task.status === 'merging' || finalTaskStatuses.includes(task.status)) continue;
         const progress = taskProgress(handoffs, task.id);
         const currentNodeId = progress.lastNodeId ?? task.currentNodeId ?? root.id;
         if (task.reworkCount === progress.reworkCount && task.currentNodeId === currentNodeId) continue;
@@ -1059,6 +1268,8 @@ export class WorkflowEngine implements WorkflowHooks {
       // the GUI was down blocks its round, and decisions the user made are carried out (CR-4).
       await this.serial(`instance:${instance.id}`, () => this.syncNow(instance.id));
     }
+    // Task lists, setups, merges and cleanups go on from where they stopped (T032).
+    await this.pipeline?.recover();
   }
 
   /**
@@ -1068,7 +1279,11 @@ export class WorkflowEngine implements WorkflowHooks {
   observe(event: AppEvent): void {
     if (event.type !== 'escalation.updated') return;
     const { escalation } = event;
-    if (escalation.kind === 'delivery-unknown' && escalation.instanceId !== undefined) this.requestSync(escalation.instanceId);
+    if (escalation.kind === 'delivery-unknown' && escalation.instanceId !== undefined) {
+      this.requestSync(escalation.instanceId);
+      // A conflict's handover whose outcome the user decided: the merge queue looks again (T032).
+      this.pipeline?.kick(escalation.instanceId);
+    }
   }
 
   // ---- rounds (CR-4) --------------------------------------------------------------------------------
