@@ -39,4 +39,7 @@ export const handoffConfirmationId = (operationId: OperationId): EscalationId =>
 export const reportConfirmationId = (operationId: OperationId): EscalationId => EscalationId.parse(`wf-report:${operationId}`);
 /** One open escalation per limit key or per (task, node) without a matching rule; a later one gets a suffix. */
 export const limitEscalationBase = (key: string): string => `wf-limit:${key}`;
-export const noRuleEscalationBase = (instanceId: InstanceId, taskId: TaskId, nodeId: string): string => `wf-no-rule:${JSON.stringify([instanceId, taskId, nodeId])}`;
+/** One escalation per blocked round (CR-4), so a restart between blocking it and opening the question finds the same one. */
+export const roundEscalationId = (instanceId: InstanceId, taskId: TaskId, nodeId: NodeId, round: number): EscalationId =>
+  EscalationId.parse(`wf-round:${JSON.stringify([instanceId, taskId, nodeId, round])}`);
+export const noRuleEscalationBase =(instanceId: InstanceId, taskId: TaskId, nodeId: string): string => `wf-no-rule:${JSON.stringify([instanceId, taskId, nodeId])}`;
