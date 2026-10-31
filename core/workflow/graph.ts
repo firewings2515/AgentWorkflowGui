@@ -48,10 +48,12 @@ export const isRework = (handoffs: readonly Handoff[], taskId: TaskId, toNodeId:
   handoffs.some((h) => h.taskId === taskId && h.toNodeId === toNodeId && (round === undefined || h.round !== round));
 
 /** What a task's handoffs say about it: the rework count and where it went last (rebuilt after a restart). */
-export const taskProgress = (handoffs: readonly Handoff[], taskId: TaskId): { reworkCount: number; lastNodeId?: NodeId } => {
+export const taskProgress = (handoffs: readonly Handoff[], taskId: TaskId, counted: (handoff: Handoff) => boolean = () => true): { reworkCount: number; lastNodeId?: NodeId } => {
   const own = handoffs.filter((h) => h.taskId === taskId).sort((a, b) => (a.acceptedAt < b.acceptedAt ? -1 : a.acceptedAt > b.acceptedAt ? 1 : 0));
   const last = own.at(-1);
-  return { reworkCount: own.filter((h) => h.rework).length, ...(last !== undefined && { lastNodeId: last.toNodeId }) };
+  // `counted`: a handoff that was never counted (T032 G-11: one held for a task list and cancelled before it was
+  // counted) adds no rework.
+  return { reworkCount: own.filter((h) => h.rework && counted(h)).length, ...(last !== undefined && { lastNodeId: last.toNodeId }) };
 };
 
 export interface HandoffCounts {

@@ -44,6 +44,11 @@ export interface SetupChange {
   path: string;
   state: string;
   tracked: boolean;
+  /**
+   * Changed by someone else before the setup ran again (r3 P1-2): kept with its content then, so no later setup
+   * run takes it for its own while it is unchanged. Never excluded from commits, never put back.
+   */
+  external?: true;
 }
 
 export interface WorktreeFiles {

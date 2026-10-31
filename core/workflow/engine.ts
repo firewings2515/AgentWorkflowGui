@@ -925,7 +925,7 @@ export class WorkflowEngine implements WorkflowHooks {
     const kept: Handoff[] = [];
     const uncounted = new Set(held.map((h) => h.id));
     // A task stopped at a limit in this pass: the rest of it was cancelled with it (T024).
-    const stopped = new Set<TaskId>();
+    const stopped = new Set<TaskId>(instance.tasks.filter((t) => t.status === 'blocked' && t.blockedReason === 'limit-exceeded').map((t) => t.id));
     for (const handoff of held) {
       if (stopped.has(handoff.taskId)) continue;
       const plan = instance.taskPlans.find((p) => handoff.taskId.startsWith(`${p.id}:`));
@@ -945,8 +945,8 @@ export class WorkflowEngine implements WorkflowHooks {
       const { current } = handoffCounts(instance, others, handoff.taskId, to, handoff.rework, arrival);
       const over = first ? current.find((c) => c.limit !== undefined && c.count >= c.limit) : undefined;
       if (over !== undefined) {
-        await cancel(handoff, `the ${over.what} limit was reached when its task list was approved`);
-        // As any handoff over a limit: the task stops and what is still queued of it is cancelled (r2-P1-1).
+        // As any handoff over a limit (r2-P1-1): the stop is written first, then what is queued of the task is
+        // cancelled, this one included (r3 P1-1); a restart finishes a stop cut short (`recover`).
         await this.limitReached(instance, handoff.taskId, root, to, over.key, over.what, over.limit ?? 0);
         stopped.add(handoff.taskId);
         continue;
@@ -964,6 +964,44 @@ export class WorkflowEngine implements WorkflowHooks {
       await this.nodeSession((await this.repos.instances.get(instanceId)) ?? instance, to, handoff.taskId, root);
       await this.publishHandoff(handoff.id);
     }
+    // The rework count of each task held handoffs touched, as a restart rebuilds it (r3 P2).
+    const touched = new Set(held.map((h) => h.taskId));
+    if (touched.size === 0) return;
+    const after = await this.repos.handoffs.listByInstance(instanceId);
+    const now = (await this.repos.instances.get(instanceId)) ?? instance;
+    for (const taskId of touched) {
+      const reworkCount = taskProgress(after, taskId, (h) => this.counted(now, h)).reworkCount;
+      await this.updateTask(instanceId, taskId, (t) => (t.reworkCount === reworkCount ? undefined : { ...t, reworkCount }));
+    }
+  }
+
+  /**
+   * Whether a handoff counted (R-05): all do at their acceptance, but a handoff root made while its task list
+   * waited for the user (G-11) is counted only at the approval; one cancelled before it was ever sent never was.
+   */
+  private counted(instance: WorkflowInstance, handoff: Handoff): boolean {
+    const plan = instance.taskPlans.find((p) => handoff.taskId.startsWith(`${p.id}:`));
+    const held = plan?.decidedAt !== undefined && handoff.fromSessionId === instance.rootSessionId && handoff.acceptedAt <= plan.decidedAt;
+    return !(held && handoff.outcome !== undefined && handoff.delivery.attempts.length === 0);
+  }
+
+  /**
+   * A task stopped at a limit whose stop a crash cut short (r3 P1-1): what is still queued of it is cancelled, and
+   * root is asked if it never was (a question the user already answered is not asked again).
+   */
+  private async finishStop(instance: WorkflowInstance, taskId: TaskId): Promise<void> {
+    await this.cancelQueued(instance, taskId);
+    const asked = (await this.repos.escalations.list()).some((e) => e.instanceId === instance.id && e.kind === 'limit-exceeded' && e.ref?.kind === 'task' && e.ref.taskId === taskId);
+    if (asked) return;
+    await this.openOnce(limitEscalationBase(JSON.stringify(['blocked', instance.id, taskId])), {
+      instanceId: instance.id,
+      rootSessionId: instance.rootSessionId,
+      fromSessionId: instance.rootSessionId,
+      kind: 'limit-exceeded',
+      title: 'Handoff limit reached',
+      detail: 'the task stopped at a handoff limit; no handoff of it is delivered any more',
+      ref: { kind: 'task', taskId },
+    });
   }
 
   /** Dispatches a pending handoff when its target's own turn is not running (SP-05); `pending` while it waits. */
@@ -1463,9 +1501,11 @@ export class WorkflowEngine implements WorkflowHooks {
       const handoffs = await this.repos.handoffs.listByInstance(instance.id);
       const root = rootNode(instance.template);
       for (const task of instance.tasks) {
+        // A stop at a limit that a crash cut short is finished: written first, its consequences now (r3 P1-1).
+        if (task.status === 'blocked' && task.blockedReason === 'limit-exceeded') await this.finishStop(instance, task.id);
         // Where a task in or past the merge queue stands is the pipeline's record, not its last handoff (T032).
         if (task.status === 'awaiting-merge' || task.status === 'merging' || finalTaskStatuses.includes(task.status)) continue;
-        const progress = taskProgress(handoffs, task.id);
+        const progress = taskProgress(handoffs, task.id, (h) => this.counted(instance, h));
         const currentNodeId = progress.lastNodeId ?? task.currentNodeId ?? root.id;
         if (task.reworkCount === progress.reworkCount && task.currentNodeId === currentNodeId) continue;
         await this.updateTask(instance.id, task.id, (t) => ({ ...t, reworkCount: progress.reworkCount, currentNodeId }));

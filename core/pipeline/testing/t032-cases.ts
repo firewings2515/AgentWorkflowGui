@@ -326,15 +326,19 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect(w.git.fileAt(main(w), 'feature.txt')).toBe('f\n');
     });
 
-    it('G-13: a setup that changes tracked files fails and names them; approve puts back those it left untouched and runs it again', async () => {
+    it('G-13 / r3 P1-2: a setup that changes tracked files fails and names them; a retry puts back only those it left untouched, and a file someone else changed is never taken for the setup\'s, across retries', async () => {
       const w = await begin(make);
       let runs = 0;
       w.commands.script = (spec) => {
-        if (spec.purpose === 'setup' && runs++ === 0) {
+        if (spec.purpose !== 'setup') return { exitCode: 0, outputTail: 'ok' };
+        runs++;
+        // First run: rewrites two tracked files. Second run (the script was fixed to leave them alone): fails for
+        // another reason. Third: clean.
+        if (runs === 1) {
           w.git.write(spec.cwd, 'README.md', 'readme with a local port\n');
           w.git.write(spec.cwd, 'src/app.txt', 'app, rewritten by the setup\n');
         }
-        return { exitCode: 0, outputTail: 'ok' };
+        return runs === 2 ? { exitCode: 1, outputTail: 'network down' } : { exitCode: 0, outputTail: 'ok' };
       };
       const t = await made(w, [item('a', 'A')]);
       await give(w, t.a!);
@@ -345,22 +349,24 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect(question?.detail).toContain('README.md');
       expect(question?.detail).toContain('src/app.txt');
       expect(question?.detail).toContain('.gitignore');
-      // Someone edits one of them meanwhile: that one is not put back, and since nothing tells it from a setup's
-      // change, the setup fails again naming only that file (conservative: no tracked change reaches a commit).
+      // Someone edits one of them by hand before the retry.
       const path = (await taskOf(w, t.a!)).worktree!.path;
       w.git.write(path, 'src/app.txt', 'app, edited by hand\n');
       await respond(w, question!.id, 'approve');
-      await until(async () => (await openEscalations(w, 'setup-failed')).length === 1 && w.commands.of('setup').length === 2, 'asked again');
+      await until(async () => (await openEscalations(w, 'setup-failed')).length === 1 && w.commands.of('setup').length === 2, 'the second run failed');
+      // The untouched one was put back; the hand edit stayed, and the second run did not take it for its own.
       expect(w.git.tree(path)?.files.get('README.md')).toBe('readme\n');
       expect(w.git.tree(path)?.files.get('src/app.txt')).toBe('app, edited by hand\n');
       const [again] = await openEscalations(w, 'setup-failed');
-      expect(again?.detail).toContain('src/app.txt');
-      expect(again?.detail).not.toContain('README.md');
-      // Put back by hand: the next approve runs the setup cleanly and the task starts.
-      w.git.restore(path, ['src/app.txt']);
+      expect(again?.detail).not.toContain('src/app.txt');
+      // The second approve keeps the hand edit too (r3 P1-2: it used to put it back).
       await respond(w, again!.id, 'approve');
-      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered after the setup ran cleanly');
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered after the third run');
+      expect(w.git.tree(path)?.files.get('src/app.txt')).toBe('app, edited by hand\n');
       expect(w.commands.of('setup')).toHaveLength(3);
+      // Not the setup's: it is committed as any work in the task.
+      await finish(w, t.a!, { 'a.txt': 'a\n' });
+      expect(w.git.fileAt(w.git.tip(CWD, (await taskOf(w, t.a!)).worktree!.branch), 'src/app.txt')).toBe('app, edited by hand\n');
     });
 
     it('r2 P2: a finished setup whose record is gone refuses the commit and asks root; approve lets it commit without the record', async () => {
@@ -1102,6 +1108,84 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect((await instanceOf(w)).rounds[0]?.state).toBe('ready');
     });
 
+    it('r3 P1-1: a crash after the stop at a limit was written and before its handoffs were cancelled: the restart finishes the stop, nothing is sent', async () => {
+      const w = await begin(make, { confirm: true, reworkLimit: 0 });
+      const asked = await createTasks(w, [item('a', 'A')], 'call-stop');
+      if (asked.status !== 'awaiting-confirmation') throw new Error('not asked');
+      const a = `${asked.taskPlanId}:a` as TaskId;
+      for (const n of [1, 2]) await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: a, content: `try ${String(n)}` });
+      // The GUI goes down at the first cancellation: the stop itself is already written.
+      hangOnce(w.store, 'recordOutcome');
+      void respond(w, asked.escalationId, 'approve');
+      await until(async () => (await instanceOf(w)).tasks.some((t) => t.id === a && t.status === 'blocked'), 'stopped');
+      const r = await w.restart();
+      await until(async () => (await openEscalations(r, 'limit-exceeded')).length === 1, 'root asked after the restart');
+      expect(await taskOf(r, a)).toMatchObject({ status: 'blocked', blockedReason: 'limit-exceeded' });
+      const both = (await r.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.taskId === a);
+      expect(both.map((h) => [h.delivery.state, h.outcome?.kind])).toEqual([
+        ['pending', 'cancelled'],
+        ['pending', 'cancelled'],
+      ]);
+      expect(await delivered(r, a)).toBe(0);
+    });
+
+    it('r3 P1-1: a crash before the stop at a limit was written: the restart counts again and stops the task the same way', async () => {
+      const w = await begin(make, { confirm: true, reworkLimit: 0 });
+      const asked = await createTasks(w, [item('a', 'A')], 'call-stop-early');
+      if (asked.status !== 'awaiting-confirmation') throw new Error('not asked');
+      const a = `${asked.taskPlanId}:a` as TaskId;
+      for (const n of [1, 2]) await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: a, content: `try ${String(n)}` });
+      hangOnce(w.repositories.instances, 'update', (next) => (next as WorkflowInstance).tasks.some((t) => t.id === a && t.status === 'blocked'));
+      void respond(w, asked.escalationId, 'approve');
+      await until(async () => (await instanceOf(w)).tasks.some((t) => t.id === a), 'tasks created');
+      await settle();
+      expect(await statusOf(w, a)).toBe('pending');
+      const r = await w.restart();
+      await until(async () => (await openEscalations(r, 'limit-exceeded')).length === 1, 'stopped after the restart');
+      expect(await taskOf(r, a)).toMatchObject({ status: 'blocked', blockedReason: 'limit-exceeded' });
+      expect((await r.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.taskId === a).every((h) => h.outcome?.kind === 'cancelled')).toBe(true);
+      expect(await delivered(r, a)).toBe(0);
+    });
+
+    it('r3 P2: held handoffs cancelled at the approval add no rework, also when a restart rebuilds the count', async () => {
+      const w = await begin(make, { confirm: true, reworkLimit: 0 });
+      const asked = await createTasks(w, [item('a', 'A')], 'call-recount');
+      if (asked.status !== 'awaiting-confirmation') throw new Error('not asked');
+      const a = `${asked.taskPlanId}:a` as TaskId;
+      for (const n of [1, 2, 3]) await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: a, content: `try ${String(n)}` });
+      await respond(w, asked.escalationId, 'approve');
+      await until(async () => (await openEscalations(w, 'limit-exceeded')).length === 1, 'stopped');
+      expect((await taskOf(w, a)).reworkCount).toBe(0);
+      const r = await w.restart();
+      await settle();
+      expect((await taskOf(r, a)).reworkCount).toBe(0);
+    });
+
+    it('r3 P2: a decline about a missing setup record cut off by a crash gives the task up at the restart', async () => {
+      const w = await begin(make);
+      w.commands.script = (spec) => {
+        if (spec.purpose === 'setup') w.git.write(spec.cwd, 'src/generated.txt', 'generated\n');
+        return { exitCode: 0, outputTail: 'ok' };
+      };
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      const path = (await taskOf(w, t.a!)).worktree!.path;
+      w.files.saved.delete(path.toLowerCase());
+      expect(await finish(w, t.a!, { 'a.txt': 'a\n' })).toMatchObject({ status: 'rejected' });
+      const [question] = await openEscalations(w, 'setup-failed');
+      // The decline is saved; the GUI goes down before the task is given up.
+      hangOnce(w.repositories.instances, 'update', (next) => (next as WorkflowInstance).tasks.some((x) => x.id === t.a && x.status === 'failed'));
+      void respond(w, question!.id, 'decline');
+      await until(async () => (await w.repositories.escalations.get(question!.id))?.state === 'declined', 'decline saved');
+      expect(await statusOf(w, t.a!)).toBe('running');
+      const r = await w.restart();
+      await until(async () => (await statusOf(r, t.a!)) === 'failed', 'given up after the restart');
+      // Without the record its work cannot be committed safely, so its worktree is kept rather than lost.
+      expect((await taskOf(r, t.a!)).worktree?.cleanup).toBe('active');
+      expect(await r.run({ type: 'task.retryCleanup', requestId: rid(), instanceId: INSTANCE, taskId: t.a! })).toMatchObject({ ok: false, code: 'invalid_transition' });
+    });
+
     it('same-folder runs: create_tasks makes tasks without worktrees; the merge node completes a task and its dependent starts', async () => {
       const w = await begin(make, { isolation: 'same-folder' });
       const instance = await instanceOf(w);
@@ -1119,6 +1203,22 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect(w.git.calls.filter((c) => c.op !== 'status' && c.op !== 'resolveBranch')).toEqual([]);
     });
   });
+
+/**
+ * Makes one call of `method` never return (where `when` holds): the GUI went down there. Unlike a rejection, which
+ * some steps catch and carry on from, nothing after it runs in this process.
+ */
+const hangOnce = <T extends object, K extends keyof T>(target: T, method: K, when: (...args: unknown[]) => boolean = () => true) => {
+  const original = (target[method] as (...args: unknown[]) => unknown).bind(target);
+  let armed = true;
+  (target as Record<K, unknown>)[method] = (...args: unknown[]) => {
+    if (armed && when(...args)) {
+      armed = false;
+      return new Promise(() => undefined);
+    }
+    return original(...args);
+  };
+};
 
 /** A restart: the previous process's hung git call stays hung (it died with it). */
 const r0 = (w: World) => w.restart();

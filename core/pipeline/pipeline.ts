@@ -50,7 +50,7 @@ import {
   taskPlanIdOf,
   taskWorktreeRef,
 } from './naming';
-import type { CommandRunner, CommandShell, RunningCommand, WorktreeFiles } from './types';
+import type { CommandRunner, CommandShell, RunningCommand, SetupChange, WorktreeFiles } from './types';
 
 /** What the pipeline takes from the workflow engine, which owns the instance queue and the handoffs. */
 export interface PipelineHost {
@@ -466,6 +466,8 @@ export class TaskPipeline {
       if (changes === undefined) return task.setup.state === 'succeeded' ? { missing: true } : { exclude: [] };
       const excluded: string[] = [];
       for (const change of changes) {
+        // An external change (someone else's, r3 P1-2) is not the setup's: it is committed as any work.
+        if (change.external === true) continue;
         if (change.state === 'dir' || (await this.deps.files.stateOf(path, change.path)) === change.state) excluded.push(change.path);
       }
       // Out of the index too: a setup output staged (by the setup, or an agent's `git add -A`) would be committed
@@ -623,8 +625,13 @@ export class TaskPipeline {
     let refused: string | undefined;
     if (!('failed' in ref)) {
       try {
-        const changes = await this.deps.files.changes(ref.ref.path);
-        await this.deps.files.saveSetupChanges(ref.ref.path, changes);
+        // Only what changed while this setup ran is the setup's (r3 P1-2): a tracked file already changed by
+        // someone else before a retry (`external`, recorded then) is not, while its content is what it was.
+        const externals = ((await this.deps.files.loadSetupChanges(ref.ref.path)) ?? []).filter((c) => c.external === true);
+        const all = await this.deps.files.changes(ref.ref.path);
+        const isExternal = (c: SetupChange) => externals.some((e) => e.path === c.path && e.state === c.state);
+        const changes = all.filter((c) => !isExternal(c));
+        await this.deps.files.saveSetupChanges(ref.ref.path, [...changes, ...all.filter(isExternal).map((c) => ({ ...c, external: true as const }))]);
         // A setup that changes files the repository tracks fails (G-13, main session's ruling): they would stay
         // changed in the worktree and keep the GUI from merging into it.
         const tracked = changes.filter((c) => c.tracked).map((c) => c.path);
@@ -1400,6 +1407,14 @@ export class TaskPipeline {
     const escalations = (await this.repos.escalations.list()).filter((e) => e.instanceId === instanceId);
     const decided = (e: Escalation | undefined): 'approved' | 'declined' | undefined => (e?.state === 'approved' || e?.state === 'declined' ? e.state : undefined);
     for (const task of instance.tasks) {
+      // A task at work whose missing setup record the user answered (r3 P2): a decline gives it up, an approve
+      // lets it commit without the record; a crash between the answer and that is finished here.
+      if (task.status === 'running') {
+        const last = escalations.filter((e) => e.kind === 'setup-failed' && e.ref?.kind === 'task' && e.ref.taskId === task.id).sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)).at(-1);
+        const decision = last?.title === RECORD_TITLE ? decided(last) : undefined;
+        if (decision !== undefined) await this.afterSetupDecision(instanceId, task.id, decision);
+        continue;
+      }
       if (task.status !== 'blocked') continue;
       if (task.blockedReason === 'setup-failed') {
         const last = escalations.filter((e) => e.kind === 'setup-failed' && e.ref?.kind === 'task' && e.ref.taskId === task.id).sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)).at(-1);
@@ -1438,8 +1453,12 @@ export class TaskPipeline {
     if (before?.status === 'blocked' && before.blockedReason === 'setup-failed' && ref !== undefined) {
       const changes = (await this.deps.files.loadSetupChanges(ref.path).catch(() => undefined)) ?? [];
       const untouched: string[] = [];
-      for (const c of changes) if (c.tracked && (await this.deps.files.stateOf(ref.path, c.path)) === c.state) untouched.push(c.path);
+      for (const c of changes) if (c.tracked && c.external !== true && (await this.deps.files.stateOf(ref.path, c.path)) === c.state) untouched.push(c.path);
       if (untouched.length > 0) await this.deps.files.restore(ref.path, untouched);
+      // What is still changed in tracked files now was changed by someone else: recorded as such with its content,
+      // so the setup about to run does not take it for its own, now or at a later retry (r3 P1-2).
+      const external = (await this.deps.files.changes(ref.path)).filter((c) => c.tracked).map((c) => ({ ...c, external: true as const }));
+      await this.deps.files.saveSetupChanges(ref.path, external);
     }
     const commands = instance === undefined ? undefined : await this.commandsOf(instance);
     const at = this.deps.now();
