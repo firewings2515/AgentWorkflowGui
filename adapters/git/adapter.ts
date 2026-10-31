@@ -34,8 +34,10 @@ class GitStepError extends Error {
 const DEFAULT_IDENTITY = { name: 'AgentWorkflowGui', email: 'agent-workflow-gui@localhost' };
 /** Where the pipeline keeps its worktrees, below the repository (SP-07 G6: short paths). */
 const AWG_FOLDER = '.awg';
-/** The branch config entry that says which folder the pipeline made the branch's worktree in: the proof of ownership. */
-const OWNER_KEY = 'awgWorktree';
+/** The branch config entry that says the pipeline made this branch (and for which folder): it allows deleting the branch. */
+const BRANCH_KEY = 'awgBranch';
+/** The branch config entry that allows removing the worktree folder it names; withdrawn once the folder is gone. */
+const FOLDER_KEY = 'awgFolder';
 /** A worktree's name under `.awg\wt`: one safe segment (no separators, no `..`, no trailing dot, no device names). */
 const SAFE_NAME = /^(?!(?:con|prn|aux|nul|com\d|lpt\d)(?:\.|$))[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/i;
 const lines = (text: string): string[] =>
@@ -109,15 +111,30 @@ export class GitAdapter implements GitPort {
         const full = `refs/heads/${worktree.branch}`;
         const branchTip = await this.tip(worktree.repo, full);
         const registered = (await this.worktrees(worktree.repo)).find((entry) => samePath(entry.path, worktree.path));
+        const key = canonicalKey(worktree.path);
         if (registered !== undefined) {
-          const same = registered.branch === full && !registered.prunable && existsSync(worktree.path);
+          // Only the worktree this adapter began (the record below, written before git was asked) is taken up again:
+          // a worktree somebody else made on that branch and path is not claimed.
+          const claimed = (await this.recorded(worktree.repo, worktree.branch, FOLDER_KEY)) === key;
+          const same = claimed && registered.branch === full && !registered.prunable && existsSync(worktree.path);
           if (same && branchTip !== undefined && (await this.isAncestor(worktree.repo, baseCommit, branchTip))) return { status: 'exists', baseCommit };
-          throw new GitStepError(`${worktree.path} is already a worktree for another branch or another base`);
+          throw new GitStepError(`${worktree.path} is already a worktree for another branch or another base, or not one this adapter made`);
         }
         if (branchTip !== undefined) throw new GitStepError(`The branch ${worktree.branch} already exists`);
         this.hideFromRepo(worktree);
-        await this.must(['worktree', 'add', '-b', worktree.branch, worktree.path, baseCommit], worktree.repo);
-        await this.must(['config', `branch.${worktree.branch}.${OWNER_KEY}`, canonicalKey(worktree.path)], worktree.repo);
+        // The record comes first, so an interruption after `worktree add` leaves a worktree that is recognised as ours.
+        // `awgBranch` stays with the branch (it allows deleting the branch); `awgFolder` allows removing the folder and
+        // is withdrawn once the folder is gone.
+        await this.must(['config', `branch.${worktree.branch}.${BRANCH_KEY}`, key], worktree.repo);
+        await this.must(['config', `branch.${worktree.branch}.${FOLDER_KEY}`, key], worktree.repo);
+        const added = await this.git(['worktree', 'add', '-b', worktree.branch, worktree.path, baseCommit], worktree.repo);
+        if (added.code !== 0) {
+          // git leaves the branch it had just made when the folder is refused. It did not exist a moment ago: it goes
+          // again, but only while it is still exactly at the base (no work on it), and its record with it.
+          await this.git(['update-ref', '-d', full, baseCommit], worktree.repo);
+          await this.git(['config', '--remove-section', `branch.${worktree.branch}`], worktree.repo);
+          throw new GitStepError(detailOf(added));
+        }
         return { status: 'created', baseCommit };
       }),
     );
@@ -215,15 +232,12 @@ export class GitAdapter implements GitPort {
           const update = await this.git(['update-ref', '-m', 'awg: fast-forward', full, target, current], repo);
           if (update.code !== 0) return this.afterRefused(repo, full, current, detailOf(update));
           // git has no lock between "checked out nowhere" and the ref moving: a worktree that checked the branch
-          // out in that gap now has a HEAD ahead of its index and files. Seen here, it is reported, never hidden;
-          // a checkout that came after the move is at the new commit and is fine. The window that remains is the
-          // one between this look and the caller's next step.
-          for (const entry of (await this.worktrees(repo)).filter((e) => e.branch === full)) {
-            if (!(await this.checkoutAt(entry, target))) {
-              throw new GitStepError(
-                `${branch} moved, but it was checked out in ${entry.path} at the same moment; that checkout may be behind its HEAD and needs the user's attention`,
-              );
-            }
+          // out in that gap now has a HEAD ahead of its index and files. A checkout seen now is always a failure
+          // (root decides), even one that happens to be in step: nothing here widens what counts as success. The
+          // window that remains is the one between this look and the caller's next step.
+          const raced = (await this.worktrees(repo)).find((entry) => entry.branch === full);
+          if (raced !== undefined) {
+            throw new GitStepError(`${branch} moved, but it is checked out in ${raced.path}; that checkout may be behind its HEAD and needs the user's attention`);
           }
           return { status: 'advanced' };
         }
@@ -240,7 +254,14 @@ export class GitAdapter implements GitPort {
         // The branch is read again: "already up to date" also comes from a branch someone moved past `target`
         // (A→C when asked for A→B), which is a moved branch, not an advance.
         const now = await this.tip(repo, full);
-        if (merged.code === 0 && now === target) return { status: 'advanced' };
+        if (merged.code === 0 && now === target) {
+          // "Already up to date" is also what a ref moved from outside looks like: the checkout itself must be at
+          // `target` — its branch, HEAD, index and files — before this is an advance.
+          if (!(await this.checkoutAt(checkout.path, target, full))) {
+            throw new GitStepError(`${branch} is at ${target}, but the checkout in ${checkout.path} is not (its HEAD, index or files differ); it needs the user's attention`);
+          }
+          return { status: 'advanced' };
+        }
         if (now !== undefined && now !== current) return { status: 'moved', current: now };
         return { status: 'refused', detail: detailOf(merged) };
       }),
@@ -295,12 +316,18 @@ export class GitAdapter implements GitPort {
     if (registered !== undefined && registered.branch !== full) {
       return pending(`Refused: ${worktree.path} is a worktree of ${registered.branch ?? 'a detached HEAD'}, not of ${worktree.branch}`);
     }
-    // Ownership: createWorktree wrote the folder into the branch's config. Without that proof for this very path and
-    // branch nothing is removed or deleted: not a registered worktree, not a leftover folder, never a branch.
+    // Two separate proofs, both written by createWorktree for this very path and branch. `awgFolder` allows touching
+    // the folder (a registered worktree or its leftover) and is withdrawn below once the folder is gone, so nothing
+    // that appears there later is ever deleted. `awgBranch` allows deleting the branch and goes with it.
+    const key = canonicalKey(worktree.path);
     const branchExists = (await this.tip(worktree.repo, full)) !== undefined;
-    const owned = branchExists && (await this.owner(worktree.repo, worktree.branch)) === canonicalKey(worktree.path);
-    if (!owned && (registered !== undefined || existsSync(worktree.path) || (options.deleteBranch && branchExists))) {
-      return pending(`Refused: the branch ${worktree.branch} was not created by the pipeline for ${worktree.path}; nothing was removed`);
+    const folderAllowed = branchExists && (await this.recorded(worktree.repo, worktree.branch, FOLDER_KEY)) === key;
+    const branchOwned = branchExists && (await this.recorded(worktree.repo, worktree.branch, BRANCH_KEY)) === key;
+    if (!folderAllowed && (registered !== undefined || existsSync(worktree.path))) {
+      return pending(`Refused: ${worktree.path} is not a worktree folder this adapter made for ${worktree.branch}; nothing was removed`);
+    }
+    if (!branchOwned && options.deleteBranch && branchExists) {
+      return pending(`Refused: the branch ${worktree.branch} was not created by the pipeline for ${worktree.path}; it was not deleted`);
     }
 
     if (registered !== undefined) {
@@ -328,21 +355,36 @@ export class GitAdapter implements GitPort {
       if ((await this.worktrees(worktree.repo)).some((entry) => samePath(entry.path, worktree.path))) return pending('The worktree is still registered after the prune');
     }
 
+    // The folder is gone: the permission to touch a folder at this path ends here (the branch may stay).
+    if (folderAllowed) {
+      const withdrawn = await this.git(['config', '--unset-all', `branch.${worktree.branch}.${FOLDER_KEY}`], worktree.repo);
+      if (withdrawn.code !== 0 && withdrawn.code !== 5) return pending(`The folder record could not be withdrawn: ${detailOf(withdrawn)}`);
+    }
+
     if (options.deleteBranch && branchExists) {
       // The caller says the task is merged. `branch -d` would compare against the checked-out HEAD, which is not the
-      // target branch, so the same check is made here (another branch holds the commits) and `-D` does the deleting.
+      // target branch, so the same check is made here (another branch holds the commits). The delete is
+      // `update-ref -d <ref> <checked sha>`, which git refuses when the branch moved since (`branch -D` has no such
+      // condition); it does not look at checkouts, so those are checked first (the window left is the one before
+      // the delete).
       const tip = await this.tip(worktree.repo, full);
-      const holders = lines(await this.must(['for-each-ref', '--format=%(refname)', '--contains', tip ?? '', 'refs/heads'], worktree.repo)).filter((ref) => ref !== full);
-      if (holders.length === 0) return pending(`Refused: the commits of ${worktree.branch} are in no other branch, so deleting it would lose them`);
-      const deleted = await this.git(['branch', '-D', worktree.branch], worktree.repo);
-      if (deleted.code !== 0) return pending(`The branch could not be deleted: ${detailOf(deleted)}`);
+      if (tip !== undefined) {
+        const checkedOut = (await this.worktrees(worktree.repo)).find((entry) => entry.branch === full);
+        if (checkedOut !== undefined) return pending(`Refused: ${worktree.branch} is checked out in ${checkedOut.path}`);
+        const holders = lines(await this.must(['for-each-ref', '--format=%(refname)', '--contains', tip, 'refs/heads'], worktree.repo)).filter((ref) => ref !== full);
+        if (holders.length === 0) return pending(`Refused: the commits of ${worktree.branch} are in no other branch, so deleting it would lose them`);
+        const deleted = await this.git(['update-ref', '-d', full, tip], worktree.repo);
+        if (deleted.code !== 0) return pending(`The branch changed while it was being checked and was kept: ${detailOf(deleted)}`);
+        // What `branch -D` also does: the branch's settings (and with them the records) go.
+        await this.git(['config', '--remove-section', `branch.${worktree.branch}`], worktree.repo);
+      }
     }
     return { status: 'removed' };
   }
 
-  /** The folder a branch was created for (`createWorktree` writes it), as `canonicalKey` spells it. */
-  private async owner(repo: string, branch: string): Promise<string | undefined> {
-    const result = await this.git(['config', '--get', `branch.${branch}.${OWNER_KEY}`], repo);
+  /** What `createWorktree` recorded in the branch's config under `key`: the folder, as `canonicalKey` spells it. */
+  private async recorded(repo: string, branch: string, key: string): Promise<string | undefined> {
+    const result = await this.git(['config', '--get', `branch.${branch}.${key}`], repo);
     return result.code === 0 ? result.stdout.trim() : undefined;
   }
 
@@ -514,8 +556,11 @@ export class GitAdapter implements GitPort {
    * (`diff --cached --check` knows the `conflict-marker-size` attribute); whitespace rules are switched off. A
    * file counts as unresolved when git flags both a start (`<<<<<<<`) and an end (`>>>>>>>`) marker in it: a lone
    * marker-looking line is ordinary text, kept. Only conflicted files are looked at, so text about markers in
-   * other files is never refused. Text in a conflicted file that has both kinds must use a larger
-   * `conflict-marker-size`.
+   * other files is never refused.
+   *
+   * Known trade-offs, both pinned by tests: a half-resolved file with only one kind of marker left is committed
+   * (a miss), and a conflicted file whose resolution legitimately shows both kinds (a document about conflicts) is
+   * refused (a false alarm) unless the repository sets a larger `conflict-marker-size` for it.
    */
   private async unresolvedConflicts(cwd: string, files: readonly string[]): Promise<string[]> {
     if (files.length === 0) return [];
@@ -524,17 +569,19 @@ export class GitAdapter implements GitPort {
       cwd,
     );
     if (check.code !== 0 && check.code !== 2) throw new GitStepError(detailOf(check));
+    // The lines are read from the index, the content that is about to be committed: the working file may differ
+    // (resolved by hand after the conflict was staged, or left out of the add by an exclude).
     const kinds = new Map<string, Set<string>>();
+    const staged = new Map<string, string[]>();
     for (const line of check.stdout.split('\n')) {
       const found = /^(.+):(\d+): leftover conflict marker/.exec(line.replace(/\r$/, ''));
       if (found === null) continue;
       const [, file = '', number = '0'] = found;
-      let text: string;
-      try {
-        text = readFileSync(join(cwd, file), 'latin1').split('\n')[Number(number) - 1] ?? '';
-      } catch {
-        continue;
+      if (!staged.has(file)) {
+        const blob = await this.git(['cat-file', '-p', `:${file}`], cwd);
+        staged.set(file, blob.code === 0 ? blob.stdout.split('\n') : []);
       }
+      const text = staged.get(file)?.[Number(number) - 1] ?? '';
       if (text.startsWith('<') || text.startsWith('>')) kinds.set(file, (kinds.get(file) ?? new Set<string>()).add(text.charAt(0)));
     }
     return [...kinds].filter(([, set]) => set.has('<') && set.has('>')).map(([file]) => file);
@@ -546,10 +593,11 @@ export class GitAdapter implements GitPort {
     return ['-c', `user.name=${this.identity.name}`, '-c', `user.email=${this.identity.email}`];
   }
 
-  /** The checkout is at `commit` with nothing out of line: HEAD there and its index and files agree. */
-  private async checkoutAt(entry: WorktreeEntry, commit: string): Promise<boolean> {
+  /** The checkout has `ref` checked out at `commit` with nothing out of line: HEAD, index and tracked files agree. */
+  private async checkoutAt(path: string, commit: string, ref: string): Promise<boolean> {
     try {
-      return existsSync(entry.path) && (await this.head(entry.path)) === commit && !(await this.hasTrackedChanges(entry.path));
+      const symbolic = await this.git(['symbolic-ref', '-q', 'HEAD'], path);
+      return existsSync(path) && symbolic.stdout.trim() === ref && (await this.head(path)) === commit && !(await this.hasTrackedChanges(path));
     } catch {
       return false;
     }

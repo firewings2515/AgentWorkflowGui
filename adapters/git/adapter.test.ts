@@ -367,6 +367,32 @@ describe.concurrent('unresolved conflict markers are never committed', () => {
     expect((await sandbox.adapter.commitAll(ref, 'docs about conflicts', [])).status).toBe('committed');
   });
 
+  it('judges the staged content: a conflict staged unresolved, the working file fixed by hand, and the file left out of the add', async () => {
+    const { int } = await conflicting();
+    await sandbox.git(int.path, 'add', 'shared.txt'); // the index now holds the full conflict markers
+    sandbox.write(int.path, 'shared.txt', 'resolved in the working file only\n');
+    const result = await sandbox.adapter.commitAll(int, 'merge k2', ['shared.txt']); // excluded: the index is what would be committed
+    expect(result).toMatchObject({ status: 'failed', detail: expect.stringContaining('shared.txt') as unknown });
+    expect((await sandbox.git(int.path, 'show', ':shared.txt')).includes('<<<<<<<')).toBe(true);
+    expect((await sandbox.adapter.status(int)).merging).toBe(true);
+    // Without the exclude the fixed file is added, and the commit goes through.
+    expect((await sandbox.adapter.commitAll(int, 'merge k2', [])).status).toBe('committed');
+  });
+
+  it('pins the known trade-offs: a half-resolved file with one kind of marker is committed, a document showing both kinds is refused', async () => {
+    const half = await conflicting();
+    sandbox.write(half.int.path, 'shared.txt', 'mostly resolved\n<<<<<<< ours\n'); // the start marker was forgotten
+    expect((await sandbox.adapter.commitAll(half.int, 'merge k2', [])).status).toBe('committed'); // known miss
+
+    const doc = await conflicting();
+    sandbox.write(doc.int.path, 'shared.txt', 'How a conflict looks:\n<<<<<<< ours\nA\n=======\nB\n>>>>>>> theirs\n');
+    expect((await sandbox.adapter.commitAll(doc.int, 'merge k2', [])).status).toBe('failed'); // known false alarm
+
+    const sized = await conflicting('shared.txt conflict-marker-size=9\n');
+    sandbox.write(sized.int.path, 'shared.txt', 'How a conflict looks:\n<<<<<<< ours\nA\n=======\nB\n>>>>>>> theirs\n');
+    expect((await sandbox.adapter.commitAll(sized.int, 'merge k2', [])).status).toBe('committed'); // the way out: a larger size
+  });
+
   it('forgets the noted conflicts at abort, so a later merge is not judged by an old one', async () => {
     const { int } = await conflicting();
     expect((await sandbox.adapter.abortMerge(int)).status).toBe('aborted');
@@ -497,7 +523,7 @@ describe.concurrent('advanceBranch', () => {
     expect((await sandbox.git(repo, 'rev-parse', 'release')).trim()).toBe(to); // the move itself cannot be undone safely
   });
 
-  it('is fine when the branch is checked out right after the move: that checkout starts at the new commit', async () => {
+  it('reports failed for any checkout found after the move, even one that came after it and is in step', async () => {
     const { repo, expected, to } = await ahead();
     await sandbox.git(repo, 'branch', 'release', expected);
     const linked = join(sandbox.root, 'late-release');
@@ -505,8 +531,22 @@ describe.concurrent('advanceBranch', () => {
     const racing = sandbox.hooked(async (args) => {
       if (args[0] === 'worktree' && args[1] === 'list' && ++lists === 2) await sandbox.git(repo, 'worktree', 'add', '-q', linked, 'release');
     });
-    expect(await racing.advanceBranch(repo, 'release', expected, to)).toEqual({ status: 'advanced' });
-    expect(existsSync(join(linked, 'one.txt'))).toBe(true);
+    expect(await racing.advanceBranch(repo, 'release', expected, to)).toMatchObject({ status: 'failed', detail: expect.stringContaining('late-release') as unknown });
+    expect(existsSync(join(linked, 'one.txt'))).toBe(true); // that checkout is in step; the result still goes to root
+  });
+
+  it('does not call it an advance when only the ref was moved to `to` from outside and the checkout stayed behind', async () => {
+    const { repo, expected, to } = await ahead();
+    let moved = false;
+    const racing = sandbox.hooked(async (args) => {
+      if (args[0] === 'merge' && args.includes('--ff-only') && !moved) {
+        moved = true;
+        await sandbox.git(repo, 'update-ref', 'refs/heads/main', to); // the ref only: index and files stay at `expected`
+      }
+    });
+    const result = await racing.advanceBranch(repo, 'main', expected, to);
+    expect(result).toMatchObject({ status: 'failed', detail: expect.stringContaining('checkout') as unknown });
+    expect(moved).toBe(true);
   });
 
   it('leaves an untracked file alone: a fast-forward that would overwrite it is refused by git, nothing moves', async () => {
@@ -561,7 +601,7 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
 
     expect(await sandbox.adapter.removeWorktree(drop, { deleteBranch: true })).toEqual({ status: 'removed' });
     expect(await sandbox.adapter.resolveBranch(repo, drop.branch)).toBeUndefined();
-    await expect(sandbox.git(repo, 'config', '--get', `branch.${drop.branch}.awgWorktree`)).rejects.toThrow(); // the proof goes with the branch
+    await expect(sandbox.git(repo, 'config', '--get-regexp', `branch\\.${drop.branch}\\.`)).rejects.toThrow(); // the records go with the branch
     // Again: nothing left to do, still removed; and the branch kept earlier can go now.
     expect(await sandbox.adapter.removeWorktree(drop, { deleteBranch: true })).toEqual({ status: 'removed' });
     expect(await sandbox.adapter.removeWorktree(keep, { deleteBranch: true })).toEqual({ status: 'removed' });
@@ -707,5 +747,100 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
     const result = await sandbox.adapter.retryCleanup(ref, { deleteBranch: false });
     expect(result.status).toBe('pending-cleanup');
     expect(readFileSync(join(outside, 'precious.txt'), 'utf8')).toBe('keep\n');
+  });
+
+  it('withdraws the permission to touch the folder once it is gone: what appears there later is never deleted', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = await taskWith(repo, 'w2', 'w.txt', 'w\n');
+    expect(await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).toEqual({ status: 'removed' });
+    expect(await sandbox.adapter.resolveBranch(repo, ref.branch)).toBeDefined(); // the branch stays, with its own record
+
+    mkdirSync(ref.path, { recursive: true }); // the user's own folder, same path
+    writeFileSync(join(ref.path, 'mine.txt'), 'user data\n');
+    for (const run of [sandbox.adapter.retryCleanup.bind(sandbox.adapter), sandbox.adapter.removeWorktree.bind(sandbox.adapter)]) {
+      expect((await run(ref, { deleteBranch: false })).status).toBe('pending-cleanup');
+    }
+    expect(readFileSync(join(ref.path, 'mine.txt'), 'utf8')).toBe('user data\n');
+
+    rmSync(ref.path, { recursive: true, force: true }); // with the folder gone again the branch can still be dealt with
+    await mergeIntoMain(repo, ref);
+    expect(await sandbox.adapter.removeWorktree(ref, { deleteBranch: true })).toEqual({ status: 'removed' });
+  });
+
+  it('keeps the folder permission through a pending cleanup, and withdraws it when that finishes', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = await taskWith(repo, 'w3', 'w.txt', 'w\n');
+    const holder = await holdFolder(ref.path);
+    expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).status).toBe('pending-cleanup');
+    expect(await sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgFolder`)).not.toBe('');
+    await holder.release();
+    expect(await sandbox.adapter.retryCleanup(ref, { deleteBranch: false })).toEqual({ status: 'removed' });
+    await expect(sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgFolder`)).rejects.toThrow();
+  });
+
+  it('keeps a branch that was moved to an unmerged commit after it was checked, instead of deleting it', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = await taskWith(repo, 'd1', 'd.txt', 'd\n');
+    await mergeIntoMain(repo, ref);
+    const tip = (await sandbox.git(repo, 'rev-parse', ref.branch)).trim();
+    const extra = (await sandbox.git(repo, 'commit-tree', `${tip}^{tree}`, '-p', tip, '-m', 'unmerged work')).trim();
+    let moved = false;
+    const racing = sandbox.hooked(async (args) => {
+      if (args[0] === 'update-ref' && args[1] === '-d' && !moved) {
+        moved = true;
+        await sandbox.git(repo, 'update-ref', `refs/heads/${ref.branch}`, extra);
+      }
+    });
+    const result = await racing.removeWorktree(ref, { deleteBranch: true });
+    expect(result).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('kept') as unknown });
+    expect(moved).toBe(true);
+    expect((await sandbox.git(repo, 'rev-parse', ref.branch)).trim()).toBe(extra);
+  });
+
+  it('refuses to delete a branch that is checked out in another worktree', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = await taskWith(repo, 'd2', 'd.txt', 'd\n');
+    await mergeIntoMain(repo, ref);
+    expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).status).toBe('removed');
+    await sandbox.git(repo, 'worktree', 'add', '-q', join(sandbox.root, 'elsewhere-d2'), ref.branch);
+    const result = await sandbox.adapter.removeWorktree(ref, { deleteBranch: true });
+    expect(result).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('checked out') as unknown });
+    expect(await sandbox.adapter.resolveBranch(repo, ref.branch)).toBeDefined();
+  });
+});
+
+describe.concurrent('createWorktree after an interruption', () => {
+  it('takes up again a worktree it had begun (the record was written before git was asked), and can clean it up', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = sandbox.task(repo, 'cr1');
+    const tip = (await sandbox.git(repo, 'rev-parse', 'main')).trim();
+    // What an interruption just after `worktree add` leaves: the record and the worktree, nothing else.
+    const key = ref.path.replaceAll('\\', '/').toLowerCase();
+    await sandbox.git(repo, 'config', `branch.${ref.branch}.awgBranch`, key);
+    await sandbox.git(repo, 'config', `branch.${ref.branch}.awgFolder`, key);
+    await sandbox.git(repo, 'worktree', 'add', '-q', '-b', ref.branch, ref.path, 'main');
+
+    expect(await sandbox.adapter.createWorktree(ref, 'main')).toEqual({ status: 'exists', baseCommit: tip });
+    expect(await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).toEqual({ status: 'removed' });
+  });
+
+  it('does not claim a worktree it has no record of, whoever made it', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = sandbox.task(repo, 'cr2');
+    await sandbox.git(repo, 'worktree', 'add', '-q', '-b', ref.branch, ref.path, 'main');
+    expect((await sandbox.adapter.createWorktree(ref, 'main')).status).toBe('failed');
+    expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: true })).status).toBe('pending-cleanup');
+    expect(existsSync(ref.path)).toBe(true);
+  });
+
+  it('leaves no record behind when git refuses to create the worktree', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = sandbox.task(repo, 'cr3');
+    mkdirSync(ref.path, { recursive: true });
+    writeFileSync(join(ref.path, 'in-the-way.txt'), 'x\n'); // git will not use a folder that is not empty
+    expect((await sandbox.adapter.createWorktree(ref, 'main')).status).toBe('failed');
+    await expect(sandbox.git(repo, 'config', '--get-regexp', `branch\\.${ref.branch}\\.`)).rejects.toThrow();
+    expect(await sandbox.adapter.resolveBranch(repo, ref.branch)).toBeUndefined();
+    expect(readFileSync(join(ref.path, 'in-the-way.txt'), 'utf8')).toBe('x\n');
   });
 });
