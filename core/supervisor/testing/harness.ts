@@ -97,6 +97,12 @@ export interface SupWorld {
   decide: (sessionId: SessionId) => PolicyDecision;
   /** When set, the store's state listings wait for it (a check that stops on an await). */
   storeGate: Promise<void> | undefined;
+  /** When set, the next `recordSent` commits and then waits for it before it returns (once). */
+  holdNextRecordSent: Promise<void> | undefined;
+  /** When set, the next `sessions.get` waits for it before it reads (once). */
+  holdNextSessionGet: Promise<void> | undefined;
+  /** Every MCP mount handed out, by session. */
+  mounts: SessionId[];
   /** The exit and close deadlines (SessionServiceOptions.sleep); by default they never pass. */
   sleeper: (ms: number) => Promise<void>;
   run(command: Command): Promise<CommandResult>;
@@ -108,9 +114,11 @@ export interface SupWorldOptions {
   locks?: boolean;
 }
 
-const build = (repositories: AppRepositories, rawStore: DeliveryStore, o: SupWorldOptions, previous?: SupWorld): SupWorld => {
+const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: SupWorldOptions, previous?: SupWorld): SupWorld => {
   const world = {
-    repositories,
+    mounts: [] as SessionId[],
+    holdNextRecordSent: undefined as Promise<void> | undefined,
+    holdNextSessionGet: undefined as Promise<void> | undefined,
     codex: new Map<string, HoldingAdapter>(),
     clock: previous?.clock ?? new ManualClock(AT),
     events: [] as AppEvent[],
@@ -123,17 +131,44 @@ const build = (repositories: AppRepositories, rawStore: DeliveryStore, o: SupWor
     storeGate: undefined as Promise<void> | undefined,
     sleeper: (): Promise<void> => new Promise<void>(() => undefined),
   } as unknown as SupWorld;
-  // The store with its state listings held while `storeGate` is set.
+  // The store with its state listings held while `storeGate` is set, and one `recordSent` held after its commit.
   world.store = new Proxy(rawStore, {
     get: (target, key): unknown => {
       const value: unknown = Reflect.get(target, key);
-      if (key !== 'listByState' || typeof value !== 'function') return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      if (typeof value !== 'function') return value;
+      const call = (args: unknown[]) => (value as (...a: unknown[]) => unknown).apply(target, args);
+      if (key === 'listByState')
+        return async (...args: unknown[]) => {
+          await world.storeGate;
+          return call(args);
+        };
+      if (key === 'recordSent')
+        return async (...args: unknown[]) => {
+          const held = world.holdNextRecordSent;
+          world.holdNextRecordSent = undefined;
+          const written = await call(args);
+          await held;
+          return written;
+        };
+      return (...args: unknown[]) => call(args);
+    },
+  });
+  // The repositories with one `sessions.get` held before it reads.
+  const sessions = new Proxy(rawRepositories.sessions, {
+    get: (target, key): unknown => {
+      const value: unknown = Reflect.get(target, key);
+      if (typeof value !== 'function') return value;
+      if (key !== 'get') return (value as (...a: unknown[]) => unknown).bind(target);
       return async (...args: unknown[]) => {
-        await world.storeGate;
+        const held = world.holdNextSessionGet;
+        world.holdNextSessionGet = undefined;
+        await held;
         return (value as (...a: unknown[]) => unknown).apply(target, args);
       };
     },
   });
+  const repositories = new Proxy(rawRepositories, { get: (target, key): unknown => (key === 'sessions' ? sessions : Reflect.get(target, key)) });
+  world.repositories = repositories;
   const policy: PermissionPolicy = { evaluate: (request) => world.decide(request.sessionId) };
   const onPermission = (handle: PermissionHandle) => world.service.onPermissionRequest(handle);
   world.claude = new HoldingAdapter('claude', onPermission);
@@ -160,7 +195,10 @@ const build = (repositories: AppRepositories, rawStore: DeliveryStore, o: SupWor
       world.codex.set(sessionId, adapter);
       return adapter;
     },
-    mountMcp: (sessionId) => ({ url: 'http://127.0.0.1:4000/mcp', token: `token-${sessionId}-${String(++mounts)}` }),
+    mountMcp: (sessionId) => {
+      world.mounts.push(sessionId);
+      return { url: 'http://127.0.0.1:4000/mcp', token: `token-${sessionId}-${String(++mounts)}` };
+    },
     listModels: (runtime) => world.claude.listModels().then((m) => m.map((x) => ({ ...x, runtime }))),
     onSessionClosed: (sessionId) => {
       world.closed.push(sessionId);
@@ -180,7 +218,7 @@ const build = (repositories: AppRepositories, rawStore: DeliveryStore, o: SupWor
   });
   world.service.attachSupervisor(world.supervisor);
   world.run = (command) => world.service.execute(command);
-  world.restart = () => build(repositories, rawStore, o, world);
+  world.restart = () => build(rawRepositories, rawStore, o, world);
   return world;
 };
 

@@ -341,6 +341,8 @@ export class SessionService {
   private workflow: WorkflowHooks | undefined;
   private transfer: TransferHooks | undefined;
   private supervisor: SupervisorHooks | undefined;
+  /** The resume of each session under way (T036 r1 P1-3). */
+  private readonly resumes = new Map<SessionId, Promise<void>>();
   /** Why the last resume of a session was refused (its folder is gone, R-06), until one succeeds (T036). */
   private readonly resumeRefused = new Map<SessionId, string>();
   /**
@@ -411,12 +413,16 @@ export class SessionService {
     // A transfer's claim is refused when its gate's view went out of date, decided synchronously in the call
     // that makes the claim (T023 r2-P1-1); every other claim goes straight to the store.
     const store = this.store;
+    // A live ack's turn is followed before its `sent` is written, on every way a delivery is sent (T036 r1 P1-1): once
+    // the store says sent, the session is never seen idle while that turn has not been seen to end.
     const claimGuarded = new Proxy(store, {
       get: (target, key): unknown =>
         key === 'claim'
           ? (input: ClaimInput): Promise<ClaimResult> =>
               this.transfer !== undefined && !this.transfer.claimAllowed(input.operationId) ? Promise.resolve({ status: 'revision-changed' }) : target.claim(input)
-          : Reflect.get(target, key),
+          : key === 'recordSent'
+            ? (...args: Parameters<DeliveryStore['recordSent']>) => this.recordSentFollowing(target, ...args)
+            : Reflect.get(target, key),
     });
     this.delivery = new DeliveryService({
       store: claimGuarded,
@@ -1523,6 +1529,10 @@ export class SessionService {
    * released by force (`onSessionClosed` ends its Job). Returns once it is released and `onSessionClosed` ran.
    */
   private async endRuntime(ref: string, timeoutMs: number): Promise<void> {
+    // The opening being closed: past the deadline only it is released, never one the session got since (T036 r1 P1-2).
+    const generation = this.runtimes.generationOf(ref);
+    // Not open: a release under way, if any, is waited for.
+    if (generation === undefined) return this.runtimes.forceRelease(ref);
     const graceful = this.runtimes.closeSession(ref, timeoutMs).then(
       () => true,
       () => true,
@@ -1530,7 +1540,7 @@ export class SessionService {
     const ended = this.options.sleep === undefined ? await graceful : await Promise.race([graceful, this.options.sleep(timeoutMs).then(() => false)]);
     // Past the deadline: released by force, or the release the graceful close began is waited for, whichever it is;
     // either way this returns once `onSessionClosed` has finished (its Job ended, r2 P1-3).
-    if (!ended || this.runtimes.isOpen(ref)) await this.runtimes.forceRelease(ref);
+    if (!ended || this.runtimes.isOpen(ref, generation)) await this.runtimes.forceRelease(ref, generation);
   }
 
   // ---- idle supervisor (T036) -----------------------------------------------------------------------
@@ -1815,7 +1825,25 @@ export class SessionService {
     if (ref === undefined || sessionId === undefined) return;
     const release = this.supervisor?.touch(sessionId);
     if (release !== undefined) await release;
-    if (this.runtimes.isOpen(ref)) return;
+    // One resume per session, its reads and checks included (T036 r1 P1-3): whoever finds one under way waits for
+    // it and looks again. Checked and begun in one synchronous step, so two never both begin.
+    for (;;) {
+      if (this.runtimes.isOpen(ref)) return;
+      const underway = this.resumes.get(sessionId);
+      if (underway === undefined) break;
+      await underway.catch(() => undefined);
+    }
+    const run = this.resumeNow(record, sessionId, ref);
+    this.resumes.set(sessionId, run);
+    const done = () => {
+      if (this.resumes.get(sessionId) === run) this.resumes.delete(sessionId);
+    };
+    void run.then(done, done);
+    await run;
+  }
+
+  /** The resume itself, as the one `resumeTarget` under way for the session. */
+  private async resumeNow(record: PayloadDelivery, sessionId: SessionId, ref: string): Promise<void> {
     const session = await this.repos.sessions.get(sessionId);
     const cwd = record.context.cwd;
     // Only this attempt's refusal is told to the sender.
@@ -1827,6 +1855,8 @@ export class SessionService {
       throw new Error(refused);
     }
     const settings = session === undefined ? record.context.session : await this.settingsOf(session);
+    // Looked at again after every await (KNOWLEDGE §5): opened meanwhile, it is not resumed a second time.
+    if (this.runtimes.isOpen(ref)) return;
     try {
       await this.runtimes.resumeSession(record.context.runtime, {
         sessionId,
@@ -2141,11 +2171,27 @@ export class SessionService {
   }
 
   /** The turn a dispatch's ack named, until it is seen to end (T023 r1-P1-4). */
-  private followAckedTurn(sessionId: SessionId | undefined, turnRef: string | undefined): void {
-    if (sessionId === undefined || turnRef === undefined || this.endedTurns.get(sessionId)?.includes(turnRef)) return;
+  private followAckedTurn(sessionId: SessionId | undefined, turnRef: string | undefined): boolean {
+    if (sessionId === undefined || turnRef === undefined || this.endedTurns.get(sessionId)?.includes(turnRef)) return false;
     const acked = this.ackedTurns.get(sessionId) ?? new Set<string>();
+    if (acked.has(turnRef)) return false;
     acked.add(turnRef);
     this.ackedTurns.set(sessionId, acked);
+    return true;
+  }
+
+  /**
+   * `recordSent` with the ack's turn followed first (T036 r1 P1-1): the decision before its consequence, so no await
+   * lies between the commit of `sent` and the turn counting against idleness. The turn stays followed whatever the
+   * write does: the runtime named it, so it runs until it is seen to end (or the runtime exits).
+   */
+  private async recordSentFollowing(store: DeliveryStore, ...args: Parameters<DeliveryStore['recordSent']>): ReturnType<DeliveryStore['recordSent']> {
+    const [operationId, , nativeRef] = args;
+    const sessionId = (await store.get(operationId))?.target.sessionId;
+    // A turn stored as ended (a reconcile after a restart names an old one) is not waited for.
+    const stored = sessionId === undefined || nativeRef.turnRef === undefined ? undefined : (await this.repos.conversations.get(sessionId)).turns.find((t) => t.id === nativeRef.turnRef);
+    if (stored === undefined || stored.state === 'running') this.followAckedTurn(sessionId, nativeRef.turnRef);
+    return store.recordSent(...args);
   }
 
   private turnSeenEnded(turn: Turn): void {

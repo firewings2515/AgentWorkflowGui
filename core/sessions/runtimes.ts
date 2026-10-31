@@ -51,8 +51,14 @@ interface Entry {
   adapter: Promise<RuntimeAdapter>;
 }
 
-/** Releases under way (`onClosed` running), by native ref: everyone who asks waits for the same one. */
-type Releasing = Map<string, Promise<void>>;
+/**
+ * Releases under way (`onClosed` running), by native ref, with the opening they release: everyone who asks about
+ * that opening waits for the same one.
+ */
+type Releasing = Map<string, { generation: number; sessionId: SessionId; done: Promise<void> }>;
+
+/** How long a new opening waits for an earlier graceful close of the same session to return (T036 r1 P1-2). */
+const CLOSE_SETTLE_MS = 5000;
 
 const notRunning = (detail: string): DispatchResult => ({
   state: 'unknown',
@@ -65,12 +71,16 @@ export class SessionRuntimes {
   private readonly entries = new Map<SessionId, Entry>();
   /** Native session ref → GUI session, for every ref seen in this process or bound at startup. */
   private readonly refs = new Map<string, SessionId>();
-  /** Refs whose session is open in its adapter now. */
-  private readonly open = new Set<string>();
+  /**
+   * Refs whose session is open in its adapter now, each with its opening's generation (T036 r1 P1-2): a close or
+   * release of one opening never touches a later one of the same ref.
+   */
+  private readonly open = new Map<string, number>();
+  private generations = 0;
   private readonly releasing: Releasing = new Map();
-  /** Resumes under way, by GUI session, and graceful closes under way, by native ref (T036 single-flight). */
+  /** Resumes under way, by GUI session, and graceful closes under way, by native ref and opening (T036 single-flight). */
   private readonly resuming = new Map<SessionId, Promise<NativeSessionInfo>>();
-  private readonly closingRefs = new Map<string, Promise<{ forced: boolean }>>();
+  private readonly closingRefs = new Map<string, { generation: number; run: Promise<{ forced: boolean }> }>();
   private readonly started = new WeakSet<RuntimeAdapter>();
   private readonly subscribed = new WeakSet<RuntimeAdapter>();
   private readonly views: Record<Runtime, RuntimeAdapter>;
@@ -94,13 +104,20 @@ export class SessionRuntimes {
     this.refs.set(nativeSessionRef, sessionId);
   }
 
-  isOpen(nativeSessionRef: string): boolean {
-    return this.open.has(nativeSessionRef);
+  /** Whether the ref is open now; with `generation`, whether that same opening still is. */
+  isOpen(nativeSessionRef: string, generation?: number): boolean {
+    const current = this.open.get(nativeSessionRef);
+    return current !== undefined && (generation === undefined || current === generation);
+  }
+
+  /** The generation of the ref's current opening; undefined when it is not open. */
+  generationOf(nativeSessionRef: string): number | undefined {
+    return this.open.get(nativeSessionRef);
   }
 
   /** Open native refs and their sessions. */
   openSessions(): { sessionId: SessionId; nativeSessionRef: string }[] {
-    return [...this.open].flatMap((ref) => {
+    return [...this.open.keys()].flatMap((ref) => {
       const sessionId = this.refs.get(ref);
       return sessionId === undefined ? [] : [{ sessionId, nativeSessionRef: ref }];
     });
@@ -128,12 +145,9 @@ export class SessionRuntimes {
   markExited(sessionIds: readonly SessionId[]): void {
     // The next use creates the session's adapter again, so a Codex host that died is not reused.
     for (const sessionId of sessionIds) this.entries.delete(sessionId);
-    for (const ref of [...this.open]) {
+    for (const [ref, generation] of [...this.open]) {
       const sessionId = this.refs.get(ref);
-      if (sessionId !== undefined && sessionIds.includes(sessionId)) {
-        this.open.delete(ref);
-        void this.options.onClosed?.(sessionId);
-      }
+      if (sessionId !== undefined && sessionIds.includes(sessionId)) void this.releaseOpen(ref, sessionId, generation);
     }
   }
 
@@ -171,6 +185,12 @@ export class SessionRuntimes {
         await this.release(sessionId, adapter);
         throw new Error('the GUI is closing');
       }
+      // An earlier release of this session finishes first, so its `onClosed` (token, Job) never meets this opening.
+      await this.settledFor(sessionId);
+      if (this.closing) {
+        await this.release(sessionId, adapter);
+        throw new Error('the GUI is closing');
+      }
       const mcp = await this.options.mountMcp(sessionId);
       this.redactor.add(mcp.token);
       let info: NativeSessionInfo;
@@ -202,22 +222,25 @@ export class SessionRuntimes {
    * close per ref at a time (T036): the task pipeline and the idle supervisor closing together close it once.
    */
   closeSession(nativeSessionRef: string, timeoutMs?: number): Promise<{ forced: boolean }> {
+    const generation = this.open.get(nativeSessionRef);
     const underway = this.closingRefs.get(nativeSessionRef);
-    if (underway !== undefined) return underway;
+    if (underway !== undefined && (generation === undefined || underway.generation === generation)) return underway.run;
     const sessionId = this.refs.get(nativeSessionRef);
     const entry = sessionId === undefined ? undefined : this.entries.get(sessionId);
-    if (sessionId === undefined || entry === undefined || !this.open.has(nativeSessionRef)) return Promise.resolve({ forced: false });
+    if (sessionId === undefined || entry === undefined || generation === undefined) return Promise.resolve({ forced: false });
     const run = (async () => {
       try {
         return await (await entry.adapter).closeSession(nativeSessionRef, timeoutMs);
       } finally {
-        // Released once: `forceRelease` may have begun it while the adapter's close hung (T032).
-        await this.releaseOpen(nativeSessionRef, sessionId);
+        // Released once, and only the opening this close was for (T036 r1 P1-2): `forceRelease` may have released it
+        // while the adapter's close hung (T032), and the session may have been resumed since.
+        await this.releaseOpen(nativeSessionRef, sessionId, generation);
       }
     })();
-    this.closingRefs.set(nativeSessionRef, run);
+    const mark = { generation, run };
+    this.closingRefs.set(nativeSessionRef, mark);
     const done = () => {
-      if (this.closingRefs.get(nativeSessionRef) === run) this.closingRefs.delete(nativeSessionRef);
+      if (this.closingRefs.get(nativeSessionRef) === mark) this.closingRefs.delete(nativeSessionRef);
     };
     void run.then(done, done);
     return run;
@@ -228,24 +251,53 @@ export class SessionRuntimes {
    * `onClosed` ends its Job, token and watchers. Resolves once that release has finished, whoever began it: a
    * graceful close that already began releasing is waited for, not skipped (r2 P1-3).
    */
-  forceRelease(nativeSessionRef: string): Promise<void> {
+  forceRelease(nativeSessionRef: string, generation: number | undefined = this.open.get(nativeSessionRef)): Promise<void> {
     const sessionId = this.refs.get(nativeSessionRef);
-    return sessionId === undefined ? Promise.resolve() : this.releaseOpen(nativeSessionRef, sessionId);
+    if (sessionId === undefined) return Promise.resolve();
+    if (generation === undefined) return this.releasing.get(nativeSessionRef)?.done ?? Promise.resolve();
+    return this.releaseOpen(nativeSessionRef, sessionId, generation);
   }
 
-  /** The one release of an open session (`onClosed` once); a second caller gets the release under way. */
-  private releaseOpen(nativeSessionRef: string, sessionId: SessionId): Promise<void> {
+  /**
+   * The one release of one opening (`onClosed` once); a second caller about it gets the release under way. An opening
+   * that is no longer the current one (released, and maybe opened again since) is left alone (T036 r1 P1-2).
+   */
+  private releaseOpen(nativeSessionRef: string, sessionId: SessionId, generation: number): Promise<void> {
     const underway = this.releasing.get(nativeSessionRef);
-    if (underway !== undefined) return underway;
-    if (!this.open.delete(nativeSessionRef)) return Promise.resolve();
-    const released = Promise.resolve()
-      .then(() => this.options.onClosed?.(sessionId))
-      .then(() => undefined)
-      .finally(() => {
-        if (this.releasing.get(nativeSessionRef) === released) this.releasing.delete(nativeSessionRef);
-      });
-    this.releasing.set(nativeSessionRef, released);
-    return released;
+    if (underway !== undefined && underway.generation === generation) return underway.done;
+    if (this.open.get(nativeSessionRef) !== generation) return Promise.resolve();
+    this.open.delete(nativeSessionRef);
+    const mark: { generation: number; sessionId: SessionId; done: Promise<void> } = {
+      generation,
+      sessionId,
+      done: Promise.resolve()
+        .then(() => this.options.onClosed?.(sessionId))
+        .then(() => undefined)
+        .finally(() => {
+          if (this.releasing.get(nativeSessionRef) === mark) this.releasing.delete(nativeSessionRef);
+        }),
+    };
+    this.releasing.set(nativeSessionRef, mark);
+    return mark.done;
+  }
+
+  /**
+   * Before a session opens again: its release under way has finished, and an earlier graceful close of it has
+   * returned (at most CLOSE_SETTLE_MS when `sleep` is given), so nothing of the old opening runs on into the new one.
+   */
+  private async settledFor(sessionId: SessionId): Promise<void> {
+    await Promise.allSettled([...this.releasing.values()].filter((r) => r.sessionId === sessionId).map((r) => r.done));
+    const closes = [...this.closingRefs.entries()]
+      .filter(([ref]) => this.refs.get(ref) === sessionId)
+      .map(([, c]) =>
+        c.run.then(
+          () => undefined,
+          () => undefined,
+        ),
+      );
+    if (closes.length === 0) return;
+    const all = Promise.all(closes);
+    await (this.options.sleep === undefined ? all : Promise.race([all, this.options.sleep(CLOSE_SETTLE_MS)]));
   }
 
   /** Closes every adapter this router created (R-14: after the sessions themselves were closed). */
@@ -323,7 +375,7 @@ export class SessionRuntimes {
 
   private opened(info: NativeSessionInfo): void {
     this.refs.set(info.nativeSessionRef, info.sessionId);
-    this.open.add(info.nativeSessionRef);
+    this.open.set(info.nativeSessionRef, ++this.generations);
     this.options.onOpened?.(info.sessionId, info.cwd);
     // R-12: Codex reports its configured model only here (start or resume), never in an event (T021).
     if (info.model.source !== 'unknown') this.options.onEvent({ type: 'model.observed', sessionId: info.sessionId, observed: info.model, at: info.model.observedAt });

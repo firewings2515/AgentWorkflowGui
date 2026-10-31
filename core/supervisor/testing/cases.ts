@@ -459,6 +459,85 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
     });
   });
 
+  describe(`idle supervisor: review r1 sequences (${name})`, () => {
+    it('P1-1: a sent delivery whose ack is not yet followed is not closed by the limit', async () => {
+      const w = await make({ maxOpen: 1 });
+      const a = await created(w, 'codex', 'session-a');
+      await exchange(w, 'codex', a);
+      // A retry from outside the queue: the runtime acks, `sent` commits, and the call has not returned yet.
+      const op = await pending(w, a, 'codex', 'retried');
+      const held = gate();
+      w.holdNextRecordSent = held.promise;
+      const dispatching = w.service.delivery.dispatch(op);
+      await settle();
+      expect(await stateOf(w, op)).toBe('sent');
+      w.clock.advance(1);
+      // A second session goes above the limit of one: the limit looks for the oldest idle session.
+      const b = await created(w, 'codex', 'session-b');
+      await settle();
+      expect(isOpen(w, a)).toBe(true);
+      expect(w.closed).not.toContain(a);
+      expect(w.logs.some((l) => l.includes(`${a} is not idle`) && l.includes('turn-acked'))).toBe(true);
+      held.open();
+      expect((await dispatching).status).toBe('sent');
+      // The newest one was the idle one, so it went instead.
+      expect(w.closed).toEqual([b]);
+    });
+
+    it('P1-2: a graceful close that returns after the deadline leaves the session resumed since alone', async () => {
+      const { w, a, adapter } = await (async () => {
+        const world = await make();
+        const id = await created(world, 'codex');
+        await exchange(world, 'codex', id);
+        world.clock.advance(IDLE_MS);
+        return { w: world, a: id, adapter: world.codex.get(id)! };
+      })();
+      const held = gate();
+      adapter.closeGate = held.promise;
+      // The close deadline passes at once: the session is released by force (its Job ended).
+      w.sleeper = () => Promise.resolve();
+      await w.supervisor.tick();
+      await settle();
+      expect(w.closed).toEqual([a]);
+      expect(isOpen(w, a)).toBe(false);
+      expect((await send(w, a, 'after the deadline')).ok).toBe(true);
+      expect(adapter.resumed).toHaveLength(1);
+      expect(isOpen(w, a)).toBe(true);
+      const mounts = w.mounts.filter((m) => m === a).length;
+      // The old close returns now: the new opening keeps its runtime, token and Job.
+      held.open();
+      await settle();
+      expect(isOpen(w, a)).toBe(true);
+      expect(w.closed).toEqual([a]);
+      expect(w.mounts.filter((m) => m === a)).toHaveLength(mounts);
+      expect(await activityOf(w, a)).toBe('idle');
+    });
+
+    it('P1-3: two deliveries to a closed session, the first held before its resume, resume it once with one mount', async () => {
+      const w = await make();
+      const a = await created(w, 'claude');
+      await exchange(w, 'claude', a);
+      await idleFor(w, IDLE_MS);
+      expect(isOpen(w, a)).toBe(false);
+      const mountsBefore = w.mounts.filter((m) => m === a).length;
+      const one = await pending(w, a, 'claude', 'one');
+      const two = await pending(w, a, 'claude', 'two');
+      const held = gate();
+      // The first one's resume stops on its read of the session.
+      w.holdNextSessionGet = held.promise;
+      const first = w.service.delivery.dispatch(one);
+      await settle();
+      const second = w.service.delivery.dispatch(two);
+      await settle();
+      held.open();
+      const outcomes = await Promise.all([first, second]);
+      expect(outcomes.map((o) => o.status)).toEqual(['sent', 'sent']);
+      expect(w.claude.resumed).toHaveLength(1);
+      expect(w.mounts.filter((m) => m === a)).toHaveLength(mountsBefore + 1);
+      expect(w.claude.dispatched.map((d) => d.text).sort()).toEqual(['hello', 'one', 'two']);
+    });
+  });
+
   describe(`idle supervisor: crashes (${name})`, () => {
     it('a crash while closing: after the restart the session is closed and resumes once in its folder', async () => {
       const w = await make();
