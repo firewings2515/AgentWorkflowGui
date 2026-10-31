@@ -8,6 +8,8 @@ export interface GitResult {
   code: number;
   stdout: string;
   stderr: string;
+  /** Output beyond the size kept was dropped: what is here is not all git said. */
+  truncated: boolean;
 }
 
 export interface GitRunOptions {
@@ -90,7 +92,12 @@ export function createGitRunner(options: GitRunnerOptions = {}): GitRunner {
       });
       child.on('error', (error) => finish(() => reject(new GitRunError(`git could not be run (${error.message})`))));
       child.on('close', (code) =>
-        finish(() => resolve({ code: code ?? -1, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') })),
+        finish(() => resolve({
+          code: code ?? -1,
+          stdout: Buffer.concat(out).toString('utf8'),
+          stderr: Buffer.concat(err).toString('utf8'),
+          truncated: outSize > MAX_OUTPUT_BYTES || errSize > MAX_OUTPUT_BYTES,
+        })),
       );
       // git may exit before reading its input: the exit code tells.
       child.stdin.on('error', () => undefined);

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { WorktreeRef } from '../../../core/ports/git';
 import { GitAdapter, worktreePath } from '../adapter';
-import { createGitRunner, type GitRunner, type SpawnFunction } from '../run';
+import { createGitRunner, type GitResult, type GitRunner, type SpawnFunction } from '../run';
 
 export interface Sandbox {
   /** The folder every repository below lives in. */
@@ -24,8 +24,11 @@ export interface Sandbox {
   task(repo: string, name: string): WorktreeRef;
   /** The adapter's configuration without a user identity, so it has to supply one. */
   anonymousAdapter(): GitAdapter;
-  /** An adapter whose every command is preceded by `before`: another process doing something in the middle of an operation. */
-  hooked(before: (args: readonly string[], cwd: string) => Promise<void>): GitAdapter;
+  /**
+   * An adapter whose every command is preceded by `before` (another process doing something in the middle of an
+   * operation, or a crash when it throws) and whose result `after` may replace (a command that failed).
+   */
+  hooked(before: (args: readonly string[], cwd: string) => Promise<void>, after?: (args: readonly string[], result: GitResult) => GitResult | undefined): GitAdapter;
   children: ChildProcess[];
   dispose(): void;
 }
@@ -84,12 +87,13 @@ export function createSandbox(): Sandbox {
     commitFile,
     task: (repo, name) => ({ repo, path: worktreePath(repo, name), branch: `task/${name}` }),
     anonymousAdapter: () => new GitAdapter({ env: isolated(anonymous) }),
-    hooked: (before) => {
+    hooked: (before, after) => {
       const inner = createGitRunner({ env: isolated(identified) });
       return new GitAdapter({
         run: async (args, options) => {
           await before(args, options.cwd);
-          return inner(args, options);
+          const result = await inner(args, options);
+          return after?.(args, result) ?? result;
         },
       });
     },

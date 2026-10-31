@@ -3,7 +3,8 @@
 // and their branches — and moves a target branch only by fast-forward. It never pushes, never rewrites
 // history, never resets a target branch. Expected outcomes (conflict, moved branch, failed cleanup) are
 // results; a thrown error means git could not be run at all (run.ts's GitRunError).
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type {
   AdvanceResult,
@@ -36,8 +37,14 @@ const DEFAULT_IDENTITY = { name: 'AgentWorkflowGui', email: 'agent-workflow-gui@
 const AWG_FOLDER = '.awg';
 /** The branch config entry that says the pipeline made this branch (and for which folder): it allows deleting the branch. */
 const BRANCH_KEY = 'awgBranch';
-/** The branch config entry that allows removing the worktree folder it names; withdrawn once the folder is gone. */
-const FOLDER_KEY = 'awgFolder';
+/** Branch config: this attempt's token and path, written before `worktree add` (an intent, which claims nothing). */
+const INTENT_KEY = 'awgIntent';
+/** Branch config: the token that was written into the new worktree's admin folder, the proof that this adapter made it. */
+const TOKEN_KEY = 'awgToken';
+/** Branch config: identity of the folder git was asked to remove, so a leftover can be told from a folder made later. */
+const LEFTOVER_KEY = 'awgLeftover';
+/** The file in a worktree's admin folder (`<common dir>\worktrees\<name>`) that holds the token. */
+const OWNER_FILE = 'awg-owner';
 /** A worktree's name under `.awg\wt`: one safe segment (no separators, no `..`, no trailing dot, no device names). */
 const SAFE_NAME = /^(?!(?:con|prn|aux|nul|com\d|lpt\d)(?:\.|$))[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/i;
 const lines = (text: string): string[] =>
@@ -113,33 +120,37 @@ export class GitAdapter implements GitPort {
         const registered = (await this.worktrees(worktree.repo)).find((entry) => samePath(entry.path, worktree.path));
         const key = canonicalKey(worktree.path);
         if (registered !== undefined) {
-          // Only the worktree this adapter began (the record below, written before git was asked) is taken up again:
-          // a worktree somebody else made on that branch and path is not claimed.
-          const claimed = (await this.recorded(worktree.repo, worktree.branch, FOLDER_KEY)) === key;
-          const same = claimed && registered.branch === full && !registered.prunable && existsSync(worktree.path);
-          if (same && branchTip !== undefined && (await this.isAncestor(worktree.repo, baseCommit, branchTip))) return { status: 'exists', baseCommit };
+          // Only a worktree this adapter finished making is taken up again: the token in its own admin folder is the
+          // one this branch's config names. An intent record alone proves nothing (the folder may be somebody else's).
+          const same = registered.branch === full && !registered.prunable && existsSync(worktree.path);
+          if (same && branchTip !== undefined && (await this.ownsWorktree(worktree)) && (await this.isAncestor(worktree.repo, baseCommit, branchTip))) {
+            return { status: 'exists', baseCommit };
+          }
           throw new GitStepError(`${worktree.path} is already a worktree for another branch or another base, or not one this adapter made`);
         }
         if (branchTip !== undefined) throw new GitStepError(`The branch ${worktree.branch} already exists`);
         this.hideFromRepo(worktree);
-        // The record comes first, so an interruption after `worktree add` leaves a worktree that is recognised as ours.
-        // `awgBranch` stays with the branch (it allows deleting the branch); `awgFolder` allows removing the folder and
-        // is withdrawn once the folder is gone.
-        await this.must(['config', `branch.${worktree.branch}.${BRANCH_KEY}`, key], worktree.repo);
-        await this.must(['config', `branch.${worktree.branch}.${FOLDER_KEY}`, key], worktree.repo);
+        // Intent first, ownership after: the intent holds this attempt's token; only when `worktree add` has succeeded
+        // is the token written into the new worktree's admin folder (the proof that this adapter made it) and the
+        // branch record made. A failure or interruption in between leaves at most the intent, which claims nothing.
+        const token = randomUUID();
+        await this.must(['config', `branch.${worktree.branch}.${INTENT_KEY}`, `${token}|${key}`], worktree.repo);
         const added = await this.git(['worktree', 'add', '-b', worktree.branch, worktree.path, baseCommit], worktree.repo);
         if (added.code !== 0) {
-          // git leaves the branch it had just made when the folder is refused. It did not exist a moment ago: it goes
-          // again, but only while it is still exactly at the base (no work on it), and its record with it.
-          await this.git(['update-ref', '-d', full, baseCommit], worktree.repo);
-          await this.git(['config', '--remove-section', `branch.${worktree.branch}`], worktree.repo);
+          // Only the intent is withdrawn. A branch git left behind (or one somebody made meanwhile) is not ours to delete.
+          await this.git(['config', '--unset-all', `branch.${worktree.branch}.${INTENT_KEY}`], worktree.repo);
           throw new GitStepError(detailOf(added));
         }
+        const admin = await this.adminDir(worktree.repo, worktree.path);
+        if (admin === undefined) throw new GitStepError(`git made ${worktree.path} but its worktree folder could not be found; it was not claimed`);
+        writeFileSync(join(admin, OWNER_FILE), token, 'utf8');
+        await this.must(['config', `branch.${worktree.branch}.${TOKEN_KEY}`, token], worktree.repo);
+        await this.must(['config', `branch.${worktree.branch}.${BRANCH_KEY}`, key], worktree.repo);
+        await this.git(['config', '--unset-all', `branch.${worktree.branch}.${INTENT_KEY}`], worktree.repo);
         return { status: 'created', baseCommit };
       }),
     );
   }
-
   commitAll(worktree: WorktreeRef, message: string, exclude: readonly string[]): Promise<CommitResult> {
     return this.serial(worktree.repo, () =>
       this.failing(async () => {
@@ -316,21 +327,33 @@ export class GitAdapter implements GitPort {
     if (registered !== undefined && registered.branch !== full) {
       return pending(`Refused: ${worktree.path} is a worktree of ${registered.branch ?? 'a detached HEAD'}, not of ${worktree.branch}`);
     }
-    // Two separate proofs, both written by createWorktree for this very path and branch. `awgFolder` allows touching
-    // the folder (a registered worktree or its leftover) and is withdrawn below once the folder is gone, so nothing
-    // that appears there later is ever deleted. `awgBranch` allows deleting the branch and goes with it.
+    // What may be touched is decided by proofs this adapter wrote, never by a path alone:
+    // - a registered worktree: the token in its own admin folder is the one the branch's config names;
+    // - a folder git no longer lists (what a failed removal leaves): the folder itself, by the identity (file id and
+    //   creation time) recorded just before git was asked to remove it; a folder made later at that path differs;
+    // - the branch: the record `createWorktree` made once it had finished.
+    // Without a proof the thing is kept and the result says so for the user to decide.
     const key = canonicalKey(worktree.path);
     const branchExists = (await this.tip(worktree.repo, full)) !== undefined;
-    const folderAllowed = branchExists && (await this.recorded(worktree.repo, worktree.branch, FOLDER_KEY)) === key;
     const branchOwned = branchExists && (await this.recorded(worktree.repo, worktree.branch, BRANCH_KEY)) === key;
-    if (!folderAllowed && (registered !== undefined || existsSync(worktree.path))) {
-      return pending(`Refused: ${worktree.path} is not a worktree folder this adapter made for ${worktree.branch}; nothing was removed`);
+    if (registered !== undefined && !(branchOwned && (await this.ownsWorktree(worktree)))) {
+      return pending(`Refused: ${worktree.path} is not a worktree this adapter made for ${worktree.branch}; the user has to decide what to do with it`);
     }
-    if (!branchOwned && options.deleteBranch && branchExists) {
+    if (registered === undefined && existsSync(worktree.path)) {
+      const identity = this.folderIdentity(worktree.path);
+      const leftover = branchExists ? await this.recorded(worktree.repo, worktree.branch, LEFTOVER_KEY) : undefined;
+      if (identity === undefined || leftover !== identity) {
+        return pending(`Refused: the folder ${worktree.path} cannot be shown to be what a removal left behind; the user has to decide what to do with it`);
+      }
+    }
+    if (options.deleteBranch && branchExists && !branchOwned) {
       return pending(`Refused: the branch ${worktree.branch} was not created by the pipeline for ${worktree.path}; it was not deleted`);
     }
 
     if (registered !== undefined) {
+      // Written before git is asked: if the removal fails halfway, this is how the leftover folder is recognised.
+      const identity = this.folderIdentity(worktree.path);
+      if (identity !== undefined) await this.must(['config', `branch.${worktree.branch}.${LEFTOVER_KEY}`, identity], worktree.repo);
       const removed = await this.git(['worktree', 'remove', '--force', worktree.path], worktree.repo);
       // A process holds something in the folder: git has already unregistered the worktree and deleted part of it (SP-07 G1).
       if (removed.code !== 0 && !retry) return pending(`git could not remove the worktree: ${detailOf(removed)}`);
@@ -345,6 +368,12 @@ export class GitAdapter implements GitPort {
         return pending(`The folder could not be deleted yet: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+    // The folder is gone. The permission that named it ends now, before any step that can fail (the identity would
+    // not match a later folder anyway).
+    if (!existsSync(worktree.path) && branchExists) {
+      const withdrawn = await this.git(['config', '--unset-all', `branch.${worktree.branch}.${LEFTOVER_KEY}`], worktree.repo);
+      if (withdrawn.code !== 0 && withdrawn.code !== 5) return pending(`The folder record could not be withdrawn: ${detailOf(withdrawn)}`);
+    }
 
     // The registration of a folder that is gone: pruned, or removed alone when another worktree's folder is gone too.
     const after = await this.worktrees(worktree.repo);
@@ -355,18 +384,12 @@ export class GitAdapter implements GitPort {
       if ((await this.worktrees(worktree.repo)).some((entry) => samePath(entry.path, worktree.path))) return pending('The worktree is still registered after the prune');
     }
 
-    // The folder is gone: the permission to touch a folder at this path ends here (the branch may stay).
-    if (folderAllowed) {
-      const withdrawn = await this.git(['config', '--unset-all', `branch.${worktree.branch}.${FOLDER_KEY}`], worktree.repo);
-      if (withdrawn.code !== 0 && withdrawn.code !== 5) return pending(`The folder record could not be withdrawn: ${detailOf(withdrawn)}`);
-    }
-
     if (options.deleteBranch && branchExists) {
       // The caller says the task is merged. `branch -d` would compare against the checked-out HEAD, which is not the
       // target branch, so the same check is made here (another branch holds the commits). The delete is
       // `update-ref -d <ref> <checked sha>`, which git refuses when the branch moved since (`branch -D` has no such
       // condition); it does not look at checkouts, so those are checked first (the window left is the one before
-      // the delete).
+      // the delete: a checkout in that gap is not seen, see the hand-over notes).
       const tip = await this.tip(worktree.repo, full);
       if (tip !== undefined) {
         const checkedOut = (await this.worktrees(worktree.repo)).find((entry) => entry.branch === full);
@@ -382,10 +405,54 @@ export class GitAdapter implements GitPort {
     return { status: 'removed' };
   }
 
-  /** What `createWorktree` recorded in the branch's config under `key`: the folder, as `canonicalKey` spells it. */
+  /** What `createWorktree` recorded in the branch's config under `key`. */
   private async recorded(repo: string, branch: string, key: string): Promise<string | undefined> {
     const result = await this.git(['config', '--get', `branch.${branch}.${key}`], repo);
     return result.code === 0 ? result.stdout.trim() : undefined;
+  }
+
+  /** The folder git keeps for the worktree at `path` (`<common dir>\worktrees\<name>`), found by the path it names; works when the worktree's own folder is gone. */
+  private async adminDir(repo: string, path: string): Promise<string | undefined> {
+    const common = resolve(repo, (await this.must(['rev-parse', '--git-common-dir'], repo)).trim());
+    const root = join(common, 'worktrees');
+    let names: string[];
+    try {
+      names = readdirSync(root);
+    } catch {
+      return undefined;
+    }
+    for (const name of names) {
+      try {
+        const target = readFileSync(join(root, name, 'gitdir'), 'utf8').trim();
+        if (samePath(dirname(target), path)) return join(root, name);
+      } catch {
+        // Not a worktree folder (or unreadable): skip.
+      }
+    }
+    return undefined;
+  }
+
+  /** The worktree's admin folder holds the token the branch's config names: this adapter finished making it. */
+  private async ownsWorktree(worktree: WorktreeRef): Promise<boolean> {
+    try {
+      const wanted = await this.recorded(worktree.repo, worktree.branch, TOKEN_KEY);
+      const admin = await this.adminDir(worktree.repo, worktree.path);
+      if (wanted === undefined || wanted === '' || admin === undefined) return false;
+      return readFileSync(join(admin, OWNER_FILE), 'utf8').trim() === wanted;
+    } catch {
+      return false;
+    }
+  }
+
+  /** A folder as itself, not as a path: file id and creation time. Undefined for a link or a folder that cannot be read. */
+  private folderIdentity(path: string): string | undefined {
+    try {
+      const stats = lstatSync(path, { bigint: true });
+      if (stats.isSymbolicLink() || (stats.ino === 0n && stats.birthtimeNs === 0n)) return undefined;
+      return `${String(stats.ino)}:${String(stats.birthtimeNs)}`;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Why Node must not delete the folder, or undefined. */
@@ -416,6 +483,7 @@ export class GitAdapter implements GitPort {
   private async must(args: readonly string[], cwd: string): Promise<string> {
     const result = await this.git(args, cwd);
     if (result.code !== 0) throw new GitStepError(detailOf(result));
+    if (result.truncated) throw new GitStepError(`The output of git ${args[0] ?? ''} was too large to read in full`);
     return result.stdout;
   }
 
@@ -569,6 +637,7 @@ export class GitAdapter implements GitPort {
       cwd,
     );
     if (check.code !== 0 && check.code !== 2) throw new GitStepError(detailOf(check));
+    if (check.truncated) throw new GitStepError('The conflict marker check printed too much to read in full; nothing was committed');
     // The lines are read from the index, the content that is about to be committed: the working file may differ
     // (resolved by hand after the conflict was staged, or left out of the add by an exclude).
     const kinds = new Map<string, Set<string>>();
@@ -579,7 +648,9 @@ export class GitAdapter implements GitPort {
       const [, file = '', number = '0'] = found;
       if (!staged.has(file)) {
         const blob = await this.git(['cat-file', '-p', `:${file}`], cwd);
-        staged.set(file, blob.code === 0 ? blob.stdout.split('\n') : []);
+        // A blob that cannot be read in full is not "no markers": nothing is committed on a guess.
+        if (blob.code !== 0 || blob.truncated) throw new GitStepError(`The staged content of ${file} could not be read in full to check it for conflict markers`);
+        staged.set(file, blob.stdout.split('\n'));
       }
       const text = staged.get(file)?.[Number(number) - 1] ?? '';
       if (text.startsWith('<') || text.startsWith('>')) kinds.set(file, (kinds.get(file) ?? new Set<string>()).add(text.charAt(0)));

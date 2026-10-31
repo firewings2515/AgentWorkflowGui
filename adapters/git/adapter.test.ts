@@ -767,15 +767,43 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
     expect(await sandbox.adapter.removeWorktree(ref, { deleteBranch: true })).toEqual({ status: 'removed' });
   });
 
-  it('keeps the folder permission through a pending cleanup, and withdraws it when that finishes', async () => {
+  it('records the folder’s identity before asking git to remove it, and drops the record when the folder is gone', async () => {
     const repo = await sandbox.newRepo();
     const ref = await taskWith(repo, 'w3', 'w.txt', 'w\n');
     const holder = await holdFolder(ref.path);
     expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).status).toBe('pending-cleanup');
-    expect(await sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgFolder`)).not.toBe('');
+    expect((await sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgLeftover`)).trim()).toMatch(/^\d+:\d+$/);
     await holder.release();
     expect(await sandbox.adapter.retryCleanup(ref, { deleteBranch: false })).toEqual({ status: 'removed' });
-    await expect(sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgFolder`)).rejects.toThrow();
+    await expect(sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgLeftover`)).rejects.toThrow();
+  });
+
+  it('never deletes a folder made later at the path of a removed worktree, even when the step after the removal failed (r3 P1-1)', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = await taskWith(repo, 'w4', 'w.txt', 'w\n');
+    // The removal succeeds, then withdrawing the record fails: the record is still there when the user comes.
+    const failing = sandbox.hooked(
+      () => Promise.resolve(),
+      (args, result) => (args.includes('--unset-all') && args.some((a) => a.endsWith('.awgLeftover')) ? { ...result, code: 1, stderr: 'config is locked' } : undefined),
+    );
+    expect((await failing.removeWorktree(ref, { deleteBranch: false })).status).toBe('pending-cleanup');
+    expect(existsSync(ref.path)).toBe(false);
+
+    mkdirSync(ref.path, { recursive: true });
+    writeFileSync(join(ref.path, 'mine.txt'), 'user data\n');
+    expect((await sandbox.adapter.retryCleanup(ref, { deleteBranch: false })).status).toBe('pending-cleanup');
+    expect(readFileSync(join(ref.path, 'mine.txt'), 'utf8')).toBe('user data\n');
+
+    // Also when the folder the record named was held, then replaced by the user's own.
+    const held = await taskWith(repo, 'w5', 'w.txt', 'w\n');
+    const holder = await holdFolder(held.path);
+    expect((await sandbox.adapter.removeWorktree(held, { deleteBranch: false })).status).toBe('pending-cleanup');
+    await holder.release();
+    rmSync(held.path, { recursive: true, force: true });
+    mkdirSync(held.path, { recursive: true });
+    writeFileSync(join(held.path, 'mine.txt'), 'user data 2\n');
+    expect((await sandbox.adapter.retryCleanup(held, { deleteBranch: false })).status).toBe('pending-cleanup');
+    expect(readFileSync(join(held.path, 'mine.txt'), 'utf8')).toBe('user data 2\n');
   });
 
   it('keeps a branch that was moved to an unmerged commit after it was checked, instead of deleting it', async () => {
@@ -809,22 +837,18 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
   });
 });
 
-describe.concurrent('createWorktree after an interruption', () => {
-  it('takes up again a worktree it had begun (the record was written before git was asked), and can clean it up', async () => {
+describe.concurrent('createWorktree: intent, ownership and interruptions', () => {
+  it('takes up again a worktree it made (its token is in the worktree’s admin folder), and can clean it up', async () => {
     const repo = await sandbox.newRepo();
     const ref = sandbox.task(repo, 'cr1');
     const tip = (await sandbox.git(repo, 'rev-parse', 'main')).trim();
-    // What an interruption just after `worktree add` leaves: the record and the worktree, nothing else.
-    const key = ref.path.replaceAll('\\', '/').toLowerCase();
-    await sandbox.git(repo, 'config', `branch.${ref.branch}.awgBranch`, key);
-    await sandbox.git(repo, 'config', `branch.${ref.branch}.awgFolder`, key);
-    await sandbox.git(repo, 'worktree', 'add', '-q', '-b', ref.branch, ref.path, 'main');
-
+    expect(await sandbox.adapter.createWorktree(ref, 'main')).toEqual({ status: 'created', baseCommit: tip });
     expect(await sandbox.adapter.createWorktree(ref, 'main')).toEqual({ status: 'exists', baseCommit: tip });
+    await expect(sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgIntent`)).rejects.toThrow(); // the intent is gone once it is done
     expect(await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).toEqual({ status: 'removed' });
   });
 
-  it('does not claim a worktree it has no record of, whoever made it', async () => {
+  it('does not claim a worktree it has no token for, whoever made it', async () => {
     const repo = await sandbox.newRepo();
     const ref = sandbox.task(repo, 'cr2');
     await sandbox.git(repo, 'worktree', 'add', '-q', '-b', ref.branch, ref.path, 'main');
@@ -833,14 +857,84 @@ describe.concurrent('createWorktree after an interruption', () => {
     expect(existsSync(ref.path)).toBe(true);
   });
 
-  it('leaves no record behind when git refuses to create the worktree', async () => {
+  it('does not take a user’s own worktree for its own after an interruption before `worktree add` (r3 P1-2)', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = sandbox.task(repo, 'cr4');
+    // The intent is written, then the process dies before git is asked.
+    const crashing = sandbox.hooked((args) => (args[0] === 'worktree' && args[1] === 'add' ? Promise.reject(new Error('crash')) : Promise.resolve()));
+    await expect(crashing.createWorktree(ref, 'main')).rejects.toThrow('crash');
+    expect((await sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgIntent`)).trim()).toContain('|'); // token|path
+
+    // The user makes the same branch, path and base by hand, with work in it.
+    await sandbox.git(repo, 'worktree', 'add', '-q', '-b', ref.branch, ref.path, 'main');
+    writeFileSync(join(ref.path, 'uncommitted.txt'), 'user work\n');
+
+    expect(await sandbox.adapter.createWorktree(ref, 'main')).toMatchObject({ status: 'failed' });
+    expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: true })).status).toBe('pending-cleanup');
+    expect((await sandbox.adapter.retryCleanup(ref, { deleteBranch: true })).status).toBe('pending-cleanup');
+    expect(readFileSync(join(ref.path, 'uncommitted.txt'), 'utf8')).toBe('user work\n');
+    expect(await sandbox.adapter.resolveBranch(repo, ref.branch)).toBeDefined();
+  });
+
+  it('does not claim a worktree it made if the process died before the token was written (it stays, for the user)', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = sandbox.task(repo, 'cr5');
+    const crashing = sandbox.hooked((args) => (args[0] === 'rev-parse' && args[1] === '--git-common-dir' ? Promise.reject(new Error('crash')) : Promise.resolve()));
+    await expect(crashing.createWorktree(ref, 'main')).rejects.toThrow('crash'); // right after `worktree add`
+    expect(existsSync(ref.path)).toBe(true);
+    expect((await sandbox.adapter.createWorktree(ref, 'main')).status).toBe('failed');
+    expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).status).toBe('pending-cleanup');
+    expect(existsSync(ref.path)).toBe(true);
+  });
+
+  it('keeps a branch made by somebody else while `worktree add` was running, and only withdraws its own intent (r3 P1-3)', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = sandbox.task(repo, 'cr6');
+    const racing = sandbox.hooked(async (args) => {
+      if (args[0] === 'worktree' && args[1] === 'add') await sandbox.git(repo, 'branch', ref.branch, 'main'); // same name, same base, made just now
+    });
+    expect((await racing.createWorktree(ref, 'main')).status).toBe('failed');
+    expect(await sandbox.adapter.resolveBranch(repo, ref.branch)).toBeDefined(); // not deleted
+    await expect(sandbox.git(repo, 'config', '--get-regexp', `branch\\.${ref.branch}\\.awg`)).rejects.toThrow(); // no record of ours left
+    expect(existsSync(ref.path)).toBe(false);
+  });
+
+  it('leaves no record behind when git refuses the folder; the branch git left stays for the user and is never claimed', async () => {
     const repo = await sandbox.newRepo();
     const ref = sandbox.task(repo, 'cr3');
     mkdirSync(ref.path, { recursive: true });
     writeFileSync(join(ref.path, 'in-the-way.txt'), 'x\n'); // git will not use a folder that is not empty
     expect((await sandbox.adapter.createWorktree(ref, 'main')).status).toBe('failed');
-    await expect(sandbox.git(repo, 'config', '--get-regexp', `branch\\.${ref.branch}\\.`)).rejects.toThrow();
-    expect(await sandbox.adapter.resolveBranch(repo, ref.branch)).toBeUndefined();
+    await expect(sandbox.git(repo, 'config', '--get-regexp', `branch\\.${ref.branch}\\.awg`)).rejects.toThrow();
     expect(readFileSync(join(ref.path, 'in-the-way.txt'), 'utf8')).toBe('x\n');
+    expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: true })).status).toBe('pending-cleanup'); // not ours: kept
+    expect(readFileSync(join(ref.path, 'in-the-way.txt'), 'utf8')).toBe('x\n');
+  });
+});
+
+describe.concurrent('conflict checks that cannot read the staged content', () => {
+  const conflicting = async () => {
+    const repo = await sandbox.newRepo();
+    await sandbox.commitFile(repo, 'shared.txt', 'base\n');
+    const a = await taskWith(repo, 'e1', 'shared.txt', 'from e1\n');
+    const b = await taskWith(repo, 'e2', 'shared.txt', 'from e2\n');
+    const int = await integration(repo);
+    await sandbox.adapter.merge(int, a.branch, 'merge e1');
+    expect((await sandbox.adapter.merge(int, b.branch, 'merge e2')).status).toBe('conflict');
+    return { repo, int };
+  };
+
+  it('fails, committing nothing, when the staged blob cannot be read or the output was cut', async () => {
+    for (const broken of [{ code: 128, stderr: 'fatal: bad object' }, { code: 0, stdout: '', truncated: true }]) {
+      const { int } = await conflicting();
+      const head = (await sandbox.adapter.status(int)).head;
+      const adapter = sandbox.hooked(
+        () => Promise.resolve(),
+        (args, result) => (args[0] === 'cat-file' ? { ...result, ...broken } : undefined),
+      );
+      const result = await adapter.commitAll(int, 'merge e2', []);
+      expect(result).toMatchObject({ status: 'failed', detail: expect.stringContaining('shared.txt') as unknown });
+      expect((await sandbox.adapter.status(int)).head).toBe(head);
+    }
   });
 });
