@@ -80,7 +80,11 @@ export interface WorkflowHooks {
   turnEnded(sessionId: SessionId): void;
   /** The node's part of a workflow session's instructions (rules, task, rework limit; R-05). */
   briefing(session: WorkflowSession): Promise<string | undefined>;
-  /** Whether a formal handoff may still go: not when its task stopped at a limit (R-05, T024 r2-P1-1). */
+  /**
+   * Whether a formal handoff may go now: not when its task stopped at a limit (R-05, T024 r2-P1-1), while its
+   * round is not complete (CR-4), or while its node's concurrency is full (R-06, T031). Asked in acceptance
+   * order until one may; the first that may is sent, and an answer of true may hold a slot for it.
+   */
   mayDeliver(handoff: HandoffMeta): Promise<boolean>;
   /**
    * Whether a user message may be dispatched now (T024 r3-P1-2): a workflow's first message only to the root
@@ -1311,8 +1315,10 @@ export class SessionService {
    * The one gate of formal handoffs (SP-05, T024 r1-P1-2/3), in the target's queue: only the oldest pending
    * handoff to the session, only while no turn of its own runs (by the stored turns, which an old event
    * cannot undo, never by its activity), and only once the turn the previous handoff started has ended.
-   * The gate always sends the oldest one, whichever handoff opened it, so one left pending (a resume that
-   * failed) is never overtaken. It then starts a new turn; anything else waits (`queued`).
+   * The gate always sends the oldest one the workflow lets go (`mayDeliver`), whichever handoff opened it, so
+   * one left pending (a resume that failed) is never overtaken; one the workflow holds (a round not complete
+   * yet, a task stopped at a limit) no longer holds the ones behind it (T031). It then starts one new turn;
+   * anything else waits (`queued`).
    */
   private async dispatchHandoff(operationId: OperationId, sessionId: SessionId): Promise<DeliveryState | 'queued'> {
     if (this.handoffTurns.has(sessionId)) return 'queued';
@@ -1321,10 +1327,15 @@ export class SessionService {
     const waiting = (await this.store.listByState('pending'))
       .filter((r) => r.kind === 'handoff' && r.target.sessionId === sessionId && r.outcome === undefined)
       .sort((a, b) => (a.acceptedAt < b.acceptedAt ? -1 : a.acceptedAt > b.acceptedAt ? 1 : a.operationId < b.operationId ? -1 : 1));
-    const next = waiting[0];
+    // In acceptance order, the first the workflow lets go: a task stopped at a limit sends nothing more,
+    // queued handoffs included (r2-P1-1), and a round's handoffs wait for the round (CR-4). One at most.
+    let next: StoredDelivery | undefined;
+    for (const candidate of waiting) {
+      if (candidate.kind === 'handoff' && candidate.handoff !== undefined && this.workflow !== undefined && !(await this.workflow.mayDeliver(candidate.handoff))) continue;
+      next = candidate;
+      break;
+    }
     if (next === undefined) return 'queued';
-    // A task stopped at a limit sends nothing more, queued handoffs included (r2-P1-1).
-    if (next.kind === 'handoff' && next.handoff !== undefined && this.workflow !== undefined && !(await this.workflow.mayDeliver(next.handoff))) return 'queued';
     const known = new Set<string>(conversation.turns.filter((t) => t.nativeTaskId === undefined).map((t) => t.id));
     const mark: { operationId: OperationId; known: Set<string>; started?: string; expected?: string } = { operationId: next.operationId, known };
     this.handoffTurns.set(sessionId, mark);

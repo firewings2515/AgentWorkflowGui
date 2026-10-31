@@ -52,7 +52,7 @@ const agent = (id: AgentId, name: string): AgentDefinition => ({
 /** The three Agents of the template flow. */
 export const agents = (): AgentDefinition[] => [agent(PLANNER, 'Planner'), agent(BUILDER, 'Builder'), agent(REVIEWER, 'Reviewer')];
 
-const node = (id: NodeId, extra: Partial<Extract<WorkflowNode, { kind: 'agent' }>>): Extract<WorkflowNode, { kind: 'agent' }> => ({
+export const node = (id: NodeId, extra: Partial<Extract<WorkflowNode, { kind: 'agent' }>>): Extract<WorkflowNode, { kind: 'agent' }> => ({
   id,
   kind: 'agent',
   label: id,
@@ -134,6 +134,7 @@ const handoffOf = (r: StoredDelivery): Handoff | undefined => {
     payloadHash: r.payloadHash,
     proposalRevision: r.proposalRevision,
     round: m.round,
+    ...(m.expectedUpstream !== undefined && { expectedUpstream: [...m.expectedUpstream] }),
     target: r.target,
     delivery: r.delivery,
     ...(r.outcome !== undefined && { outcome: r.outcome }),
@@ -186,9 +187,14 @@ let uuids = 0;
 const uuid = () => `00000000-0000-4000-8000-${(++uuids).toString(16).padStart(12, '0')}`;
 let requests = 0;
 export const rid = () => RequestId.parse(`r-${++requests}`);
-/** Strictly increasing timestamps, so handoffs keep their order. */
+/** Strictly increasing timestamps, so handoffs keep their order; `advanceClock` moves them on (wait limits, T031). */
 let ticks = 0;
-const now = () => new Date(Date.UTC(2026, 9, 29, 1, 0, 0, ++ticks)).toISOString();
+let skipped = 0;
+const now = () => new Date(Date.UTC(2026, 9, 29, 1, 0, 0, ++ticks + skipped)).toISOString();
+export const advanceClock = (ms: number) => {
+  skipped += ms;
+};
+
 
 export interface World {
   repositories: AppRepositories;
@@ -214,6 +220,10 @@ export interface World {
   emitTurn(sessionId: SessionId, turnId: string, state: 'running' | 'completed'): void;
   run(command: Command): Promise<CommandResult>;
   restart(): Promise<World>;
+  /** The engine's timers (wait limits, T031); they end with the process, so a restart's engine arms its own. */
+  timers: Set<{ at: string; fn: () => void }>;
+  /** Runs the timers that are due by the clock (see `advanceClock`). */
+  fireTimers(): void;
 }
 
 let turns = 0;
@@ -261,7 +271,21 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     holding: previous?.holding ?? new Set<SessionId>(),
     silent: previous?.silent ?? new Set<SessionId>(),
     open: new Map<SessionId, string>(),
+    timers: new Set<{ at: string; fn: () => void }>(),
   } as unknown as World;
+  const schedule = (at: string, fn: () => void) => {
+    const timer = { at, fn };
+    world.timers.add(timer);
+    return () => void world.timers.delete(timer);
+  };
+  world.fireTimers = () => {
+    const due = Date.parse(now());
+    for (const timer of [...world.timers]) {
+      if (Date.parse(timer.at) > due) continue;
+      world.timers.delete(timer);
+      timer.fn();
+    }
+  };
   const policy: PermissionPolicy = { evaluate: () => world.decide() };
   let mounts = 0;
   world.claude = withTurns(new FakeAdapter('claude', (handle) => world.service.onPermissionRequest(handle)), world);
@@ -269,7 +293,10 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     repositories,
     store,
     policy,
-    publish: (event) => world.events.push(event),
+    publish: (event) => {
+      world.events.push(event);
+      world.engine?.observe(event);
+    },
     now,
     uuid,
     hashPayload: hashOf,
@@ -289,7 +316,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     log: (message) => world.logs.push(message),
     sleep: () => new Promise<void>(() => undefined),
   });
-  world.engine = new WorkflowEngine({ sessions: world.service, publish: (event) => world.events.push(event), now, uuid, hashPayload: hashOf, log: (m) => world.logs.push(m) });
+  world.engine = new WorkflowEngine({ sessions: world.service, publish: (event) => world.events.push(event), now, uuid, hashPayload: hashOf, schedule, log: (m) => world.logs.push(m) });
   world.service.attachWorkflow(world.engine);
   world.emitTurn = (sessionId, turnId, state) => {
     const adapter = adapterOf(world, sessionId);

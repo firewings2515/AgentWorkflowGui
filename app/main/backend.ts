@@ -138,6 +138,18 @@ const notInWorkflow = { status: 'rejected', rejection: { reason: 'not-in-workflo
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref());
 
+/** Calls `fn` once `at` has come by `now`, in setTimeout steps it can hold (about 24 days at most each). */
+const scheduleAt = (now: () => string) => (at: string, fn: () => void): (() => void) => {
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  const arm = () => {
+    const delay = Date.parse(at) - Date.parse(now());
+    if (delay <= 0) return fn();
+    handle = setTimeout(arm, Math.min(delay, 2 ** 31 - 1)).unref();
+  };
+  arm();
+  return () => clearTimeout(handle);
+};
+
 export async function startBackend(options: BackendOptions): Promise<Backend | DamagedBackend> {
   const { bus } = options;
   // Every MCP token handed out, revoked ones included, in every spelling the core matches: no log line
@@ -262,7 +274,11 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     repositories,
     store,
     policy: options.policy ?? permissionPolicy,
-    publish: (event) => void bus.publish(event),
+    publish: (event) => {
+      void bus.publish(event);
+      // T031: a delivery decision may end a round's branch.
+      ref.workflow?.observe(event);
+    },
     now,
     uuid,
     hashPayload: sha256,
@@ -293,7 +309,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   });
   ref.service = service;
   // T024: workflow.start, the workflow tools and workflow escalations; it reaches storage through the service.
-  const workflow = new WorkflowEngine({ sessions: service, publish: (event) => void bus.publish(event), now, uuid, hashPayload: sha256, log });
+  const workflow = new WorkflowEngine({ sessions: service, publish: (event) => void bus.publish(event), now, uuid, hashPayload: sha256, schedule: scheduleAt(now), log });
   service.attachWorkflow(workflow);
   ref.workflow = workflow;
   // T023: transfer.prepare / confirm / cancel; it reaches storage and runtimes through the service too.
