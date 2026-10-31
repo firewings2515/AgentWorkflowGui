@@ -4,6 +4,7 @@ import type { DetailTab } from './workbench-state';
 import { Empty, formatTime, observedModelText, Status } from './ui';
 import { RequestId } from '../../../contracts';
 import type { RendererStore } from './renderer-store';
+import { FolderButton } from './FolderButton';
 
 interface DetailProps {
   snapshot: Snapshot;
@@ -91,7 +92,7 @@ function SessionInfo({ snapshot, session }: Pick<DetailProps, 'snapshot' | 'sess
     <dt>要求的 Model</dt><dd>{session.requestedModel.model} · {session.requestedModel.effort ?? '未指定 effort'}</dd>
     <dt>模型觀察</dt><dd>{observedModelText(session)}</dd>
     <dt>Runtime</dt><dd>{session.requestedModel.runtime}</dd>
-    <dt>工作資料夾</dt><dd className="mono">{session.cwd}</dd>
+    <dt>工作資料夾</dt><dd className="mono">{session.cwd}<FolderButton key={session.id} target={{ kind: 'session-cwd', sessionId: session.id }} /></dd>
     <dt>有效資料夾範圍</dt><dd>
       <dl className="folder-scope">
         <dt>範圍來源</dt><dd>{session.folderScope.source === 'task-worktree' ? 'Task worktree' : 'Session 工作資料夾'}</dd>

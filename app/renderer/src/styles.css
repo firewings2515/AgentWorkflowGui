@@ -70,6 +70,21 @@
 .progress-canvas { height: 450px; min-width: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .progress-logs { max-height: 450px; overflow: auto; }
 .progress-logs h4 { margin-top: 0; }
+.task-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); list-style: none; padding: 0; gap: 10px; }
+.task-list > li { padding: 12px; border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+.task-list button[aria-pressed='true'] { border-color: var(--accent); background: var(--accent-bg); }
+.task-list p, .task-facts, .merge-queue, .lock-waits { overflow-wrap: anywhere; }
+.task-list p { font-size: 12px; margin: 8px 0 0; }
+.task-list button { text-align: left; }
+.dependency-canvas { height: 260px; min-width: 0; }
+.merge-queue { padding-left: 24px; }
+.pipeline-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+.pipeline-actions p { flex-basis: 100%; }
+.folder-action { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0; }
+.folder-action small { color: var(--muted); }
+.lock-waits { border-left: 3px solid var(--warning); padding: 10px; background: var(--surface); }
+.lock-waits h4, .lock-waits p { margin: 4px 0; }
+.workflow-progress pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .progress-logs button { display: block; margin: 8px 0; }
 .progress-node[data-current='true'], .progress-logs [data-current='true'] { border: 2px solid var(--accent); background: var(--accent-bg); }
 .progress-node button span { display: block; }
@@ -201,8 +216,15 @@ p { line-height: 1.7; }
 .selectors label { display: flex; flex: 1; min-width: 120px; flex-direction: column; gap: 5px; color: var(--muted); font-size: 11px; }
 .selectors select { color: var(--text); width: 100%; font-size: 12px; }
 .composer-note { color: var(--muted); font-size: 10px; line-height: 1.6; margin: 9px 0; overflow-wrap: anywhere; }
+.composer-help { margin: 5px 0; font-size: 11px; color: var(--muted); }
+.composer-help summary { cursor: pointer; }
 .composer textarea { display: block; resize: vertical; min-height: 65px; max-height: 180px; width: 100%; padding: 12px; background: var(--surface); line-height: 1.5; }
 .composer textarea::placeholder { color: var(--muted); }
+@media (max-height: 800px) {
+  .composer { padding: 8px 12px; }
+  .composer textarea { min-height: 44px; max-height: 120px; padding: 6px 10px; }
+  .composer-note { margin: 4px 0; }
+}
 .composer-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
 .composer-target { flex: 1; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
 .menu-root { position: relative; }

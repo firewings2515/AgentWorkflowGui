@@ -215,13 +215,18 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
         {draft.destinationPrompt && unapplied.length > 0 && <div className="workflow-validation" role="alert" tabIndex={-1} id={workflowFieldId('pending-destinations')}>
           <strong>尚未儲存：請先套用或放棄以下目的地選擇，再按「儲存 Workflow」。</strong>
           <ul>{unapplied.map(item => <li key={item.key}><button onClick={() => { select({ kind: 'node', id: item.node.id }); requestFocus(`nodes.${item.nodeIndex}.outputRules.${item.ruleIndex}.target`); }}>
-            {item.node.label} · Output {item.ruleIndex + 1}：{item.rule.condition || '未填條件'} → {item.value === 'root' ? '回報 root' : workflow.nodes.find(node => `node:${node.id}` === item.value)?.label ?? '目的地節點已不存在，請重新選取'}
+            {item.node.label} · Output {item.ruleIndex + 1}：{item.rule.condition || '未填條件'} → {item.value === 'root' ? '回報 root' : item.value === 'tasks' ? '拆分 task' : workflow.nodes.find(node => `node:${node.id}` === item.value)?.label ?? '目的地節點已不存在，請重新選取'}
           </button></li>)}</ul>
           <button disabled={pending} onClick={() => {
+            const invalid = unapplied.find(item => item.value === 'tasks' && !(item.node.kind === 'agent' && item.node.isRoot));
+            if (invalid) {
+              patch(selectedId, { message: '只有 root 能拆分 task，請重新選擇此規則的目的地。' });
+              select({ kind: 'node', id: invalid.node.id }); requestFocus(`nodes.${invalid.nodeIndex}.outputRules.${invalid.ruleIndex}.target`); return;
+            }
             let next = workflow;
             for (const item of unapplied) {
               const node = next.nodes.find(node => node.id === item.node.id)!;
-              next = replaceNode(next, { ...node, outputRules: node.outputRules.map(rule => rule.id === item.rule.id ? { ...rule, target: item.value === 'root' ? { kind: 'root' } : { kind: 'node', nodeId: NodeId.parse(item.value.slice(5)) } } : rule) });
+              next = replaceNode(next, { ...node, outputRules: node.outputRules.map(rule => rule.id === item.rule.id ? { ...rule, target: item.value === 'root' ? { kind: 'root' } : item.value === 'tasks' ? { kind: 'tasks' } : { kind: 'node', nodeId: NodeId.parse(item.value.slice(5)) } } : rule) });
             }
             change(next); requestFocus('save');
           }}>套用所有目的地</button>

@@ -12,6 +12,29 @@ const envelope = (seq: number, event: EventEnvelope['event']): EventEnvelope => 
 afterEach(() => vi.useRealTimers());
 
 describe('renderer IPC store', () => {
+  it('updates projects and replaces the lock list from authoritative events without dispatching commands', async () => {
+    const fake = fakeBridge(); const store = createRendererStore(fake.bridge); await store.start();
+    const project = { ...fixtureSnapshot.projects[0]!, name: '最新專案' };
+    fake.emit(envelope(fixtureSnapshot.seq + 1, { type: 'project.updated', project }));
+    expect(store.getSnapshot().snapshot!.projects).toEqual([project]);
+    fake.emit(envelope(fixtureSnapshot.seq + 2, { type: 'locks.updated', locks: [], at: project.updatedAt }));
+    expect(store.getSnapshot().snapshot!.locks).toEqual([]);
+    fake.emit(envelope(fixtureSnapshot.seq + 3, { type: 'locks.updated', locks: fixtureSnapshot.locks, at: project.updatedAt }));
+    expect(store.getSnapshot().snapshot!.locks).toEqual(fixtureSnapshot.locks);
+    expect(fake.bridge.send).not.toHaveBeenCalled(); store.dispose();
+  });
+
+  it('isolates uncertain cleanup receipts by both task and instance ID', async () => {
+    const fake = fakeBridge(); const store = createRendererStore(fake.bridge); await store.start();
+    fake.bridge.send.mockImplementation(command => Promise.resolve({ ok: false, requestId: RequestId.parse(command.requestId), code: 'unknown_outcome', message: '', retryable: true, mayHaveSideEffects: true }));
+    const first = Command.parse({ type: 'task.retryCleanup', requestId: 'clean-1', instanceId: 'inst-login', taskId: 'task-d' });
+    const next = Command.parse({ type: 'task.retryCleanup', requestId: 'clean-2', instanceId: 'inst-login', taskId: 'task-e' });
+    await store.send(first); await store.send(next);
+    expect(commandTarget(first)).not.toBe(commandTarget(next));
+    expect(fake.bridge.send).toHaveBeenCalledTimes(2);
+    await store.send(Command.parse({ ...first, requestId: 'clean-3' }));
+    expect(fake.bridge.send).toHaveBeenCalledTimes(2); store.dispose();
+  });
   it('cancels a subscription during loading and ignores its late snapshot after remount', async () => {
     const fake = fakeBridge();
     const load = deferred<Snapshot>();

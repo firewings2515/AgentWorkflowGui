@@ -2,7 +2,7 @@
 import { useSyncExternalStore } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
-import { Command, CONTRACTS_VERSION, Escalation, PermissionRequest, RequestId, SessionId } from '../../../contracts';
+import { Command, CONTRACTS_VERSION, Escalation, EscalationId, JoinRound, PermissionRequest, RequestId, SessionId, TaskPlan } from '../../../contracts';
 import type { EscalationKind, Snapshot } from '../../../contracts';
 import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
 import { EscalationPanel } from './EscalationPanel';
@@ -31,6 +31,97 @@ const pushCard = () => card('要求執行 git push');
 const deliveryCard = () => card('訊息送達結果未知');
 
 describe('T025 escalation decisions', () => {
+  it.each(['approve', 'decline'] as const)('shows the exact task plan and submits only the explicit %s decision', async decision => {
+    const { fake } = await setup();
+    const plan = fixtureSnapshot.instances[0]!.taskPlans[1]!;
+    const escalation = fixtureSnapshot.escalations.find(e => e.id === plan.escalationId)!;
+    const target = card(escalation.title);
+    expect(target.getByText('第三方登入')).toBeTruthy();
+    expect(target.getByText('第三方登入文件')).toBeTruthy();
+    expect(target.getByText('清單內依賴：第三方登入（g）')).toBeTruthy();
+    expect(fake.bridge.send).not.toHaveBeenCalled();
+    fake.bridge.send.mockImplementation(command => Promise.resolve({ ok: true, requestId: RequestId.parse(command.requestId), created: [] }));
+    fireEvent.click(target.getByRole('button', { name: decision === 'approve' ? '核准' : '拒絕' }));
+    await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(1));
+    expect(Command.parse(fake.bridge.send.mock.calls[0]![0])).toEqual({ type: 'escalation.respond', requestId: fake.bridge.send.mock.calls[0]![0].requestId, escalationId: 'esc-4', decision });
+    await screen.findByText('決定已接受，等待最新狀態。');
+    fireEvent.click(target.getByRole('button', { name: '核准' }));
+    expect(fake.bridge.send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['missing', 'Task 清單尚未齊全'],
+    ['declined', '此 task 清單已拒絕，不再等待確認'],
+    ['created', '此 task 清單已建立 task，不再等待確認'],
+    ['mismatched', '此 task 清單的確認項目已變更，與目前項目不符'],
+  ] as const)('explains and prevents task-plan replies when %s', async (state, explanation) => {
+    const data = structuredClone(fixtureSnapshot); const instance = data.instances[0]!; const plan = instance.taskPlans[1]!;
+    if (state === 'missing') instance.taskPlans = [];
+    else if (state === 'mismatched') plan.escalationId = EscalationId.parse('esc-other');
+    else instance.taskPlans[1] = TaskPlan.parse({ ...plan, state, decidedAt: plan.createdAt,
+      created: state === 'created' ? plan.items.map((item, index) => ({ key: item.key, taskId: instance.tasks[index]!.id })) : [],
+    });
+    const { fake } = await setup(data);
+    const escalation = data.escalations.find(e => e.id === 'esc-4')!;
+    const target = card(escalation.title);
+    expect(target.getByRole('status').textContent).toContain(explanation);
+    for (const name of ['核准', '拒絕']) {
+      const button = target.getByRole('button', { name });
+      expect(button.matches(':disabled')).toBe(true);
+      fireEvent.click(button);
+    }
+    expect(fake.bridge.send).not.toHaveBeenCalled();
+  });
+
+  it('expands a round-blocked ref with the exact round and reason without treating it as completed', async () => {
+    const data = structuredClone(fixtureSnapshot); const instance = data.instances[1]!;
+    const round = JoinRound.parse({ ...instance.rounds[0], round: 2, arrived: [], state: 'blocked', blockedReason: 'upstream-cancelled', blockedUpstream: 'n-rev-codex', settledAt: instance.createdAt });
+    instance.rounds.push(round);
+    const escalation = Escalation.parse({ id: 'esc-round', instanceId: instance.id, rootSessionId: instance.rootSessionId, fromSessionId: instance.rootSessionId,
+      kind: 'round-blocked', title: '第二輪匯流受阻', detail: '', state: 'open', createdAt: instance.createdAt,
+      ref: { kind: 'round', taskId: round.taskId, nodeId: round.nodeId, round: round.round } });
+    data.escalations = [escalation];
+    const { fake } = await setup(data, instance.rootSessionId);
+    const target = card(escalation.title);
+    expect(target.getByRole('heading', { name: /第 2 輪 · 受阻/ })).toBeTruthy();
+    expect(target.getByText(/受阻原因：上游已取消.*不視為完成/)).toBeTruthy();
+    expect(target.getByText('本輪已到：無')).toBeTruthy();
+    expect(target.getByText(/尚未到達：/).textContent).toContain('Codex');
+    expect(target.queryByText(/h-6/)).toBeNull();
+    expect(fake.bridge.send).not.toHaveBeenCalled();
+  });
+
+  it('expands a merge ref with the referenced attempt conflicts and integration details', async () => {
+    const data = structuredClone(fixtureSnapshot); const instance = data.instances[0]!;
+    const merge = instance.mergeQueue.find(m => m.state === 'conflict')!;
+    const escalation = Escalation.parse({ id: 'esc-merge', instanceId: instance.id, rootSessionId: root, fromSessionId: root,
+      kind: 'merge-failed', title: '合併需要處理', detail: '', state: 'open', createdAt: instance.createdAt,
+      ref: { kind: 'merge', taskId: merge.taskId, attempt: merge.attempt } });
+    data.escalations = [escalation];
+    const { fake } = await setup(data);
+    const target = card(escalation.title);
+    expect(target.getByText(/合併衝突 · 第 1 次嘗試/)).toBeTruthy();
+    expect(target.getByText('src/auth/session.ts')).toBeTruthy();
+    expect(target.getByText(merge.integration!.path)).toBeTruthy();
+    expect(target.queryByText(/整合測試：通過/)).toBeNull();
+    expect(fake.bridge.send).not.toHaveBeenCalled();
+  });
+
+  it('expands a lock ref and mounts current fixture lock waits inside the escalation card', async () => {
+    const data = structuredClone(fixtureSnapshot); const lock = data.locks[0]!; const waiter = lock.waiters[0]!;
+    const escalation = Escalation.parse({ id: 'esc-lock', rootSessionId: root, fromSessionId: waiter.sessionId,
+      kind: 'lock-timeout', title: '檔案鎖等待逾時', detail: '', state: 'open', createdAt: waiter.since,
+      ref: { kind: 'lock', path: lock.path, sessionId: waiter.sessionId, holderSessionId: lock.holderSessionId } });
+    data.escalations = [escalation];
+    const { fake } = await setup(data);
+    const target = card(escalation.title);
+    expect(target.getByText(/當時持有者：s-research.*等待／寫入者：s-plan-notes/)).toBeTruthy();
+    const waits = within(target.getByRole('region', { name: '檔案鎖等待' }));
+    expect(waits.getByText(lock.path)).toBeTruthy();
+    expect(waits.getByText(/持有者：.*s-research/)).toBeTruthy();
+    expect(waits.getByText(/已等待/)).toBeTruthy();
+    expect(fake.bridge.send).not.toHaveBeenCalled();
+  });
   it('groups only open escalations belonging to this root, with explicit user authority', async () => {
     const { fake, store, rerender } = await setup();
     expect(screen.getByText('由你決定，不是 root 的 AI')).toBeTruthy();

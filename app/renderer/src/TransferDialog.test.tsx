@@ -34,6 +34,14 @@ async function update(p: TransferProposal) {
 }
 function emit(p: TransferProposal) { fake.emit({ schemaVersion: CONTRACTS_VERSION, seq: ++seq, event: { type: 'transfer.updated', proposal: p } }); }
 beforeEach(() => vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} }));
+it.each([
+  ['source-changed', '來源已變更，請重新產生'], ['user', '使用者已取消此提案'], ['failed', '轉交失敗，提案已取消'],
+] as const)('explains cancelled transfer reason %s without confirming or resending', async (cancelReason, text) => {
+  await setup(TransferProposal.parse({ ...proposal(), state: 'cancelled', cancelReason, cancelledAt: proposal().createdAt }));
+  expect(screen.getByText(new RegExp(text))).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '確認轉交' })).toBeNull();
+  expect(fake.bridge.send).not.toHaveBeenCalled();
+});
 afterEach(() => { cleanup(); store?.dispose(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('T026 轉交確認', () => {

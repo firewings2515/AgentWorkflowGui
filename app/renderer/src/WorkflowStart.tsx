@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { InstanceId, RequestId, SessionId } from '../../../contracts';
 import type { CommandResult, Snapshot, WorkflowTemplate } from '../../../contracts';
 import { commandFeedback } from './command-feedback';
+import { FolderButton } from './FolderButton';
 import type { RendererState, RendererStore } from './renderer-store';
 
 export function WorkflowStart({ snapshot, store, ipcState, onOpen }: {
@@ -56,6 +57,7 @@ export function WorkflowStart({ snapshot, store, ipcState, onOpen }: {
         {stale && <div role="alert" className="command-warning">範本版本已變更或移除，請重新審閱後再啟動。<button type="button" onClick={() => select(snapshot.workflows.find(item => item.id === template?.id))}>載入目前範本</button></div>}
         <label>標題<input required value={title} onChange={event => setTitle(event.target.value)} /></label>
         <label>工作資料夾<input required value={cwd} onChange={event => setCwd(event.target.value)} placeholder="輸入完整資料夾路徑" /></label>
+        <FolderButton disabled={disabled} onPick={setCwd} />
         <label>第一則訊息<textarea required rows={4} value={firstMessage} onChange={event => setFirstMessage(event.target.value)} /></label>
         {crossTool && <label className="check-label"><input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />我同意此版本、此執行群組內的跨工具交接（handoff、send_message、report_to_root）。</label>}
         <p className="muted">手動更換工具或傳給群組外的 session，仍需另行確認。</p>

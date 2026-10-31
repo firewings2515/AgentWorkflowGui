@@ -47,7 +47,8 @@ const workflowDefault: z.input<typeof WorkflowTemplate> = {
   nodes: [
     { id: 'n-plan', kind: 'agent', label: '規劃', agentId: 'agent-planner', model: claudeOpus, writePolicy: 'read-only', isRoot: true, position: { x: 0, y: 120 },
       inputRules: [{ id: 'in-user', condition: '使用者訊息：閒聊直接回答，需求整理成計畫' }],
-      outputRules: [{ id: 'out-plan', condition: '計畫經使用者確認', payload: '計畫與驗收條件', target: node('n-build'), requiresUserConfirmation: true }] },
+      outputRules: [{ id: 'out-plan', condition: '計畫經使用者確認', payload: '計畫與驗收條件', target: node('n-build'), requiresUserConfirmation: true },
+        { id: 'out-tasks', condition: '計畫可拆分為多個 task', payload: 'Task 清單與依賴', target: { kind: 'tasks' }, requiresUserConfirmation: true }] },
     { id: 'n-build', kind: 'agent', label: '實作', agentId: 'agent-builder', model: codexAstra, writePolicy: 'write', concurrency: 2, position: { x: 260, y: 120 },
       inputRules: [{ id: 'in-plan', condition: '來自規劃的計畫' }, { id: 'in-rework', condition: '來自 review 或測試的退回' }],
       outputRules: [{ id: 'out-done', condition: '完成', payload: '變更摘要與檔案清單', target: node('n-review') }, { id: 'out-unclear', condition: '需求不清楚', payload: '問題', target: root }] },

@@ -56,6 +56,34 @@ function mediaViolations(rules: CSSRule[], inMedia = false): string[] {
   });
 }
 
+// Separate @media blocks with the same condition still share one cascade scope.
+function mediaConflicts(rules: CSSRule[]) {
+  const declarations = new Map<string, string>();
+  const conflicts: string[] = [];
+  function visit(current: CSSRule[], conditions: string[]) {
+    for (const rule of current) {
+      if (rule.type === CSSRule.MEDIA_RULE) {
+        const media = rule as CSSMediaRule;
+        visit(Array.from(media.cssRules), [...conditions, media.conditionText]);
+      } else if (rule.type === CSSRule.STYLE_RULE && conditions.length) {
+        const style = rule as CSSStyleRule;
+        for (const selector of style.selectorText.split(',').map(part => part.trim())) {
+          for (let index = 0; index < style.style.length; index++) {
+            const property = style.style[index]!;
+            const key = `${conditions.join(' / ')} | ${selector} | ${property}`;
+            const value = style.style.getPropertyValue(property).trim();
+            const previous = declarations.get(key);
+            if (previous !== undefined && previous !== value) conflicts.push(`${key}: ${previous} -> ${value}`);
+            declarations.set(key, value);
+          }
+        }
+      }
+    }
+  }
+  visit(rules, []);
+  return conflicts;
+}
+
 describe('layout stylesheet declarations', () => {
   const rules = parseRules(css);
 
@@ -88,6 +116,40 @@ describe('layout stylesheet declarations', () => {
 
   it('preserves transcript shrinking and scrolling in every media query', () => {
     expect(mediaViolations(rules)).toEqual([]);
+  });
+
+  it('compacts the composer for 768px height and stacks progress logs at 1024px width', () => {
+    const media = rules.filter((rule): rule is CSSMediaRule => rule.type === CSSRule.MEDIA_RULE);
+    const compact = media.find(rule => rule.conditionText === '(max-height: 800px)')!;
+    expect(baseValue(Array.from(compact.cssRules), '.composer textarea', 'min-height')).toBe('44px');
+    expect(baseValue(Array.from(compact.cssRules), '.composer', 'padding')).toBe('8px 12px');
+    const progress = media.find(rule => rule.conditionText === '(max-width: 1100px)')!;
+    expect(baseValue(Array.from(progress.cssRules), '.progress-layout', 'grid-template-columns')).toBe('minmax(0, 1fr)');
+    expect(baseValue(Array.from(progress.cssRules), '.progress-logs', 'max-height')).toBe('none');
+  });
+
+  it('has no conflicting selector properties within the same media condition', () => {
+    expect(mediaConflicts(rules)).toEqual([]);
+  });
+
+  it.each([true, false])('detects conflicting progress log heights across media blocks: %s', separateBlocks => {
+    const fixture = parseRules(`
+      @media (max-width: 1100px) {
+        .progress-logs { max-height: 300px; }
+        ${separateBlocks ? '} @media (max-width: 1100px) {' : ''}
+        .other, .progress-logs { max-height: none; }
+      }
+    `);
+    expect(mediaConflicts(fixture)).toEqual(['(max-width: 1100px) | .progress-logs | max-height: 300px -> none']);
+  });
+
+  it('allows different breakpoint values and repeated identical media declarations', () => {
+    expect(mediaConflicts(parseRules(`
+      .progress-logs { max-height: 450px; }
+      @media (max-width: 1100px) { .progress-logs { max-height: none; } }
+      @media (max-width: 1100px) { .progress-logs { max-height: none; } }
+      @media (max-width: 700px) { .progress-logs { max-height: 300px; } }
+    `))).toEqual([]);
   });
 
   it('accepts indented, combined selectors and harmless media overrides', () => {
