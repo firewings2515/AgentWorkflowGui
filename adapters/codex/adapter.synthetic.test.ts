@@ -245,6 +245,8 @@ describe('permission requests', () => {
         onPermissionRequest: () => {
           throw new Error('policy module crashed');
         },
+        // No item announces the patch: it goes up at once.
+        fileChangeItemWaitMs: 0,
       },
     );
     await until(() => h.fake.finished, 'script');

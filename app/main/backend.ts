@@ -32,6 +32,7 @@ import { TransferService } from '../../core/transfer';
 import { WorkflowEngine } from '../../core/workflow';
 import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
+import { hashFile, setTimer } from './file-hash';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
 
 /** What the main process needs from its process host: the port plus the spawn the adapters use (T013). */
@@ -134,8 +135,6 @@ export const damagedFacade = (reason: string, location: string): AppFacade => ({
 
 const sha256 = (text: string): PayloadHash => `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`;
 
-const notInWorkflow = { status: 'rejected', rejection: { reason: 'not-in-workflow', detail: 'this tool works in workflow sessions only' } } as const;
-
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref());
 
 export async function startBackend(options: BackendOptions): Promise<Backend | DamagedBackend> {
@@ -192,7 +191,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     handoff: (input, ctx) => ref.workflow?.handoff(input, ctx) ?? Promise.resolve(starting),
     create_tasks: (input, ctx) => ref.workflow?.createTasks(input, ctx) ?? Promise.resolve(starting),
     report_to_root: (input, ctx) => ref.workflow?.reportToRoot(input, ctx) ?? Promise.resolve(starting),
-    wait_for_file: () => Promise.resolve(notInWorkflow),
+    // Same-folder locks (R-07): ordinary and workflow sessions alike.
+    wait_for_file: (input, ctx) => ref.service?.waitForFile(input, ctx) ?? Promise.resolve(starting),
     send_message: (input, ctx) => {
       if (ref.service === undefined) return Promise.resolve({ status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is starting' } });
       return ref.service.sendMessage(input, ctx);
@@ -274,6 +274,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       return mount;
     },
     sleep,
+    // Same-folder file locks (T033, R-07): in memory only, so a restart starts with none.
+    locks: { hashFile: (path) => hashFile(path), setTimer },
     listModels,
     isRuntimeAvailable: (runtime) => runtime === 'claude' || options.codexExecutable !== undefined || options.createAdapter !== undefined,
     onSessionOpened: (sessionId) => {
@@ -356,8 +358,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         escalations: data.escalations,
         transfers: data.transfers,
         projects: data.projects,
-        // File locks (R-07) live in memory; the lock table comes with T033.
-        locks: [],
+        // File locks (R-07) live in memory only: the lock table's list now.
+        locks: service.locks?.list() ?? [],
         preferences: data.preferences,
       };
     },

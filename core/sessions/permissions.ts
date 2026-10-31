@@ -12,6 +12,7 @@ import {
   type SessionId,
   type Timestamp,
 } from '../../contracts';
+import type { LockCoordinator, LockStep } from '../locks';
 import type { AppRepositories, PermissionHandle, PermissionPolicy, PolicyContext, PolicyDecision } from '../ports';
 import type { WrittenPaths } from './written-paths';
 
@@ -55,6 +56,11 @@ export interface PermissionGateOptions {
    * to the session itself, which is right for ordinary sessions.
    */
   rootOf?(session: LogicalSession): Promise<{ rootSessionId: SessionId; instanceId?: InstanceId }>;
+  /**
+   * Same-folder file locks (R-07): the last step before an approval is answered. Absent: approvals are
+   * answered at once (no locks).
+   */
+  locks?: LockCoordinator;
 }
 
 export type RespondResult = 'answered' | 'not-found' | 'not-open' | 'gone';
@@ -80,10 +86,18 @@ export class PermissionGate {
       handle.answer(this.policyDecision('decline', 'the session is not known to the GUI'));
       return;
     }
+    // A write to a file another session holds is refused before anyone is asked (R-07): it would be anyway.
+    const locked = this.options.locks?.screen(request, session);
+    if (locked !== undefined) {
+      handle.answer(this.policyDecision('decline', locked));
+      return;
+    }
     const decision: PolicyDecision = this.options.policy.evaluate(request, this.context(session));
     if (decision.action === 'approve') {
       if (this.declinedForClosing(handle)) return;
-      if (handle.answer(this.policyDecision('approve')) && (request.kind === 'command' || request.kind === 'fileChange')) {
+      // The policy's approval stands; the lock may only make it wait or refuse it (R-07).
+      const step = await this.approve(handle, this.policyDecision('approve'), session);
+      if (step === 'approved' && (request.kind === 'command' || request.kind === 'fileChange')) {
         this.options.written.add(session.id, request.paths, request.cwd ?? session.cwd);
       }
       return;
@@ -134,25 +148,35 @@ export class PermissionGate {
       await this.close(escalation, 'resolved');
       return 'gone';
     }
-    const answered =
-      handle?.answer({
-        outcome: input.decision,
-        decidedBy: 'user',
-        escalationId: escalation.id,
-        ...(input.note !== undefined && { reason: input.note }),
-        ...(input.content !== undefined && { content: input.content }),
-        at: this.options.now(),
-      }) ?? false;
+    const decision: PermissionDecision = {
+      outcome: input.decision,
+      decidedBy: 'user',
+      escalationId: escalation.id,
+      ...(input.note !== undefined && { reason: input.note }),
+      ...(input.content !== undefined && { content: input.content }),
+      at: this.options.now(),
+    };
+    const session = handle !== undefined ? await this.options.repositories.sessions.get(handle.request.sessionId) : undefined;
+    if (handle !== undefined && this.declinedForClosing(handle)) {
+      this.held.delete(escalation.id);
+      await this.close(escalation, 'resolved');
+      return 'gone';
+    }
+    // The user's approval goes through the locks like the policy's (R-07): a held write is answered later.
+    let step: LockStep | Promise<LockStep> = 'gone';
+    if (handle !== undefined && input.decision === 'approve' && session !== undefined) step = this.approve(handle, decision, session);
+    else if (handle?.answer(decision) === true) step = input.decision === 'approve' ? 'approved' : 'refused';
     this.held.delete(escalation.id);
-    if (!answered) {
+    if (step === 'gone') {
       // The runtime withdrew it (turn ended, process exited) or this GUI restarted: nobody can be answered.
       await this.close(escalation, 'resolved');
       return 'gone';
     }
     const { request } = handle!;
+    const written = () => this.options.written.add(request.sessionId, request.paths, request.cwd ?? session?.cwd ?? '');
     if (input.decision === 'approve' && (request.kind === 'command' || request.kind === 'fileChange')) {
-      const session = await this.options.repositories.sessions.get(request.sessionId);
-      this.options.written.add(request.sessionId, request.paths, request.cwd ?? session?.cwd ?? '');
+      if (step === 'approved') written();
+      else if (step !== 'refused') void step.then((s) => s === 'approved' && written());
     }
     await this.close(escalation, input.decision === 'approve' ? 'approved' : 'declined');
     return 'answered';
@@ -195,6 +219,12 @@ export class PermissionGate {
       writtenPaths: this.options.written.list(session.id),
       resolveRealPath: (p) => this.options.resolveRealPath(p),
     };
+  }
+
+  /** Answers an approval, through the locks when there are any. */
+  private approve(handle: PermissionHandle, decision: PermissionDecision, session: LogicalSession): LockStep | Promise<LockStep> {
+    if (this.options.locks !== undefined) return this.options.locks.approve(handle, decision, session);
+    return handle.answer(decision) ? 'approved' : 'gone';
   }
 
   /** Held requests of a session, e.g. to show them on exit. */
