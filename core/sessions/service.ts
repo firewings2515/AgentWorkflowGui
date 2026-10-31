@@ -43,6 +43,8 @@ import {
 import { DeliveryService, type DeliveryEscalation, type DispatchOutcome, type PayloadDelivery, type RecoveryReport } from '../delivery';
 import type {
   AppRepositories,
+  ClaimInput,
+  ClaimResult,
   Conversation,
   DeliveryStore,
   DispatchEntry,
@@ -97,8 +99,16 @@ export type TransferCommand = CommandOf<'transfer.prepare' | 'transfer.confirm' 
  */
 export interface TransferHooks {
   execute(command: TransferCommand): Promise<CommandResult>;
-  /** A session's own turn ended: a draft waiting for its source's turn boundary may finish now. */
-  turnEnded(turn: Turn): void;
+  /**
+   * A session's stored content changed (a turn, message, item or sub-agent written; T023 r2-P1-2): a draft of
+   * it may finish now, or a proposal of it no longer holds. Called outside the session's queue.
+   */
+  contentChanged(sessionId: SessionId): void;
+  /**
+   * Asked synchronously right before a `transfer` delivery is claimed, with nothing awaited between the
+   * answer and the claim (T023 r2-P1-1): false refuses the claim, which leaves the delivery pending.
+   */
+  claimAllowed(operationId: OperationId): boolean;
   /** Whether a `transfer` delivery may still go (the gate in `dispatchOne`). */
   mayDispatch(record: PayloadDelivery): Promise<boolean>;
   /** A session a transfer created: its provision is left to the transfer service at a restart. */
@@ -294,6 +304,11 @@ export class SessionService {
   /** The last own turns of each session seen to end, so an ack read after its turn's end adds nothing. */
   private readonly endedTurns = new Map<SessionId, string[]>();
   /**
+   * How many content writes each session's conversation had in this process, counted synchronously as each
+   * commits (T023 r2-P1-1): a transfer gate that saw the same count right before the claim saw no change.
+   */
+  private readonly contentWrites = new Map<SessionId, number>();
+  /**
    * A formal handoff dispatched to a session whose turn has not been seen to end yet (SP-05, T024 r1-P1-2/3):
    * the main turns the session had before the dispatch, and the new one once it started. A replayed old turn
    * is in `known` and never ends the wait; until it ends, no other handoff goes to that session.
@@ -326,8 +341,18 @@ export class SessionService {
       onEvent: (event) => this.record(event),
       ...(options.sleep !== undefined && { sleep: (ms: number) => this.options.sleep!(ms) }),
     });
+    // A transfer's claim is refused when its gate's view went out of date, decided synchronously in the call
+    // that makes the claim (T023 r2-P1-1); every other claim goes straight to the store.
+    const store = this.store;
+    const claimGuarded = new Proxy(store, {
+      get: (target, key): unknown =>
+        key === 'claim'
+          ? (input: ClaimInput): Promise<ClaimResult> =>
+              this.transfer !== undefined && !this.transfer.claimAllowed(input.operationId) ? Promise.resolve({ status: 'revision-changed' }) : target.claim(input)
+          : Reflect.get(target, key),
+    });
     this.delivery = new DeliveryService({
-      store: this.store,
+      store: claimGuarded,
       runtimes: this.runtimes.adapters,
       now: () => options.now(),
       uuid: () => options.uuid(),
@@ -1314,6 +1339,11 @@ export class SessionService {
     return (this.ackedTurns.get(sessionId)?.size ?? 0) > 0;
   }
 
+  /** How many content writes the session's conversation had in this process (read synchronously, T023 r2-P1-1). */
+  contentWritesOf(sessionId: SessionId): number {
+    return this.contentWrites.get(sessionId) ?? 0;
+  }
+
   /** The native session a GUI session is bound to, once its provision was sent. */
   nativeSessionOf(sessionId: SessionId): Promise<string | undefined> {
     return this.binding(sessionId);
@@ -1706,17 +1736,13 @@ export class SessionService {
           if (stored !== undefined && stored.state !== 'running') return;
         }
         await conversations.upsertTurn(turn);
+        this.contentWritten(turn.sessionId);
         if (turn.nativeTaskId === undefined) this.followHandoffTurn(turn);
         if (turn.nativeTaskId === undefined && turn.state !== 'running') this.turnSeenEnded(turn);
         // Outside this queue: what the engine dispatches next runs in the same session's queue (T024).
         if (turn.state !== 'running' && turn.nativeTaskId === undefined && this.workflow !== undefined) {
           const hooks = this.workflow;
           void Promise.resolve().then(() => hooks.turnEnded(turn.sessionId));
-        }
-        // A transfer waiting for its source's turn boundary (T023), outside this queue for the same reason.
-        if (turn.state !== 'running' && turn.nativeTaskId === undefined && this.transfer !== undefined) {
-          const hooks = this.transfer;
-          void Promise.resolve().then(() => hooks.turnEnded(turn));
         }
         break;
       }
@@ -1725,10 +1751,12 @@ export class SessionService {
         // A native sub-agent's prompt is a user message too, and is kept (R-13).
         if (this.isEcho(event.message)) return;
         await conversations.appendMessage(event.message);
+        this.contentWritten(event.message.sessionId);
         break;
       case 'item.updated': {
         const { item } = event;
         await conversations.upsertItem(item);
+        this.contentWritten(item.sessionId);
         if (item.kind === 'fileChange' && item.state !== 'declined') {
           const session = await this.repos.sessions.get(item.sessionId);
           this.written.add(
@@ -1746,6 +1774,7 @@ export class SessionService {
         break;
       case 'nativeTask.updated':
         await conversations.upsertNativeTask(event.task);
+        this.contentWritten(event.task.sessionId);
         break;
       case 'usage.tokens':
         if (event.usage.nativeTaskId === undefined) this.usage.set(event.usage.sessionId, event.usage);
@@ -1780,6 +1809,16 @@ export class SessionService {
     if (mark.known.has(turn.id)) return;
     if (turn.state === 'running') mark.started ??= turn.id;
     else if (mark.started === turn.id) this.handoffTurns.delete(turn.sessionId);
+  }
+
+  /**
+   * A write to a session's conversation committed (T023 r2): counted at once, then the transfer service is
+   * told, outside this queue, as the workflow engine is of a turn end.
+   */
+  private contentWritten(sessionId: SessionId): void {
+    this.contentWrites.set(sessionId, (this.contentWrites.get(sessionId) ?? 0) + 1);
+    const hooks = this.transfer;
+    if (hooks !== undefined) void Promise.resolve().then(() => hooks.contentChanged(sessionId));
   }
 
   /** The turn a dispatch's ack named, until it is seen to end (T023 r1-P1-4). */
@@ -1846,6 +1885,7 @@ export class SessionService {
     if (before !== undefined) return same(before) ? 'written' : 'taken';
     const message: Message = { id, sessionId, role: 'user', origin: { kind: 'user' }, text, attachments: [], createdAt };
     await this.repos.conversations.appendMessage(message);
+    this.contentWritten(sessionId);
     const after = (await this.repos.conversations.get(sessionId)).messages.find((m) => m.id === id);
     if (!same(after)) return 'taken';
     this.options.publish({ type: 'message.completed', message });

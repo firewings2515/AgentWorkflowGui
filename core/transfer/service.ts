@@ -7,7 +7,7 @@
 // its own provision, the frame a `transfer` payload waiting for it, and the request for the source agent's
 // note another `transfer` payload. All of a proposal's steps run in one queue per proposal, so a cancel is
 // ordered with them, and every step can be redone after a restart on the same fixed IDs.
-import type { AppEvent, CommandResult, LogicalSession, MessageOrigin, ModelSelection, PayloadHash, Timestamp, TransferId, TransferProposal, Turn } from '../../contracts';
+import type { AppEvent, CommandResult, LogicalSession, MessageOrigin, ModelSelection, PayloadHash, Timestamp, TransferId, TransferProposal } from '../../contracts';
 import type { DeliveryEscalation, PayloadDelivery } from '../delivery';
 import type { HistoryEntry, StoredDelivery } from '../ports';
 import type { CommandOf, SessionService, TransferCommand, TransferHooks } from '../sessions';
@@ -69,6 +69,15 @@ export class TransferService implements TransferHooks {
    * sends no payload from the moment the user cancelled (CR2 §3), not only once the cancel's turn comes.
    */
   private readonly cancelling = new Set<TransferId>();
+  /** Proposals this process cancelled or failed: none of their deliveries is claimed any more (r2-P1-1). */
+  private readonly ended = new Set<TransferId>();
+  /**
+   * What the gate saw of a payload's source right before its claim (r2-P1-1): the source's content-write
+   * count when the gate began checking it. The claim goes only while the count is still that one.
+   */
+  private readonly approvals = new Map<string, { sourceSessionId: LogicalSession['id']; writes: number }>();
+  /** Sources whose content change is queued to be looked at, so a burst of writes is looked at once (r2-P1-2). */
+  private readonly changed = new Set<LogicalSession['id']>();
 
   constructor(private readonly options: TransferServiceOptions) {}
 
@@ -308,7 +317,8 @@ export class TransferService implements TransferHooks {
       if (saved.status === 'saved') await this.publish(p.id);
       return;
     }
-    this.log(`the source of ${p.id} kept changing while its content was read; the draft waits for its next turn end`);
+    // The write that made the last read differ also told this service (contentChanged): another read follows.
+    this.log(`the source of ${p.id} kept changing while its content was read; it is read again after its next change`);
   }
 
   /** The source's content version, or undefined while its own turn runs (not at a turn boundary). */
@@ -492,6 +502,8 @@ export class TransferService implements TransferHooks {
 
   /** Records the payload and the note request as ended apart from delivery, so no gate lets them go. */
   private async stopDeliveries(p: TransferProposal, detail: string, kind: 'cancelled' | 'failed' = 'cancelled'): Promise<void> {
+    // From this moment no claim of it goes, whatever is still on its way (r2-P1-1).
+    this.ended.add(p.id);
     for (const op of [p.operationId, noteOperationOf(p.id)]) {
       const record = await this.store.get(op);
       if (record === undefined || record.kind === 'provision' || record.outcome !== undefined || record.delivery.state === 'sent') continue;
@@ -513,15 +525,26 @@ export class TransferService implements TransferHooks {
     const next: TransferProposal = failed ? { ...base, state: 'failed', failure: { message } } : { ...base, state: 'cancelled', cancelledAt: this.options.now() };
     const saved = await this.repos.transfers.update(next, p.revision);
     if (saved.status === 'stale') return 'stale';
+    this.ended.add(p.id);
     await this.publish(p.id);
     return saved.record;
   }
 
   // ---- hooks of the session service ----------------------------------------------------------------
 
-  turnEnded(turn: Turn): void {
+  /**
+   * The source's content changed (r2-P1-2): a turn, a message (a late one included) or an item was stored.
+   * A draft reads it again, so a draft whose source stopped changing always finishes; a proposal the user is
+   * looking at turns stale; a confirmed one whose payload has not left is cancelled. Writes that come while
+   * this is queued for the source are looked at together.
+   */
+  contentChanged(sessionId: LogicalSession['id']): void {
+    if (this.changed.has(sessionId)) return;
+    this.changed.add(sessionId);
     void (async () => {
-      const waiting = (await this.repos.transfers.list()).filter((p) => p.sourceSessionId === turn.sessionId && ['draft', 'awaiting-confirmation', 'approved'].includes(p.state));
+      // From here on, a write is a new change (looked at again), not part of this one.
+      this.changed.delete(sessionId);
+      const waiting = (await this.repos.transfers.list()).filter((p) => p.sourceSessionId === sessionId && ['draft', 'awaiting-confirmation', 'approved'].includes(p.state));
       for (const { id } of waiting) {
         await this.serial(id, async () => {
           const p = await this.repos.transfers.get(id);
@@ -532,27 +555,42 @@ export class TransferService implements TransferHooks {
           else if (p?.state === 'approved' && (await this.superseded(p, await this.store.get(p.operationId)))) await this.supersede(p);
         });
       }
-    })().catch((error: unknown) => this.log(`following the turn end of ${turn.sessionId} failed (${errorName(error)})`));
+    })().catch((error: unknown) => this.log(`following a change of ${sessionId} failed (${errorName(error)})`));
   }
 
   /**
    * The gate of every transfer delivery, asked before the dispatch and again once the target was resumed,
    * right before the claim (r1-P1-3). A first dispatch of a payload also needs the source unchanged
    * (r1-P1-2); a user's retry of one that already crossed the boundary sends the content already confirmed.
-   * The proposal and the cancel flag are read last, so nothing but the claim itself comes after them.
+   * Every read comes first. For a first dispatch the source's write count is taken before its version is
+   * checked, and `claimAllowed` compares it again inside the claim call (r2-P1-1): any write after that
+   * point, however late the gate's reads came back, refuses the claim.
    */
   async mayDispatch(record: PayloadDelivery): Promise<boolean> {
     const of = transferOfOperation(record.operationId);
     if (of === undefined) return false;
-    const fresh = await this.store.get(record.operationId);
-    if (fresh === undefined || fresh.kind === 'provision' || fresh.outcome !== undefined) return false;
-    if (of.part === 'payload' && fresh.delivery.attempts.length === 0) {
-      const bound = await this.repos.transfers.get(of.transferId);
-      if (bound === undefined || (await this.sourceChanged(bound))) return false;
-    }
+    this.approvals.delete(record.operationId);
     const p = await this.repos.transfers.get(of.transferId);
-    if (p === undefined || this.cancelling.has(p.id)) return false;
-    return of.part === 'payload' ? p.state === 'approved' && p.operationId === record.operationId : p.state === 'draft';
+    const fresh = await this.store.get(record.operationId);
+    if (p === undefined || fresh === undefined || fresh.kind === 'provision' || fresh.outcome !== undefined) return false;
+    if (of.part === 'payload' ? p.state !== 'approved' || p.operationId !== record.operationId : p.state !== 'draft') return false;
+    if (of.part === 'payload' && fresh.delivery.attempts.length === 0) {
+      const writes = this.options.sessions.contentWritesOf(p.sourceSessionId);
+      if (await this.sourceChanged(p)) return false;
+      this.approvals.set(record.operationId, { sourceSessionId: p.sourceSessionId, writes });
+    }
+    return !this.cancelling.has(p.id) && !this.ended.has(p.id);
+  }
+
+  /** Synchronous, inside the claim call (r2-P1-1): no cancel, no end, and no source write since the gate looked. */
+  claimAllowed(operationId: Parameters<TransferHooks['claimAllowed']>[0]): boolean {
+    const of = transferOfOperation(operationId);
+    if (of === undefined) return true;
+    if (this.cancelling.has(of.transferId) || this.ended.has(of.transferId)) return false;
+    const approval = this.approvals.get(operationId);
+    if (approval === undefined) return true;
+    this.approvals.delete(operationId);
+    return this.options.sessions.contentWritesOf(approval.sourceSessionId) === approval.writes;
   }
 
   isTarget(session: LogicalSession): boolean {

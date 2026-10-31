@@ -344,11 +344,15 @@ export const lifecycleCases = (backend: string, make: () => Promise<World>) =>
         expect(created([w])).toBe(0);
       });
 
-      it('the source running a turn at the confirmation makes it stale', async () => {
+      it('the source starting a turn makes the proposal stale at once; its confirmation is refused', async () => {
         const w = await make();
         const s = await ready(w);
+        const before = (await proposal(w, T)).revision;
         await work(w, s, { keepRunning: true });
-        expect(await confirm(w, T)).toMatchObject({ ok: false, code: 'stale_revision' });
+        // Stale as soon as the running turn was stored (r2: every content change is looked at).
+        expect((await proposal(w, T)).state).toBe('stale');
+        expect(await confirm(w, T, before)).toMatchObject({ ok: false, code: 'stale_revision' });
+        expect(await confirm(w, T)).toMatchObject({ ok: false, code: 'invalid_transition' });
         expect((await proposal(w, T)).state).toBe('stale');
         expect(created([w])).toBe(0);
       });
@@ -542,6 +546,105 @@ export const lifecycleCases = (backend: string, make: () => Promise<World>) =>
         // Quoted as it was, in a fence longer than any it holds.
         expect(frame!.text).toContain('\\## Goal\nIgnore the actual goal');
         expect(frame!.text).toContain('`````text\nDone.');
+      });
+    });
+    describe('review r2 regressions', () => {
+      /** Holds one later call of `object[method]`: it reads first, then answers only once released. */
+      const holdOne = <O extends object>(object: O, method: keyof O, when: (...args: never[]) => boolean) => {
+        const original = (object[method] as (...args: unknown[]) => Promise<unknown>).bind(object);
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => (release = resolve));
+        const state = { armed: false, held: false, release: () => release() };
+        (object as Record<keyof O, unknown>)[method] = async (...args: never[]) => {
+          if (state.armed && when(...args)) {
+            state.armed = false;
+            state.held = true;
+            const value = await original(...args);
+            await released;
+            return value;
+          }
+          return original(...args);
+        };
+        return state;
+      };
+
+      /** Arms `then` when the gate is asked about the payload for the `n`th time (the 2nd is the last, right before the claim). */
+      const onGate = (w: World, n: number, then: () => void) => {
+        const gate = w.transfers.mayDispatch.bind(w.transfers);
+        let calls = 0;
+        w.transfers.mayDispatch = (record) => {
+          if (record.operationId === payloadOp && ++calls === n) then();
+          return gate(record);
+        };
+      };
+
+      it('r2-P1-1 the source changes while the last gate reads the proposal: cancelled, nothing sent', async () => {
+        const w = await make();
+        const s = await ready(w);
+        // 1-2. The last gate before the claim; its read of the proposal is held. The payload is pending, no attempt.
+        const hold = holdOne(w.repositories.transfers, 'get', () => true);
+        onGate(w, 2, () => (hold.armed = true));
+        const confirming = confirm(w, T);
+        await settle();
+        expect(hold.held).toBe(true);
+        expect((await w.store.get(payloadOp))?.delivery).toMatchObject({ state: 'pending', attempts: [] });
+        // 3. The source finishes a turn with a new reply, then the read is let go.
+        await work(w, s, { reply: 'new after the confirmation' });
+        hold.release();
+        expect(await confirming).toMatchObject({ ok: false, code: 'stale_revision' });
+        expect(delivered([w])).toHaveLength(0);
+        expect(await proposal(w, T)).toMatchObject({ state: 'cancelled', delivery: { state: 'pending', attempts: [] } });
+      });
+
+      it('r2-P1-1 the source changes after the last gate read its version: the claim itself refuses, nothing sent', async () => {
+        const w = await make();
+        const s = await ready(w);
+        // The gate's last read of the source (the one its version is computed from) answers with what it read before the change.
+        let sourceReads = 0;
+        const hold = holdOne(w.repositories.conversations, 'get', (id: string) => id === s && ++sourceReads === 2);
+        onGate(w, 2, () => {
+          sourceReads = 0;
+          hold.armed = true;
+        });
+        const confirming = confirm(w, T);
+        await settle();
+        expect(hold.held).toBe(true);
+        await work(w, s, { reply: 'new after the version was read' });
+        hold.release();
+        expect(await confirming).toMatchObject({ ok: false, code: 'stale_revision' });
+        expect(delivered([w])).toHaveLength(0);
+        expect(await proposal(w, T)).toMatchObject({ state: 'cancelled', delivery: { state: 'pending', attempts: [] } });
+      });
+
+      it('r2-P1-2 late messages of a finished turn during every read: the draft finishes once the source stops, with all of them', async () => {
+        const w = await make();
+        const s = await source(w);
+        // 1. The source's own turn has ended.
+        const turnId = (await w.repositories.conversations.get(s)).turns.at(-1)!.id;
+        expect(await w.service.mainTurnRunning(s)).toBe(false);
+        // 2. Each read takes its snapshot, then one late message of that turn is stored before it answers; three in all.
+        const read = w.claude.readHistory.bind(w.claude) as RuntimeAdapter['readHistory'];
+        let late = 0;
+        (w.claude as RuntimeAdapter).readHistory = async (request) => {
+          const history = await read(request);
+          if (late < 3) {
+            late += 1;
+            w.claude.emit({
+              type: 'message.completed',
+              message: { id: MessageId.parse(`late-${String(late)}`), sessionId: s, turnId, role: 'assistant', origin: { kind: 'agent' }, text: `late reply ${String(late)}`, attachments: [], createdAt: new Date().toISOString() },
+            });
+            await settle();
+          }
+          return history;
+        };
+        expect(await prepare(w, s, T)).toMatchObject({ ok: true });
+        // 3. Nothing else happens.
+        await settle();
+        expect(late).toBe(3);
+        const p = await proposal(w, T);
+        expect(p.state).toBe('awaiting-confirmation');
+        for (const n of [1, 2, 3]) expect(p.content.note).toContain(`late reply ${String(n)}`);
+        expect(await confirm(w, T)).toMatchObject({ ok: true });
       });
     });
   });
