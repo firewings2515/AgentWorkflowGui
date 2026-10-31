@@ -239,7 +239,7 @@ describe('cross-tool transfer in the backend (T023)', () => {
     expect(codex[0]!.started).toHaveLength(1);
     expect(codex[0]!.dispatched).toHaveLength(1);
     expect(codex[0]!.dispatched[0]).toMatchObject({ origin: { kind: 'transfer', fromSessionId: source, transferId: T }, entry: { kind: 'new-turn' } });
-    expect(codex[0]!.dispatched[0]!.text).toContain('## Current test output\n$ npm test');
+    expect(codex[0]!.dispatched[0]!.text).toContain('## Current test output\n```text\n$ npm test');
     // The new session shows the transfer content as a message from the transfer (G-1), stored by SQLite.
     expect(snap.messages.filter((m) => m.sessionId === targetSessionOf(T) && m.role === 'user')).toMatchObject([
       { origin: { kind: 'transfer', fromSessionId: source, transferId: T }, text: codex[0]!.dispatched[0]!.text },

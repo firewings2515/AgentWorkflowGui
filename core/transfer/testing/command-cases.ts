@@ -104,7 +104,7 @@ export const commandCases = (backend: string, make: () => Promise<World>) =>
         // The runtime's echo is stored in the new session as a message from the transfer, not from the user (G-1).
         const shown = (await w.repositories.conversations.get(target)).messages.filter((m) => m.role === 'user');
         expect(shown).toMatchObject([{ role: 'user', origin: { kind: 'transfer', fromSessionId: s, transferId: T }, text: delivered[0]!.text }]);
-        expect(delivered[0]!.text).toContain('## Goal\nImplement add() and subtract() in calc.js.');
+        expect(delivered[0]!.text).toContain('## Goal\n```text\nImplement add() and subtract() in calc.js.\n```');
         expect(delivered[0]!.text).toContain(`claude session (${s})`);
         // The same confirmation again does nothing twice.
         expect(await confirm(w, T, p.revision)).toMatchObject({ ok: true });

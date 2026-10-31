@@ -66,6 +66,8 @@ export interface World {
   available: Set<Runtime>;
   /** Sessions whose next dispatched turns stay running until `finishTurn`. */
   holding: Set<SessionId>;
+  /** Sessions whose runtime acks a dispatch but reports nothing of its turn until `finishTurn` (a late notice). */
+  silent: Set<SessionId>;
   /** What the source agent answers to the note request, per session. */
   notes: Map<SessionId, string>;
   /** Runtimes whose readHistory throws (the GUI then uses its own record). */
@@ -111,6 +113,10 @@ const wire = (adapter: FakeAdapter, w: World): FakeAdapter => {
       const id = `turn-run-${next()}`;
       result = { ...result, nativeRef: { ...result.nativeRef, turnRef: id } };
       void Promise.resolve().then(() => {
+        if (w.silent.has(sessionId)) {
+          w.open.set(sessionId, id);
+          return;
+        }
         w.emitTurn(sessionId, id, 'running');
         // The runtime echoes what it received, with the origin it was dispatched with (both adapters do).
         adapter.emit({
@@ -142,6 +148,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     logs: [] as string[],
     available: previous?.available ?? new Set<Runtime>(['claude', 'codex']),
     holding: previous?.holding ?? new Set<SessionId>(),
+    silent: previous?.silent ?? new Set<SessionId>(),
     notes: previous?.notes ?? new Map<SessionId, string>(),
     historyFails: previous?.historyFails ?? new Set<Runtime>(),
     refs: previous?.refs ?? new Map<string, SessionId>(),

@@ -286,6 +286,14 @@ export class SessionService {
   private workflow: WorkflowHooks | undefined;
   private transfer: TransferHooks | undefined;
   /**
+   * Turns a dispatch's ack named that were not seen to end yet, per session (T023 r1-P1-4): the session is
+   * not at its turn boundary while one is here, even before the runtime reported it running. Only an end of
+   * that turn, the runtime's exit or a restart clears one (as T024 r2-P1-2 waits for the dispatched turn).
+   */
+  private readonly ackedTurns = new Map<SessionId, Set<string>>();
+  /** The last own turns of each session seen to end, so an ack read after its turn's end adds nothing. */
+  private readonly endedTurns = new Map<SessionId, string[]>();
+  /**
    * A formal handoff dispatched to a session whose turn has not been seen to end yet (SP-05, T024 r1-P1-2/3):
    * the main turns the session had before the dispatch, and the new one once it started. A replayed old turn
    * is in `known` and never ends the wait; until it ends, no other handoff goes to that session.
@@ -1302,7 +1310,8 @@ export class SessionService {
 
   /** Whether the session's own turn runs, by the stored turns (an old event cannot undo them): its turn boundary. */
   async mainTurnRunning(sessionId: SessionId): Promise<boolean> {
-    return runningMainTurn(await this.repos.conversations.get(sessionId)) !== undefined;
+    if (runningMainTurn(await this.repos.conversations.get(sessionId)) !== undefined) return true;
+    return (this.ackedTurns.get(sessionId)?.size ?? 0) > 0;
   }
 
   /** The native session a GUI session is bound to, once its provision was sent. */
@@ -1498,8 +1507,17 @@ export class SessionService {
     );
   }
 
-  /** Before a claim (DeliveryOptions.prepareTarget): the target session is resumed when it is not open. */
+  /**
+   * Before a claim (DeliveryOptions.prepareTarget): the target session is resumed when it is not open. A
+   * transfer delivery passes its gate again afterwards (T023 r1-P1-3): a cancel while the resume ran stops
+   * it here, and the claim follows with nothing in between to wait for.
+   */
   private async prepareTarget(record: PayloadDelivery): Promise<void> {
+    await this.resumeTarget(record);
+    if (record.kind === 'transfer' && this.transfer !== undefined && !(await this.transfer.mayDispatch(record))) throw new Error('the transfer no longer sends this');
+  }
+
+  private async resumeTarget(record: PayloadDelivery): Promise<void> {
     const ref = record.target.nativeSessionRef;
     const sessionId = record.target.sessionId;
     if (ref === undefined || sessionId === undefined || this.runtimes.isOpen(ref)) return;
@@ -1546,7 +1564,9 @@ export class SessionService {
     }
     const outcome: DispatchOutcome = await this.delivery.dispatch(operationId, options);
     if (outcome.status === 'sent') {
-      this.expectEcho(await this.store.get(operationId), outcome.attemptId);
+      const sent = await this.store.get(operationId);
+      this.followAckedTurn(sent?.target.sessionId, outcome.nativeRef.turnRef);
+      this.expectEcho(sent, outcome.attemptId);
       await this.settled(operationId, outcome.attemptId);
     }
     return outcome;
@@ -1649,6 +1669,7 @@ export class SessionService {
       this.runtimes.markExited(event.sessionIds);
       // No turn of an exited runtime ends any more; the next handoff waits for a restart instead.
       for (const sessionId of event.sessionIds) this.handoffTurns.delete(sessionId);
+      for (const sessionId of event.sessionIds) this.ackedTurns.delete(sessionId);
       for (const sessionId of event.sessionIds) void this.setActivity(sessionId, event.expected ? 'closed' : 'error').catch(() => undefined);
       this.options.publish(event);
       return;
@@ -1686,6 +1707,7 @@ export class SessionService {
         }
         await conversations.upsertTurn(turn);
         if (turn.nativeTaskId === undefined) this.followHandoffTurn(turn);
+        if (turn.nativeTaskId === undefined && turn.state !== 'running') this.turnSeenEnded(turn);
         // Outside this queue: what the engine dispatches next runs in the same session's queue (T024).
         if (turn.state !== 'running' && turn.nativeTaskId === undefined && this.workflow !== undefined) {
           const hooks = this.workflow;
@@ -1758,6 +1780,20 @@ export class SessionService {
     if (mark.known.has(turn.id)) return;
     if (turn.state === 'running') mark.started ??= turn.id;
     else if (mark.started === turn.id) this.handoffTurns.delete(turn.sessionId);
+  }
+
+  /** The turn a dispatch's ack named, until it is seen to end (T023 r1-P1-4). */
+  private followAckedTurn(sessionId: SessionId | undefined, turnRef: string | undefined): void {
+    if (sessionId === undefined || turnRef === undefined || this.endedTurns.get(sessionId)?.includes(turnRef)) return;
+    const acked = this.ackedTurns.get(sessionId) ?? new Set<string>();
+    acked.add(turnRef);
+    this.ackedTurns.set(sessionId, acked);
+  }
+
+  private turnSeenEnded(turn: Turn): void {
+    this.ackedTurns.get(turn.sessionId)?.delete(turn.id);
+    // A few per session: enough to cover an ack that is read after its turn already ended.
+    this.endedTurns.set(turn.sessionId, [...(this.endedTurns.get(turn.sessionId) ?? []), turn.id].slice(-50));
   }
 
   /** Remembers a user message this process dispatched, so its runtime echo is recognised. */

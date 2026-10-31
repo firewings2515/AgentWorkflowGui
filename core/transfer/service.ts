@@ -9,7 +9,7 @@
 // ordered with them, and every step can be redone after a restart on the same fixed IDs.
 import type { AppEvent, CommandResult, LogicalSession, MessageOrigin, ModelSelection, PayloadHash, Timestamp, TransferId, TransferProposal, Turn } from '../../contracts';
 import type { DeliveryEscalation, PayloadDelivery } from '../delivery';
-import type { HistoryEntry } from '../ports';
+import type { HistoryEntry, StoredDelivery } from '../ports';
 import type { CommandOf, SessionService, TransferCommand, TransferHooks } from '../sessions';
 import { agentNoteOf, contentVersion, digestOf, DRAFT_GOAL, entriesOf, frameText, NOTE_REQUEST } from './frame';
 import { noteOperationOf, payloadOperationOf, targetSessionOf, transferOfOperation, transferOfProvision, transferOfSession } from './ids';
@@ -49,7 +49,18 @@ const errorName = (error: unknown) => (error instanceof Error ? error.name : 'no
 const isActive = (p: TransferProposal) => ['draft', 'awaiting-confirmation', 'stale'].includes(p.state) || (p.state === 'approved' && p.delivery?.state !== 'sent');
 
 /** Where the steps after a confirmation stand. */
-type Progress = 'sent' | 'unknown' | 'waiting' | 'failed' | 'cancelled' | 'storage';
+type Progress = 'sent' | 'unknown' | 'waiting' | 'failed' | 'cancelled' | 'superseded' | 'storage';
+
+const PROVISION_CANCELLED = 'creating the new session was cancelled after its outcome stayed unknown';
+
+/** Whether the user's decision on this delivery's last attempt was to cancel it (CR2 §2); kept when it is reconciled later. */
+const cancelDecided = (record: StoredDelivery | undefined): boolean => {
+  const last = record?.delivery.attempts.at(-1);
+  return last?.resolution?.decision === 'cancel';
+};
+
+/** Why a confirmed transfer was cancelled by the GUI: its source changed before the payload left. */
+const SUPERSEDED = 'the source session changed after the confirmation; prepare the transfer again';
 
 export class TransferService implements TransferHooks {
   private readonly queues = new Map<string, Promise<unknown>>();
@@ -194,6 +205,8 @@ export class TransferService implements TransferHooks {
         return fail(requestId, 'runtime_unavailable', 'The new session could not be created; the work stays in the source session', { mayHaveSideEffects: true });
       case 'cancelled':
         return fail(requestId, 'invalid_transition', 'The transfer was cancelled');
+      case 'superseded':
+        return fail(requestId, 'stale_revision', 'The source session changed after the confirmation; the transfer was cancelled, prepare it again', { mayHaveSideEffects: true });
     }
   }
 
@@ -272,8 +285,39 @@ export class TransferService implements TransferHooks {
     return this.complete(p, source, turnRef);
   }
 
-  /** The draft's real content, bound to the source's content version now (at its turn boundary). */
+  /**
+   * The draft's real content, bound to the source's content version (T023 r1-P1-1): the version is read before
+   * and after the content, and only a content read while the source stood still is saved. Otherwise it is
+   * read again; a source that keeps changing leaves the draft for its next turn end.
+   */
   private async complete(p: TransferProposal, source: LogicalSession, noteTurn: string | undefined): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = await this.versionAtBoundary(source.id);
+      if (before === undefined) return;
+      const content = await this.contentOf(p, source, noteTurn);
+      if ((await this.versionAtBoundary(source.id)) !== before) continue;
+      const next: TransferProposal = {
+        ...p,
+        revision: p.revision + 1,
+        state: 'awaiting-confirmation',
+        sourceRevision: before,
+        content,
+        payloadHash: await this.options.hashPayload(frameText({ ...p, content }, source.requestedModel.runtime)),
+      };
+      const saved = await this.repos.transfers.update(next, p.revision);
+      if (saved.status === 'saved') await this.publish(p.id);
+      return;
+    }
+    this.log(`the source of ${p.id} kept changing while its content was read; the draft waits for its next turn end`);
+  }
+
+  /** The source's content version, or undefined while its own turn runs (not at a turn boundary). */
+  private async versionAtBoundary(sourceId: LogicalSession['id']): Promise<number | undefined> {
+    if (await this.options.sessions.mainTurnRunning(sourceId)) return undefined;
+    return contentVersion(await this.repos.conversations.get(sourceId));
+  }
+
+  private async contentOf(p: TransferProposal, source: LogicalSession, noteTurn: string | undefined): Promise<TransferProposal['content']> {
     const history = await this.history(source);
     // A session a transfer created keeps that transfer's goal: a later message of the user is a step of it.
     const inherited = (await this.repos.transfers.list()).find((t) => t.createdSessionId === source.id)?.content.goal;
@@ -289,23 +333,13 @@ export class TransferService implements TransferHooks {
     }
     // Nothing the GUI handed out (an MCP token quoted in a transcript) leaves in a proposal (C-07).
     const redact = (text: string) => this.options.sessions.runtimes.redactText(text);
-    const content: TransferProposal['content'] = {
+    return {
       goal: redact(inherited ?? digest.goal),
       note: redact(note),
       noteSource: p.content.noteSource,
       diff: redact(digest.diff),
       testOutput: redact(digest.testOutput),
     };
-    const next: TransferProposal = {
-      ...p,
-      revision: p.revision + 1,
-      state: 'awaiting-confirmation',
-      sourceRevision: contentVersion(await this.repos.conversations.get(source.id)),
-      content,
-      payloadHash: await this.options.hashPayload(frameText({ ...p, content }, source.requestedModel.runtime)),
-    };
-    const saved = await this.repos.transfers.update(next, p.revision);
-    if (saved.status === 'saved') await this.publish(p.id);
   }
 
   /** The source's history through the runtime (read-only, no resume); the GUI's own record when it cannot be read. */
@@ -325,8 +359,22 @@ export class TransferService implements TransferHooks {
 
   /** Whether the source is not what the proposal bound: it runs a turn, or its content version moved. */
   private async sourceChanged(p: TransferProposal): Promise<boolean> {
-    if (await this.options.sessions.mainTurnRunning(p.sourceSessionId)) return true;
-    return contentVersion(await this.repos.conversations.get(p.sourceSessionId)) !== p.sourceRevision;
+    return (await this.versionAtBoundary(p.sourceSessionId)) !== p.sourceRevision;
+  }
+
+  /**
+   * An approved proposal whose payload never crossed the dispatch boundary, while its source went on: the
+   * confirmed content is no longer the source's (T023 r1-P1-2). It is never sent; since a payload was
+   * accepted it cannot be stale (T022 r2), so it is cancelled and the user prepares it again.
+   */
+  private async superseded(p: TransferProposal, payload: StoredDelivery | undefined): Promise<boolean> {
+    if (p.state !== 'approved' || (payload !== undefined && (payload.delivery.state !== 'pending' || payload.delivery.attempts.length > 0))) return false;
+    return this.sourceChanged(p);
+  }
+
+  private async supersede(p: TransferProposal): Promise<void> {
+    await this.stopDeliveries(p, SUPERSEDED);
+    await this.end(p, 'cancelled', SUPERSEDED);
   }
 
   private async markStale(p: TransferProposal): Promise<void> {
@@ -344,6 +392,10 @@ export class TransferService implements TransferHooks {
     const targetId = targetSessionOf(p.id);
     let payload = await this.store.get(p.operationId);
     if (payload?.outcome !== undefined) return payload.outcome.kind === 'cancelled' ? 'cancelled' : 'failed';
+    if (await this.superseded(p, payload)) {
+      await this.supersede(p);
+      return 'superseded';
+    }
     const provision = p.provision === undefined ? undefined : await this.store.get(p.provision.operationId);
     // Nothing crossed the boundary yet and the target tool is gone: it fails for good, nothing is created.
     if ((provision === undefined || (provision.delivery.state === 'pending' && provision.delivery.attempts.length === 0)) && !sessions.runtimeAvailable(p.target.runtime)) {
@@ -394,6 +446,12 @@ export class TransferService implements TransferHooks {
     if (payload.delivery.state === 'sent') return 'sent';
     if (payload.delivery.state === 'unknown') return 'unknown';
     if (this.cancelling.has(p.id)) return 'cancelled';
+    // The gate held it back because the source went on meanwhile (e.g. while the new session was created).
+    const current = await this.repos.transfers.get(p.id);
+    if (current !== undefined && (await this.superseded(current, payload))) {
+      await this.supersede(current);
+      return 'superseded';
+    }
     const created = p.provision === undefined ? undefined : await this.store.get(p.provision.operationId);
     return created?.delivery.state === 'unknown' ? 'unknown' : 'waiting';
   }
@@ -463,21 +521,35 @@ export class TransferService implements TransferHooks {
 
   turnEnded(turn: Turn): void {
     void (async () => {
-      const waiting = (await this.repos.transfers.list()).filter((p) => p.sourceSessionId === turn.sessionId && (p.state === 'draft' || p.state === 'awaiting-confirmation'));
+      const waiting = (await this.repos.transfers.list()).filter((p) => p.sourceSessionId === turn.sessionId && ['draft', 'awaiting-confirmation', 'approved'].includes(p.state));
       for (const { id } of waiting) {
         await this.serial(id, async () => {
           const p = await this.repos.transfers.get(id);
           if (p?.state === 'draft') await this.advance(p);
           // The source went on after the proposal was made: it must be prepared again (CR-5).
           else if (p?.state === 'awaiting-confirmation' && (await this.sourceChanged(p))) await this.markStale(p);
+          // Confirmed, but its payload has not left yet (e.g. waiting for the new session): cancelled (r1-P1-2).
+          else if (p?.state === 'approved' && (await this.superseded(p, await this.store.get(p.operationId)))) await this.supersede(p);
         });
       }
     })().catch((error: unknown) => this.log(`following the turn end of ${turn.sessionId} failed (${errorName(error)})`));
   }
 
+  /**
+   * The gate of every transfer delivery, asked before the dispatch and again once the target was resumed,
+   * right before the claim (r1-P1-3). A first dispatch of a payload also needs the source unchanged
+   * (r1-P1-2); a user's retry of one that already crossed the boundary sends the content already confirmed.
+   * The proposal and the cancel flag are read last, so nothing but the claim itself comes after them.
+   */
   async mayDispatch(record: PayloadDelivery): Promise<boolean> {
     const of = transferOfOperation(record.operationId);
     if (of === undefined) return false;
+    const fresh = await this.store.get(record.operationId);
+    if (fresh === undefined || fresh.kind === 'provision' || fresh.outcome !== undefined) return false;
+    if (of.part === 'payload' && fresh.delivery.attempts.length === 0) {
+      const bound = await this.repos.transfers.get(of.transferId);
+      if (bound === undefined || (await this.sourceChanged(bound))) return false;
+    }
     const p = await this.repos.transfers.get(of.transferId);
     if (p === undefined || this.cancelling.has(p.id)) return false;
     return of.part === 'payload' ? p.state === 'approved' && p.operationId === record.operationId : p.state === 'draft';
@@ -526,7 +598,7 @@ export class TransferService implements TransferHooks {
       const p = await this.repos.transfers.get(transferId);
       if (p === undefined || p.state === 'cancelled' || p.state === 'failed' || p.delivery?.state === 'sent') return;
       if (transferOfOperation(operationId) === undefined) {
-        await this.fail(p, 'creating the new session was cancelled after its outcome stayed unknown');
+        await this.fail(p, PROVISION_CANCELLED);
         return;
       }
       await this.stopDeliveries(p, 'the user cancelled the delivery');
@@ -545,11 +617,22 @@ export class TransferService implements TransferHooks {
       await this.serial(id, async () => {
         const p = await this.repos.transfers.get(id);
         if (p === undefined) return;
-        if (p.state === 'draft') await this.advance(p, true);
-        else if (p.state === 'approved') {
+        if (p.state === 'draft') {
+          // The user's cancel of its note request was saved, its follow-up cut off (r1-P1-5).
+          if (cancelDecided(await this.store.get(noteOperationOf(p.id)))) {
+            await this.stopDeliveries(p, 'the user cancelled the delivery');
+            await this.end(p, 'cancelled', 'the user cancelled the delivery');
+          } else await this.advance(p, true);
+        } else if (p.state === 'approved') {
           const payload = await this.store.get(p.operationId);
+          const provision = p.provision === undefined ? undefined : await this.store.get(p.provision.operationId);
           // A cancel or failure cut off before its proposal was saved.
           if (payload?.outcome !== undefined) await this.end(p, payload.outcome.kind === 'failed' ? 'failed' : 'cancelled', payload.outcome.detail);
+          // A user's cancel of an unknown delivery that was saved before its follow-up ran (r1-P1-5).
+          else if (payload?.delivery.state !== 'sent' && cancelDecided(payload)) {
+            await this.stopDeliveries(p, 'the user cancelled the delivery');
+            await this.end(p, 'cancelled', 'the user cancelled the delivery');
+          } else if (payload?.delivery.state !== 'sent' && cancelDecided(provision)) await this.fail(p, PROVISION_CANCELLED);
           else if (payload?.delivery.state !== 'sent' && payload?.delivery.state !== 'unknown') await this.proceed(p);
         } else if (p.state === 'cancelled' || p.state === 'failed') {
           await this.stopDeliveries(p, p.state === 'failed' ? (p.failure?.message ?? 'the transfer failed') : 'the user cancelled the transfer', p.state === 'failed' ? 'failed' : 'cancelled');
