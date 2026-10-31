@@ -73,6 +73,12 @@ interface PendingWrite {
   paths: string[];
   turnId?: TurnId;
   nativeTaskId?: NativeTaskId;
+  /**
+   * The GUI sees this session's reads (Claude's Read tool), so what its write left is what it knows of
+   * the file. Codex reads through its shell, which the GUI never sees: its patch checks its own context
+   * (SP-06 W4), and a read check would only refuse its next patch after anyone else's change (V-24 run 1).
+   */
+  readsSeen: boolean;
 }
 
 /** The part of an AbortSignal used here (core's lib has no DOM types). */
@@ -217,7 +223,7 @@ export class LockCoordinator {
             }
           }
           // A file of the write the item does not name (or a declined / failed item): nothing applied to it.
-          for (const path of write.paths) this.ended(write.sessionId, path, outcomes.get(path) ?? { kind: 'failed' });
+          for (const path of write.paths) this.ended(write, path, outcomes.get(path) ?? { kind: 'failed' });
           return;
         }
         if (item.kind === 'command') {
@@ -389,6 +395,7 @@ export class LockCoordinator {
       paths: started,
       ...(turnId !== undefined && { turnId }),
       ...(request.nativeTaskId !== undefined && { nativeTaskId: request.nativeTaskId }),
+      readsSeen: isClaude(request),
     });
     if (this.answer(handle, decision) === 'approved') return 'approved';
     // The runtime withdrew it meanwhile: nothing will be written.
@@ -497,10 +504,12 @@ export class LockCoordinator {
     return { kind: 'written', hash: state };
   }
 
-  private ended(sessionId: SessionId, path: string, outcome: WriteOutcome): void {
+  private ended(write: PendingWrite, path: string, outcome: WriteOutcome): void {
     if (outcome.kind === 'written') this.remember(path, outcome.hash);
     else if (outcome.kind === 'deleted') this.remember(path, 'missing');
-    this.table.writeEnded(sessionId, path, outcome);
+    this.table.writeEnded(write.sessionId, path, outcome);
+    // The table takes the holder's write as its read; only for a session whose reads the GUI sees.
+    if (!write.readsSeen) this.table.forgetRead(write.sessionId, path);
   }
 
   /** Bounded: the oldest paths are forgotten first (a forgotten one only means its next event is checked). */

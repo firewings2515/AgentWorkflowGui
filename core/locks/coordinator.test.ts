@@ -240,6 +240,23 @@ describe('Codex writes (held approval, SP-06 W3)', () => {
     expect(hd.answers[0]!.reason).toContain('changed after this session last read it');
   });
 
+  // V-24 run 1: Codex's second patch after Claude's change was refused as "changed since read".
+  it('never refuses a Codex patch for a read check: the GUI does not see its reads', () => {
+    const { locks, files } = setup();
+    const first = write(B, [F]);
+    void locks.approve(handle(first), approve, session(B));
+    files.set(fk(F), h(2));
+    locks.observe(fileItem(first, 'applied'));
+    locks.observe(turnEnd(B, TB));
+    const claude = write(A, [F], { claude: true });
+    void locks.approve(handle(claude), approve, session(A));
+    files.set(fk(F), h(3));
+    locks.observe(fileItem(claude, 'applied'));
+    locks.observe(turnEnd(A, T1));
+    const second = handle(write(B, [F]));
+    expect(locks.approve(second, approve, session(B))).toBe('approved');
+  });
+
   it('declines and escalates once the hold passes its limit', async () => {
     const { clock, locks, escalations } = setup({ holdMs: 1000 });
     void locks.approve(handle(write(A, [F])), approve, session(A));
