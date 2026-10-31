@@ -32,6 +32,8 @@ import { TransferService } from '../../core/transfer';
 import { executeCommand, WorkflowEngine } from '../../core/workflow';
 import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
+import { hashFile, setTimer } from './file-hash';
+import { GitIgnoreRules } from './git-ignore';
 import { jobCommandRunner, worktreeFiles } from './pipeline-host';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
 
@@ -135,8 +137,6 @@ export const damagedFacade = (reason: string, location: string): AppFacade => ({
 
 const sha256 = (text: string): PayloadHash => `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`;
 
-const notInWorkflow = { status: 'rejected', rejection: { reason: 'not-in-workflow', detail: 'this tool works in workflow sessions only' } } as const;
-
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref());
 
 /** Calls `fn` once `at` has come by `now`, in setTimeout steps it can hold (about 24 days at most each). */
@@ -205,15 +205,29 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     handoff: (input, ctx) => ref.workflow?.handoff(input, ctx) ?? Promise.resolve(starting),
     create_tasks: (input, ctx) => ref.workflow?.createTasks(input, ctx) ?? Promise.resolve(starting),
     report_to_root: (input, ctx) => ref.workflow?.reportToRoot(input, ctx) ?? Promise.resolve(starting),
-    wait_for_file: () => Promise.resolve(notInWorkflow),
+    // Same-folder locks (R-07): ordinary and workflow sessions alike.
+    wait_for_file: (input, ctx) => ref.service?.waitForFile(input, ctx) ?? Promise.resolve(starting),
     send_message: (input, ctx) => {
       if (ref.service === undefined) return Promise.resolve({ status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is starting' } });
       return ref.service.sendMessage(input, ctx);
     },
   };
   const mcp = await GuiMcpServer.start({ handlers, log: (message) => log(`[mcp] ${message}`) });
+  // What git ignores is no unlocked write (T033); its rules are read again when the watcher sees them change.
+  const ignored = new GitIgnoreRules(undefined, undefined, log);
   const watchers = new WorkspaceWatchers(
-    { changed: (sessionId, root, path) => ref.service?.workspaceChanged(sessionId, root, path), failed: (sessionId, root) => ref.service?.workspaceWatchFailed(sessionId, root) },
+    {
+      changed: (sessionId, root, path) => {
+        // Nothing here may throw into fs.watch's callback (T033 r1 P1-4).
+        try {
+          ignored.changed(path);
+          ref.service?.workspaceChanged(sessionId, root, path);
+        } catch (error) {
+          log(`[watch] a change of ${sessionId} could not be handled (${describe(error)})`);
+        }
+      },
+      failed: (sessionId, root) => ref.service?.workspaceWatchFailed(sessionId, root),
+    },
     log,
     options.watch,
   );
@@ -291,6 +305,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       return mount;
     },
     sleep,
+    // Same-folder file locks (T033, R-07): in memory only, so a restart starts with none.
+    locks: { hashFile: (path) => hashFile(path), setTimer, isIgnored: (path) => ignored.isIgnored(path) },
     listModels,
     isRuntimeAvailable: (runtime) => runtime === 'claude' || options.codexExecutable !== undefined || options.createAdapter !== undefined,
     onSessionOpened: (sessionId) => {
@@ -351,6 +367,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     const left: OwnedProcess[] = await host.listOwned().catch(() => []);
     for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
     watchers.stopAll();
+    ignored.close();
     return damaged(error);
   }
 
@@ -392,8 +409,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         escalations: data.escalations,
         transfers: data.transfers,
         projects: data.projects,
-        // File locks (R-07) live in memory; the lock table comes with T033.
-        locks: [],
+        // File locks (R-07) live in memory only: the lock table's list now.
+        locks: service.locks?.list() ?? [],
         preferences: data.preferences,
       };
     },
@@ -428,6 +445,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       const left: OwnedProcess[] = await host.listOwned().catch(() => []);
       for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
       watchers.stopAll();
+      ignored.close();
       db.close();
     })();
     return closing;

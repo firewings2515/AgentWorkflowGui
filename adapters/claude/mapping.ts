@@ -94,7 +94,9 @@ export const startItem = (p: Placement, use: ToolUse, cwd: string, startedAt: Ti
     case 'command': {
       const command = str(input.command);
       if (!command) return undefined;
-      return { ...base, kind: 'command', command, cwd, state: 'running', output: '', outputTruncated: false } satisfies CommandItem;
+      // `run_in_background`: it outlives its tool call, and file locks wait for it (R-07, SP-06 W3).
+      const background = input.run_in_background === true;
+      return { ...base, kind: 'command', command, cwd, state: 'running', ...(background && { background }), output: '', outputTruncated: false } satisfies CommandItem;
     }
     case 'fileChange': {
       const paths = toolPaths(input);
