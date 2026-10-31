@@ -21,11 +21,12 @@ import {
 } from '../../contracts';
 import { ClaudeAdapter, claudeAgentSdk } from '../../adapters/claude';
 import { CodexAdapter } from '../../adapters/codex';
+import { GitAdapter } from '../../adapters/git';
 import { GuiMcpServer, type McpToolHandlers } from '../../adapters/mcp-server';
 import { claudeProcessSpawn, codexAppServerSpawn, type JobSpawner } from '../../adapters/process';
 import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../adapters/storage';
 import { permissionPolicy } from '../../core/policy';
-import type { AppRepositories, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter } from '../../core/ports';
+import type { AppRepositories, GitPort, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter } from '../../core/ports';
 import { Redactor, SessionService } from '../../core/sessions';
 import { TransferService } from '../../core/transfer';
 import { WorkflowEngine } from '../../core/workflow';
@@ -48,6 +49,8 @@ export interface BackendOptions {
   codexExecutable?: string | undefined;
   /** Replaces the real adapters (tests). */
   createAdapter?: AdapterFactory;
+  /** Replaces the git adapter (tests). */
+  createGit?: () => GitPort;
   /** Replaces the runtimes' model lists (tests). */
   listModels?: (runtime: Runtime) => Promise<ModelOption[]>;
   policy?: PermissionPolicy;
@@ -71,6 +74,8 @@ export interface Backend {
   transfer: TransferService;
   repositories: AppRepositories;
   mcp: GuiMcpServer;
+  /** The git / worktree adapter (T030) the task pipeline (T032) runs its worktrees, merges and fast-forwards through. */
+  git: GitPort;
   /** What exiting now would cut off (R-14). */
   unfinishedWork(): Promise<{ runningSessions: number; heldRequests: number; runningNativeTasks: number; commands: number }>;
   shutdown(): Promise<void>;
@@ -399,6 +404,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     transfer,
     repositories,
     mcp,
+    git: options.createGit?.() ?? new GitAdapter(),
     async unfinishedWork() {
       const work = await service.unfinishedWork();
       const owned = await host.listOwned().catch(() => []);
