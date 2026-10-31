@@ -1,7 +1,8 @@
 // Ordinary sessions over the ports (T017): the commands of the renderer, the runtime events that become the
 // stored conversation, the GUI MCP server's `send_message`, and restart / exit. Workflow execution belongs
 // to the workflow engine (T024), attached with `attachWorkflow`; this service only gives it workflow
-// sessions, their deliveries and their escalations. Cross-tool transfer still answers `unsupported`.
+// sessions, their deliveries and their escalations. Cross-tool transfer (T023) belongs to the transfer
+// service, attached with `attachTransfer` the same way.
 //
 // Every payload reaches a runtime through the CR-2 delivery service (T008); a session's runtime session is
 // itself created as a provision delivery, so a lost create response is never followed by a second create.
@@ -42,6 +43,8 @@ import {
 import { DeliveryService, type DeliveryEscalation, type DispatchOutcome, type PayloadDelivery, type RecoveryReport } from '../delivery';
 import type {
   AppRepositories,
+  ClaimInput,
+  ClaimResult,
   Conversation,
   DeliveryStore,
   DispatchEntry,
@@ -85,6 +88,37 @@ export interface WorkflowHooks {
    * to anything else. Every other user message is `deliver`.
    */
   userMessageFate(record: StoredDelivery): Promise<'deliver' | 'wait' | 'cancel'>;
+}
+
+export type TransferCommand = CommandOf<'transfer.prepare' | 'transfer.confirm' | 'transfer.cancel'>;
+
+/**
+ * What the transfer service (T023, R-02) takes over from the session service. Every `transfer` delivery (a
+ * proposal's payload, or the request for the source agent's note) is dispatched by it, in its own order
+ * with the proposal's state, so a cancelled proposal never sends anything.
+ */
+export interface TransferHooks {
+  execute(command: TransferCommand): Promise<CommandResult>;
+  /**
+   * A session's stored content changed (a turn, message, item or sub-agent written; T023 r2-P1-2): a draft of
+   * it may finish now, or a proposal of it no longer holds. Called outside the session's queue.
+   */
+  contentChanged(sessionId: SessionId): void;
+  /**
+   * Asked synchronously right before a `transfer` delivery is claimed, with nothing awaited between the
+   * answer and the claim (T023 r2-P1-1): false refuses the claim, which leaves the delivery pending.
+   */
+  claimAllowed(operationId: OperationId): boolean;
+  /** Whether a `transfer` delivery may still go (the gate in `dispatchOne`). */
+  mayDispatch(record: PayloadDelivery): Promise<boolean>;
+  /** A session a transfer created: its provision is left to the transfer service at a restart. */
+  isTarget(session: LogicalSession): boolean;
+  /** Re-dispatches a `transfer` delivery the user retried, in the transfer's own order. */
+  redeliver(operationId: OperationId): Promise<void>;
+  /** Where an unknown transfer delivery, or a transfer target's provision, is shown: the source session. */
+  escalationFor(item: DeliveryEscalation): Promise<{ ref: NonNullable<Escalation['ref']>; rootSessionId: SessionId } | undefined>;
+  /** The user decided on an unknown delivery with `delivery.resolve` (already recorded). */
+  deliveryResolved(operationId: OperationId, decision: 'wait' | 'cancel' | 'retry'): Promise<void>;
 }
 
 /** How a workflow payload enters its target: a formal handoff waits for the target's turn to end (SP-05). */
@@ -260,6 +294,20 @@ export class SessionService {
   /** Set when shutdown finished: nothing is stored any more (the database closes next). */
   private closed = false;
   private workflow: WorkflowHooks | undefined;
+  private transfer: TransferHooks | undefined;
+  /**
+   * Turns a dispatch's ack named that were not seen to end yet, per session (T023 r1-P1-4): the session is
+   * not at its turn boundary while one is here, even before the runtime reported it running. Only an end of
+   * that turn, the runtime's exit or a restart clears one (as T024 r2-P1-2 waits for the dispatched turn).
+   */
+  private readonly ackedTurns = new Map<SessionId, Set<string>>();
+  /** The last own turns of each session seen to end, so an ack read after its turn's end adds nothing. */
+  private readonly endedTurns = new Map<SessionId, string[]>();
+  /**
+   * How many content writes each session's conversation had in this process, counted synchronously as each
+   * commits (T023 r2-P1-1): a transfer gate that saw the same count right before the claim saw no change.
+   */
+  private readonly contentWrites = new Map<SessionId, number>();
   /**
    * A formal handoff dispatched to a session whose turn has not been seen to end yet (SP-05, T024 r1-P1-2/3):
    * the main turns the session had before the dispatch, and the new one once it started. A replayed old turn
@@ -293,8 +341,18 @@ export class SessionService {
       onEvent: (event) => this.record(event),
       ...(options.sleep !== undefined && { sleep: (ms: number) => this.options.sleep!(ms) }),
     });
+    // A transfer's claim is refused when its gate's view went out of date, decided synchronously in the call
+    // that makes the claim (T023 r2-P1-1); every other claim goes straight to the store.
+    const store = this.store;
+    const claimGuarded = new Proxy(store, {
+      get: (target, key): unknown =>
+        key === 'claim'
+          ? (input: ClaimInput): Promise<ClaimResult> =>
+              this.transfer !== undefined && !this.transfer.claimAllowed(input.operationId) ? Promise.resolve({ status: 'revision-changed' }) : target.claim(input)
+          : Reflect.get(target, key),
+    });
     this.delivery = new DeliveryService({
-      store: this.store,
+      store: claimGuarded,
       runtimes: this.runtimes.adapters,
       now: () => options.now(),
       uuid: () => options.uuid(),
@@ -313,6 +371,11 @@ export class SessionService {
   /** The workflow engine (T024); without one, `workflow.start` answers `unsupported`. */
   attachWorkflow(hooks: WorkflowHooks): void {
     this.workflow = hooks;
+  }
+
+  /** The transfer service (T023); without one, `transfer.*` answers `unsupported`. */
+  attachTransfer(hooks: TransferHooks): void {
+    this.transfer = hooks;
   }
 
   // ---- lifecycle ------------------------------------------------------------------------------------
@@ -338,12 +401,23 @@ export class SessionService {
       // The last run's processes are gone (its Job ended them, D-03), so nothing of it is still running:
       // turns, items and sub-agents it left open were cut off by its exit (T021: a GUI killed mid-turn).
       const at = this.options.now();
-      for (const turn of conversation.turns) if (turn.state === 'running') await repositories.conversations.upsertTurn({ ...turn, state: 'interrupted', endedAt: at });
+      for (const turn of conversation.turns)
+        if (turn.state === 'running') {
+          this.contentWrite(session.id);
+          await repositories.conversations.upsertTurn({ ...turn, state: 'interrupted', endedAt: at });
+        }
       for (const item of conversation.items) {
         const ended = endedByExit(item, at);
-        if (ended !== undefined) await repositories.conversations.upsertItem(ended);
+        if (ended !== undefined) {
+          this.contentWrite(session.id);
+          await repositories.conversations.upsertItem(ended);
+        }
       }
-      for (const task of conversation.nativeTasks) if (task.state === 'running') await repositories.conversations.upsertNativeTask({ ...task, state: 'stopped', endedAt: at });
+      for (const task of conversation.nativeTasks)
+        if (task.state === 'running') {
+          this.contentWrite(session.id);
+          await repositories.conversations.upsertNativeTask({ ...task, state: 'stopped', endedAt: at });
+        }
       for (const request of conversation.permissionRequests) {
         if ((request.kind === 'command' || request.kind === 'fileChange') && request.decision?.outcome === 'approve')
           this.written.add(session.id, request.paths, request.cwd ?? session.cwd);
@@ -371,12 +445,19 @@ export class SessionService {
     // A workflow node's session is created for the work sent to it: a provision with none (a crash between
     // the two acceptances) waits for the first handoff instead of starting a runtime now (T024 r1-P2-1).
     const workflowSessions = new Set((await repositories.sessions.list()).filter((s) => s.kind === 'workflow').map((s) => s.id));
+    // A transfer's payloads and its target's provision go in the transfer's own order, after this (T023).
+    const transfer = this.transfer;
+    const transferTargets = new Set(transfer === undefined ? [] : (await repositories.sessions.list()).filter((s) => transfer.isTarget(s)).map((s) => s.id));
     const withWork = new Set<string>();
     for (const state of ['pending', 'unknown', 'sent'] as const)
       for (const record of await this.store.listByState(state)) if (record.kind !== 'provision' && record.target.sessionId !== undefined) withWork.add(record.target.sessionId);
     const report = await this.delivery.recover({
       select: (record) => {
-        if (record.kind === 'provision') return workflowSessions.has(record.spec.sessionId) && !withWork.has(record.spec.sessionId) ? 'skip' : {};
+        if (record.kind === 'provision') {
+          if (transferTargets.has(record.spec.sessionId)) return 'skip';
+          return workflowSessions.has(record.spec.sessionId) && !withWork.has(record.spec.sessionId) ? 'skip' : {};
+        }
+        if (record.kind === 'transfer' && transfer !== undefined) return 'skip';
         // A formal handoff goes through the one queue of its target (T024 r1-P1-2), below.
         if (record.kind === 'handoff' && record.target.sessionId !== undefined) {
           handoffs.push({ operationId: record.operationId, sessionId: record.target.sessionId });
@@ -540,6 +621,7 @@ export class SessionService {
       case 'transfer.prepare':
       case 'transfer.confirm':
       case 'transfer.cancel':
+        if (this.transfer !== undefined) return this.transfer.execute(command);
         return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
     }
   }
@@ -822,12 +904,19 @@ export class SessionService {
       await this.retryPending(attempt.operationId);
       if (escalation.ref?.kind === 'provision') for (const blocked of escalation.ref.blocked) await this.retryPending(blocked);
     }
+    // A transfer follows the user's decision on its target or payload (T023).
+    if (decision === 'cancel') await this.transfer?.deliveryResolved(attempt.operationId, decision);
     return ok(requestId);
   }
 
   /** A pending delivery the user retried: a formal handoff waits in its target's queue like any other (r1-P1-2). */
   private async retryPending(operationId: OperationId): Promise<void> {
     const record = await this.store.get(operationId);
+    // A transfer delivery goes in its transfer's order, which a cancel also takes (T023).
+    if (record?.kind === 'transfer' && this.transfer !== undefined) {
+      await this.transfer.redeliver(operationId);
+      return;
+    }
     if (record?.kind === 'handoff' && record.target.sessionId !== undefined) {
       await this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn');
       return;
@@ -1253,6 +1342,55 @@ export class SessionService {
     return { operationId: provisionOp(sessionId), bindingKey: `session:${sessionId}`, state: 'pending', preallocated: false };
   }
 
+  // ---- transfers (T023) -----------------------------------------------------------------------------
+
+  /** Whether the session's own turn runs, by the stored turns (an old event cannot undo them): its turn boundary. */
+  async mainTurnRunning(sessionId: SessionId): Promise<boolean> {
+    if (runningMainTurn(await this.repos.conversations.get(sessionId)) !== undefined) return true;
+    return (this.ackedTurns.get(sessionId)?.size ?? 0) > 0;
+  }
+
+  /** How many content writes the session's conversation had in this process (read synchronously, T023 r2-P1-1). */
+  contentWritesOf(sessionId: SessionId): number {
+    return this.contentWrites.get(sessionId) ?? 0;
+  }
+
+  /** The native session a GUI session is bound to, once its provision was sent. */
+  nativeSessionOf(sessionId: SessionId): Promise<string | undefined> {
+    return this.binding(sessionId);
+  }
+
+  /**
+   * Dispatches a pending `transfer` delivery in its session's queue, as a new turn and only at the session's
+   * turn boundary (`queued` while its own turn runs); its provision first when needed (CR2 §3).
+   */
+  deliverTransfer(operationId: OperationId, sessionId: SessionId): Promise<DeliveryState | 'queued'> {
+    return this.serial(sessionKey(sessionId), async (): Promise<DeliveryState | 'queued'> => {
+      const record = await this.store.get(operationId);
+      if (record === undefined || record.delivery.state !== 'pending') return record?.delivery.state ?? 'pending';
+      const session = await this.repos.sessions.get(sessionId);
+      if (this.closing || session === undefined) return 'pending';
+      const provisioned = await this.ensureProvisioned(session);
+      if (!provisioned.ok || this.closing) return 'pending';
+      if (runningMainTurn(await this.repos.conversations.get(sessionId)) !== undefined) return 'queued';
+      return this.dispatchPending(operationId, { origin: await this.originOf(operationId), entry: { kind: 'new-turn' } });
+    });
+  }
+
+  /**
+   * The user cancelled what an unknown delivery was for (`transfer.cancel`): the live unknown attempt gets
+   * the user's cancel and its escalation is closed. It stays reconcilable (CR2 §2).
+   */
+  async cancelUnknownDelivery(operationId: OperationId): Promise<void> {
+    const record = await this.store.get(operationId);
+    const last = record?.delivery.attempts.at(-1);
+    if (record?.delivery.state !== 'unknown' || last?.state !== 'unknown' || last.resolution?.decision === 'cancel') return;
+    const resolved = await this.delivery.resolve({ operationId, attemptId: last.attemptId, decision: 'cancel', acceptDuplicateRisk: false });
+    if (resolved.status === 'commit-uncertain') throw new Error('the cancel of an unknown delivery could not be saved for certain');
+    const escalation = await this.repos.escalations.get(deliveryEscalationId(`${operationId}/${last.attemptId}`));
+    if (escalation?.state === 'open') await this.closeEscalation(escalation, 'resolved', 'user');
+  }
+
   /** Where a session's escalations go (R-05): a workflow session's to its instance's root. */
   private async rootOf(session: LogicalSession): Promise<{ rootSessionId: SessionId; instanceId?: InstanceId }> {
     if (session.kind !== 'workflow') return { rootSessionId: session.id };
@@ -1410,8 +1548,17 @@ export class SessionService {
     );
   }
 
-  /** Before a claim (DeliveryOptions.prepareTarget): the target session is resumed when it is not open. */
+  /**
+   * Before a claim (DeliveryOptions.prepareTarget): the target session is resumed when it is not open. A
+   * transfer delivery passes its gate again afterwards (T023 r1-P1-3): a cancel while the resume ran stops
+   * it here, and the claim follows with nothing in between to wait for.
+   */
   private async prepareTarget(record: PayloadDelivery): Promise<void> {
+    await this.resumeTarget(record);
+    if (record.kind === 'transfer' && this.transfer !== undefined && !(await this.transfer.mayDispatch(record))) throw new Error('the transfer no longer sends this');
+  }
+
+  private async resumeTarget(record: PayloadDelivery): Promise<void> {
     const ref = record.target.nativeSessionRef;
     const sessionId = record.target.sessionId;
     if (ref === undefined || sessionId === undefined || this.runtimes.isOpen(ref)) return;
@@ -1442,7 +1589,11 @@ export class SessionService {
   private async dispatchOne(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry }): Promise<DispatchOutcome | undefined> {
     if (this.closing) return undefined;
     // Every way a user message is dispatched (sent at once, recovered, retried) passes here (T024 r3-P1-2).
-    const record = this.workflow === undefined ? undefined : await this.store.get(operationId);
+    const record = this.workflow === undefined && this.transfer === undefined ? undefined : await this.store.get(operationId);
+    // Every transfer delivery passes here too: never once its proposal is cancelled or failed (T023).
+    if (record?.kind === 'transfer' && this.transfer !== undefined) {
+      if (record.outcome !== undefined || !(await this.transfer.mayDispatch(record))) return undefined;
+    }
     if (record?.kind === 'user-message' && this.workflow !== undefined) {
       if (record.outcome !== undefined) return undefined;
       const fate = await this.workflow.userMessageFate(record);
@@ -1454,7 +1605,9 @@ export class SessionService {
     }
     const outcome: DispatchOutcome = await this.delivery.dispatch(operationId, options);
     if (outcome.status === 'sent') {
-      this.expectEcho(await this.store.get(operationId), outcome.attemptId);
+      const sent = await this.store.get(operationId);
+      this.followAckedTurn(sent?.target.sessionId, outcome.nativeRef.turnRef);
+      this.expectEcho(sent, outcome.attemptId);
       await this.settled(operationId, outcome.attemptId);
     }
     return outcome;
@@ -1471,8 +1624,11 @@ export class SessionService {
       await this.setActivity(sessionId, 'reconciling');
       return;
     }
-    const ref: Escalation['ref'] =
-      item.deliveryKind === 'provision'
+    // A transfer's own deliveries, and its target's creation, are shown at the source session (T023).
+    const transferred = await this.transfer?.escalationFor(item);
+    const ref: Escalation['ref'] = transferred
+      ? transferred.ref
+      : item.deliveryKind === 'provision'
         ? {
             kind: 'provision',
             operationId: item.operationId,
@@ -1488,7 +1644,7 @@ export class SessionService {
     if ((await this.repos.escalations.get(id)) !== undefined) return;
     // A workflow session's question goes to its instance's root (R-05).
     const target = await this.repos.sessions.get(sessionId);
-    const root = target === undefined ? { rootSessionId: sessionId } : await this.rootOf(target);
+    const root = transferred ? { rootSessionId: transferred.rootSessionId } : target === undefined ? { rootSessionId: sessionId } : await this.rootOf(target);
     const escalation: Escalation = {
       id,
       ...(root.instanceId !== undefined && { instanceId: root.instanceId }),
@@ -1496,7 +1652,13 @@ export class SessionService {
       fromSessionId: sessionId,
       kind: 'delivery-unknown',
       title:
-        item.deliveryKind === 'provision' ? 'Session start outcome unknown' : item.deliveryKind === 'handoff' ? 'Handoff delivery outcome unknown' : 'Message delivery outcome unknown',
+        item.deliveryKind === 'provision'
+          ? 'Session start outcome unknown'
+          : item.deliveryKind === 'handoff'
+            ? 'Handoff delivery outcome unknown'
+            : item.deliveryKind === 'transfer'
+              ? 'Transfer delivery outcome unknown'
+              : 'Message delivery outcome unknown',
       // Fixed words only: the adapter's detail may quote paths or content.
       detail: `reason: ${item.reason}; duplicate risk on retry: ${item.duplicateRisk}`,
       ref,
@@ -1548,6 +1710,7 @@ export class SessionService {
       this.runtimes.markExited(event.sessionIds);
       // No turn of an exited runtime ends any more; the next handoff waits for a restart instead.
       for (const sessionId of event.sessionIds) this.handoffTurns.delete(sessionId);
+      for (const sessionId of event.sessionIds) this.ackedTurns.delete(sessionId);
       for (const sessionId of event.sessionIds) void this.setActivity(sessionId, event.expected ? 'closed' : 'error').catch(() => undefined);
       this.options.publish(event);
       return;
@@ -1583,8 +1746,11 @@ export class SessionService {
           const stored = (await conversations.get(turn.sessionId)).turns.find((t) => t.id === turn.id);
           if (stored !== undefined && stored.state !== 'running') return;
         }
+        this.contentWrite(turn.sessionId);
         await conversations.upsertTurn(turn);
+        this.contentWritten(turn.sessionId);
         if (turn.nativeTaskId === undefined) this.followHandoffTurn(turn);
+        if (turn.nativeTaskId === undefined && turn.state !== 'running') this.turnSeenEnded(turn);
         // Outside this queue: what the engine dispatches next runs in the same session's queue (T024).
         if (turn.state !== 'running' && turn.nativeTaskId === undefined && this.workflow !== undefined) {
           const hooks = this.workflow;
@@ -1596,11 +1762,15 @@ export class SessionService {
         // The user's own message was stored by session.send under the renderer's ID; its echo is not kept.
         // A native sub-agent's prompt is a user message too, and is kept (R-13).
         if (this.isEcho(event.message)) return;
+        this.contentWrite(event.message.sessionId);
         await conversations.appendMessage(event.message);
+        this.contentWritten(event.message.sessionId);
         break;
       case 'item.updated': {
         const { item } = event;
+        this.contentWrite(item.sessionId);
         await conversations.upsertItem(item);
+        this.contentWritten(item.sessionId);
         if (item.kind === 'fileChange' && item.state !== 'declined') {
           const session = await this.repos.sessions.get(item.sessionId);
           this.written.add(
@@ -1617,7 +1787,9 @@ export class SessionService {
         await this.followHold(event.request);
         break;
       case 'nativeTask.updated':
+        this.contentWrite(event.task.sessionId);
         await conversations.upsertNativeTask(event.task);
+        this.contentWritten(event.task.sessionId);
         break;
       case 'usage.tokens':
         if (event.usage.nativeTaskId === undefined) this.usage.set(event.usage.sessionId, event.usage);
@@ -1652,6 +1824,36 @@ export class SessionService {
     if (mark.known.has(turn.id)) return;
     if (turn.state === 'running') mark.started ??= turn.id;
     else if (mark.started === turn.id) this.handoffTurns.delete(turn.sessionId);
+  }
+
+  /**
+   * Counts a write to a session's conversation (T023 r3-P1). Called right before the write's call, with no
+   * await between: both repositories commit inside that call, so once a write is stored it is counted, and a
+   * claim can never see the new content with the old count. A write that then fails counts once too often,
+   * which at most makes a proposal stale; it is never counted too few times.
+   */
+  private contentWrite(sessionId: SessionId): void {
+    this.contentWrites.set(sessionId, (this.contentWrites.get(sessionId) ?? 0) + 1);
+  }
+
+  /** A write to a session's conversation committed (T023 r2): the transfer service is told, outside this queue. */
+  private contentWritten(sessionId: SessionId): void {
+    const hooks = this.transfer;
+    if (hooks !== undefined) void Promise.resolve().then(() => hooks.contentChanged(sessionId));
+  }
+
+  /** The turn a dispatch's ack named, until it is seen to end (T023 r1-P1-4). */
+  private followAckedTurn(sessionId: SessionId | undefined, turnRef: string | undefined): void {
+    if (sessionId === undefined || turnRef === undefined || this.endedTurns.get(sessionId)?.includes(turnRef)) return;
+    const acked = this.ackedTurns.get(sessionId) ?? new Set<string>();
+    acked.add(turnRef);
+    this.ackedTurns.set(sessionId, acked);
+  }
+
+  private turnSeenEnded(turn: Turn): void {
+    this.ackedTurns.get(turn.sessionId)?.delete(turn.id);
+    // A few per session: enough to cover an ack that is read after its turn already ended.
+    this.endedTurns.set(turn.sessionId, [...(this.endedTurns.get(turn.sessionId) ?? []), turn.id].slice(-50));
   }
 
   /** Remembers a user message this process dispatched, so its runtime echo is recognised. */
@@ -1703,7 +1905,9 @@ export class SessionService {
     const before = (await this.repos.conversations.get(sessionId)).messages.find((m) => m.id === id);
     if (before !== undefined) return same(before) ? 'written' : 'taken';
     const message: Message = { id, sessionId, role: 'user', origin: { kind: 'user' }, text, attachments: [], createdAt };
+    this.contentWrite(sessionId);
     await this.repos.conversations.appendMessage(message);
+    this.contentWritten(sessionId);
     const after = (await this.repos.conversations.get(sessionId)).messages.find((m) => m.id === id);
     if (!same(after)) return 'taken';
     this.options.publish({ type: 'message.completed', message });
