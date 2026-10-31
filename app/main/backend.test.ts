@@ -139,6 +139,13 @@ describe('the assembled backend', () => {
     db.close();
   });
 
+  it('hands the pipeline a git adapter (T030) that runs real git, with no repository touched', async () => {
+    const s = await start();
+    // The temp folder is no repository: git says so, which is an error, not an answer.
+    await expect(s.backend.git.resolveBranch(dir, 'main')).rejects.toThrow(/not a git repository/i);
+    await s.backend.shutdown();
+  });
+
   it('mounts the GUI MCP server with a token that never reaches the database or the log', async () => {
     const s = await start();
     await createSession(s);
