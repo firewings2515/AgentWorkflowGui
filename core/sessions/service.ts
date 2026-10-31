@@ -626,6 +626,7 @@ export class SessionService {
       case 'project.save': {
         const saved = await this.repos.projects.save(command.project, command.expectedRevision);
         if (saved.status === 'stale') return fail(command.requestId, 'stale_revision', 'The project has changed since it was loaded', { retryable: true });
+        this.options.publish({ type: 'project.updated', project: saved.record });
         return ok(command.requestId, { revision: saved.record.revision });
       }
       // Ending a run and the task pipeline come with T032 (contracts 0.6).

@@ -34,8 +34,13 @@ export const FileLock = z
     acquiredAt: Timestamp,
     /** The holder's turn ended but its background commands still run, so the lock stays (SP-06 W3). */
     waitingForBackground: z.boolean().default(false),
-    /** The file's hash after the holder's last completed write, to spot a later write by someone else (SP-06 W5). */
-    writtenHash: PayloadHash.optional(),
+    /** The holder's writes started and not yet ended; while any is, the holder's own changes are expected. */
+    writing: z.number().int().nonnegative().default(0),
+    /**
+     * What the holder's last ended write left, to spot a later write by someone else (SP-06 W5): the file's
+     * hash, or that it deleted the file. Absent until a write of the holder applied something.
+     */
+    lastWrite: z.discriminatedUnion('kind', [z.strictObject({ kind: z.literal('written'), hash: PayloadHash }), z.strictObject({ kind: z.literal('deleted') })]).optional(),
     waiters: z.array(LockWaiter),
   })
   .superRefine((l, ctx) => {

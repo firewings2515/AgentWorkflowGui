@@ -278,7 +278,7 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
     // Creation can update the session again while provisioning. Read its latest revision
     // before exposing the composer, even if an earlier session.updated already arrived.
     const refresh = async (receipt: CommandResult) => {
-      if (receipt.ok && ['agent.save', 'agent.delete', 'workflow.save', 'session.create'].includes(command.type)) {
+      if (receipt.ok && ['agent.save', 'agent.delete', 'workflow.save', 'project.save', 'session.create'].includes(command.type)) {
         await loading;
         if (state.connection !== 'idle') await reconnect();
       }

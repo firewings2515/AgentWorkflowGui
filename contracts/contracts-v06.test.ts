@@ -109,11 +109,12 @@ describe('contracts 0.6', () => {
     const task = pick(login.tasks, 0);
     const queue = login.mergeQueue ?? [];
 
-    it('a blocked task says why; merged and completed tasks say when', () => {
+    it('a blocked task says why; only merged and completed tasks say when', () => {
       expect(ok(WorkflowTask, { ...task, status: 'blocked', blockedReason: 'setup-failed' })).toBe(true);
       expect(rules(WorkflowTask, { ...task, blockedReason: 'setup-failed' })).toEqual(['task.blocked-reason']);
       expect(ok(WorkflowTask, { ...task, status: 'completed', completedAt: at })).toBe(true);
-      expect(rules(WorkflowTask, { ...task, status: 'merged' })).toEqual(['task.completed-at']);
+      // r1 P1-1: 0.5 stored merged tasks without a completion time.
+      expect(ok(WorkflowTask, { ...task, status: 'merged' })).toBe(true);
       expect(rules(WorkflowTask, { ...task, completedAt: at })).toEqual(['task.completed-at']);
       expect(rules(WorkflowTask, { ...task, setup: { state: 'failed', command: MARKER, startedAt: at } })).toEqual(['task.setup-ended']);
     });
@@ -123,11 +124,18 @@ describe('contracts 0.6', () => {
       expect(WorkflowTask.parse(pick(login.tasks, 3)).worktree?.cleanup).toBe('pending-cleanup');
     });
 
-    it('dependencies form no cycle, and task worktrees need a target branch', () => {
+    it('r1 P1-1: every run 0.5 could store still reads', () => {
       const a = pick(login.tasks, 0);
+      // A worktree without a target branch, a merged task without completedAt, an ended run without endedAt
+      // and with tasks still running, a dependency cycle: all valid under 0.5.
+      const old = { ...login, targetBranch: undefined, tasks: [{ ...a, status: 'merged' }, ...login.tasks.slice(1)] };
+      expect(ok(WorkflowInstance, old)).toBe(true);
+      expect(ok(WorkflowInstance, { ...login, state: 'completed' })).toBe(true);
+      expect(ok(WorkflowInstance, { ...login, state: 'cancelled', mergeQueue: [] })).toBe(true);
       const c = pick(login.tasks, 2);
-      expect(rules(WorkflowInstance, { ...login, tasks: [{ ...a, dependsOn: ['task-c'] }, ...login.tasks.slice(1, 2), c, ...login.tasks.slice(3)] })).toEqual(['instance.task-dependency-cycle']);
-      expect(rules(WorkflowInstance, { ...login, targetBranch: undefined })).toEqual(['instance.worktree-needs-target']);
+      expect(ok(WorkflowInstance, { ...login, tasks: [{ ...a, dependsOn: ['task-c'] }, ...login.tasks.slice(1, 2), c, ...login.tasks.slice(3)] })).toBe(true);
+      // Only a run that ended has an end time.
+      expect(rules(WorkflowInstance, { ...login, endedAt: at })).toEqual(['instance.ended-at']);
     });
 
     it('at most one merge attempt is active; attempts are unique per task and in queue order', () => {
@@ -154,6 +162,12 @@ describe('contracts 0.6', () => {
       const [created, waiting] = [pick(login.taskPlans, 0), pick(login.taskPlans, 1)];
       expect(rules(TaskPlan, { ...waiting, escalationId: undefined })).toEqual(['taskplan.confirming-needs-escalation']);
       expect(rules(TaskPlan, { ...created, created: [pick(created.created, 0)] })).toEqual(['taskplan.created-tasks']);
+      // r1 P2-1: one distinct task for each item key, not just as many entries.
+      const wrong = created.created?.map(() => ({ key: 'wrong-key', taskId: 'task-a' }));
+      expect(rules(TaskPlan, { ...created, created: wrong })).toEqual(['taskplan.created-tasks']);
+      const sameTask = created.created?.map((c) => ({ ...c, taskId: 'task-a' }));
+      expect(rules(TaskPlan, { ...created, created: sameTask })).toEqual(['taskplan.created-tasks']);
+      expect(rules(TaskPlan, { ...waiting, created: created.created })).toEqual(['taskplan.created-tasks']);
       expect(rules(TaskPlan, { ...waiting, decidedAt: at })).toEqual(['taskplan.decided-at']);
       expect(ok(TaskPlan, { ...waiting, state: 'declined', decidedAt: at })).toBe(true);
       expect(rules(WorkflowInstance, { ...login, taskPlans: [created, created] })).toEqual(['instance.task-plan-unique']);
@@ -178,11 +192,9 @@ describe('contracts 0.6', () => {
       expect(ok(CreateTasksToolResult, { status: 'awaiting-confirmation', escalationId: 'esc-4' })).toBe(false);
     });
 
-    it('an ended run has an end time and only final tasks; the user ends it with a command', () => {
+    it('an ended run may say when; the user ends it with a command', () => {
       const tasks = login.tasks.map((t) => (t.status === 'merged' ? t : { ...t, status: 'cancelled', blockedReason: undefined }));
       expect(ok(WorkflowInstance, { ...login, state: 'cancelled', endedAt: at, tasks, mergeQueue: [] })).toBe(true);
-      expect(rules(WorkflowInstance, { ...login, state: 'cancelled', tasks, mergeQueue: [] })).toEqual(['instance.ended-at']);
-      expect(rules(WorkflowInstance, { ...login, state: 'completed', endedAt: at })).toEqual(['instance.ended-tasks-final']);
       for (const type of ['workflow.complete', 'workflow.cancel']) expect(ok(Command, { type, requestId: 'r', instanceId: login.id, expectedRevision: 4 })).toBe(true);
       expect(ok(Command, { type: 'task.retryCleanup', requestId: 'r', instanceId: login.id, taskId: 'task-d' })).toBe(true);
     });
@@ -206,6 +218,14 @@ describe('contracts 0.6', () => {
       expect(rules(FileLock, { ...lock, waiters: [{ ...waiter, via: 'codex-approval' }] })).toEqual(['lock.approval-needs-request']);
       expect(rules(FileLock, { ...lock, waiters: [waiter, waiter] })).toEqual(['lock.waiters-distinct']);
       expect(rules(FileLock, { ...lock, waiters: [{ ...waiter, sessionId: lock.holderSessionId }] })).toEqual(['lock.waiters-distinct']);
+    });
+
+    it('r1 P1-4: a lock counts writes in progress and says what the last one left, a deletion included', () => {
+      expect(FileLock.parse(lock)).toMatchObject({ writing: 0, waitingForBackground: false });
+      expect(ok(FileLock, { ...lock, writing: 2, lastWrite: { kind: 'deleted' } })).toBe(true);
+      expect(ok(FileLock, { ...lock, lastWrite: { kind: 'written', hash: `sha256:${'a'.repeat(64)}` } })).toBe(true);
+      expect(ok(FileLock, { ...lock, writing: -1 })).toBe(false);
+      expect(ok(FileLock, { ...lock, lastWrite: { kind: 'written' } })).toBe(false);
     });
 
     it('the whole lock list is pushed, and a lock escalation points at its lock', () => {

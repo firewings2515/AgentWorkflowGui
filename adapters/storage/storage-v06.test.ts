@@ -100,3 +100,62 @@ describe('C-20: delivery records by target session', () => {
     await run(new MemoryDeliveryStore());
   });
 });
+
+// T028 review r1: the reviewer's repros.
+describe('T028 r1', () => {
+  it('P1-1: runs 0.5 could store still read after v6 (worktree without target branch, merged without completedAt, ended with running tasks)', async () => {
+    const old = new DatabaseSync(path);
+    migrate(old, MIGRATIONS.slice(0, 5));
+    const login = fixtureSnapshotInput.instances[0]!;
+    const as05 = { ...login.template, schemaVersion: '0.5.0' };
+    const tasks = login.tasks.map((t) => omit(t, 'completedAt', 'setup', 'blockedReason'));
+    const base = omit(login, 'rounds', 'mergeQueue', 'taskPlans', 'taskLimit', 'projectId', 'targetBranch');
+    const runs = [
+      { ...base, id: 'old-running', template: as05, tasks: tasks.map((t) => ({ ...t, instanceId: 'old-running' })) },
+      { ...base, id: 'old-completed', state: 'completed', template: as05, tasks: tasks.map((t) => ({ ...t, instanceId: 'old-completed' })) },
+      { ...base, id: 'old-cancelled', state: 'cancelled', template: as05, tasks: tasks.map((t) => ({ ...t, instanceId: 'old-cancelled' })) },
+    ];
+    for (const [i, run] of runs.entries()) old.prepare('INSERT INTO workflow_instance (id, revision, created_ms, body) VALUES (?, ?, ?, ?)').run(run.id, login.revision, i, JSON.stringify(run));
+    old.close();
+
+    const db = openDatabase(path);
+    try {
+      const instances = (await createRepositories(db).readSnapshotData()).instances;
+      expect(instances.map((i) => [i.id, i.state, i.targetBranch])).toEqual([['old-running', 'running', undefined], ['old-completed', 'completed', undefined], ['old-cancelled', 'cancelled', undefined]]);
+      expect(instances[0]?.tasks.find((t) => t.status === 'merged')?.completedAt).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('P1-2: settings with an exec-only write policy are stored for payloads and provisions', async () => {
+    const db = openDatabase(path);
+    try {
+      const store = new SqliteDeliveryStore(db);
+      const payload = payloadInput();
+      const execOnly = { ...payload.context, session: { ...payload.context.session, readOnly: true, writePolicy: 'exec-only' as const } };
+      expect((await store.accept({ ...payload, context: execOnly })).status).toBe('accepted');
+      const provision = provisionInput();
+      expect((await store.accept({ ...provision, spec: { ...provision.spec, writePolicy: 'exec-only' } })).status).toBe('accepted');
+      const stored = await store.get(payload.operationId);
+      expect(stored?.kind !== 'provision' && stored?.context.session.writePolicy).toBe('exec-only');
+      const created = await store.get(provision.operationId);
+      expect(created?.kind === 'provision' && created.spec.writePolicy).toBe('exec-only');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('P1-3: a damaged target fails the query instead of reading as no record', async () => {
+    const db = openDatabase(path);
+    try {
+      const store = new SqliteDeliveryStore(db);
+      await store.accept(payloadInput());
+      db.prepare("UPDATE delivery SET target = '{' WHERE operation_id = ?").run('op-1');
+      await expect(store.listByTarget(SessionId.parse('session-target'))).rejects.toThrow();
+      await expect(store.listByTarget(SessionId.parse('anyone'))).rejects.toThrow();
+    } finally {
+      db.close();
+    }
+  });
+});

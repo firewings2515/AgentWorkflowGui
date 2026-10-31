@@ -177,12 +177,13 @@ export const WorkflowTask = z
     worktree: TaskWorktree.optional(),
     setup: TaskSetup.optional(),
     reworkCount: z.number().int().nonnegative(),
-    /** When it reached `merged` or `completed`. */
+    /** When it reached `merged` or `completed`; absent on tasks stored before 0.6. */
     completedAt: Timestamp.optional(),
   })
   .superRefine((t, ctx) => {
     if (t.blockedReason !== undefined && t.status !== 'blocked') addRuleIssue(ctx, 'task.blocked-reason', ['blockedReason']);
-    if ((t.status === 'merged' || t.status === 'completed') !== (t.completedAt !== undefined)) addRuleIssue(ctx, 'task.completed-at', ['completedAt']);
+    // One direction only: 0.5 stored no completion time (T028 r1 P1-1).
+    if (t.completedAt !== undefined && t.status !== 'merged' && t.status !== 'completed') addRuleIssue(ctx, 'task.completed-at', ['completedAt']);
   });
 export type WorkflowTask = z.infer<typeof WorkflowTask>;
 
@@ -313,7 +314,10 @@ export const TaskPlan = z
   .superRefine((p, ctx) => {
     const fail = (rule: ContractRule) => addRuleIssue(ctx, rule);
     if (p.state === 'awaiting-confirmation' && p.escalationId === undefined) fail('taskplan.confirming-needs-escalation');
-    if ((p.state === 'created') !== (p.created.length > 0) || (p.state === 'created' && p.created.length !== p.items.length)) fail('taskplan.created-tasks');
+    const keys = p.items.map((i) => i.key).sort();
+    const named = p.created.map((c) => c.key).sort();
+    const oneEach = named.length === keys.length && named.every((k, i) => k === keys[i]) && new Set(p.created.map((c) => c.taskId)).size === p.created.length;
+    if (p.state === 'created' ? !oneEach : p.created.length > 0) fail('taskplan.created-tasks');
     if ((p.state === 'awaiting-confirmation') !== (p.decidedAt === undefined)) fail('taskplan.decided-at');
   });
 export type TaskPlan = z.infer<typeof TaskPlan>;
@@ -339,7 +343,7 @@ export const WorkflowInstance = z
     template: WorkflowTemplate,
     /** The project whose setup script and test command the tasks use (O-06), when the cwd is one. */
     projectId: ProjectId.optional(),
-    /** The branch merges go to (R-06); set for worktree isolation once the first task worktree is made. */
+    /** The branch merges go to (R-06); the pipeline sets it before its first merge (absent before 0.6). */
     targetBranch: z.string().min(1).optional(),
     /** Global limit of tasks in progress at once (O-05). */
     taskLimit: z.number().int().positive().default(3),
@@ -351,7 +355,7 @@ export const WorkflowInstance = z
     /** `create_tasks` lists of this run (O-07). */
     taskPlans: z.array(TaskPlan).default([]),
     createdAt: Timestamp,
-    /** When the user ended it (`workflow.complete` / `workflow.cancel`). */
+    /** When the user ended it (`workflow.complete` / `workflow.cancel`); absent on runs stored before 0.6. */
     endedAt: Timestamp.optional(),
   })
   .superRefine((inst, ctx) => {
@@ -361,11 +365,11 @@ export const WorkflowInstance = z
       if (t.instanceId !== inst.id) addRuleIssue(ctx, 'instance.task-other-instance', ['tasks', i, 'instanceId']);
       if (t.dependsOn.some((d) => d === t.id || !ids.has(d))) addRuleIssue(ctx, 'instance.task-invalid-dependency', ['tasks', i, 'dependsOn']);
     });
-    if (hasDependencyCycle(inst.tasks.map((t) => ({ key: t.id, dependsOn: t.dependsOn })))) addRuleIssue(ctx, 'instance.task-dependency-cycle', ['tasks']);
-    if (inst.tasks.some((t) => t.worktree !== undefined) && inst.targetBranch === undefined) addRuleIssue(ctx, 'instance.worktree-needs-target', ['targetBranch']);
+    // Only what 0.5 could not store is checked here, so every run 0.5 stored still reads (T028 r1 P1-1): a
+    // cycle is refused where tasks are made (`create_tasks`), a target branch is set by the pipeline before
+    // it merges, and the tasks of an ended run are made final by the command that ends it.
     const ended = inst.state === 'completed' || inst.state === 'cancelled';
-    if (ended !== (inst.endedAt !== undefined)) addRuleIssue(ctx, 'instance.ended-at', ['endedAt']);
-    if (ended && inst.tasks.some((t) => !finalTaskStatuses.includes(t.status))) addRuleIssue(ctx, 'instance.ended-tasks-final', ['tasks']);
+    if (inst.endedAt !== undefined && !ended) addRuleIssue(ctx, 'instance.ended-at', ['endedAt']);
     const rounds = new Set<string>();
     inst.rounds.forEach((r, i) => {
       const key = JSON.stringify([r.taskId, r.nodeId, r.round]);

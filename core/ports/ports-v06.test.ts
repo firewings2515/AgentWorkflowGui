@@ -32,13 +32,13 @@ describe('file lock table (C-19)', () => {
     const holder = 's-research' as SessionId;
     const table: FileLockTable = {
       acquire: (request) => {
-        const lock: FileLock = { path: request.path, holderSessionId: holder, acquiredAt: request.at, waitingForBackground: false, waiters: [] };
+        const lock: FileLock = { path: request.path, holderSessionId: holder, acquiredAt: request.at, waitingForBackground: false, writing: 1, waiters: [] };
         if (request.sessionId !== holder) return { status: 'held', lock };
         locks.push(lock);
         return { status: 'acquired', lock };
       },
       wait: () => Promise.resolve({ status: 'timeout' }),
-      recordWrite: () => undefined,
+      writeEnded: () => undefined,
       recordRead: () => undefined,
       turnEnded: () => undefined,
       backgroundCommands: () => undefined,

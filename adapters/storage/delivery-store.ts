@@ -312,7 +312,8 @@ export class SqliteDeliveryStore implements DeliveryStore {
     return this.run(() =>
       readTransaction(this.db, () =>
         (this.db
-          .prepare("SELECT * FROM delivery WHERE (CASE WHEN json_valid(target) THEN json_extract(target, '$.sessionId') END) = ? ORDER BY accepted_ms, rowid")
+          // A row whose target cannot be read is selected too, so loading it fails closed (T028 r1 P1-3).
+          .prepare("SELECT * FROM delivery WHERE NOT json_valid(target) OR json_extract(target, '$.sessionId') = ? ORDER BY accepted_ms, rowid")
           .all(sessionId) as unknown as DeliveryRow[]).map((row) => this.load(row)),
       ),
     );
