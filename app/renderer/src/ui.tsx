@@ -40,7 +40,7 @@ export function observedModelText(session: LogicalSession): string {
 }
 export function Empty({ children }: { children: ReactNode }) { return <p className="empty-note">{children}</p>; }
 
-export interface MenuAction { label: string; hint?: string; onSelect: () => void }
+export interface MenuAction { label: string; hint?: string; group?: string; checked?: boolean; disabled?: boolean; onSelect: () => void }
 export function Menu({ label, children, actions, shortcut = false, className = '' }: {
   label: string; children: ReactNode; actions: MenuAction[]; shortcut?: boolean; className?: string;
 }) {
@@ -50,7 +50,7 @@ export function Menu({ label, children, actions, shortcut = false, className = '
   const menu = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
-    menu.current?.querySelector('button')?.focus();
+    menu.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
     const outside = (event: PointerEvent) => {
       if (event.target instanceof Node && !root.current?.contains(event.target)) setOpen(false);
     };
@@ -66,7 +66,7 @@ export function Menu({ label, children, actions, shortcut = false, className = '
     const handler = (event: KeyboardEvent) => {
       if (event.ctrlKey && event.key.toLowerCase() === 'u' && root.current?.closest('[data-workspace]')?.contains(document.activeElement)) {
         event.preventDefault();
-        actions[0]?.onSelect();
+        if (!actions[0]?.disabled) actions[0]?.onSelect();
         setOpen(false);
       }
     };
@@ -76,14 +76,20 @@ export function Menu({ label, children, actions, shortcut = false, className = '
   return <div className={`menu-root ${className}`} ref={root} onBlur={event => {
     if (event.relatedTarget instanceof Node && !event.currentTarget.contains(event.relatedTarget)) setOpen(false);
   }}>
-    <button type="button" ref={trigger} aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>{children}</button>
+    <button type="button" ref={trigger} aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)} onKeyDown={event => {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setOpen(true); }
+      if (event.key === 'Enter') { event.preventDefault(); if (!event.repeat) setOpen(!open); }
+    }}>{children}</button>
     {open && <div className="popup-menu" role="menu" aria-label={label} ref={menu} onKeyDown={event => {
-      const buttons = Array.from(event.currentTarget.querySelectorAll('button'));
+      const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'));
       const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+      if (event.key === 'Enter') { event.preventDefault(); if (!event.repeat && current >= 0) buttons[current]?.click(); return; }
       const next = event.key === 'ArrowDown' ? (current + 1) % buttons.length : event.key === 'ArrowUp' ? (current - 1 + buttons.length) % buttons.length : event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : -1;
       if (next >= 0) { event.preventDefault(); buttons[next]?.focus(); }
-    }}>{actions.map(action => <button type="button" key={action.label} role="menuitem" onClick={() => {
+    }}>{actions.map((action, index) => <div key={action.label} role="none">
+      {action.group && action.group !== actions[index - 1]?.group && <div className="menu-group" role="presentation">{action.group}</div>}
+      <button type="button" role={action.checked === undefined ? 'menuitem' : 'menuitemradio'} aria-checked={action.checked} aria-label={action.hint ? `${action.label} ${action.hint}` : action.label} aria-keyshortcuts={action.hint?.replace('Ctrl+', 'Control+')} disabled={action.disabled} onClick={() => {
       setOpen(false); trigger.current?.focus(); action.onSelect();
-    }}>{action.label}{action.hint && <kbd>{action.hint}</kbd>}</button>)}</div>}
+    }}><span>{action.label}</span>{action.checked && <span aria-hidden="true">✓</span>}{action.hint && <kbd>{action.hint}</kbd>}</button></div>)}</div>}
   </div>;
 }

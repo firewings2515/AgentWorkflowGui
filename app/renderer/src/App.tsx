@@ -20,6 +20,9 @@ import { rendererStore } from './renderer-store';
 import type { RendererStore, RendererState } from './renderer-store';
 import { ConnectionStatus } from './ConnectionStatus';
 import { WorkflowStart } from './WorkflowStart';
+import { SessionCreate } from './SessionCreate';
+import type { SessionCreateDraft } from './SessionCreate';
+import { AppMenu } from './AppMenu';
 import './styles.css';
 
 export const APP_NAME = 'AgentWorkflowGui';
@@ -38,6 +41,7 @@ const subscribeWidth = (onChange: () => void) => {
 export const pageRegistry = [
   { id: 'workbench', title: '工作台', pattern: /^\/workbench$/, navigation: true },
   { id: 'start', title: '啟動 Workflow', pattern: /^\/workflows\/start$/, navigation: false },
+  { id: 'create', title: '新增 session', pattern: /^\/sessions\/new$/, navigation: false },
   { id: 'workflow', title: 'Workflow 編輯器', pattern: /^\/workflows\/([^/]+)\/edit$/, navigation: true },
   { id: 'agents', title: 'Agent 管理', pattern: /^\/agents(?:\/([^/]+))?$/, navigation: true },
   { id: 'progress', title: 'Workflow 執行進度', pattern: /^\/workflow-instances\/([^/]+)$/, navigation: false },
@@ -76,6 +80,7 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
   const [notice, setNotice] = useState('');
   const [selections, setSelections] = useState<Record<string, Selection>>({});
   const [transfer, setTransfer] = useState<TransferPreview | null>(null);
+  const [createDraft, setCreateDraft] = useState<SessionCreateDraft>({ agentId: '', modelKey: '', cwd: '', parentId: '' });
   // Discard the preview as soon as damaged data is observed, before recovery can render it again.
   if (snapshot.app.status === 'damaged' && transfer) setTransfer(null);
   const returnAnchor = useRef<{ viewId: string; sessionId: SessionId } | null>(null);
@@ -136,35 +141,53 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
       view?.querySelector<HTMLElement>(transfer?.model ? 'select[aria-label="Model"]' : '[data-transfer-trigger]')?.focus();
     });
   };
+  const commandDisabled = snapshot.app.status === 'damaged' || (!!store && ipcState?.connection !== 'ready');
+  const themeDisabled = commandDisabled || !!store?.isBlocked('preferences.set', 'preferences');
+  const tabDisabled = workspace.views.length >= 2 || snapshot.sessions.length === 0;
+  const addTab = () => {
+    if (tabDisabled) return;
+    const sessionId = workspace.closedViews.at(-1)?.sessionId ?? snapshot.sessions.find(session => !workspace.views.some(view => view.sessionId === session.id))?.id ?? snapshot.sessions[0]?.id;
+    if (sessionId) {
+      const id = workspace.closedViews.at(-1)?.id ?? `view-${workspace.nextId}`;
+      dispatch({ type: 'add', sessionId }); navigate('/workbench'); focusView(id);
+    }
+  };
+  const createSession = () => {
+    if (commandDisabled) return;
+    navigate('/sessions/new');
+  };
+  const changeTheme = (next: Theme) => {
+    if (themeDisabled || next === theme) return;
+    if (store) void store.send({ type: 'preferences.set', requestId: RequestId.parse(crypto.randomUUID()), preferences: { ...snapshot.preferences, theme: next } });
+    else setTheme(next);
+  };
+  const header = <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true">≋</span>
+    <AppMenu theme={theme} commandDisabled={commandDisabled} themeDisabled={themeDisabled} tabDisabled={tabDisabled} reloadDisabled={!store || ipcState?.connection === 'loading'}
+      onCreate={createSession} onWorkflow={() => { if (!commandDisabled) navigate('/workflows/start'); }} onTab={addTab}
+      onNavigate={page => navigate(routes[page] ?? '/workbench')} onTheme={changeTheme} onReload={() => void store?.reconnect()} />
+    <strong>{APP_NAME}</strong>{!store && <span className="demo-badge">示意資料 · 示意模式</span>}</div>
+    <label className="theme-picker">外觀<select aria-label="外觀主題" value={theme} disabled={themeDisabled} onChange={event => changeTheme(event.target.value === 'light' ? 'light' : 'dark')}><option value="dark">深色</option><option value="light">淺色</option></select></label>
+  </header>;
 
   let entityId = page?.pattern.exec(path)?.[1] ?? '';
   try { entityId = decodeURIComponent(entityId); } catch { /* Keep a malformed ID visible as missing. */ }
 
   if (snapshot.app.status === 'damaged') return <div className="connection-screen damaged-screen">
-    <h1>{APP_NAME}</h1><section role="alert"><h2>資料損壞，所有操作已停用</h2>
+    {header}<section role="alert"><h2>資料損壞，所有操作已停用</h2>
       <p>請保留資料庫並交由維護人員檢查。</p><dl><dt>原因代碼</dt><dd><code>{snapshot.app.reason}</code></dd><dt>資料庫位置</dt><dd><code>{snapshot.app.location}</code></dd></dl>
     </section>
     <button disabled={!store || ipcState?.connection === 'loading'} onClick={() => void store?.reconnect()}>重新讀取資料</button>
     {ipcState?.connection === 'loading' && <p role="status">正在重新讀取資料…</p>}
     {ipcState?.connection === 'error' && <p role="alert">資料同步失敗，請再次重新讀取。</p>}
-    <label>外觀主題<select disabled value={theme}><option value="dark">深色</option><option value="light">淺色</option></select></label>
   </div>;
 
   return <div className="app-shell">
-    <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true">≋</span><strong>{APP_NAME}</strong>{!store && <span className="demo-badge">示意資料 · 示意模式</span>}</div>
-      <label className="theme-picker">外觀<select aria-label="外觀主題" value={theme} disabled={store?.isBlocked('preferences.set', 'preferences')} onChange={event => {
-        const next = event.target.value === 'light' ? 'light' : 'dark';
-        if (store) void store.send({ type: 'preferences.set', requestId: RequestId.parse(crypto.randomUUID()), preferences: { ...snapshot.preferences, theme: next } });
-        else setTheme(next);
-      }}><option value="dark">深色</option><option value="light">淺色</option></select></label>
-    </header>
+    {header}
     <nav className="app-nav" aria-label="主要導覽">{pageRegistry.filter(entry => entry.navigation).map(entry => <a key={entry.id} href={`#${routes[entry.id]}`} aria-current={page?.id === entry.id ? 'page' : undefined} onClick={event => { event.preventDefault(); navigate(routes[entry.id] ?? '/workbench'); }}>{entry.title}</a>)}<span className="nav-note">{store ? '資料來自應用程式服務' : '以契約假資料預覽工作台'}</span></nav>
     <div className="page-toolbar"><h1 ref={pageHeading} tabIndex={-1}>{page?.title ?? '找不到頁面'}</h1>
-      {(workbenchVisible || page?.id === 'workflow') && <button onClick={() => navigate('/workflows/start')}>啟動 Workflow</button>}
-      {workbenchVisible && <button className="primary" disabled={workspace.views.length >= 2 || snapshot.sessions.length === 0} title={workspace.views.length >= 2 ? '此階段提供兩組工作區' : '開啟第二組並排工作區'} onClick={() => {
-        const sessionId = workspace.closedViews.at(-1)?.sessionId ?? snapshot.sessions.find(session => !workspace.views.some(view => view.sessionId === session.id))?.id ?? snapshot.sessions[0]?.id;
-        if (sessionId) { const id = workspace.closedViews.at(-1)?.id ?? `view-${workspace.nextId}`; dispatch({ type: 'add', sessionId }); focusView(id); }
-      }}>＋ 新增 tab</button>}
+      {workbenchVisible && <button disabled={commandDisabled} onClick={createSession}>新增 session</button>}
+      {(workbenchVisible || page?.id === 'workflow') && <button disabled={commandDisabled} onClick={() => navigate('/workflows/start')}>啟動 Workflow</button>}
+      {workbenchVisible && <button className="primary" disabled={tabDisabled} title={workspace.views.length >= 2 ? '此階段提供兩組工作區' : '開啟第二組並排工作區'} onClick={addTab}>＋ 新增 tab</button>}
     </div>
     <main className="page-content">
       <div className="workbench" hidden={!workbenchVisible}>
@@ -201,6 +224,7 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
       <AgentCatalog repository={agentRepository} demo={agentDemo} selectedId={page?.id === 'agents' ? entityId : ''} visible={page?.id === 'agents'} onSelect={id => navigate(id ? `/agents/${encodeURIComponent(id)}` : '/agents')} />
       <WorkflowEditor repository={workflowRepository} demo={workflowDemo} agents={agentOptions} models={snapshot.modelOptions} selectedId={page?.id === 'workflow' ? entityId : ''} visible={page?.id === 'workflow'} onSelect={id => navigate(`/workflows/${encodeURIComponent(id)}/edit`)} />
       {page?.id === 'start' && <WorkflowStart snapshot={snapshot} store={store} ipcState={ipcState} onOpen={id => { navigate('/workbench'); openSession(id); }} />}
+      {page?.id === 'create' && <SessionCreate snapshot={snapshot} store={store} ipcState={ipcState} draft={createDraft} onDraft={setCreateDraft} onOpen={id => { setCreateDraft({ agentId: '', modelKey: '', cwd: '', parentId: '' }); navigate('/workbench'); openSession(id); }} />}
       {page?.id === 'progress' && <WorkflowProgress snapshot={snapshot} instanceId={entityId} onOpen={openProgressSession} onBack={() => {
           navigate('/workbench');
           if (returnAnchor.current) { const anchor = returnAnchor.current; openSession(anchor.sessionId, anchor.viewId); }

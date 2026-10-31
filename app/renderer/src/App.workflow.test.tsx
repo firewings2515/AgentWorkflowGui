@@ -31,14 +31,15 @@ describe('T025 application integration', () => {
     expect(fake.bridge.send).not.toHaveBeenCalled();
   });
 
-  it.each(['dark', 'light'] as const)('renders damaged reason/location and allows only data reload in %s theme', async theme => {
+  it.each(['dark', 'light'] as const)('renders damaged reason/location with data reload and the app menu in %s theme', async theme => {
     fake.data.snapshot.app = { status: 'damaged', reason: 'sessions.invalid-json', location: 'E:\\資料\\awg.sqlite' };
     fake.data.snapshot.preferences.theme = theme;
     render(<App />);
     await screen.findByRole('heading', { name: '資料損壞，所有操作已停用' });
     expect(screen.getByText('sessions.invalid-json')).toBeTruthy();
     expect(screen.getByText('E:\\資料\\awg.sqlite')).toBeTruthy();
-    expect(screen.getAllByRole('button')).toHaveLength(1);
+    expect(screen.getAllByRole('button')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: '應用程式選單' })).toBeTruthy();
     expect(screen.getByRole<HTMLSelectElement>('combobox', { name: '外觀主題' }).disabled).toBe(true);
     expect(document.documentElement.dataset.theme).toBe(theme);
     expect(fake.bridge.send).not.toHaveBeenCalled();

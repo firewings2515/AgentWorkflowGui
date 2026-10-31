@@ -8,6 +8,7 @@ import { Empty, formatTime, Menu, observedModelText, Status } from './ui';
 import { MessageId, RequestId } from '../../../contracts';
 import { commandFeedback } from './command-feedback';
 import type { RendererStore, RendererState } from './renderer-store';
+import { sessionBlocksSend, sessionCanInterrupt } from './renderer-store';
 import { EscalationPanel, openEscalations } from './EscalationPanel';
 
 export interface Selection { agentId: AgentId; model: ModelSelection }
@@ -72,8 +73,14 @@ export function SessionWorkspace(props: WorkspaceProps) {
   const pendingCount = openEscalations(snapshot, session.id).length;
   const chosen = selection ?? { agentId: session.agent.id, model: session.requestedModel };
   const instance = session.kind === 'workflow' ? snapshot.instances.find(candidate => candidate.id === session.workflow.instanceId) : undefined;
-  const activeTurn = snapshot.turns.some(turn => turn.sessionId === session.id && turn.state === 'running') || session.activity === 'running';
-  const blocked = props.store?.isBlocked('session.send', `session:${session.id}`) ?? false;
+  const activeTurn = sessionBlocksSend(snapshot, session.id);
+  const canInterrupt = sessionCanInterrupt(snapshot, session.id);
+  const creating = Object.values(props.ipcState?.blockedCommands ?? {}).some(item => item.command.type === 'session.create' && item.command.sessionId === session.id && !item.result);
+  const blocked = !!props.store && (props.ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || props.store.isBlocked('session.send', `session:${session.id}`) || creating);
+  const interruptBlocked = props.store?.isBlocked('session.interrupt', `session:${session.id}`) ?? false;
+  const interrupt = Object.values(props.ipcState?.blockedCommands ?? {}).find(item => item.command.type === 'session.interrupt' && item.command.sessionId === session.id);
+  const lastInterrupt = Object.values(props.ipcState?.commands ?? {}).filter(item => item.command.type === 'session.interrupt' && item.command.sessionId === session.id).at(-1);
+  const staleSend = Object.values(props.ipcState?.blockedCommands ?? {}).find(item => item.command.type === 'session.send' && item.command.sessionId === session.id && item.result && !item.result.ok && item.result.code === 'stale_revision' && !item.result.mayHaveSideEffects);
   const activity = Object.values(props.ipcState?.commands ?? {}).filter(item => 'sessionId' in item.command && item.command.sessionId === session.id).at(-1);
   const attach = (kind: 'files' | 'folder') => onNotice(`附件目標：${session.title}。${kind === 'files' ? '檔案／照片' : '資料夾'}選擇器尚未接入；未讀取檔案，也未新增附件。`);
   return <section className={`workspace ${active ? 'active-workspace' : ''}`} data-workspace={view.id} data-active={active} aria-label={`工作區 ${view.id}`} onFocusCapture={onFocus} onPointerDown={onFocus}>
@@ -98,8 +105,11 @@ export function SessionWorkspace(props: WorkspaceProps) {
           event.preventDefault();
           if (!props.store) { onNotice(`「${session.title}」尚未連接 runtime，草稿已保留，未送出訊息。`); return; }
           if (blocked || activeTurn || !context.draft.trim()) return;
+          const current = props.store.getSnapshot().snapshot;
+          const latestSession = current?.sessions.find(item => item.id === session.id);
+          if (!latestSession || !current || sessionBlocksSend(current, session.id)) return;
           const text = context.draft;
-          void props.store.send({ type: 'session.send', requestId: RequestId.parse(crypto.randomUUID()), sessionId: session.id, messageId: MessageId.parse(crypto.randomUUID()), expectedRevision: session.revision, text, attachments: [] }).then(result => {
+          void props.store.send({ type: 'session.send', requestId: RequestId.parse(crypto.randomUUID()), sessionId: session.id, messageId: MessageId.parse(crypto.randomUUID()), expectedRevision: latestSession.revision, text, attachments: [] }).then(result => {
             if (result.ok && latestDraft.current.sessionId === session.id && latestDraft.current.text === text) onContext({ draft: '' });
           });
         }}>
@@ -123,9 +133,18 @@ export function SessionWorkspace(props: WorkspaceProps) {
           <textarea id={`${view.id}-draft`} value={context.draft} onChange={event => onContext({ draft: event.target.value })} placeholder={`傳訊息給 ${session.title}…`} rows={3} />
           <div className="composer-actions"><Menu label="新增附件" shortcut actions={[{ label: 'Add files or photos', hint: 'Ctrl+U', onSelect: () => attach('files') }, { label: 'Add folder', onSelect: () => attach('folder') }]}>＋</Menu>
             <span className="composer-target">附件／訊息目標：{session.title}</span>
+            {canInterrupt && <button type="button" disabled={!props.store || props.ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || interruptBlocked} onClick={() => {
+              if (!props.store || interruptBlocked) return;
+              void props.store.send({ type: 'session.interrupt', requestId: RequestId.parse(crypto.randomUUID()), sessionId: session.id });
+            }}>{interrupt?.result && !interrupt.result.ok ? '中斷結果待核對' : interruptBlocked ? '中斷中…' : '中斷'}</button>}
             <button type="submit" className="primary" disabled={!context.draft.trim() || activeTurn || blocked}>送出</button>
           </div>
           {activeTurn && <p className="composer-note">此 session 有執行中的 turn；可編輯草稿，暫不送出。</p>}
+          {creating && <p role="status">Session 建立中；完成後才能送出，草稿已保留。</p>}
+          {props.store && props.ipcState?.connection !== 'ready' && <p role="status">資料尚未同步完成；完成後才能送出，草稿已保留。</p>}
+          {interrupt && <p role="status">{interrupt.result && !interrupt.result.ok ? commandFeedback(interrupt.result) : '已請求中斷，等待服務回報停止狀態。'}</p>}
+          {canInterrupt && !interruptBlocked && lastInterrupt?.interruptRetryReady && <p role="status">中斷已接受，但 10 秒內仍未收到停止狀態；可重新讀取資料或再次按「中斷」。</p>}
+          {staleSend && <p role="status">草稿已保留；等待新的 session revision 後可自行重送。<button type="button" disabled={props.ipcState?.connection === 'loading'} onClick={() => void props.store?.reconnect()}>重新讀取 session 資料</button></p>}
           {activity && <p className={activity.result && !activity.result.ok ? activity.result.code === 'unknown_outcome' ? 'command-warning' : 'field-error' : undefined}
             role={activity.result && !activity.result.ok && activity.result.code !== 'unknown_outcome' ? 'alert' : 'status'}>{!activity.result ? '處理中…' : activity.result.ok ? '操作已接受' : commandFeedback(activity.result, activity.command.type)}</p>}
           {props.ipcState?.runtimeExits[session.requestedModel.runtime]?.sessionIds.includes(session.id) && <p role="status">Runtime 曾回報結束，請核對最新 session 狀態；訊息送達結果另列。</p>}

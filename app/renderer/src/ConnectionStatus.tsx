@@ -4,13 +4,19 @@ import { commandFeedback } from './command-feedback';
 
 export function ConnectionStatus({ state, store }: { state: RendererState; store: RendererStore }) {
   const commands = Object.values(state.commands);
-  const unresolved = Object.values(state.blockedCommands).filter(activity => activity.result);
+  const unresolved = Object.values(state.blockedCommands).filter(activity => activity.result && !activity.result.ok);
   return <div className="connection-status">
     <span role="status">{state.connection === 'ready' ? 'IPC 已連線' : state.connection === 'loading' || state.connection === 'idle' ? '正在同步資料…' : state.snapshot ? '資料同步失敗，保留上次資料' : '資料同步失敗，尚未載入資料'}</span>
     <button disabled={state.connection === 'loading'} onClick={() => { void store.reconnect(); }}>重新讀取資料</button>
-    {unresolved.length > 0 && <details><summary>待核對操作（{unresolved.length}）</summary>{unresolved.map(({ command }) => <div key={command.requestId}>
+    {unresolved.length > 0 && <details><summary>待核對操作（{unresolved.length}）</summary>{unresolved.map(({ command, result, createCheck }) => <div key={command.requestId}>
       <span>{command.type} · {commandTarget(command)}</span>
-      <button onClick={() => store.acknowledge(command.type, commandTarget(command))}>已核對結果</button>
+      {command.type === 'session.send' && result && !result.ok && result.code === 'stale_revision' && !result.mayHaveSideEffects
+        ? <span>等待新的 session revision</span>
+        : command.type === 'session.create'
+          ? createCheck === 'missing' && !state.snapshot?.sessions.some(session => session.id === command.sessionId)
+            ? <button disabled={state.connection !== 'ready'} onClick={() => store.acknowledge(command.type, commandTarget(command))}>我已確認沒有建立，重新填寫</button>
+            : <span>請回新增 session 頁面，重新讀取資料並依 session ID 核對</span>
+          : <button onClick={() => store.acknowledge(command.type, commandTarget(command))}>已核對結果</button>}
     </div>)}</details>}
     {commands.length > 0 && <details className="command-history"><summary>操作結果（{commands.length}）</summary><ol aria-label="操作結果">{commands.map(({ command, result, reviewed }, index) => <li key={command.requestId}>
       <strong>{command.type}</strong><span className="mono">{commandTarget(command)}</span>

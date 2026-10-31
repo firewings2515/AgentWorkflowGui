@@ -209,6 +209,14 @@ p { line-height: 1.7; }
 .popup-menu { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 5; width: 260px; max-width: calc(100vw - 48px); padding: 5px; border: 1px solid var(--line); border-radius: 9px; background: var(--raised); box-shadow: 0 10px 30px var(--shadow); }
 .popup-menu button { display: flex; width: 100%; justify-content: space-between; gap: 12px; text-align: left; border: 0; background: var(--transparent); font-size: 12px; padding: 12px 9px; }
 .popup-menu kbd { color: var(--muted); font-size: 10px; }
+.app-menu .popup-menu { top: calc(100% + 8px); bottom: auto; z-index: 40; width: 300px; max-height: calc(100dvh - 100px); overflow-y: auto; }
+.app-menu .popup-menu button { padding: 8px 10px; font-size: 13px; }
+.menu-group { color: var(--muted); font-size: 11px; padding: 8px 10px 4px; border-top: 1px solid var(--line); }
+.popup-menu > :first-child > .menu-group { border-top: 0; }
+:root[data-theme='light'] .app-menu .popup-menu { border-color: #8998aa; box-shadow: 0 8px 24px #20304840, 0 2px 6px #20304826; }
+.session-create form { max-width: 620px; }
+.session-create .mono { overflow-wrap: anywhere; }
+.composer-actions { flex-wrap: wrap; }
 .owner-menu .popup-menu { top: calc(100% + 6px); bottom: auto; left: auto; right: 0; width: 180px; }
 .detail-panel { min-height: 0; border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; }
 .detail-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; padding: 16px 12px; }

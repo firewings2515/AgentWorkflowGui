@@ -3,8 +3,13 @@ import type { AppEvent } from '../../../contracts';
 import type { AwgBridge } from '../../preload/bridge-types';
 import { blocksResubmit, unknownResult } from './command-feedback';
 
-export interface CommandActivity { command: Command; result: CommandResult | null; reviewed?: boolean }
+export interface CommandActivity {
+  command: Command; result: CommandResult | null; reviewed?: boolean;
+  createCheck?: 'found' | 'missing';
+  interruptRetryReady?: boolean;
+}
 export const COMMAND_HISTORY_LIMIT = 50;
+export const INTERRUPT_WAIT_MS = 10000;
 export interface RendererState {
   snapshot: Snapshot | null;
   connection: 'idle' | 'loading' | 'ready' | 'error';
@@ -22,6 +27,17 @@ const without = <T>(items: Readonly<Record<string, T>>, key: string) => {
   const next = { ...items }; delete next[key]; return next;
 };
 const streamKey = (sessionId: string, id: string) => JSON.stringify([sessionId, id]);
+
+export function sessionCanInterrupt(snapshot: Snapshot, sessionId: string): boolean {
+  const activity = snapshot.sessions.find(session => session.id === sessionId)?.activity;
+  return activity === 'running' || activity === 'waiting-user' || activity === 'waiting-lock'
+    || snapshot.turns.some(turn => turn.sessionId === sessionId && !turn.nativeTaskId && turn.state === 'running');
+}
+
+export function sessionBlocksSend(snapshot: Snapshot, sessionId: string): boolean {
+  return snapshot.sessions.some(session => session.id === sessionId && session.activity === 'running')
+    || snapshot.turns.some(turn => turn.sessionId === sessionId && turn.state === 'running');
+}
 
 /** Apply only observed facts. A runtime exit does not establish a delivery or turn outcome. */
 export function applyEnvelope(state: RendererState, envelope: EventEnvelope): RendererState {
@@ -99,12 +115,30 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
   const submittedIds = new Set<string>();
   const blockKey = (type: Command['type'], target: string) => JSON.stringify([type, target]);
   const listeners = new Set<() => void>();
+  const interruptTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let unsubscribe: (() => void) | undefined;
   let loading: Promise<void> | undefined;
   let generation = 0;
   let buffer: EventEnvelope[] | null = null;
   let invalidatedSeq = 0;
-  const publish = (next: RendererState) => { if (next === state) return; state = next; listeners.forEach(listener => listener()); };
+  const publish = (next: RendererState) => {
+    if (next === state) return;
+    // These guards survive pane/route changes.
+    for (const [key, activity] of Object.entries(next.blockedCommands)) {
+      const { command, result } = activity;
+      if (!next.snapshot || !result) continue;
+      const newerRevision = command.type === 'session.send' && !result.ok && result.code === 'stale_revision' && !blocksResubmit(result)
+        && next.snapshot.sessions.some(session => session.id === command.sessionId && session.revision > command.expectedRevision);
+      const interrupted = command.type === 'session.interrupt' && result.ok && !sessionCanInterrupt(next.snapshot, command.sessionId);
+      if (newerRevision || interrupted) next = { ...next, blockedCommands: without(next.blockedCommands, key) };
+    }
+    for (const [id, timer] of interruptTimers) {
+      if (!Object.values(next.blockedCommands).some(activity => activity.command.requestId === id)) {
+        clearTimeout(timer); interruptTimers.delete(id);
+      }
+    }
+    state = next; listeners.forEach(listener => listener());
+  };
   const receive = (envelope: EventEnvelope) => {
     const parsed = EventEnvelope.safeParse(envelope);
     if (!parsed.success) {
@@ -157,6 +191,15 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
           next = applyEnvelope(next, envelope);
         }
         if (gap) continue;
+        // Only a successful authoritative read after an uncertain receipt enables
+        // reconciliation. A session.updated event alone is not this evidence.
+        for (const [key, activity] of Object.entries(next.blockedCommands)) {
+          const { command, result } = activity;
+          if (command.type !== 'session.create' || !result || result.ok) continue;
+          const checked: CommandActivity = { ...activity, createCheck: snapshot.sessions.some(session => session.id === command.sessionId) ? 'found' : 'missing' };
+          next = { ...next, blockedCommands: { ...next.blockedCommands, [key]: checked },
+            commands: next.commands[command.requestId] ? { ...next.commands, [command.requestId]: checked } : next.commands };
+        }
         buffer = null;
         publish(next);
         return;
@@ -171,6 +214,11 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
     const key = blockKey(type, target);
     const activity = state.blockedCommands[key];
     if (!activity?.result) return;
+    // Generic acknowledgement must not bypass a required revision or create-ID check.
+    if (activity.command.type === 'session.send' && !activity.result.ok && activity.result.code === 'stale_revision' && !activity.result.mayHaveSideEffects) return;
+    if (activity.command.type === 'session.interrupt' && activity.result.ok) return;
+    const command = activity.command;
+    if (command.type === 'session.create' && (state.connection !== 'ready' || !activity.createCheck)) return;
     const id = activity.command.requestId;
     publish({ ...state, blockedCommands: without(state.blockedCommands, key),
       commands: state.commands[id] ? { ...state.commands, [id]: { ...state.commands[id], reviewed: true } } : state.commands });
@@ -188,9 +236,20 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
       let blockedCommands = state.blockedCommands;
       if (!result) blockedCommands = { ...blockedCommands, [key]: activity };
       else if (blockedCommands[key]?.command.requestId === command.requestId) {
-        blockedCommands = blocksResubmit(result) ? { ...blockedCommands, [key]: activity } : without(blockedCommands, key);
+        const waitingRevision = command.type === 'session.send' && !result.ok && result.code === 'stale_revision';
+        const waitingInterrupt = command.type === 'session.interrupt' && result.ok;
+        blockedCommands = blocksResubmit(result) || waitingRevision || waitingInterrupt ? { ...blockedCommands, [key]: activity } : without(blockedCommands, key);
       }
       publish({ ...state, commands, blockedCommands });
+      if (command.type === 'session.interrupt' && result?.ok && state.blockedCommands[key]?.command.requestId === command.requestId && !interruptTimers.has(command.requestId)) {
+        interruptTimers.set(command.requestId, setTimeout(() => {
+          interruptTimers.delete(command.requestId);
+          if (state.blockedCommands[key]?.command.requestId !== command.requestId) return;
+          const previous = state.commands[command.requestId];
+          publish({ ...state, blockedCommands: without(state.blockedCommands, key),
+            commands: previous ? { ...state.commands, [command.requestId]: { ...previous, interruptRetryReady: true } } : state.commands });
+        }, INTERRUPT_WAIT_MS));
+      }
     };
     record(null);
     if (state.snapshot?.app.status === 'damaged') {
@@ -214,17 +273,25 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
     }).then(validate, () => unknownResult(command.requestId));
     const result = await Promise.race([response, new Promise<CommandResult>(resolve => { timer = setTimeout(() => resolve(unknownResult(command.requestId)), timeoutMs); })]);
     clearTimeout(timer);
-    record(result);
-    // Agent/Workflow updates have no event in v0.4; read their authoritative revisions.
+    // Creation can update the session again while provisioning. Read its latest revision
+    // before exposing the composer, even if an earlier session.updated already arrived.
     const refresh = async (receipt: CommandResult) => {
-      if (receipt.ok && ['agent.save', 'agent.delete', 'workflow.save'].includes(command.type)) {
+      if (receipt.ok && ['agent.save', 'agent.delete', 'workflow.save', 'session.create'].includes(command.type)) {
         await loading;
         if (state.connection !== 'idle') await reconnect();
       }
     };
-    await refresh(result);
+    const settle = async (receipt: CommandResult) => {
+      // Also protect late create receipts: a timed-out screen can already be
+      // watching this command, so do not expose success before its fresh read.
+      const creating = command.type === 'session.create' && receipt.ok;
+      if (!creating) record(receipt);
+      await refresh(receipt);
+      if (creating) record(receipt);
+    };
+    await settle(result);
     // A late receipt can resolve a timeout, but it must never trigger a second send.
-    void response.then(async late => { if (late !== result) { record(late); await refresh(late); } });
+    void response.then(async late => { if (late !== result) await settle(late); });
     return result;
   };
   return {
@@ -233,6 +300,7 @@ export function createRendererStore(bridge: AwgBridge, timeoutMs = 15000) {
     start: () => state.connection === 'idle' ? reconnect() : loading ?? Promise.resolve(),
     reconnect, send, isBlocked, acknowledge,
     dispose: () => {
+      interruptTimers.forEach(clearTimeout); interruptTimers.clear();
       generation++; unsubscribe?.(); unsubscribe = undefined; loading = undefined; buffer = null;
       publish({ ...state, connection: 'idle' });
     },
