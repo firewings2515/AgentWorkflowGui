@@ -87,6 +87,14 @@ function mediaConflicts(rules: CSSRule[]) {
 describe('layout stylesheet declarations', () => {
   const rules = parseRules(css);
 
+  it('keeps dependency labels readable and reserves space for three rows', () => {
+    expect(baseValue(rules, '.dependency-canvas', 'height')).toBe('360px');
+    expect(baseValue(rules, '.dependency-canvas .task-dependency-node', 'width')).toBe('220px');
+    expect(baseValue(rules, '.dependency-canvas .task-dependency-node', 'min-height')).toBe('64px');
+    expect(baseValue(rules, '.dependency-canvas .task-dependency-node', 'font-size')).toBe('16px');
+    expect(baseValue(rules, '.dependency-canvas .task-dependency-node', 'overflow-wrap')).toBe('anywhere');
+  });
+
   it.each([
     ['.workbench', 'grid-template-rows', 'minmax(0, 1fr)'],
     ['.workspace-grid', 'grid-template-rows', 'minmax(0, 1fr)'],

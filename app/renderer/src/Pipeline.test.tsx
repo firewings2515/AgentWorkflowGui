@@ -26,6 +26,19 @@ async function setup(snapshot: Snapshot = fixtureSnapshot) {
 const select = (name: string) => fireEvent.click(within(screen.getByRole('region', { name: '群組 task 清單' })).getByRole('button', { name }));
 const confirm = (type: 'workflow.complete' | 'workflow.cancel') => fireEvent.click(screen.getByRole('button', { name: type === 'workflow.complete' ? '確認結束為已完成' : '確認取消執行群組' }));
 describe('T034 task pipeline', () => {
+  it('hides the merge queue for same-folder runs and keeps it for worktree runs', () => {
+    const props = { snapshot: fixtureSnapshot, onOpen: vi.fn(), onBack: vi.fn() };
+    const view = render(<WorkflowProgress {...props} instanceId="inst-docs" />);
+    expect(screen.queryByRole('region', { name: '合併佇列' })).toBeNull();
+    expect(screen.queryByText(/目標分支 尚未指定/)).toBeNull();
+    expect(screen.queryByText(/依序處理，一次一個 task/)).toBeNull();
+    expect(screen.getByText('同資料夾模式不經合併佇列')).toBeTruthy();
+    expect(screen.getByRole('region', { name: '唯讀流程圖' })).toBeTruthy();
+    view.rerender(<WorkflowProgress {...props} instanceId="inst-login" />);
+    expect(screen.getByRole('region', { name: '合併佇列' })).toBeTruthy();
+    expect(screen.queryByText('同資料夾模式不經合併佇列')).toBeNull();
+  });
+
   it('scopes tasks, graph sessions and handoffs to the chosen run/task and keeps selection on live updates', async () => {
     const { fake } = await setup();
     const list = within(screen.getByRole('region', { name: '群組 task 清單' }));

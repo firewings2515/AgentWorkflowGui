@@ -76,7 +76,8 @@
 .task-list p, .task-facts, .merge-queue, .lock-waits { overflow-wrap: anywhere; }
 .task-list p { font-size: 12px; margin: 8px 0 0; }
 .task-list button { text-align: left; }
-.dependency-canvas { height: 260px; min-width: 0; }
+.dependency-canvas { height: 360px; min-width: 0; }
+.dependency-canvas .task-dependency-node { width: 220px; min-height: 64px; padding: 12px 18px; font-size: 16px; line-height: 1.5; overflow-wrap: anywhere; }
 .merge-queue { padding-left: 24px; }
 .pipeline-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
 .pipeline-actions p { flex-basis: 100%; }

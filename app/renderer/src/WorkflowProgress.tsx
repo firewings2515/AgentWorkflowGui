@@ -65,7 +65,9 @@ function GroupProgress({ snapshot, instance, onOpen, store, ipcState }: Pipeline
       </li>)}</ul><TaskDependencies instance={instance} selected={selected} onSelect={setSelected} />
     </section>}
     {task ? <SingleTaskProgress key={task.id} snapshot={snapshot} instance={instance} task={task} onOpen={onOpen} store={store} ipcState={ipcState} /> : <Empty>{instance.tasks.length ? '請選擇 task 查看進度。' : '尚無 task 資料；不代表已完成。'}</Empty>}
-    <MergeQueue instance={instance} store={store} ipcState={ipcState} />
+    {instance.template.isolation === 'same-folder'
+      ? <p className="muted">同資料夾模式不經合併佇列</p>
+      : <MergeQueue instance={instance} store={store} ipcState={ipcState} />}
   </>;
 }
 
@@ -86,14 +88,14 @@ function SingleTaskProgress({ snapshot, instance, task, onOpen, store, ipcState 
     <p className="muted">框線標示目前節點；各節點顯示 session 活動。已送達、閒置均不代表工作完成或驗收通過。</p>
     <div className="progress-layout">
       <div className="workflow-canvas progress-canvas" role="region" aria-label="唯讀流程圖">
-        <ReactFlow<ProgressNode> nodes={graph.nodes} edges={graph.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView fitViewOptions={progressFitOptions} minZoom={PROGRESS_MIN_ZOOM} maxZoom={2}
+        <ReactFlow<ProgressNode> nodes={graph.nodes} edges={graph.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} minZoom={PROGRESS_MIN_ZOOM} maxZoom={2}
           nodesDraggable={false} nodesConnectable={false} nodesFocusable={false} edgesFocusable={false} edgesReconnectable={false} elementsSelectable={false} deleteKeyCode={null} zoomOnDoubleClick={false}
           onNodeClick={(event, node) => {
             if (!(event.target as Element).closest('button') && node.data.sessions.length === 1 && node.data.sessions[0]) onOpen(node.data.sessions[0].id);
           }}
           defaultMarkerColor="var(--muted)" defaultEdgeOptions={{ markerEnd: { type: MarkerType.ArrowClosed, width: 24, height: 24 } }}
           ariaLabelConfig={{ 'controls.zoomIn.ariaLabel': '放大進度圖', 'controls.zoomOut.ariaLabel': '縮小進度圖', 'controls.fitView.ariaLabel': '符合進度圖大小' }}>
-          <Background /><Controls showInteractive={false} /><ProgressFit />
+          <Background /><Controls showInteractive={false} fitViewOptions={progressFitOptions} /><ProgressFit />
         </ReactFlow>
       </div>
       <section className="progress-logs" aria-label="各 node 的 session 與日誌"><h3>節點與工作日誌</h3>
