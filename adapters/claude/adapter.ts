@@ -187,6 +187,13 @@ interface LiveSession {
   declined: Set<string>;
   tasks: Map<string, NativeTask>;
   taskByToolUse: Map<string, string>;
+  /**
+   * Background shell commands (`local_bash` tasks) by task id: the tool call that started each, and how
+   * it ended when that came before the call's result (R-07: locks wait for them).
+   */
+  shellTasks: Map<string, { toolUseId?: string; ended?: 'completed' | 'failed' | 'interrupted' }>;
+  /** Background commands whose tool call returned but whose task still runs, by tool_use id. */
+  background: Map<string, SessionItem>;
   permissions: Set<PermissionEntry>;
   closing: boolean;
   ended: boolean;
@@ -746,6 +753,8 @@ export class ClaudeAdapter implements RuntimeAdapter {
       streamIds: new Map(),
       usage: new Map(),
       items: new Map(),
+      shellTasks: new Map(),
+      background: new Map(),
       declined: new Set(),
       tasks: new Map(),
       taskByToolUse: new Map(),
@@ -1032,9 +1041,23 @@ export class ClaudeAdapter implements RuntimeAdapter {
       // The structured output belongs to the single result of a frame.
       const structured = results.length === 1 && i === 0 ? m.tool_use_result : undefined;
       const interrupted = s.turn?.interruptRequested === true || toolResultText(result.content).startsWith(INTERRUPT_MARKER);
-      const item = finishItem(tracked.item, { ...result, ...opt('structured', structured) }, { endedAt: at, declined: s.declined.has(result.toolUseId), interrupted, maxOutputChars });
+      let item = finishItem(tracked.item, { ...result, ...opt('structured', structured) }, { endedAt: at, declined: s.declined.has(result.toolUseId), interrupted, maxOutputChars });
       s.items.delete(result.toolUseId);
       s.declined.delete(result.toolUseId);
+      // A command sent to the background returns at once; it ends with its task, not with this result.
+      const taskId = isObject(structured) ? str(structured.backgroundTaskId) : undefined;
+      if (item.kind === 'command' && item.state === 'completed' && (isNonEmptyString(taskId) || item.background === true)) {
+        const known = isNonEmptyString(taskId) ? taskId : [...s.shellTasks].find(([, t]) => t.toolUseId === result.toolUseId)?.[0];
+        const shell = known === undefined ? undefined : s.shellTasks.get(known);
+        if (shell?.ended !== undefined) item = { ...item, background: true, state: shell.ended };
+        else {
+          const running: SessionItem = { ...item, background: true, state: 'running' };
+          delete running.endedAt;
+          if (known !== undefined) s.shellTasks.set(known, { toolUseId: result.toolUseId });
+          s.background.set(result.toolUseId, running);
+          item = running;
+        }
+      }
       this.emit({ type: 'item.updated', item });
     }
   }
@@ -1178,6 +1201,11 @@ export class ClaudeAdapter implements RuntimeAdapter {
 
   private onTaskStarted(s: LiveSession, m: Json, at: Timestamp): void {
     const taskId = str(m.task_id);
+    if (isNonEmptyString(taskId) && m.task_type === 'local_bash') {
+      const toolUseId = str(m.tool_use_id);
+      s.shellTasks.set(taskId, { ...s.shellTasks.get(taskId), ...opt('toolUseId', isNonEmptyString(toolUseId) ? toolUseId : undefined) });
+      return;
+    }
     // Background shell commands are tasks too; only sub-agents are native tasks.
     if (!isNonEmptyString(taskId) || (m.task_type !== undefined && m.task_type !== 'local_agent')) return;
     const toolUseId = str(m.tool_use_id);
@@ -1202,6 +1230,10 @@ export class ClaudeAdapter implements RuntimeAdapter {
 
   private onTaskChanged(s: LiveSession, m: Json, at: Timestamp): void {
     const taskId = str(m.task_id);
+    if (isNonEmptyString(taskId) && s.shellTasks.has(taskId)) {
+      this.onShellTaskChanged(s, taskId, m, at);
+      return;
+    }
     const task = taskId === undefined ? undefined : s.tasks.get(taskId);
     if (!task || taskId === undefined) return;
     let next: NativeTask = task;
@@ -1226,6 +1258,25 @@ export class ClaudeAdapter implements RuntimeAdapter {
     }
     s.tasks.set(taskId, next);
     if (next !== task) this.emit({ type: 'nativeTask.updated', task: next });
+  }
+
+  /** A background shell command's task ended: so does its command item (R-07: its session's locks may go). */
+  private onShellTaskChanged(s: LiveSession, taskId: string, m: Json, at: Timestamp): void {
+    const status = m.subtype === 'task_updated' && isObject(m.patch) ? str(m.patch.status) : m.subtype === 'task_notification' ? str(m.status) : undefined;
+    const ended = status === 'completed' ? 'completed' : status === 'failed' ? 'failed' : status === 'killed' || status === 'stopped' ? 'interrupted' : undefined;
+    if (ended === undefined) return;
+    const shell = s.shellTasks.get(taskId)!;
+    const toolUseId = shell.toolUseId ?? (isNonEmptyString(str(m.tool_use_id)) ? str(m.tool_use_id) : undefined);
+    const running = toolUseId === undefined ? undefined : s.background.get(toolUseId);
+    if (running === undefined || toolUseId === undefined) {
+      // Ended before its tool call returned: the result ends the item with this state.
+      s.shellTasks.set(taskId, { ...shell, ...opt('toolUseId', toolUseId), ended });
+      return;
+    }
+    s.background.delete(toolUseId);
+    s.shellTasks.delete(taskId);
+    const endTime = isObject(m.patch) ? num(m.patch.end_time) : undefined;
+    this.emit({ type: 'item.updated', item: { ...running, state: ended, endedAt: endTime === undefined ? at : isoFromMs(endTime) } as SessionItem });
   }
 
   /** A finished sub-agent's open message and calls end with it. */

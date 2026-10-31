@@ -115,6 +115,11 @@ export interface CodexAdapterOptions extends RuntimeAdapterHooks {
   requestTimeoutMs?: number;
   /** Deadline for a dispatch before its outcome is reported unknown (default 30 s). */
   dispatchTimeoutMs?: number;
+  /**
+   * How long a file-change approval that arrived before its `item/started` waits for it, so the GUI knows
+   * which files to lock (R-07; default 2 s). Past it the request goes up as it is.
+   */
+  fileChangeItemWaitMs?: number;
   log?: (level: 'debug' | 'warn', message: string, detail?: unknown) => void;
 }
 
@@ -268,6 +273,8 @@ export class CodexAdapter implements RuntimeAdapter {
   /** Children whose turn state came from live events: only these are trusted without reading the child again. */
   private readonly liveChildTurns = new Set<string>();
   private readonly permissions = new Map<string, PermissionEntry>();
+  /** File-change approvals that came before their item, by item ID: each goes up once the item starts (R-07). */
+  private readonly earlyFileChanges = new Map<string, { release: () => void }>();
   private readonly dispatched = new Set<string>();
   /** Origin of each payload this adapter dispatched, by clientMessageId, for the user message it becomes. */
   private readonly origins = new Map<string, Message['origin']>();
@@ -1186,7 +1193,12 @@ export class CodexAdapter implements RuntimeAdapter {
       this.items.set(item.id, tracked);
     }
     tracked.wire = item;
-    if (started) return this.emitItem(tracked, {});
+    if (started) {
+      this.emitItem(tracked, {});
+      // An approval of this change that came first goes up now, with the item's files (R-07).
+      this.earlyFileChanges.get(item.id)?.release();
+      return;
+    }
     if (item.type === 'commandExecution' && typeof item.aggregatedOutput === 'string') this.setOutput(tracked, item.aggregatedOutput);
     this.emitItem(tracked, { endedAt: at });
     this.items.delete(item.id);
@@ -1358,12 +1370,26 @@ export class CodexAdapter implements RuntimeAdapter {
 
   // ---- internals: server requests -----------------------------------------------------------------
 
-  private onServerRequest(id: RpcId, method: string, params: unknown): void {
+  private onServerRequest(id: RpcId, method: string, params: unknown, waited = false): void {
     const kind = permissionKindOf(method);
     if (!kind) {
       // Dynamic tools, user-input questions, auth refresh, legacy approvals: not offered by this client.
       this.log('warn', `unsupported server request ${method}; answering with an error`);
       this.conn?.respondError(id, -32601, `${method} is not supported by AgentWorkflowGui`);
+      return;
+    }
+    // A file change asked for before its `item/started`: the files to lock are not known yet, so the request
+    // waits briefly for the item (SP-06 W2; the order is not guaranteed). Without it, it goes up as it is.
+    const itemId = isObject(params) && typeof params.itemId === 'string' ? params.itemId : undefined;
+    if (!waited && kind === 'fileChange' && itemId !== undefined && this.items.get(itemId)?.wire.type !== 'fileChange' && !this.earlyFileChanges.has(itemId)) {
+      const release = () => {
+        if (this.earlyFileChanges.get(itemId)?.release !== release) return;
+        this.earlyFileChanges.delete(itemId);
+        clearTimeout(timer);
+        if (this.conn !== undefined) this.guard(method, () => this.onServerRequest(id, method, params, true));
+      };
+      this.earlyFileChanges.set(itemId, { release });
+      const timer = setTimeout(release, this.options.fileChangeItemWaitMs ?? 2000);
       return;
     }
     let entry: PermissionEntry;
@@ -1473,6 +1499,8 @@ export class CodexAdapter implements RuntimeAdapter {
   }
 
   private onExit(exit: ExitInfo): void {
+    // Approvals still waiting for their item die with the process: nobody can answer them.
+    this.earlyFileChanges.clear();
     for (const entry of [...this.permissions.values()]) this.withdraw(entry);
     this.emit({
       type: 'runtime.exited',

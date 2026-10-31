@@ -3,6 +3,8 @@
 import { type AgentDefinition, AgentId, type AppEvent, CONTRACTS_VERSION, type Command, type CommandResult, RequestId, type Runtime, SessionId } from '../../../contracts';
 import { hashOf } from '../../delivery/testing/fixtures';
 import { MemoryDeliveryStore } from '../../delivery/testing/memory-store';
+import type { FileState } from '../../locks';
+import { ManualClock } from '../../locks/testing/clock';
 import type { McpMount, PermissionPolicy, PolicyContext, PolicyDecision } from '../../ports';
 import { SessionService } from '../service';
 import { FakeAdapter } from './fake-adapter';
@@ -46,12 +48,26 @@ export interface World {
   sleeper: (ms: number) => Promise<void>;
   service: SessionService;
   logs: string[];
+  /** With `locks`: the files the lock table hashes (folded path → state; absent means missing) and its clock. */
+  files: Map<string, FileState>;
+  clock: ManualClock;
   run(command: Command): Promise<CommandResult>;
   restart(): World;
 }
 
-const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, previous?: World): World => {
+export interface WorldOptions {
+  /** Same-folder file locks (T033) on the service; off by default. */
+  locks?: boolean;
+  /** The locks' Codex hold limit (default 5 minutes). */
+  holdMs?: number;
+}
+
+const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, previous?: World, o: WorldOptions = {}): World => {
+  const files = previous?.files ?? new Map<string, FileState>();
+  const clock = previous?.clock ?? new ManualClock('2026-10-29T01:00:00.000Z');
   const world = {
+    files,
+    clock,
     repositories,
     store,
     codex: new Map<string, FakeAdapter>(),
@@ -79,7 +95,8 @@ const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, pre
     store,
     policy,
     publish: (event) => world.events.push(event),
-    now: () => '2026-10-29T01:00:00.000Z',
+    // The lock tests move the clock; everything else sees it stand still at its start.
+    now: () => clock.now(),
     uuid,
     hashPayload: hashOf,
     resolveRealPath: (path) => world.realPath(path),
@@ -101,14 +118,17 @@ const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, pre
     },
     log: (message) => world.logs.push(message),
     sleep: (ms) => world.sleeper(ms),
+    ...(o.locks === true && {
+      locks: { hashFile: (path: string) => files.get(path.toLowerCase()) ?? 'missing', setTimer: clock.setTimer, ...(o.holdMs !== undefined && { holdMs: o.holdMs }) },
+    }),
   });
   world.run = (command) => world.service.execute(command);
-  world.restart = () => build(repositories, store, world);
+  world.restart = () => build(repositories, store, world, o);
   return world;
 };
 
-export const world = async (): Promise<World> => {
-  const w = build(new MemoryRepositories(), new MemoryDeliveryStore());
+export const world = async (o: WorldOptions = {}): Promise<World> => {
+  const w = build(new MemoryRepositories(), new MemoryDeliveryStore(), undefined, o);
   await w.repositories.agents.save(agent(), null);
   return w;
 };

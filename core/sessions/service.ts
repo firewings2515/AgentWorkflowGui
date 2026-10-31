@@ -35,12 +35,15 @@ import {
   type TaskId,
   type Timestamp,
   type Turn,
+  type WaitForFileToolInput,
+  type WaitForFileToolResult,
   type DeliveryState,
   type NodeId,
   type WorkflowInstance,
   AttemptId,
 } from '../../contracts';
 import { DeliveryService, type DeliveryEscalation, type DispatchOutcome, type PayloadDelivery, type RecoveryReport } from '../delivery';
+import { type AbortLike, LockCoordinator, type LockCoordinatorOptions, type LockEscalation } from '../locks';
 import type {
   AppRepositories,
   ClaimInput,
@@ -153,6 +156,11 @@ export interface SessionServiceOptions {
   /** Resolves after `ms`; bounds the wait for running work on exit (R-14). Without it, exit waits for all of it. */
   sleep?(ms: number): Promise<void>;
   written?: WrittenPathsOptions;
+  /**
+   * Same-folder file locks (T033, R-07): the file hash and the timers they need. Absent: nothing is locked
+   * (tests that are not about locks).
+   */
+  locks?: Pick<LockCoordinatorOptions, 'hashFile' | 'setTimer' | 'holdMs' | 'waitMs' | 'isIgnored'>;
   log?(message: string): void;
 }
 
@@ -280,6 +288,8 @@ export class SessionService {
   readonly gate: PermissionGate;
   readonly runtimes: SessionRuntimes;
   readonly delivery: DeliveryService;
+  /** Same-folder file locks (R-07), when the options gave what they need. */
+  readonly locks: LockCoordinator | undefined;
   private readonly repos: AppRepositories;
   private readonly store: DeliveryStore;
   private readonly queues = new Map<string, Promise<unknown>>();
@@ -324,6 +334,16 @@ export class SessionService {
     this.repos = gated(options.repositories, () => this.closed);
     this.store = gated(options.store, () => this.closed);
     this.written = new WrittenPaths(options.written);
+    if (options.locks !== undefined) {
+      this.locks = new LockCoordinator({
+        ...options.locks,
+        now: () => options.now(),
+        resolveRealPath: (path) => options.resolveRealPath(path),
+        escalate: (escalation) => this.lockEscalation(escalation),
+        publish: (locks) => options.publish({ type: 'locks.updated', locks, at: options.now() }),
+        log: (message) => options.log?.(message),
+      });
+    }
     this.gate = new PermissionGate({
       repositories: this.repos,
       policy: options.policy,
@@ -335,13 +355,21 @@ export class SessionService {
       log: (message) => options.log?.(message),
       isClosing: () => this.closing,
       rootOf: (session) => this.rootOf(session),
+      ...(this.locks !== undefined && { locks: this.locks }),
     });
     this.runtimes = new SessionRuntimes({
       createAdapter: (runtime, sessionId) => options.createAdapter(runtime, sessionId),
       mountMcp: (sessionId) => options.mountMcp(sessionId),
       listModels: (runtime) => options.listModels(runtime),
-      onOpened: (sessionId, cwd) => options.onSessionOpened?.(sessionId, cwd),
-      onClosed: (sessionId) => options.onSessionClosed?.(sessionId),
+      onOpened: (sessionId, cwd) => {
+        // The locks need its folder and mode before its first write or its folder's first change (R-07).
+        if (this.locks !== undefined) void this.repos.sessions.get(sessionId).then((s) => s && this.locks?.track(s)).catch(() => undefined);
+        options.onSessionOpened?.(sessionId, cwd);
+      },
+      onClosed: (sessionId) => {
+        this.locks?.closed(sessionId);
+        return options.onSessionClosed?.(sessionId);
+      },
       onEvent: (event) => this.record(event),
       ...(options.sleep !== undefined && { sleep: (ms: number) => this.options.sleep!(ms) }),
     });
@@ -511,6 +539,8 @@ export class SessionService {
   beginClose(): void {
     this.closing = true;
     this.runtimes.beginClose();
+    // A write held for a lock is declined now, like every other approval from here on (R-14).
+    this.locks?.beginClose();
   }
 
   async shutdown(timeoutMs = 5000): Promise<void> {
@@ -567,6 +597,40 @@ export class SessionService {
   /** A file changed in a session's workspace while its runtime ran (writtenPaths source 3). */
   workspaceChanged(sessionId: SessionId, root: string, path: string): void {
     this.written.changed(sessionId, root, path);
+    // Also the after-the-fact check for writes no lock covered (R-07, SP-06 W5/W6).
+    this.locks?.fileChanged(sessionId, path);
+  }
+
+  /** `wait_for_file` (R-07) of the calling session; not in same-folder mode, nothing is ever locked. */
+  waitForFile(input: WaitForFileToolInput, ctx: { caller: SessionId; signal?: AbortLike }): Promise<WaitForFileToolResult> {
+    if (this.locks === undefined || this.closing) return Promise.resolve(this.closing ? { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } } : { status: 'not-locked' });
+    return this.locks.waitForFile(input, ctx.caller, ctx.signal);
+  }
+
+  /**
+   * A lock escalation (R-07) at the session's root: for the user to know, never something to approve. The
+   * write it is about was already refused, or already happened.
+   */
+  private async lockEscalation(e: LockEscalation): Promise<EscalationId | undefined> {
+    if (this.closing) return undefined;
+    const session = await this.repos.sessions.get(e.sessionId);
+    if (session === undefined || this.closing) return undefined;
+    const root = await this.rootOf(session);
+    const escalation: Escalation = {
+      id: EscalationId.parse(`lock-${this.options.uuid()}`),
+      ...(root.instanceId !== undefined && { instanceId: root.instanceId }),
+      rootSessionId: root.rootSessionId,
+      fromSessionId: e.sessionId,
+      kind: e.kind,
+      title: e.title,
+      detail: e.detail,
+      ref: { kind: 'lock', path: e.path, sessionId: e.sessionId, ...(e.holderSessionId !== undefined && { holderSessionId: e.holderSessionId }) },
+      state: 'open',
+      createdAt: this.options.now(),
+    };
+    await this.repos.escalations.upsert(escalation);
+    this.options.publish({ type: 'escalation.updated', escalation });
+    return escalation.id;
   }
 
   /** The workspace watch failed or cannot run: everything in it counts as written (fail closed). */
@@ -758,6 +822,8 @@ export class SessionService {
     if (ref === undefined || !this.runtimes.isOpen(ref)) return ok(command.requestId);
     try {
       await this.runtimes.adapters[session.requestedModel.runtime].interrupt(ref);
+      // Stopped by the user: its locks go even if background work goes on (R-07).
+      this.locks?.stopped(session.id);
       return ok(command.requestId);
     } catch (error) {
       this.log(`interrupting ${session.id} failed (${errorName(error)})`);
@@ -877,6 +943,12 @@ export class SessionService {
       });
       if (answered === 'answered') return ok(requestId);
       return fail(requestId, 'invalid_transition', 'The request is no longer open');
+    }
+    if (escalation.kind === 'lock-timeout' || escalation.kind === 'unlocked-write') {
+      // Only for the user to know (R-07): the write was already refused, or already happened.
+      await this.closeEscalation(escalation, 'resolved', 'user');
+      this.locks?.escalationClosed(escalation.id);
+      return ok(requestId);
     }
     const handled = await this.workflow?.respond(escalation, command);
     if (handled !== undefined) return handled;
@@ -1728,6 +1800,9 @@ export class SessionService {
    */
   private record(event: RuntimeEvent): void {
     if (this.closed) return;
+    // The locks see each event as it arrives, before any await of storing it: a write's end, a turn's end
+    // and an exit change who may write at once (R-07, KNOWLEDGE §5).
+    this.locks?.observe(event);
     if (event.type === 'runtime.exited') {
       this.runtimes.markExited(event.sessionIds);
       // No turn of an exited runtime ends any more; the next handoff waits for a restart instead.
@@ -1958,14 +2033,22 @@ export class SessionService {
     // Only what blocks the session itself counts: a background sub-agent waiting for the user leaves an idle
     // session idle, so a new message still starts a turn (t021-r1-P1-2, R-13).
     const main = runningMainTurn(conversation);
-    const waits = (r: PermissionRequest) =>
-      r.state === 'held' && r.hold?.reason === 'awaiting-user' && (r.nativeTaskId === undefined || (main !== undefined && r.turnId === main.id));
-    if (waits(request)) {
-      await this.updateSession(sessionId, (s) => (s.activity === 'running' || s.activity === 'idle' ? { ...s, activity: 'waiting-user' } : undefined));
+    // A write held for a file lock shows `waiting-lock` the same way (R-07); waiting for the user comes first.
+    const waitsFor = (reason: 'awaiting-user' | 'file-lock') => (r: PermissionRequest) =>
+      r.state === 'held' && r.hold?.reason === reason && (r.nativeTaskId === undefined || (main !== undefined && r.turnId === main.id));
+    const waits = waitsFor('awaiting-user');
+    const waitsLock = waitsFor('file-lock');
+    const others = conversation.permissionRequests.filter((r) => r.id !== request.id);
+    const wanted = waits(request) || others.some(waits) ? 'waiting-user' : waitsLock(request) || others.some(waitsLock) ? 'waiting-lock' : undefined;
+    const activity = (await this.repos.sessions.get(sessionId))?.activity;
+    if (wanted !== undefined) {
+      if (activity === wanted || !(activity === 'running' || activity === 'idle' || activity === 'waiting-user' || activity === 'waiting-lock')) return;
+      await this.updateSession(sessionId, (s) =>
+        s.activity === 'running' || s.activity === 'idle' || s.activity === 'waiting-user' || s.activity === 'waiting-lock' ? { ...s, activity: wanted } : undefined,
+      );
       return;
     }
-    if ((await this.repos.sessions.get(sessionId))?.activity !== 'waiting-user') return;
-    if (conversation.permissionRequests.some(waits)) return;
+    if (activity !== 'waiting-user' && activity !== 'waiting-lock') return;
     await this.setActivity(sessionId, main !== undefined ? 'running' : 'idle');
   }
 
