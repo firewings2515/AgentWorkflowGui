@@ -1,6 +1,7 @@
 import { join } from 'node:path';
-import { app, BrowserWindow, dialog, shell } from 'electron';
+import { app, BrowserWindow, dialog, Menu, nativeTheme, shell } from 'electron';
 import { WindowsProcessHost } from '../../adapters/process';
+import type { Theme } from '../../contracts';
 import { APP_INFO_CHANNEL } from '../preload/channels';
 import { registerAppIpc } from './app-ipc';
 import { type Backend, type DamagedBackend, startBackend } from './backend';
@@ -9,6 +10,7 @@ import { EventBus } from './event-bus';
 import { handleTrusted } from './ipc';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
 import { resolveRealPath } from './real-path';
+import { hiddenMenuTemplate, themeOf, WINDOW_BACKGROUND } from './window-chrome';
 import { createWebPreferences } from './window-options';
 
 const APP_NAME = 'AgentWorkflowGui';
@@ -20,8 +22,16 @@ const isTrustedUrl = createTrustedUrlMatcher({ devUrl, rendererFile });
 let mainWindow: BrowserWindow | null = null;
 let backend: Backend | DamagedBackend | undefined;
 let quitting = false;
+let theme: Theme = 'dark';
 
 const log = (message: string) => console.error(message);
+
+/** The native title bar and the window background follow the app's saved theme (R-15). */
+function applyTheme(next: Theme): void {
+  theme = next;
+  nativeTheme.themeSource = next;
+  if (mainWindow !== null && !mainWindow.isDestroyed()) mainWindow.setBackgroundColor(WINDOW_BACKGROUND[next]);
+}
 
 function getTrustedSender(): TrustedSender | null {
   if (mainWindow === null || mainWindow.isDestroyed()) return null;
@@ -33,8 +43,10 @@ function createWindow(): void {
     width: 1100,
     height: 720,
     title: APP_NAME,
+    backgroundColor: WINDOW_BACKGROUND[theme],
     webPreferences: createWebPreferences(join(__dirname, '../preload/index.js')),
   });
+  win.setMenuBarVisibility(false);
   mainWindow = win;
   win.on('closed', () => {
     if (mainWindow === win) mainWindow = null;
@@ -95,7 +107,13 @@ app.setName(APP_NAME);
 
 void app.whenReady().then(async () => {
   handleTrusted(APP_INFO_CHANNEL, getTrustedSender, () => ({ name: APP_NAME, version: app.getVersion() }));
+  Menu.setApplicationMenu(Menu.buildFromTemplate(hiddenMenuTemplate(devUrl !== undefined)));
+  applyTheme(theme);
   const bus = new EventBus();
+  bus.subscribe((envelope) => {
+    const next = themeOf(envelope);
+    if (next !== undefined) applyTheme(next);
+  });
   const dbPath = join(app.getPath('userData'), 'awg.sqlite');
   backend = await startBackend({
     dbPath,
@@ -112,6 +130,10 @@ void app.whenReady().then(async () => {
     getEventTarget: () => (mainWindow === null || mainWindow.isDestroyed() ? null : mainWindow.webContents),
     isTrustedUrl,
   });
+  if (backend.status === 'ready') {
+    const saved = await Promise.resolve(backend.facade.snapshot()).catch(() => undefined);
+    if (saved !== undefined) applyTheme(saved.preferences.theme);
+  }
   createWindow();
   if (backend.status === 'damaged') void showDamaged(backend);
   app.on('activate', () => {
