@@ -1,7 +1,7 @@
 // T023 in core: outcomes that stay unknown (CR-2), cancels in every state, failures, restarts between any two
 // steps, and the MCP token. Fake adapters and memory ports.
 import { describe, expect, it } from 'vitest';
-import { EscalationId, MessageId, TransferId, TurnId } from '../../../contracts';
+import { EscalationId, MessageId, type SessionId, TransferId, TurnId } from '../../../contracts';
 import type { RuntimeAdapter } from '../../ports';
 import { FRAME_SECTIONS } from '../frame';
 import { noteOperationOf, payloadOperationOf, targetSessionOf } from '../ids';
@@ -645,6 +645,61 @@ export const lifecycleCases = (backend: string, make: () => Promise<World>) =>
         expect(p.state).toBe('awaiting-confirmation');
         for (const n of [1, 2, 3]) expect(p.content.note).toContain(`late reply ${String(n)}`);
         expect(await confirm(w, T)).toMatchObject({ ok: true });
+      });
+    });
+    describe('review r3 regressions', () => {
+      /** A message of the source's turn that already ended, as a runtime reports one late. */
+      const lateOf = async (w: World, s: SessionId, n: number) => {
+        const turnId = (await w.repositories.conversations.get(s)).turns.at(-1)!.id;
+        return {
+          type: 'message.completed' as const,
+          message: { id: MessageId.parse(`late-${String(n)}`), sessionId: s, turnId, role: 'assistant' as const, origin: { kind: 'agent' as const }, text: `late reply ${String(n)}`, attachments: [], createdAt: new Date().toISOString() },
+        };
+      };
+
+      it('r3-P1 a late message queued right after the second payload gate: the claim counts it, cancelled, no attempt', async () => {
+        const w = await make();
+        // 1. The source, and a proposal awaiting confirmation.
+        const s = await ready(w);
+        // 2. After the second payload gate, a late message of the ended turn is queued; the gate answers at once.
+        const lateMessage = await lateOf(w, s, 1);
+        const gate = w.transfers.mayDispatch.bind(w.transfers);
+        let calls = 0;
+        w.transfers.mayDispatch = async (record) => {
+          const allowed = await gate(record);
+          if (record.operationId === payloadOp && ++calls === 2) void Promise.resolve().then(() => w.claude.emit(lateMessage));
+          return allowed;
+        };
+        // 3. Confirm.
+        expect(await confirm(w, T)).toMatchObject({ ok: false, code: 'stale_revision' });
+        expect(await proposal(w, T)).toMatchObject({ state: 'cancelled', delivery: { state: 'pending', attempts: [] } });
+        expect(delivered([w])).toHaveLength(0);
+        expect((await w.repositories.conversations.get(s)).messages.some((m) => m.text === 'late reply 1')).toBe(true);
+      });
+
+      it('r3-P2 a burst of 100 messages while the proposals are listed: listed twice, the last change still looked at', async () => {
+        const w = await make();
+        const s = await ready(w);
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => (release = resolve));
+        let lists = 0;
+        const list = w.repositories.transfers.list.bind(w.repositories.transfers);
+        // The first listing is held until all 100 messages were stored.
+        (w.repositories.transfers as { list: typeof list }).list = async () => {
+          lists += 1;
+          const all = await list();
+          if (lists === 1) await released;
+          return all;
+        };
+        for (let n = 1; n <= 100; n++) w.claude.emit(await lateOf(w, s, n));
+        await settle();
+        expect(lists).toBe(1);
+        release();
+        await settle();
+        // One pass under way, one more for everything that came during it.
+        expect(lists).toBe(2);
+        expect((await proposal(w, T)).state).toBe('stale');
+        expect((await w.repositories.conversations.get(s)).messages.filter((m) => m.text.startsWith('late reply '))).toHaveLength(100);
       });
     });
   });

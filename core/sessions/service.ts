@@ -401,12 +401,23 @@ export class SessionService {
       // The last run's processes are gone (its Job ended them, D-03), so nothing of it is still running:
       // turns, items and sub-agents it left open were cut off by its exit (T021: a GUI killed mid-turn).
       const at = this.options.now();
-      for (const turn of conversation.turns) if (turn.state === 'running') await repositories.conversations.upsertTurn({ ...turn, state: 'interrupted', endedAt: at });
+      for (const turn of conversation.turns)
+        if (turn.state === 'running') {
+          this.contentWrite(session.id);
+          await repositories.conversations.upsertTurn({ ...turn, state: 'interrupted', endedAt: at });
+        }
       for (const item of conversation.items) {
         const ended = endedByExit(item, at);
-        if (ended !== undefined) await repositories.conversations.upsertItem(ended);
+        if (ended !== undefined) {
+          this.contentWrite(session.id);
+          await repositories.conversations.upsertItem(ended);
+        }
       }
-      for (const task of conversation.nativeTasks) if (task.state === 'running') await repositories.conversations.upsertNativeTask({ ...task, state: 'stopped', endedAt: at });
+      for (const task of conversation.nativeTasks)
+        if (task.state === 'running') {
+          this.contentWrite(session.id);
+          await repositories.conversations.upsertNativeTask({ ...task, state: 'stopped', endedAt: at });
+        }
       for (const request of conversation.permissionRequests) {
         if ((request.kind === 'command' || request.kind === 'fileChange') && request.decision?.outcome === 'approve')
           this.written.add(session.id, request.paths, request.cwd ?? session.cwd);
@@ -1735,6 +1746,7 @@ export class SessionService {
           const stored = (await conversations.get(turn.sessionId)).turns.find((t) => t.id === turn.id);
           if (stored !== undefined && stored.state !== 'running') return;
         }
+        this.contentWrite(turn.sessionId);
         await conversations.upsertTurn(turn);
         this.contentWritten(turn.sessionId);
         if (turn.nativeTaskId === undefined) this.followHandoffTurn(turn);
@@ -1750,11 +1762,13 @@ export class SessionService {
         // The user's own message was stored by session.send under the renderer's ID; its echo is not kept.
         // A native sub-agent's prompt is a user message too, and is kept (R-13).
         if (this.isEcho(event.message)) return;
+        this.contentWrite(event.message.sessionId);
         await conversations.appendMessage(event.message);
         this.contentWritten(event.message.sessionId);
         break;
       case 'item.updated': {
         const { item } = event;
+        this.contentWrite(item.sessionId);
         await conversations.upsertItem(item);
         this.contentWritten(item.sessionId);
         if (item.kind === 'fileChange' && item.state !== 'declined') {
@@ -1773,6 +1787,7 @@ export class SessionService {
         await this.followHold(event.request);
         break;
       case 'nativeTask.updated':
+        this.contentWrite(event.task.sessionId);
         await conversations.upsertNativeTask(event.task);
         this.contentWritten(event.task.sessionId);
         break;
@@ -1812,11 +1827,17 @@ export class SessionService {
   }
 
   /**
-   * A write to a session's conversation committed (T023 r2): counted at once, then the transfer service is
-   * told, outside this queue, as the workflow engine is of a turn end.
+   * Counts a write to a session's conversation (T023 r3-P1). Called right before the write's call, with no
+   * await between: both repositories commit inside that call, so once a write is stored it is counted, and a
+   * claim can never see the new content with the old count. A write that then fails counts once too often,
+   * which at most makes a proposal stale; it is never counted too few times.
    */
-  private contentWritten(sessionId: SessionId): void {
+  private contentWrite(sessionId: SessionId): void {
     this.contentWrites.set(sessionId, (this.contentWrites.get(sessionId) ?? 0) + 1);
+  }
+
+  /** A write to a session's conversation committed (T023 r2): the transfer service is told, outside this queue. */
+  private contentWritten(sessionId: SessionId): void {
     const hooks = this.transfer;
     if (hooks !== undefined) void Promise.resolve().then(() => hooks.contentChanged(sessionId));
   }
@@ -1884,6 +1905,7 @@ export class SessionService {
     const before = (await this.repos.conversations.get(sessionId)).messages.find((m) => m.id === id);
     if (before !== undefined) return same(before) ? 'written' : 'taken';
     const message: Message = { id, sessionId, role: 'user', origin: { kind: 'user' }, text, attachments: [], createdAt };
+    this.contentWrite(sessionId);
     await this.repos.conversations.appendMessage(message);
     this.contentWritten(sessionId);
     const after = (await this.repos.conversations.get(sessionId)).messages.find((m) => m.id === id);

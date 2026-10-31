@@ -76,8 +76,12 @@ export class TransferService implements TransferHooks {
    * count when the gate began checking it. The claim goes only while the count is still that one.
    */
   private readonly approvals = new Map<string, { sourceSessionId: LogicalSession['id']; writes: number }>();
-  /** Sources whose content change is queued to be looked at, so a burst of writes is looked at once (r2-P1-2). */
-  private readonly changed = new Set<LogicalSession['id']>();
+  /**
+   * Sources whose changes are being looked at now, and those that changed again meanwhile (r3-P2): a burst of
+   * writes is looked at once more after the pass under way, never once per write, and never not at all.
+   */
+  private readonly looking = new Set<LogicalSession['id']>();
+  private readonly changedAgain = new Set<LogicalSession['id']>();
 
   constructor(private readonly options: TransferServiceOptions) {}
 
@@ -536,26 +540,38 @@ export class TransferService implements TransferHooks {
    * The source's content changed (r2-P1-2): a turn, a message (a late one included) or an item was stored.
    * A draft reads it again, so a draft whose source stopped changing always finishes; a proposal the user is
    * looking at turns stale; a confirmed one whose payload has not left is cancelled. Writes that come while
-   * this is queued for the source are looked at together.
+   * a pass for the source runs are looked at together in one more pass right after it.
    */
   contentChanged(sessionId: LogicalSession['id']): void {
-    if (this.changed.has(sessionId)) return;
-    this.changed.add(sessionId);
+    if (this.looking.has(sessionId)) {
+      this.changedAgain.add(sessionId);
+      return;
+    }
+    this.looking.add(sessionId);
     void (async () => {
-      // From here on, a write is a new change (looked at again), not part of this one.
-      this.changed.delete(sessionId);
-      const waiting = (await this.repos.transfers.list()).filter((p) => p.sourceSessionId === sessionId && ['draft', 'awaiting-confirmation', 'approved'].includes(p.state));
-      for (const { id } of waiting) {
-        await this.serial(id, async () => {
-          const p = await this.repos.transfers.get(id);
-          if (p?.state === 'draft') await this.advance(p);
-          // The source went on after the proposal was made: it must be prepared again (CR-5).
-          else if (p?.state === 'awaiting-confirmation' && (await this.sourceChanged(p))) await this.markStale(p);
-          // Confirmed, but its payload has not left yet (e.g. waiting for the new session): cancelled (r1-P1-2).
-          else if (p?.state === 'approved' && (await this.superseded(p, await this.store.get(p.operationId)))) await this.supersede(p);
-        });
+      try {
+        do {
+          this.changedAgain.delete(sessionId);
+          await this.lookAtChange(sessionId);
+        } while (this.changedAgain.has(sessionId));
+      } finally {
+        this.looking.delete(sessionId);
       }
     })().catch((error: unknown) => this.log(`following a change of ${sessionId} failed (${errorName(error)})`));
+  }
+
+  private async lookAtChange(sessionId: LogicalSession['id']): Promise<void> {
+    const waiting = (await this.repos.transfers.list()).filter((p) => p.sourceSessionId === sessionId && ['draft', 'awaiting-confirmation', 'approved'].includes(p.state));
+    for (const { id } of waiting) {
+      await this.serial(id, async () => {
+        const p = await this.repos.transfers.get(id);
+        if (p?.state === 'draft') await this.advance(p);
+        // The source went on after the proposal was made: it must be prepared again (CR-5).
+        else if (p?.state === 'awaiting-confirmation' && (await this.sourceChanged(p))) await this.markStale(p);
+        // Confirmed, but its payload has not left yet (e.g. waiting for the new session): cancelled (r1-P1-2).
+        else if (p?.state === 'approved' && (await this.superseded(p, await this.store.get(p.operationId)))) await this.supersede(p);
+      });
+    }
   }
 
   /**
