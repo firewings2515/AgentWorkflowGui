@@ -68,6 +68,9 @@ export class SessionRuntimes {
   /** Refs whose session is open in its adapter now. */
   private readonly open = new Set<string>();
   private readonly releasing: Releasing = new Map();
+  /** Resumes under way, by GUI session, and graceful closes under way, by native ref (T036 single-flight). */
+  private readonly resuming = new Map<SessionId, Promise<NativeSessionInfo>>();
+  private readonly closingRefs = new Map<string, Promise<{ forced: boolean }>>();
   private readonly started = new WeakSet<RuntimeAdapter>();
   private readonly subscribed = new WeakSet<RuntimeAdapter>();
   private readonly views: Record<Runtime, RuntimeAdapter>;
@@ -138,9 +141,21 @@ export class SessionRuntimes {
     return this.openWith(runtime, options.sessionId, (adapter, mcp) => adapter.startSession({ ...options, mcp }));
   }
 
+  /**
+   * One resume per session at a time (T036): a second caller while one runs gets that one's result, so two
+   * deliveries racing to a closed session never start its runtime twice.
+   */
   resumeSession(runtime: Runtime, options: ResumeSessionOptions): Promise<NativeSessionInfo> {
+    const underway = this.resuming.get(options.sessionId);
+    if (underway !== undefined) return underway;
     this.refs.set(options.nativeSessionRef, options.sessionId);
-    return this.openWith(runtime, options.sessionId, (adapter, mcp) => adapter.resumeSession({ ...options, mcp }));
+    const run = this.openWith(runtime, options.sessionId, (adapter, mcp) => adapter.resumeSession({ ...options, mcp }));
+    this.resuming.set(options.sessionId, run);
+    const done = () => {
+      if (this.resuming.get(options.sessionId) === run) this.resuming.delete(options.sessionId);
+    };
+    void run.then(done, done);
+    return run;
   }
 
   /**
@@ -182,17 +197,30 @@ export class SessionRuntimes {
     return run;
   }
 
-  /** Releases one session (R-14: the adapter interrupts before closing). Nothing to do when it is not open. */
-  async closeSession(nativeSessionRef: string, timeoutMs?: number): Promise<{ forced: boolean }> {
+  /**
+   * Releases one session (R-14: the adapter interrupts before closing). Nothing to do when it is not open. One
+   * close per ref at a time (T036): the task pipeline and the idle supervisor closing together close it once.
+   */
+  closeSession(nativeSessionRef: string, timeoutMs?: number): Promise<{ forced: boolean }> {
+    const underway = this.closingRefs.get(nativeSessionRef);
+    if (underway !== undefined) return underway;
     const sessionId = this.refs.get(nativeSessionRef);
     const entry = sessionId === undefined ? undefined : this.entries.get(sessionId);
-    if (sessionId === undefined || entry === undefined || !this.open.has(nativeSessionRef)) return { forced: false };
-    try {
-      return await (await entry.adapter).closeSession(nativeSessionRef, timeoutMs);
-    } finally {
-      // Released once: `forceRelease` may have begun it while the adapter's close hung (T032).
-      await this.releaseOpen(nativeSessionRef, sessionId);
-    }
+    if (sessionId === undefined || entry === undefined || !this.open.has(nativeSessionRef)) return Promise.resolve({ forced: false });
+    const run = (async () => {
+      try {
+        return await (await entry.adapter).closeSession(nativeSessionRef, timeoutMs);
+      } finally {
+        // Released once: `forceRelease` may have begun it while the adapter's close hung (T032).
+        await this.releaseOpen(nativeSessionRef, sessionId);
+      }
+    })();
+    this.closingRefs.set(nativeSessionRef, run);
+    const done = () => {
+      if (this.closingRefs.get(nativeSessionRef) === run) this.closingRefs.delete(nativeSessionRef);
+    };
+    void run.then(done, done);
+    return run;
   }
 
   /**

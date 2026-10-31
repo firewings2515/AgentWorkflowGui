@@ -61,6 +61,7 @@ import type {
   SessionSettings,
   StoredDelivery,
 } from '../ports';
+import type { IdleFacts } from '../supervisor/idle';
 import { PermissionGate } from './permissions';
 import { SessionRuntimes } from './runtimes';
 import { WrittenPaths, type WrittenPathsOptions } from './written-paths';
@@ -137,6 +138,26 @@ export interface TransferHooks {
   /** The user decided on an unknown delivery with `delivery.resolve` (already recorded). */
   deliveryResolved(operationId: OperationId, decision: 'wait' | 'cancel' | 'retry'): Promise<void>;
 }
+
+/**
+ * What the idle supervisor (T036, core/supervisor) is told by this service, attached by the main process. It
+ * decides when an idle runtime is closed; this service closes it and resumes it on the next delivery.
+ */
+export interface SupervisorHooks {
+  /**
+   * The session is in use: a delivery is about to be claimed for it, or one of its runtime events came. Returns
+   * the release of its runtime under way, to wait for before resuming it; undefined when there is none.
+   */
+  touch(sessionId: SessionId): Promise<void> | undefined;
+  /** A session's runtime came up (start or resume). */
+  opened(sessionId: SessionId): void;
+}
+
+/** Runtime events that show a session in use (T036); periodic ones (usage, model) and its exit do not. */
+const USE_EVENTS = new Set<RuntimeEvent['type']>(['session.activity', 'turn.updated', 'message.delta', 'message.completed', 'item.updated', 'item.outputDelta', 'permission.updated', 'nativeTask.updated']);
+
+/** Why a session whose folder is gone is not resumed (R-06, SP-07 G5: never in another folder). */
+const folderGone = (cwd: string) => `This session's folder ${cwd} no longer exists, so it cannot be resumed there (nor in any other folder); its conversation can only be viewed.`;
 
 /** How a workflow payload enters its target: a formal handoff waits for the target's turn to end (SP-05). */
 export type WorkflowEntry = 'after-turn' | 'insert-if-busy';
@@ -319,6 +340,9 @@ export class SessionService {
   private closed = false;
   private workflow: WorkflowHooks | undefined;
   private transfer: TransferHooks | undefined;
+  private supervisor: SupervisorHooks | undefined;
+  /** Why the last resume of a session was refused (its folder is gone, R-06), until one succeeds (T036). */
+  private readonly resumeRefused = new Map<SessionId, string>();
   /**
    * Turns a dispatch's ack named that were not seen to end yet, per session (T023 r1-P1-4): the session is
    * not at its turn boundary while one is here, even before the runtime reported it running. Only an end of
@@ -375,6 +399,7 @@ export class SessionService {
         // The locks need its folder and mode before its first write or its folder's first change (R-07).
         if (this.locks !== undefined) void this.repos.sessions.get(sessionId).then((s) => s && this.locks?.track(s)).catch(() => undefined);
         options.onSessionOpened?.(sessionId, cwd);
+        this.supervisor?.opened(sessionId);
       },
       onClosed: (sessionId) => {
         this.locks?.closed(sessionId);
@@ -418,6 +443,11 @@ export class SessionService {
   /** The transfer service (T023); without one, `transfer.*` answers `unsupported`. */
   attachTransfer(hooks: TransferHooks): void {
     this.transfer = hooks;
+  }
+
+  /** The idle supervisor (T036); without one, runtimes stay open until exit or a task's cleanup. */
+  attachSupervisor(hooks: SupervisorHooks): void {
+    this.supervisor = hooks;
   }
 
   // ---- lifecycle ------------------------------------------------------------------------------------
@@ -772,6 +802,9 @@ export class SessionService {
       const refused = await this.workflow?.sessionAccess?.(sessionId);
       if (refused !== undefined) return fail(requestId, 'invalid_transition', refused);
     }
+    // A closed session is resumed only in its own folder (R-06, T036): when that is gone, nothing is saved or sent.
+    const closed = await this.closedRefusal(session);
+    if (closed !== undefined) return fail(requestId, 'invalid_transition', closed);
     return this.sendUserMessage(requestId, session, messageId, text);
   }
 
@@ -826,8 +859,12 @@ export class SessionService {
         return fail(requestId, 'unknown_outcome', 'It is not known whether the message reached the session; it is not sent again', {
           mayHaveSideEffects: true,
         });
-      default:
+      default: {
+        // Its folder went while the message was on its way (T036): said plainly, never resumed elsewhere.
+        const refused = this.resumeRefused.get(sessionId);
+        if (refused !== undefined) return fail(requestId, 'invalid_transition', refused);
         return fail(requestId, 'runtime_unavailable', 'The message is saved but could not be handed to the session yet', { retryable: true });
+      }
     }
   }
 
@@ -1180,6 +1217,9 @@ export class SessionService {
     let record = await this.store.get(p.operationId);
     if (record === undefined) {
       if (this.closing) return shuttingDown;
+      // A closed target whose folder is gone is not resumed anywhere (R-06, T036): refused before it is accepted.
+      const closed = await this.closedRefusal(target);
+      if (closed !== undefined) return { status: 'rejected', rejection: { reason: 'unknown-target', detail: 'the target session is closed and its folder no longer exists' } };
       const provisioned = await this.ensureProvisioned(target);
       if (this.closing) return shuttingDown;
       const provision = await this.store.get(provisionOp(target.id));
@@ -1473,6 +1513,16 @@ export class SessionService {
     if (ref === undefined) return;
     // Not open: closed already, or a release under way (another closer), which is waited for (r2 P1-3).
     if (!this.runtimes.isOpen(ref)) return this.runtimes.forceRelease(ref);
+    await this.endRuntime(ref, timeoutMs);
+    // The record follows in the session's queue; the runtime is already gone.
+    if (!this.closed) void this.serial(sessionKey(sessionId), () => this.setActivity(sessionId, 'closed')).catch(() => undefined);
+  }
+
+  /**
+   * The graceful close of an open runtime (R-14) with `timeoutMs` counted from this call; past it the session is
+   * released by force (`onSessionClosed` ends its Job). Returns once it is released and `onSessionClosed` ran.
+   */
+  private async endRuntime(ref: string, timeoutMs: number): Promise<void> {
     const graceful = this.runtimes.closeSession(ref, timeoutMs).then(
       () => true,
       () => true,
@@ -1481,8 +1531,62 @@ export class SessionService {
     // Past the deadline: released by force, or the release the graceful close began is waited for, whichever it is;
     // either way this returns once `onSessionClosed` has finished (its Job ended, r2 P1-3).
     if (!ended || this.runtimes.isOpen(ref)) await this.runtimes.forceRelease(ref);
-    // The record follows in the session's queue; the runtime is already gone.
-    if (!this.closed) void this.serial(sessionKey(sessionId), () => this.setActivity(sessionId, 'closed')).catch(() => undefined);
+  }
+
+  // ---- idle supervisor (T036) -----------------------------------------------------------------------
+
+  /** Sessions whose runtime is open now. */
+  openSessions(): { sessionId: SessionId; nativeSessionRef: string }[] {
+    return this.runtimes.openSessions();
+  }
+
+  /**
+   * What says whether a session is idle (core/supervisor/idle.ts), as stored and as this process follows it: its
+   * activity and conversation, acked and handoff turns, held requests, deliveries to it nobody gave up on, and its
+   * file locks. Undefined when the session does not exist.
+   */
+  async idleFacts(sessionId: SessionId): Promise<Omit<IdleFacts, 'ownedCommands'> | undefined> {
+    const session = await this.repos.sessions.get(sessionId);
+    if (session === undefined) return undefined;
+    const conversation = await this.repos.conversations.get(sessionId);
+    const deliveries = { pending: 0, unknown: 0 };
+    for (const state of ['pending', 'unknown'] as const)
+      for (const record of await this.store.listByState(state)) {
+        if (record.kind === 'provision' || record.target.sessionId !== sessionId || record.outcome !== undefined) continue;
+        // An unknown delivery the user cancelled waits for nothing any more (CR2 §2).
+        if (state === 'unknown' && record.delivery.attempts.at(-1)?.resolution?.decision === 'cancel') continue;
+        deliveries[state]++;
+      }
+    const locks = (this.locks?.list() ?? []).filter((l) => l.holderSessionId === sessionId || l.waiters.some((w) => w.sessionId === sessionId)).length;
+    return {
+      activity: session.activity,
+      turns: conversation.turns,
+      items: conversation.items,
+      nativeTasks: conversation.nativeTasks,
+      ackedTurns: this.ackedTurns.get(sessionId)?.size ?? 0,
+      handoffTurn: this.handoffTurns.has(sessionId),
+      heldRequests: this.gate.heldFor(sessionId).length,
+      deliveries,
+      locks,
+    };
+  }
+
+  /**
+   * The supervisor's close of an idle runtime, in the session's queue (in order with its commands, deliveries and
+   * events): `decide()` last, and when it says yes the graceful close starts in that same step (R-14; past
+   * `timeoutMs` its Job is ended) and the session is marked closed before this returns, so a delivery that waited
+   * for the release resumes it afterwards. The session stays as it was otherwise (C-07: it resumes on demand).
+   */
+  closeIdle(sessionId: SessionId, decide: () => Promise<boolean>, timeoutMs: number): Promise<'closed' | 'kept'> {
+    return this.serial(sessionKey(sessionId), async () => {
+      if (this.closing) return 'kept';
+      const ref = await this.binding(sessionId);
+      if (ref === undefined || this.closing || !this.runtimes.isOpen(ref)) return 'kept';
+      if (!(await decide())) return 'kept';
+      await this.endRuntime(ref, timeoutMs);
+      if (!this.closed) await this.setActivity(sessionId, 'closed');
+      return 'closed';
+    });
   }
 
   /** Whether the session's own turn runs, by the stored turns (an old event cannot undo them): its turn boundary. */
@@ -1699,19 +1803,64 @@ export class SessionService {
     if (record.kind === 'transfer' && this.transfer !== undefined && !(await this.transfer.mayDispatch(record))) throw new Error('the transfer no longer sends this');
   }
 
+  /**
+   * Resumes a closed target in its original folder (R-06), with the model it has now (R-12). Every delivery passes
+   * here, so it is where the supervisor learns the session is in use (T036): a release of its runtime under way
+   * ends first. A folder that is gone, or a task's session kept read only (T032), is refused before the runtime
+   * is called; the delivery stays pending, never claimed.
+   */
   private async resumeTarget(record: PayloadDelivery): Promise<void> {
     const ref = record.target.nativeSessionRef;
     const sessionId = record.target.sessionId;
-    if (ref === undefined || sessionId === undefined || this.runtimes.isOpen(ref)) return;
+    if (ref === undefined || sessionId === undefined) return;
+    const release = this.supervisor?.touch(sessionId);
+    if (release !== undefined) await release;
+    if (this.runtimes.isOpen(ref)) return;
     const session = await this.repos.sessions.get(sessionId);
+    const cwd = record.context.cwd;
+    // Only this attempt's refusal is told to the sender.
+    this.resumeRefused.delete(sessionId);
+    const refused = await this.resumeRefusal(session, cwd);
+    if (refused !== undefined) {
+      this.resumeRefused.set(sessionId, refused);
+      this.log(`resuming ${sessionId} was refused (its folder is gone or kept read only)`);
+      throw new Error(refused);
+    }
     const settings = session === undefined ? record.context.session : await this.settingsOf(session);
-    await this.runtimes.resumeSession(record.context.runtime, {
-      sessionId,
-      nativeSessionRef: ref,
-      cwd: record.context.cwd,
-      ...settings,
-    });
+    try {
+      await this.runtimes.resumeSession(record.context.runtime, {
+        sessionId,
+        nativeSessionRef: ref,
+        cwd,
+        ...settings,
+      });
+    } catch (error) {
+      // Claude reports a folder removed meanwhile as a binary that cannot start (SP-07 G5): said plainly instead.
+      if (this.options.resolveRealPath(cwd) === null) {
+        this.resumeRefused.set(sessionId, folderGone(cwd));
+        // eslint-disable-next-line preserve-caught-error
+        throw new Error(folderGone(cwd));
+      }
+      throw error;
+    }
+    this.resumeRefused.delete(sessionId);
     await this.setActivity(sessionId, 'idle');
+  }
+
+  /** Why a closed session cannot be resumed in `cwd`, or undefined (R-06, T032 read-only sessions, T036). */
+  private async resumeRefusal(session: LogicalSession | undefined, cwd: string): Promise<string | undefined> {
+    if (session?.kind === 'workflow') {
+      const refused = await this.workflow?.sessionAccess?.(session.id);
+      if (refused !== undefined) return refused;
+    }
+    return this.options.resolveRealPath(cwd) === null ? folderGone(cwd) : undefined;
+  }
+
+  /** Why a send to this session would not reach it: it is closed and cannot be resumed (T036); undefined when it can. */
+  private async closedRefusal(session: LogicalSession): Promise<string | undefined> {
+    const ref = await this.binding(session.id);
+    if (ref === undefined || this.runtimes.isOpen(ref)) return undefined;
+    return this.resumeRefusal(session, session.cwd);
   }
 
   /** Dispatches a delivery that is still pending; returns its state afterwards. */
@@ -1850,6 +1999,11 @@ export class SessionService {
     // The locks see each event as it arrives, before any await of storing it: a write's end, a turn's end
     // and an exit change who may write at once (R-07, KNOWLEDGE §5).
     this.locks?.observe(event);
+    // The supervisor too, synchronously: an event while it checks a session for idleness cancels that close (T036).
+    if (USE_EVENTS.has(event.type)) {
+      const used = sessionOf(event);
+      if (used !== undefined) void this.supervisor?.touch(used);
+    }
     if (event.type === 'runtime.exited') {
       this.runtimes.markExited(event.sessionIds);
       // No turn of an exited runtime ends any more; the next handoff waits for a restart instead.

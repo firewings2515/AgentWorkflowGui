@@ -12,6 +12,7 @@ import { handleFolderRequest } from './folders';
 import { handleTrusted } from './ipc';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
 import { resolveRealPath } from './real-path';
+import { supervisorSettings } from './supervisor-settings';
 import { hiddenMenuTemplate, themeOf, WINDOW_BACKGROUND } from './window-chrome';
 import { createWebPreferences } from './window-options';
 
@@ -123,6 +124,7 @@ void app.whenReady().then(async () => {
     createHost: (repository) => new WindowsProcessHost({ repository, log: (_level, message) => log(`[process] ${message}`) }),
     codexExecutable: resolveCodexExecutable(),
     resolveRealPath,
+    supervisor: supervisorSettings(process.env),
     log,
   });
   registerAppIpc({

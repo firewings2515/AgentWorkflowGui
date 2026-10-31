@@ -10,6 +10,7 @@ export {
   type TransferHooks,
   type WorkflowEntry,
   type WorkflowHooks,
+  type SupervisorHooks,
   type WorkflowSession,
 } from './service';
 export { absolutePath, isAbsolutePath, WrittenPaths, type WrittenPathsOptions } from './written-paths';
