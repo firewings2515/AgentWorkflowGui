@@ -141,6 +141,8 @@ interface PendingHandoff {
   ctx: HandoffCallContext;
   /** The handoff the caller was working on when it called: its round is fixed then, not at the approval (r1-P1-1). */
   lineageId: Handoff['id'] | undefined;
+  /** The caller's own turn the call came in with: its fan-out, if still open at the approval, takes it (r3-P1). */
+  turnId: string | undefined;
 }
 
 /** What a handoff call carries from where it came in. */
@@ -148,7 +150,7 @@ interface CallFacts {
   /** The caller's own turn running when the call came in (read before anything else waited, r1-P1-2). */
   turnAtCall?: Promise<string | undefined>;
   /** Set for a handoff the user confirmed: the lineage its call had. */
-  confirmed?: { lineageId: Handoff['id'] | undefined };
+  confirmed?: { lineageId: Handoff['id'] | undefined; turnId: string | undefined };
 }
 
 /** Everything a handoff call resolves to before anything is written. */
@@ -396,8 +398,11 @@ export class WorkflowEngine implements WorkflowHooks {
     const arrival = waitsForAll(to);
     // The fan-out of the turn the call came in with: a call of the next turn never joins a group still
     // waiting for calls of the previous one (r2-P1-1). A confirmed handoff is a group of its own.
-    const turnId = call.turnAtCall === undefined ? undefined : await call.turnAtCall;
-    const groupKey = groupKeyOf(instance.id, taskId, caller.id, call.confirmed !== undefined ? `confirmed:${ctx.operationId}` : (turnId ?? 'no-turn'));
+    // A confirmed handoff belongs to the fan-out of the turn its call came in with while that is still open
+    // (the turn runs on, r3-P1); once it closed, the handoff is a group of its own.
+    const turnId = call.confirmed !== undefined ? call.confirmed.turnId : call.turnAtCall === undefined ? undefined : await call.turnAtCall;
+    const ownKey = groupKeyOf(instance.id, taskId, caller.id, turnId ?? 'no-turn');
+    const groupKey = call.confirmed === undefined || (turnId !== undefined && this.groups.has(ownKey)) ? ownKey : groupKeyOf(instance.id, taskId, caller.id, `confirmed:${ctx.operationId}`);
     const fresh = nextRound(handoffs, instance.rounds, taskId, this.openRounds(instance.id, taskId));
     // The work the caller was on when it called; a confirmed handoff keeps the one its call had (r1-P1-1).
     const lineage = call.confirmed !== undefined ? handoffs.find((h) => h.id === call.confirmed?.lineageId) : lineageOf(handoffs, taskId, from.id);
@@ -411,7 +416,7 @@ export class WorkflowEngine implements WorkflowHooks {
     const over = first ? current.find((c) => c.limit !== undefined && c.count >= c.limit) : undefined;
     if (over !== undefined) return this.limitReached(instance, taskId, caller, to, over.key, over.what, over.limit ?? 0);
 
-    if (planned.requiresUserConfirmation && !confirmed) return this.askConfirmation(instance, caller, planned, input, ctx, lineage?.id);
+    if (planned.requiresUserConfirmation && !confirmed) return this.askConfirmation(instance, caller, planned, input, ctx, lineage?.id, turnId);
 
     const targetSessionId = await this.nodeSession(instance, to, taskId, caller);
     if (targetSessionId === undefined) return rejected('unknown-target', 'the target session cannot be created');
@@ -747,7 +752,7 @@ export class WorkflowEngine implements WorkflowHooks {
       if (decision === 'approve') {
         const caller = await this.repos.sessions.get(pending.caller);
         if (caller?.kind === 'workflow') {
-          const result = await this.serial(`instance:${caller.workflow.instanceId}`, () => this.handoffNow(caller, pending.input, pending.ctx, { confirmed: { lineageId: pending.lineageId } }));
+          const result = await this.serial(`instance:${caller.workflow.instanceId}`, () => this.handoffNow(caller, pending.input, pending.ctx, { confirmed: { lineageId: pending.lineageId, turnId: pending.turnId } }));
           // Its own group (the caller's turn is long over): closed once nothing else of the caller is on its way.
           await this.afterTurn(caller.id);
           if (result.status !== 'accepted' && result.status !== 'duplicate') this.log(`a confirmed handoff of ${caller.id} ended ${result.status}`);
@@ -951,7 +956,7 @@ export class WorkflowEngine implements WorkflowHooks {
     return rejected('no-matching-rule', 'no output rule of this node has this ruleId and target');
   }
 
-  private async askConfirmation(instance: WorkflowInstance, caller: WorkflowSession, planned: Planned, input: HandoffToolInput, ctx: HandoffCallContext, lineageId: Handoff['id'] | undefined): Promise<HandoffToolResult> {
+  private async askConfirmation(instance: WorkflowInstance, caller: WorkflowSession, planned: Planned, input: HandoffToolInput, ctx: HandoffCallContext, lineageId: Handoff['id'] | undefined, turnId: string | undefined): Promise<HandoffToolResult> {
     const id = handoffConfirmationId(ctx.operationId);
     const escalation: Escalation = {
       id,
@@ -965,7 +970,7 @@ export class WorkflowEngine implements WorkflowHooks {
       state: 'open',
       createdAt: this.options.now(),
     };
-    this.confirmations.set(id, { caller: caller.id, input, ctx, lineageId });
+    this.confirmations.set(id, { caller: caller.id, input, ctx, lineageId, turnId });
     await this.repos.escalations.upsert(escalation);
     this.options.publish({ type: 'escalation.updated', escalation });
     return { status: 'escalated', escalationId: id, reason: 'needs-confirmation' };

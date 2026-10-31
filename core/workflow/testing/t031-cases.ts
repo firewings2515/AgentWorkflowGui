@@ -49,7 +49,7 @@ const rule = (id: string, nodeId: NodeId) => ({ id, condition: id, payload: '', 
  * Plan (root) fans out to two read-only reviews, Claude and Codex, which both hand to Verdict; Verdict waits
  * for all upstream and reports to root.
  */
-export const fanTemplate = (join: Partial<InputRule> = {}, confirmA = false): WorkflowTemplate => ({
+export const fanTemplate = (join: Partial<InputRule> = {}, confirmA = false, confirmToB = false): WorkflowTemplate => ({
   schemaVersion: CONTRACTS_VERSION,
   id: WORKFLOW,
   revision: 0,
@@ -58,7 +58,7 @@ export const fanTemplate = (join: Partial<InputRule> = {}, confirmA = false): Wo
   reworkLimit: 5,
   isolation: 'same-folder',
   nodes: [
-    node(PLAN, { label: 'Plan', agentId: PLANNER, isRoot: true, outputRules: [rule('to-a', RA), rule('to-b', RB)] }),
+    node(PLAN, { label: 'Plan', agentId: PLANNER, isRoot: true, outputRules: [rule('to-a', RA), { ...rule('to-b', RB), requiresUserConfirmation: confirmToB }] }),
     node(RA, {
       label: 'Review A',
       agentId: REVIEWER,
@@ -532,6 +532,55 @@ export const t031Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       const after = await w.restart();
       await settle();
       expect(received(after, await joinOf(after))).toEqual(['B2', 'A2', 'B1', 'A1']);
+    });
+
+    it('r3-P1 a branch the user confirms while the source turn still runs stays in that fan-out', async () => {
+      const w = await make(fanTemplate({}, false, true));
+      w.holding.add(ROOT);
+      await started(w);
+      await handoff(w, ROOT, { ...toA, content: 'review A please' });
+      const asked = await handoff(w, ROOT, { ...toB, content: 'review B please' });
+      expect(asked).toMatchObject({ status: 'escalated', reason: 'needs-confirmation' });
+      // The user confirms B before root's turn ends: B joins round 1 with A.
+      await w.run({ type: 'escalation.respond', requestId: rid(), escalationId: (asked as { escalationId: Escalation['id'] }).escalationId, decision: 'approve' });
+      await settle();
+      expect((await w.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.fromNodeId === PLAN).map((h) => [h.toNodeId, h.round])).toEqual([
+        [RA, 1],
+        [RB, 1],
+      ]);
+      await handoff(w, await sessionOf(w, RB), { ...verdict, content: 'B: fine' });
+      await settle();
+      const join = await joinOf(w);
+      expect(await roundsOf(w)).toEqual([]);
+      expect(received(w, join)).toEqual([]);
+      await w.finishTurn(ROOT);
+      expect((await roundsOf(w))[0]).toMatchObject({ round: 1, expectedUpstream: [RA, RB], state: 'waiting' });
+      expect(received(w, join)).toEqual([]);
+      await handoff(w, await sessionOf(w, RA), { ...verdict, content: 'A: fine' });
+      await settle();
+      expect(received(w, join)).toEqual(['B: fine', 'A: fine']);
+    });
+
+    it('r3-P1 a branch the user confirms after the source turn ended is a fan-out of its own', async () => {
+      const w = await make(fanTemplate({}, false, true));
+      w.holding.add(ROOT);
+      await started(w);
+      await handoff(w, ROOT, { ...toA, content: 'review A please' });
+      const asked = await handoff(w, ROOT, { ...toB, content: 'review B please' });
+      await w.finishTurn(ROOT);
+      await w.run({ type: 'escalation.respond', requestId: rid(), escalationId: (asked as { escalationId: Escalation['id'] }).escalationId, decision: 'approve' });
+      await settle();
+      expect((await w.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.fromNodeId === PLAN).map((h) => [h.toNodeId, h.round])).toEqual([
+        [RA, 1],
+        [RB, 2],
+      ]);
+      await handoff(w, await sessionOf(w, RA), { ...verdict, content: 'A: fine' });
+      await handoff(w, await sessionOf(w, RB), { ...verdict, content: 'B: fine' });
+      await settle();
+      expect((await roundsOf(w)).map((r) => [r.round, r.expectedUpstream, r.state])).toEqual([
+        [1, [RA], 'ready'],
+        [2, [RB], 'ready'],
+      ]);
     });
 
     it('ordinary handoffs queued for a busy target still go one per turn in acceptance order (the gate change, T031)', async () => {
