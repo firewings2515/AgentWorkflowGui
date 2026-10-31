@@ -64,6 +64,8 @@ export interface PipelineHost {
   wakeTask(instanceId: InstanceId, taskId: TaskId): Promise<void>;
   /** A merge ended (merged or given back): handoffs waiting for a node's slot are tried again (R-06, r1 P1-2). */
   wakeNodes(instanceId: InstanceId): void;
+  /** Root's handoffs held for a decided task list are adopted or cancelled (G-11); in the instance's queue. */
+  settleHeld(instanceId: InstanceId): Promise<void>;
 }
 
 export interface GuiHandoff {
@@ -320,6 +322,18 @@ export class TaskPipeline {
     return { status: 'awaiting-confirmation', taskPlanId: plan.id, escalationId: plan.escalationId ?? taskPlanEscalationId(plan.id) };
   }
 
+  /** The task list awaiting the user's confirmation that `taskId` (`<taskPlanId>:<key>`) belongs to (G-11). */
+  heldPlanOf(instance: WorkflowInstance, taskId: TaskId): TaskPlan | undefined {
+    return instance.taskPlans.find((p) => p.state === 'awaiting-confirmation' && p.items.some((i) => planTaskIdOf(p.id, i.key) === taskId));
+  }
+
+  /** The folder a task's sessions will work in: its worktree's fixed path (worktree runs), else undefined. */
+  async plannedCwd(instance: WorkflowInstance, taskId: TaskId): Promise<string | undefined> {
+    if (!this.worktreeMode(instance)) return undefined;
+    const repo = await this.repoOf(instance);
+    return repo === undefined ? undefined : (await taskWorktreeRef(this.deps.hash, repo, instance.id, taskId)).path;
+  }
+
   /** The plan as created: every item named with its fixed task ID. */
   private createdPlan(plan: TaskPlan, at: Timestamp): TaskPlan {
     const created = plan.items.map((i) => ({ key: i.key, taskId: planTaskIdOf(plan.id, i.key) }));
@@ -387,6 +401,8 @@ export class TaskPipeline {
       const plans = current.taskPlans.map((x) => (x.id === planId ? next : x));
       return { ...current, taskPlans: plans, tasks: approved ? [...current.tasks, ...this.tasksOf(current, next)] : current.tasks };
     });
+    // What root handed off while the list waited: adopted, or cancelled with the list (G-11).
+    await this.deps.host.settleHeld(instanceId);
     if (approved) await this.admitNow(instanceId);
   }
 
@@ -1285,6 +1301,8 @@ export class TaskPipeline {
 
   /** What follows the end of a run, each part best effort (a restart's recover does it again). */
   private async afterEnd(instance: WorkflowInstance): Promise<void> {
+    // Held handoffs of a list never decided end with the run (G-11).
+    await this.deps.host.settleHeld(instance.id);
     for (const handoff of await this.repos.handoffs.listByInstance(instance.id)) {
       if (handoff.delivery.state !== 'pending' || handoff.outcome !== undefined || toMerge(instance, handoff)) continue;
       await this.store.recordOutcome(handoff.operationId, { kind: 'cancelled', detail: `the run was ${instance.state}`, at: this.deps.now() }).catch(() => undefined);
@@ -1514,6 +1532,8 @@ export class TaskPipeline {
           await this.openPlanQuestion(instance, plan);
           await this.carryOutPlan(instance.id, plan.id);
         }
+        // Held handoffs of a list decided before a crash are settled (G-11): never left orphaned.
+        await this.deps.host.settleHeld(instance.id);
       });
       // A handoff to the merge node accepted just before a crash joins the queue now (r1 P1-1).
       await this.deps.host.serial(instance.id, async () => {

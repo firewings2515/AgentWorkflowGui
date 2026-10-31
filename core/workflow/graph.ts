@@ -109,7 +109,7 @@ export const briefing = (instance: WorkflowInstance, node: AgentNode, taskId: Ta
   if (pipelined && node.isRoot && node.outputRules.some((r) => r.target.kind === 'tasks')) {
     lines.push(
       '',
-      'You split the work into tasks with the `create_tasks` tool of the `gui` MCP server: the ruleId of your rule with target {"kind":"tasks"}, and per task a key, a title and the keys of the tasks it depends on. The tool says whether the user confirms the list first. Then hand each task its work with `handoff`, naming its taskId; you may do that at once, also for a task whose dependencies are not merged yet.',
+      'You split the work into tasks with the `create_tasks` tool of the `gui` MCP server: the ruleId of your rule with target {"kind":"tasks"}, and per task a key, a title and the keys of the tasks it depends on. The tool says whether the user confirms the list first. Then hand each task its work with `handoff`, naming its taskId; you may do that at once, also for a task whose dependencies are not merged yet. When the list waits for the user, the result names its taskPlanId and each task\'s ID is `<taskPlanId>:<key>`: hand the tasks off in the same turn with those IDs, and the GUI holds them until the user decides (approved: they start; declined: they are cancelled, and you are not told otherwise, so plan again when the user asks you to).',
       ...(template.isolation === 'worktree'
         ? ['There is no task until you create them: in this run every task gets its own worktree, so first call `create_tasks`, then hand off each task with its taskId. A handoff without a taskId is refused until then.']
         : []),

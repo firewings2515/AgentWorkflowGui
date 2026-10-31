@@ -909,6 +909,81 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect((await taskOf(r, t.b!)).worktree?.cleanup).toBe('removed');
     });
 
+    it('G-11: root hands off the tasks of a list that waits for the user; they are held (nothing created, counted or sent) and start once it is approved, also across a restart', async () => {
+      const w = await begin(make, { confirm: true });
+      const asked = await createTasks(w, [item('a', 'A'), item('b', 'B', ['a'])], 'call-held');
+      if (asked.status !== 'awaiting-confirmation') throw new Error('not asked');
+      const ids = { a: `${asked.taskPlanId}:a` as TaskId, b: `${asked.taskPlanId}:b` as TaskId };
+      const ha = await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: ids.a, content: 'build A' }, { operationId: 'op-held-a', sourceCallRef: 'call-held-a' });
+      expect(ha).toMatchObject({ status: 'accepted', delivery: 'pending' });
+      await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: ids.b, content: 'build B' });
+      // A resend is the same operation; a node that is not root cannot use such an ID.
+      expect(await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: ids.a, content: 'build A' }, { operationId: 'op-held-a', sourceCallRef: 'call-held-a' })).toMatchObject({ status: 'duplicate' });
+      const held = (await w.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.taskId === ids.a || h.taskId === ids.b);
+      expect(held).toHaveLength(2);
+      for (const h of held) expect(await w.repositories.sessions.get(h.target.sessionId!)).toBeUndefined();
+      expect(w.git.calls.filter((c) => c.op === 'createWorktree')).toHaveLength(0);
+      expect((await instanceOf(w)).tasks).toHaveLength(0);
+      // A restart in between sends nothing either.
+      const r = await w.restart();
+      await settle();
+      expect((await r.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.delivery.state !== 'pending')).toHaveLength(0);
+      const [question] = await openEscalations(r, 'confirmation');
+      await respond(r, question!.id, 'approve');
+      await until(async () => (await delivered(r, ids.a)) === 1, 'A delivered after the approval');
+      // B waits for A to be merged, as any dependent does; its session is there, in its worktree.
+      const bSession = await r.repositories.instances.findNodeSession({ instanceId: INSTANCE, nodeId: IMPL, taskId: ids.b });
+      expect((await r.repositories.sessions.get(bSession!))?.cwd).toBe((await taskWorktreeRef(hashOf, CWD, INSTANCE, ids.b)).path);
+      expect(await delivered(r, ids.b)).toBe(0);
+      await finish(r, ids.a, { 'a.txt': 'a\n' });
+      await until(async () => (await delivered(r, ids.b)) === 1, 'B delivered once A merged');
+    });
+
+    it('G-11: a declined list cancels what root handed off for it; so does ending the run before the decision', async () => {
+      const w = await begin(make, { confirm: true });
+      const asked = await createTasks(w, [item('a', 'A')], 'call-decline');
+      if (asked.status !== 'awaiting-confirmation') throw new Error('not asked');
+      await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: `${asked.taskPlanId}:a` as TaskId, content: 'build A' });
+      await respond(w, asked.escalationId, 'decline');
+      const [cancelled] = (await w.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.taskId === `${asked.taskPlanId}:a`);
+      expect(cancelled?.outcome).toMatchObject({ kind: 'cancelled', detail: 'the user declined the task list' });
+      expect(await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: `${asked.taskPlanId}:a` as TaskId, content: 'again' })).toMatchObject({ status: 'rejected', rejection: { reason: 'unknown-target' } });
+      // Another list, never decided: the run ends.
+      const second = await createTasks(w, [item('x', 'X')], 'call-undecided');
+      if (second.status !== 'awaiting-confirmation') throw new Error('not asked');
+      await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: `${second.taskPlanId}:x` as TaskId, content: 'build X' });
+      expect(await w.run({ type: 'workflow.cancel', requestId: rid(), instanceId: INSTANCE, expectedRevision: (await instanceOf(w)).revision })).toMatchObject({ ok: true });
+      await until(async () => (await w.repositories.handoffs.listByInstance(INSTANCE)).find((h) => h.taskId === `${second.taskPlanId}:x`)?.outcome !== undefined, 'cancelled with the run');
+    });
+
+    it('G-11: a crash after the approval and before the held handoffs were adopted is finished by the restart; the receive limit is counted then', async () => {
+      const template = pipelineTemplate({ confirm: true });
+      const impl = template.nodes.find((n) => n.id === IMPL)!;
+      impl.inputRules = [{ id: 'work', condition: 'a task', acceptanceLimit: 1, waitForAllUpstream: false }];
+      const w = await make(template);
+      await w.repositories.projects.save(project(), null);
+      await started(w);
+      const asked = await createTasks(w, [item('a', 'A')], 'call-crash');
+      if (asked.status !== 'awaiting-confirmation') throw new Error('not asked');
+      const a = `${asked.taskPlanId}:a` as TaskId;
+      await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: a, content: 'first' });
+      await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: a, content: 'second' });
+      crashOnce(w.repositories.instances, 'update');
+      await respond(w, asked.escalationId, 'approve').catch(() => undefined);
+      const r = await w.restart();
+      // Counted at the adoption, as T024 counts: the second is over the limit, the task stops and what is still
+      // queued of it (the first too) is cancelled; root is asked. Nothing was delivered.
+      await until(async () => (await openEscalations(r, 'limit-exceeded')).length === 1, 'the limit escalated after the restart');
+      expect((await instanceOf(r)).taskPlans[0]?.state).toBe('created');
+      expect(await taskOf(r, a)).toMatchObject({ status: 'blocked', blockedReason: 'limit-exceeded' });
+      const both = (await r.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.taskId === a);
+      expect(both.map((h) => [h.delivery.state, h.outcome?.kind])).toEqual([
+        ['pending', 'cancelled'],
+        ['pending', 'cancelled'],
+      ]);
+      expect(await delivered(r, a)).toBe(0);
+    });
+
     it('same-folder runs: create_tasks makes tasks without worktrees; the merge node completes a task and its dependent starts', async () => {
       const w = await begin(make, { isolation: 'same-folder' });
       const instance = await instanceOf(w);

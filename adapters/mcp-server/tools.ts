@@ -76,7 +76,8 @@ export const toolSpecs: Record<McpToolName, ToolSpec> = {
       'Formally hand your work to the next workflow node, or to root, by naming one of your output rules. ' +
       'The GUI checks the edge, limits and task dependencies and delivers the content; the result says ' +
       'whether it was accepted, escalated or rejected, not whether it was read. To retry an earlier handoff, ' +
-      'pass its operationId as retryOf with the same content.',
+      'pass its operationId as retryOf with the same content. Root may hand off a task of a list that waits for ' +
+      'the user (taskId <taskPlanId>:<key>): the GUI holds it until the user decides, then delivers it or cancels it.',
     input: HandoffToolInput,
     result: HandoffToolResult,
     delivers: true,
@@ -84,7 +85,10 @@ export const toolSpecs: Record<McpToolName, ToolSpec> = {
   create_tasks: {
     description:
       'Root only: split the work into tasks. Keys name tasks within this call; dependsOn lists other keys ' +
-      'in this call, dependsOnExisting lists task IDs that already exist. The user usually confirms first.',
+      'in this call, dependsOnExisting lists task IDs that already exist. The user usually confirms first: then ' +
+      'the result is awaiting-confirmation with a taskPlanId, and each task\'s ID will be <taskPlanId>:<key>. Hand ' +
+      'the tasks off right away with those IDs; the GUI holds them until the user approves the list (if the user ' +
+      'declines, they are cancelled and you plan again).',
     input: CreateTasksToolInput,
     result: CreateTasksToolResult,
     delivers: false,
