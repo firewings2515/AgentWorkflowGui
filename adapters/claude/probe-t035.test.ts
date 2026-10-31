@@ -9,20 +9,27 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { CLI_TMPDIR_ENV, type ClaudeAdapterOptions } from './adapter';
+import { CLI_TMPDIR_ENV, type ClaudeAdapterOptions, PROBE_SESSION_ID } from './adapter';
 import type { FakeQuery } from './testing/fake-sdk';
 import { setup, started, until } from './testing/harness';
 import type { WireSpawnedProcess } from './wire';
 
-/** A claude.exe that exits when the test says so. */
+/** A claude.exe that exits when the test says so, or on kill() once `exitOnKill` is set. */
 class FakeProcess extends EventEmitter implements WireSpawnedProcess {
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();
   killed = false;
+  kills = 0;
+  exitOnKill = false;
+  /** What kill() answers: false is a kill that failed. */
+  killWorks = true;
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
   kill(): boolean {
+    this.kills++;
+    if (!this.killWorks) return false;
     this.killed = true;
+    if (this.exitOnKill) setTimeout(() => this.exit(1), 5);
     return true;
   }
   exit(code = 0): void {
@@ -33,16 +40,19 @@ class FakeProcess extends EventEmitter implements WireSpawnedProcess {
 
 /**
  * The fake SDK starts claude.exe through the probe's spawn when the query is made, as the SDK does. With
- * `exitOnClose` the process exits a moment after close(); otherwise it lives until the test ends it.
+ * `exitOnClose` the process exits a moment after close(); otherwise it lives until the test ends it. Without
+ * `ownSpawn` the adapter picks its spawn itself (spawnProcess, as the GUI gives it).
  */
-const probeSetup = (options: Partial<ClaudeAdapterOptions>, exitOnClose = true) => {
+const probeSetup = (options: Partial<ClaudeAdapterOptions>, exitOnClose = true, ownSpawn = true) => {
   const processes: FakeProcess[] = [];
   const h = setup({
-    spawnProbe: () => {
-      const p = new FakeProcess();
-      processes.push(p);
-      return p;
-    },
+    ...(ownSpawn && {
+      spawnProbe: () => {
+        const p = new FakeProcess();
+        processes.push(p);
+        return p;
+      },
+    }),
     ...options,
   });
   const query = h.sdk.query.bind(h.sdk);
@@ -198,7 +208,9 @@ describe('T035 r1 P1 the folder is removed only after claude.exe has exited, nev
     expect(await h.adapter.listModels()).toMatchObject([{ model: 'sonnet' }]);
     await new Promise((r) => setTimeout(r, 20));
     expect(removed).toEqual([]);
-    expect(h.logs).toContain('warn: listModels: the probe CLI has not exited; its temp folder is removed once it does');
+    expect(h.logs).toContain('warn: listModels: the probe CLI has not exited; it is ended, and its temp folder removed once it exits');
+    // r2: it is ended (this process only); this one does not go at once.
+    expect(processes[0]!.kills).toBe(1);
     // When it does exit, its own folder goes, by its path.
     processes[0]!.exit();
     await until(() => removed.length === 1, 'removal after the exit');
@@ -268,5 +280,109 @@ describe('T035 r1 P2 a query that cannot even be made still removes the folder',
     await h.adapter.start();
     await expect(h.adapter.listModels()).rejects.toThrow('spawn failed');
     expect(readdirSync(probeCwd)).toEqual([]);
+  });
+});
+
+describe('T035 r2 P1 a probe claude.exe is managed like a session one, and the GUI closing ends it', () => {
+  it('t035-r2-P1 with spawnProcess given (the GUI), the probe starts its claude.exe through it, in the probe Job', async () => {
+    const jobs: string[] = [];
+    const processes: FakeProcess[] = [];
+    const { h } = probeSetup({
+      probeCwd: join(root, 'probe'),
+      spawnProcess: ({ sessionId }) => {
+        jobs.push(sessionId);
+        return () => {
+          const p = new FakeProcess();
+          processes.push(p);
+          return p;
+        };
+      },
+    }, true, false);
+    h.sdk.behaviour.models = MODELS;
+    await h.adapter.start();
+    expect(await h.adapter.listModels()).toMatchObject([{ model: 'sonnet' }]);
+    expect(jobs).toEqual([PROBE_SESSION_ID]);
+    expect(processes).toHaveLength(1);
+    expect(readdirSync(join(root, 'probe'))).toEqual([]);
+  });
+
+  it("t035-r2-P1 the reviewer's case: two probes still running after the wait; close() ends both, and each folder goes once its process exited", async () => {
+    const probeCwd = join(root, 'probe');
+    const { h, processes } = probeSetup({ probeCwd, probeExitTimeoutMs: 30 }, false);
+    h.sdk.behaviour.models = MODELS;
+    h.sdk.behaviour.closeEnds = false;
+    h.sdk.behaviour.onSupportedModels = makeScratch;
+    await h.adapter.start();
+    await Promise.all([h.adapter.listModels(), h.adapter.listModels()]);
+    const temps = h.sdk.queries.map(tempOf);
+    expect(processes).toHaveLength(2);
+    // Ended once after the wait, but these ones did not go.
+    for (const p of processes) expect(p.kills).toBe(1);
+    for (const temp of temps) expect(existsSync(temp!)).toBe(true);
+    for (const p of processes) p.exitOnKill = true;
+
+    expect(await h.adapter.close(1000)).toEqual({ forced: false });
+    for (const p of processes) expect(p.kills).toBe(2);
+    for (const p of processes) expect(p.exitCode).toBe(1);
+    for (const temp of temps) expect(existsSync(temp!)).toBe(false);
+    expect(readdirSync(probeCwd)).toEqual([]);
+    for (const p of processes) expect([p.listenerCount('exit'), p.listenerCount('error')]).toEqual([0, 0]);
+  });
+
+  it('t035-r2-P1 close() ends a probe still waiting for its answer, and removes its folder after the exit', async () => {
+    const probeCwd = join(root, 'probe');
+    const { h, processes } = probeSetup({ probeCwd, startTimeoutMs: 200 }, false);
+    const original = h.sdk.query.bind(h.sdk);
+    h.sdk.query = (params) => {
+      const q = original(params);
+      q.supportedModels = () => new Promise(() => undefined);
+      return q;
+    };
+    await h.adapter.start();
+    const listing = h.adapter.listModels();
+    await until(() => processes.length === 1, 'probe started');
+    processes[0]!.exitOnKill = true;
+    expect(await h.adapter.close(1000)).toEqual({ forced: false });
+    expect(processes[0]!.kills).toBe(1);
+    expect(readdirSync(probeCwd)).toEqual([]);
+    await expect(listing).rejects.toThrow(/did not answer/);
+  });
+
+  it('t035-r2-P1 a kill that fails: close() reports forced, drops its listeners, leaves its folder and logs it', async () => {
+    const probeCwd = join(root, 'probe');
+    const removed: string[] = [];
+    const { h, processes } = probeSetup({ probeCwd, probeExitTimeoutMs: 20, removeFolder: (path) => Promise.resolve(void removed.push(path)) }, false);
+    h.sdk.behaviour.models = MODELS;
+    h.sdk.behaviour.onSupportedModels = () => {
+      processes[0]!.killWorks = false;
+    };
+    await h.adapter.start();
+    await h.adapter.listModels();
+    const p = processes[0]!;
+    expect(await h.adapter.close(30)).toEqual({ forced: true });
+    expect(h.logs).toContain('warn: listModels: could not end the probe CLI');
+    expect(h.logs).toContain('warn: close: could not end a probe CLI');
+    expect(h.logs).toContain('warn: close: a probe CLI did not exit; its temp folder is left');
+    expect([p.listenerCount('exit'), p.listenerCount('error')]).toEqual([0, 0]);
+    expect(removed).toEqual([]);
+    // Nothing is left waiting on it: a late exit removes nothing, and a second close has nothing to end.
+    p.exit();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(removed).toEqual([]);
+    expect(await h.adapter.close(30)).toEqual({ forced: false });
+    expect(p.kills).toBe(2);
+  });
+
+  it('t035-r2-P1 a probe whose folder could not be made is ended by close() too', async () => {
+    const file = join(root, 'a-file');
+    writeFileSync(file, '');
+    const { h, processes } = probeSetup({ probeCwd: join(file, 'probe'), probeExitTimeoutMs: 20 }, false);
+    h.sdk.behaviour.models = MODELS;
+    await h.adapter.start();
+    await h.adapter.listModels();
+    expect(processes).toHaveLength(1);
+    processes[0]!.exitOnKill = true;
+    expect(await h.adapter.close(1000)).toEqual({ forced: false });
+    expect(processes[0]!.exitCode).toBe(1);
   });
 });
