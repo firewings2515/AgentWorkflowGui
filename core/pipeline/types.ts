@@ -57,4 +57,8 @@ export interface WorktreeFiles {
   saveSetupChanges(worktree: string, changes: readonly SetupChange[]): Promise<void>;
   /** What `saveSetupChanges` kept; undefined when nothing was. */
   loadSetupChanges(worktree: string): Promise<SetupChange[] | undefined>;
+  /** Takes paths out of the index (`git reset -- <paths>`): a staged setup output is not committed (r2 P1-4). */
+  unstage(worktree: string, paths: readonly string[]): Promise<void>;
+  /** Puts paths back as the worktree's commit has them, index and files (G-13: before a setup runs again). */
+  restore(worktree: string, paths: readonly string[]): Promise<void>;
 }

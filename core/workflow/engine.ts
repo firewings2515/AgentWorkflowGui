@@ -12,6 +12,7 @@ import {
   type CreateTasksToolInput,
   type CreateTasksToolResult,
   type DeliveryState,
+  type DeliveryTarget,
   type Escalation,
   EscalationId,
   finalTaskStatuses,
@@ -39,7 +40,7 @@ import {
 } from '../../contracts';
 import type { DeliveryService } from '../delivery';
 import { type GuiHandoff, isResolverSession, resolverBriefing, TaskPipeline, type TaskPipelineOptions } from '../pipeline';
-import type { AppRepositories, DeliveryStore, HandoffMeta, StoredDelivery } from '../ports';
+import type { AppRepositories, DeliveryStore, HandoffMeta, PayloadContext, StoredDelivery } from '../ports';
 import type { CommandOf, SessionService, WorkflowHooks, WorkflowSession } from '../sessions';
 import { type AgentNode, agentNodes, briefing, handoffCounts, handoffText, hasEdge, isRework, nodeOf, reportText, reworkKey, rootNode, runtimesOf, sameTarget, taskProgress } from './graph';
 import {
@@ -440,10 +441,12 @@ export class WorkflowEngine implements WorkflowHooks {
     // A resend: the same call after a restart (same sourceCallRef) or a `retryOf` (same operationId, CR2 §4).
     const known = (await this.store.get(ctx.operationId)) ?? (await this.store.findBySourceCallRef(ctx.sourceCallRef));
     if (known !== undefined) return this.resent(known, caller, planned);
-    if (planned.held === true) return this.hold(caller, planned, input, ctx, confirmed);
+    // Root's handoff of a task whose list waits for the user (T032 G-11): planned as any handoff (its fan-out
+    // group, round and rework, r2 P1-1/P1-2), but nothing made, counted or sent before the decision.
+    const held = planned.held === true;
 
     // The task's worktree is made the first time, and a writing node's changes are committed (T032, R-06).
-    if (this.pipeline !== undefined) {
+    if (this.pipeline !== undefined && !held) {
       const refused = await this.pipeline.beforeHandoff(instance, taskId, from, to);
       if (refused !== undefined) return refused;
       instance = (await this.repos.instances.get(instance.id)) ?? instance;
@@ -471,18 +474,17 @@ export class WorkflowEngine implements WorkflowHooks {
     const expectedUpstream = 'expectedUpstream' in placed ? placed.expectedUpstream : undefined;
     const rework = first && isRework(handoffs, taskId, to.id, arrival ? round : undefined);
     const { counts, current } = handoffCounts(instance, handoffs, taskId, to, rework, arrival);
-    const over = first ? current.find((c) => c.limit !== undefined && c.count >= c.limit) : undefined;
+    // A held handoff is counted when its list is approved (`settleHeldNow`), in acceptance order.
+    const over = first && !held ? current.find((c) => c.limit !== undefined && c.count >= c.limit) : undefined;
     if (over !== undefined) return this.limitReached(instance, taskId, caller, to, over.key, over.what, over.limit ?? 0);
 
     if (planned.requiresUserConfirmation && !confirmed) return this.askConfirmation(instance, caller, planned, input, ctx, lineage?.id, turnId);
 
-    const targetSessionId = await this.nodeSession(instance, to, taskId, caller);
-    if (targetSessionId === undefined) return rejected('unknown-target', 'the target session cannot be created');
-    const target = await this.options.sessions.payloadTarget(targetSessionId);
     const handoffId = handoffIdOf(ctx.operationId);
     const origin: MessageOrigin = { kind: 'handoff', fromSessionId: caller.id, handoffId };
-    const context = await this.options.sessions.payloadContext(targetSessionId, origin);
-    if (target === undefined || context === undefined) return rejected('unknown-target', 'the target session cannot be started');
+    const destination = held ? await this.heldDestination(instance, to, taskId, origin) : await this.destination(instance, to, taskId, caller, origin);
+    if ('status' in destination) return destination;
+    const { targetSessionId, target, context } = destination;
     if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
     const payload = this.payloadOf(planned, arrival ? { round, expectedUpstream } : undefined);
     const accepted = await this.delivery.accept({
@@ -496,8 +498,8 @@ export class WorkflowEngine implements WorkflowHooks {
       target,
       at: this.options.now(),
       context,
-      // A later arrival of a round the node already received counts nothing.
-      ...(first && { counts }),
+      // A later arrival of a round the node already received counts nothing; a held one is counted later.
+      ...(first && !held && { counts }),
       handoff: {
         handoffId,
         instanceId: instance.id,
@@ -532,6 +534,12 @@ export class WorkflowEngine implements WorkflowHooks {
     }
     // The caller's fan-out takes it in its own turn; with no turn of its own running, nothing else can join.
     if (!arrival) this.joinGroup({ instanceId: instance.id, taskId, sessionId: caller.id, round, ...(turnId !== undefined && { turnId }) }, groupKey);
+    if (held) {
+      await this.publishHandoff(handoffId);
+      // Decided meanwhile (the user answered while this call ran): settled now rather than at the next restart.
+      if (this.pipeline?.heldPlanOf((await this.repos.instances.get(instance.id)) ?? instance, taskId) === undefined) await this.settleHeldNow(instance.id);
+      return { status: 'accepted', handoffId, operationId: ctx.operationId, delivery: 'pending' };
+    }
     const reworkCount = accepted.counts?.find((c) => c.key === reworkKey(instance.id, taskId))?.count;
     // A task held at a blocked round stays held (the user decides it); one not started yet waits to start (T032).
     await this.updateTask(instance.id, taskId, (t) => ({
@@ -845,62 +853,48 @@ export class WorkflowEngine implements WorkflowHooks {
     return bound.status === 'exists' ? bound.sessionId : fresh;
   }
 
+  /** Where a handoff goes: the (node, task) session, made now if it is not there yet, and its delivery context. */
+  private async destination(
+    instance: WorkflowInstance,
+    to: AgentNode,
+    taskId: TaskId,
+    caller: WorkflowSession,
+    origin: MessageOrigin,
+  ): Promise<{ targetSessionId: SessionId; target: DeliveryTarget; context: PayloadContext } | HandoffToolResult> {
+    const targetSessionId = await this.nodeSession(instance, to, taskId, caller);
+    if (targetSessionId === undefined) return rejected('unknown-target', 'the target session cannot be created');
+    const target = await this.options.sessions.payloadTarget(targetSessionId);
+    const context = await this.options.sessions.payloadContext(targetSessionId, origin);
+    if (target === undefined || context === undefined) return rejected('unknown-target', 'the target session cannot be started');
+    return { targetSessionId, target, context };
+  }
+
   /**
-   * Root hands off a task of a list that waits for the user (T032 G-11): accepted once with its fixed operation,
-   * payload and hash (CR-2), counted nowhere yet. Its target is the (node, task) session bound now and created only
-   * when the list is approved, in the task's worktree: the delivery waits for that session's own provision, as a
-   * run's first message does, so nothing is created or sent before the decision. A decline cancels it.
+   * Where a held handoff goes (T032 G-11): the (node, task) session bound now and created only once the list is
+   * approved, in the task's worktree. The delivery waits for that session's own provision, as a run's first
+   * message does (the store fixes the destination at acceptance), so nothing is created or sent before the
+   * decision; its context names the node's runtime and the task's worktree.
    */
-  private async hold(caller: WorkflowSession, planned: Planned, input: HandoffToolInput, ctx: HandoffCallContext, confirmed: boolean): Promise<HandoffToolResult> {
-    const { instance, taskId, from, to } = planned;
-    const pipeline = this.pipeline;
-    if (pipeline === undefined) return rejected('unknown-target', 'no such task');
-    if (planned.requiresUserConfirmation && !confirmed) return this.askConfirmation(instance, caller, planned, input, ctx, undefined, undefined);
+  private async heldDestination(
+    instance: WorkflowInstance,
+    to: AgentNode,
+    taskId: TaskId,
+    origin: MessageOrigin,
+  ): Promise<{ targetSessionId: SessionId; target: DeliveryTarget; context: PayloadContext } | HandoffToolResult> {
     const root = await this.repos.sessions.get(instance.rootSessionId);
-    if (root === undefined) return rejected('unknown-target', 'the run has no root session');
-    const sessionId = await this.boundSession(instance, to, taskId);
-    const handoffId = handoffIdOf(ctx.operationId);
-    const handoffs = await this.repos.handoffs.listByInstance(instance.id);
-    const payload = this.payloadOf(planned);
-    if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
-    const accepted = await this.delivery.accept({
-      kind: 'handoff',
-      operationId: ctx.operationId,
-      sourceCallRef: ctx.sourceCallRef,
-      sender: caller.id,
-      payloadHash: await this.options.hashPayload(payload),
-      payload,
-      proposalRevision: instance.workflowRevision,
-      target: { sessionId, provision: this.options.sessions.provisionFor(sessionId) },
-      at: this.options.now(),
+    if (root === undefined || this.pipeline === undefined) return rejected('unknown-target', 'the run has no root session');
+    const targetSessionId = await this.boundSession(instance, to, taskId);
+    return {
+      targetSessionId,
+      target: { sessionId: targetSessionId, provision: this.options.sessions.provisionFor(targetSessionId) },
       context: {
         runtime: to.model.runtime,
-        cwd: (await pipeline.plannedCwd(instance, taskId)) ?? root.cwd,
+        cwd: (await this.pipeline.plannedCwd(instance, taskId)) ?? root.cwd,
         entry: { kind: 'new-turn' },
         session: { model: to.model, readOnly: to.writePolicy !== 'write' },
-        origin: { kind: 'handoff', fromSessionId: caller.id, handoffId },
+        origin,
       },
-      handoff: { handoffId, instanceId: instance.id, taskId, fromNodeId: from.id, toNodeId: to.id, fromSessionId: caller.id, ruleId: planned.ruleId, rework: false, round: nextRound(handoffs, instance.rounds, taskId, []) },
-    });
-    switch (accepted.status) {
-      case 'accepted':
-        break;
-      case 'duplicate':
-        return this.resent(accepted.record, caller, planned);
-      case 'conflict':
-        return accepted.existing.sender !== undefined && accepted.existing.sender !== caller.id ? NOT_OWNER : RESEND_MISMATCH;
-      case 'limit-exceeded':
-      case 'invalid':
-        this.log(`a held handoff of ${caller.id} was not accepted (${accepted.status})`);
-        return rejected('invalid-input', 'the handoff cannot be accepted');
-      case 'commit-uncertain':
-        throw new Error('accepting the handoff could not be confirmed');
-    }
-    await this.publishHandoff(handoffId);
-    // Decided meanwhile (the user answered while this call ran): settled now rather than at the next restart.
-    const plan = pipeline.heldPlanOf((await this.repos.instances.get(instance.id)) ?? instance, taskId);
-    if (plan === undefined) await this.settleHeldNow(instance.id);
-    return { status: 'accepted', handoffId, operationId: ctx.operationId, delivery: 'pending' };
+    };
   }
 
   /**
@@ -930,7 +924,10 @@ export class WorkflowEngine implements WorkflowHooks {
     // steps leaves nothing that skipped its count: later held ones count the earlier ones kept (acceptance order).
     const kept: Handoff[] = [];
     const uncounted = new Set(held.map((h) => h.id));
+    // A task stopped at a limit in this pass: the rest of it was cancelled with it (T024).
+    const stopped = new Set<TaskId>();
     for (const handoff of held) {
+      if (stopped.has(handoff.taskId)) continue;
       const plan = instance.taskPlans.find((p) => handoff.taskId.startsWith(`${p.id}:`));
       const to = nodeOf(instance.template, handoff.toNodeId);
       if (plan === undefined || (plan.state === 'awaiting-confirmation' && !ended)) continue;
@@ -939,13 +936,19 @@ export class WorkflowEngine implements WorkflowHooks {
         continue;
       }
       if (!instance.tasks.some((t) => t.id === handoff.taskId)) continue;
-      // Counted now (R-04), as any handoff: what was delivered or kept before it, not the held ones after it.
-      const others = handoffs.filter((h) => h.id !== handoff.id && h.outcome === undefined && !uncounted.has(h.id));
-      const { current } = handoffCounts(instance, others, handoff.taskId, to, handoff.rework);
-      const over = current.find((c) => c.limit !== undefined && c.count >= c.limit);
+      // Counted now, as `handoffNow` counts (R-04, R-05, r2 P1-1): against what came before it, the held ones
+      // after it left out; its rework flag was set at its acceptance by the same rule (T024). A later arrival of a
+      // round already received counts nothing (CR-4).
+      const others = handoffs.filter((h) => h.id !== handoff.id && !uncounted.has(h.id));
+      const arrival = waitsForAll(to);
+      const first = !arrival || !others.some((h) => h.taskId === handoff.taskId && h.toNodeId === to.id && h.round === handoff.round);
+      const { current } = handoffCounts(instance, others, handoff.taskId, to, handoff.rework, arrival);
+      const over = first ? current.find((c) => c.limit !== undefined && c.count >= c.limit) : undefined;
       if (over !== undefined) {
         await cancel(handoff, `the ${over.what} limit was reached when its task list was approved`);
+        // As any handoff over a limit: the task stops and what is still queued of it is cancelled (r2-P1-1).
         await this.limitReached(instance, handoff.taskId, root, to, over.key, over.what, over.limit ?? 0);
+        stopped.add(handoff.taskId);
         continue;
       }
       uncounted.delete(handoff.id);
@@ -953,7 +956,7 @@ export class WorkflowEngine implements WorkflowHooks {
     }
     // Then the sessions they wait for: the task's worktree first (the session's folder), then the session itself.
     for (const handoff of kept) {
-      if (onlyTask !== undefined && handoff.taskId !== onlyTask) continue;
+      if ((onlyTask !== undefined && handoff.taskId !== onlyTask) || stopped.has(handoff.taskId)) continue;
       const to = nodeOf(instance.template, handoff.toNodeId);
       if (to?.kind !== 'agent') continue;
       const current = (await this.repos.instances.get(instanceId)) ?? instance;

@@ -18,6 +18,7 @@ import { hashOf } from '../../delivery/testing/fixtures';
 import { crashOnce } from '../../workflow/testing/r2-cases';
 import { BUILDER, CWD, handoff, IMPL, INSTANCE, instanceOf, node, PLAN, PLANNER, rid, ROOT, settle, started, WORKFLOW, type World } from '../../workflow/testing/harness';
 import { integrationRef, resolveOperationOf, resolverSessionIdOf, taskWorktreeRef } from '../naming';
+import { fanTemplate, JOIN, RA, RB } from '../../workflow/testing/t031-cases';
 
 export const MERGE = NodeId.parse('merge');
 const PROJECT = ProjectId.parse('project-1');
@@ -301,12 +302,13 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect(w.git.fileAt(main(w), 'node_modules/pkg.js')).toBeUndefined();
     });
 
-    it('r1 P1-6: a tracked file the setup changed and a file it added in an existing folder stay out of commits, unless the agent changed them; the setup result says so', async () => {
+    it('r1 P1-6 / r2 P1-4: a file the setup added in an existing folder stays out of commits, also when it was staged, unless the agent changed it', async () => {
       const w = await begin(make);
       w.commands.script = (spec) => {
         if (spec.purpose === 'setup') {
-          w.git.write(spec.cwd, 'README.md', 'readme with a local port\n');
           w.git.write(spec.cwd, 'src/generated.txt', 'generated\n');
+          // The setup stages what it made (`git add`): the index would carry it into a commit.
+          w.git.stage(spec.cwd, 'src/generated.txt');
           w.git.write(spec.cwd, 'src/config.local', 'port=1\n');
         }
         return { exitCode: 0, outputTail: 'ok' };
@@ -314,16 +316,76 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       const t = await made(w, [item('a', 'A')]);
       await give(w, t.a!);
       await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
-      expect((await taskOf(w, t.a!)).setup?.outputTail).toContain('README.md');
       const path = (await taskOf(w, t.a!)).worktree!.path;
       // The agent changes one of the setup's files (its own work now) and adds its own.
       w.git.write(path, 'src/config.local', 'port=2 (agent)\n');
       expect(await finish(w, t.a!, { 'feature.txt': 'f\n' })).toMatchObject({ status: 'accepted' });
       await until(async () => (await statusOf(w, t.a!)) === 'merged', 'merged');
-      expect(w.git.fileAt(main(w), 'README.md')).toBe('readme\n');
       expect(w.git.fileAt(main(w), 'src/generated.txt')).toBeUndefined();
       expect(w.git.fileAt(main(w), 'src/config.local')).toBe('port=2 (agent)\n');
       expect(w.git.fileAt(main(w), 'feature.txt')).toBe('f\n');
+    });
+
+    it('G-13: a setup that changes tracked files fails and names them; approve puts back those it left untouched and runs it again', async () => {
+      const w = await begin(make);
+      let runs = 0;
+      w.commands.script = (spec) => {
+        if (spec.purpose === 'setup' && runs++ === 0) {
+          w.git.write(spec.cwd, 'README.md', 'readme with a local port\n');
+          w.git.write(spec.cwd, 'src/app.txt', 'app, rewritten by the setup\n');
+        }
+        return { exitCode: 0, outputTail: 'ok' };
+      };
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await openEscalations(w, 'setup-failed')).length === 1, 'asked');
+      expect(await taskOf(w, t.a!)).toMatchObject({ status: 'blocked', blockedReason: 'setup-failed', setup: { state: 'failed' } });
+      expect(await delivered(w, t.a!)).toBe(0);
+      const [question] = await openEscalations(w, 'setup-failed');
+      expect(question?.detail).toContain('README.md');
+      expect(question?.detail).toContain('src/app.txt');
+      expect(question?.detail).toContain('.gitignore');
+      // Someone edits one of them meanwhile: that one is not put back, and since nothing tells it from a setup's
+      // change, the setup fails again naming only that file (conservative: no tracked change reaches a commit).
+      const path = (await taskOf(w, t.a!)).worktree!.path;
+      w.git.write(path, 'src/app.txt', 'app, edited by hand\n');
+      await respond(w, question!.id, 'approve');
+      await until(async () => (await openEscalations(w, 'setup-failed')).length === 1 && w.commands.of('setup').length === 2, 'asked again');
+      expect(w.git.tree(path)?.files.get('README.md')).toBe('readme\n');
+      expect(w.git.tree(path)?.files.get('src/app.txt')).toBe('app, edited by hand\n');
+      const [again] = await openEscalations(w, 'setup-failed');
+      expect(again?.detail).toContain('src/app.txt');
+      expect(again?.detail).not.toContain('README.md');
+      // Put back by hand: the next approve runs the setup cleanly and the task starts.
+      w.git.restore(path, ['src/app.txt']);
+      await respond(w, again!.id, 'approve');
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered after the setup ran cleanly');
+      expect(w.commands.of('setup')).toHaveLength(3);
+    });
+
+    it('r2 P2: a finished setup whose record is gone refuses the commit and asks root; approve lets it commit without the record', async () => {
+      const w = await begin(make);
+      w.commands.script = (spec) => {
+        if (spec.purpose === 'setup') w.git.write(spec.cwd, 'src/generated.txt', 'generated\n');
+        return { exitCode: 0, outputTail: 'ok' };
+      };
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      const path = (await taskOf(w, t.a!)).worktree!.path;
+      const branch = (await taskOf(w, t.a!)).worktree!.branch;
+      const tip = w.git.tip(CWD, branch);
+      // The record goes missing from the worktree's git folder.
+      w.files.saved.delete(path.toLowerCase());
+      expect(await finish(w, t.a!, { 'a.txt': 'a\n' })).toMatchObject({ status: 'rejected', rejection: { reason: 'invalid-input' } });
+      expect(w.git.tip(CWD, branch)).toBe(tip);
+      const [question] = await openEscalations(w, 'setup-failed');
+      expect(question?.title).toContain('record');
+      await respond(w, question!.id, 'approve');
+      expect(await finish(w, t.a!, { 'a.txt': 'a\n' })).toMatchObject({ status: 'accepted' });
+      await until(async () => (await statusOf(w, t.a!)) === 'merged', 'merged');
+      // Without the record everything not ignored is the agent's: the user chose that.
+      expect(w.git.fileAt(main(w), 'src/generated.txt')).toBe('generated\n');
     });
 
     it('r1 P1-6: when what the setup made cannot be recorded the task does not start; when it cannot be read nothing is committed', async () => {
@@ -982,6 +1044,62 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
         ['pending', 'cancelled'],
       ]);
       expect(await delivered(r, a)).toBe(0);
+    });
+
+    it('r2 P1-1: held handoffs keep the rework rule: with reworkLimit 0, the second of three stops the task at the approval and nothing is sent', async () => {
+      const w = await begin(make, { confirm: true, reworkLimit: 0 });
+      const asked = await createTasks(w, [item('a', 'A')], 'call-rework');
+      if (asked.status !== 'awaiting-confirmation') throw new Error('not asked');
+      const a = `${asked.taskPlanId}:a` as TaskId;
+      for (const n of [1, 2, 3]) await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: a, content: `try ${String(n)}` });
+      // Their rework flags follow T024 at acceptance: the first is no rework, the next ones are.
+      const sorted = async (x: World) => (await x.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.taskId === a).sort((p, q) => (p.acceptedAt < q.acceptedAt ? -1 : 1));
+      expect((await sorted(w)).map((h) => h.rework)).toEqual([false, true, true]);
+      await respond(w, asked.escalationId, 'approve');
+      await until(async () => (await openEscalations(w, 'limit-exceeded')).length === 1, 'the rework limit escalated');
+      expect(await taskOf(w, a)).toMatchObject({ status: 'blocked', blockedReason: 'limit-exceeded', reworkCount: 0 });
+      expect((await sorted(w)).map((h) => [h.delivery.state, h.outcome?.kind])).toEqual([
+        ['pending', 'cancelled'],
+        ['pending', 'cancelled'],
+        ['pending', 'cancelled'],
+      ]);
+      expect(await delivered(w, a)).toBe(0);
+    });
+
+    it('r2 P1-2: held handoffs of one root turn stay one fan-out: the waiting node gets nothing until both branches arrived', async () => {
+      const base = fanTemplate();
+      const template: WorkflowTemplate = {
+        ...base,
+        isolation: 'worktree',
+        nodes: base.nodes.map((n) =>
+          n.id === PLAN ? { ...n, outputRules: [...n.outputRules, { id: 'split', condition: 'split', payload: '', target: { kind: 'tasks' as const }, requiresUserConfirmation: true }] } : n,
+        ),
+      };
+      const w = await make(template);
+      await w.repositories.projects.save(project(), null);
+      w.holding.add(ROOT);
+      await started(w);
+      const asked = await createTasks(w, [item('a', 'A')], 'call-fan');
+      if (asked.status !== 'awaiting-confirmation') throw new Error('not asked');
+      const a = `${asked.taskPlanId}:a` as TaskId;
+      // In root's one turn: both branches.
+      await handoff(w, ROOT, { ruleId: 'to-a', target: { kind: 'node', nodeId: RA }, taskId: a, content: 'review A please' });
+      await handoff(w, ROOT, { ruleId: 'to-b', target: { kind: 'node', nodeId: RB }, taskId: a, content: 'review B please' });
+      await w.finishTurn(ROOT);
+      const rounds = (await w.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.taskId === a).map((h) => h.round);
+      expect(new Set(rounds).size).toBe(1);
+      await respond(w, asked.escalationId, 'approve');
+      const sent = async (node: NodeId) => (await w.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.taskId === a && h.toNodeId === node && h.delivery.state === 'sent').length;
+      await until(async () => (await sent(RA)) === 1 && (await sent(RB)) === 1, 'both branches delivered');
+      const ra = await w.repositories.instances.findNodeSession({ instanceId: INSTANCE, nodeId: RA, taskId: a });
+      const rb = await w.repositories.instances.findNodeSession({ instanceId: INSTANCE, nodeId: RB, taskId: a });
+      expect(await handoff(w, ra!, { ruleId: 'verdict', target: { kind: 'node', nodeId: JOIN }, taskId: a, content: 'A: fine' })).toMatchObject({ status: 'accepted', delivery: 'pending' });
+      await settle();
+      expect(await sent(JOIN)).toBe(0);
+      expect((await instanceOf(w)).rounds).toEqual([expect.objectContaining({ nodeId: JOIN, expectedUpstream: [RA, RB], state: 'waiting' })]);
+      await handoff(w, rb!, { ruleId: 'verdict', target: { kind: 'node', nodeId: JOIN }, taskId: a, content: 'B: fine' });
+      await until(async () => (await sent(JOIN)) >= 1, 'the round delivered once complete');
+      expect((await instanceOf(w)).rounds[0]?.state).toBe('ready');
     });
 
     it('same-folder runs: create_tasks makes tasks without worktrees; the merge node completes a task and its dependent starts', async () => {

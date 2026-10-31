@@ -83,4 +83,14 @@ export class FakeFiles implements WorktreeFiles {
     }
     return Promise.resolve(this.saved.get(folderKey(worktree)));
   }
+
+  unstage(worktree: string, paths: readonly string[]): Promise<void> {
+    this.git.unstage(worktree, paths);
+    return Promise.resolve();
+  }
+
+  restore(worktree: string, paths: readonly string[]): Promise<void> {
+    this.git.restore(worktree, paths);
+    return Promise.resolve();
+  }
 }

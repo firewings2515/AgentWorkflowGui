@@ -1,6 +1,6 @@
 // T032: the setup and test commands run for real, each in a Job of its own (R-14), and the setup outputs found
 // by their creation time. Everything happens in an mkdtemp folder that is deleted by its explicit path.
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -126,6 +126,15 @@ describe('worktree files (T032 r1 P1-6)', () => {
     expect((await files.changes(wt)).length).toBe(4);
     writeFileSync(join(wt, 'README.md'), 'readme, changed by the agent\n');
     expect(await files.stateOf(wt, 'README.md')).not.toBe(changes[0]?.state);
+    // G-13: put back as the commit has them, index and files; r2 P1-4: out of the index, files kept.
+    await must(wt, 'add', 'src/generated.txt');
+    await files.restore(wt, ['README.md', 'gone.txt']);
+    expect(readFileSync(join(wt, 'README.md'), 'utf8')).toBe('readme\n');
+    expect(readFileSync(join(wt, 'gone.txt'), 'utf8')).toBe('gone\n');
+    await files.unstage(wt, ['src/generated.txt']);
+    const staged = await git(['diff', '--cached', '--name-only'], { cwd: wt });
+    expect(staged.stdout.trim()).toBe('');
+    expect(readFileSync(join(wt, 'src', 'generated.txt'), 'utf8')).toBe('generated\n');
     expect(files.exists(wt)).toBe(true);
     expect(files.exists(join(wt, 'nope'))).toBe(false);
   }, 30_000);

@@ -159,4 +159,14 @@ export const gitWorktreeFiles = (run: GitRunner = createGitRunner()): WorktreeFi
     if (!Array.isArray(parsed)) throw new Error(`${file} is not a list`);
     return Promise.resolve(parsed as SetupChange[]);
   },
+  async unstage(worktree, paths) {
+    // Index only, and only the paths named (the setup's record): the worktree's files stay as they are.
+    const result = await run(['reset', '-q', '--', ...paths.map((p) => `:(literal)${p}`)], { cwd: worktree });
+    if (result.code !== 0) throw new Error(`git reset failed: ${result.stderr.trim() || String(result.code)}`);
+  },
+  async restore(worktree, paths) {
+    // Index and files back to the worktree's commit, only for the paths named.
+    const result = await run(['checkout', '-q', 'HEAD', '--', ...paths.map((p) => `:(literal)${p}`)], { cwd: worktree });
+    if (result.code !== 0) throw new Error(`git checkout failed: ${result.stderr.trim() || String(result.code)}`);
+  },
 });

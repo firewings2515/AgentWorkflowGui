@@ -1470,12 +1470,16 @@ export class SessionService {
     const session = await this.repos.sessions.get(sessionId);
     if (session?.kind !== 'workflow') return;
     const ref = await this.binding(sessionId);
-    if (ref === undefined || !this.runtimes.isOpen(ref)) return;
+    if (ref === undefined) return;
+    // Not open: closed already, or a release under way (another closer), which is waited for (r2 P1-3).
+    if (!this.runtimes.isOpen(ref)) return this.runtimes.forceRelease(ref);
     const graceful = this.runtimes.closeSession(ref, timeoutMs).then(
       () => true,
       () => true,
     );
     const ended = this.options.sleep === undefined ? await graceful : await Promise.race([graceful, this.options.sleep(timeoutMs).then(() => false)]);
+    // Past the deadline: released by force, or the release the graceful close began is waited for, whichever it is;
+    // either way this returns once `onSessionClosed` has finished (its Job ended, r2 P1-3).
     if (!ended || this.runtimes.isOpen(ref)) await this.runtimes.forceRelease(ref);
     // The record follows in the session's queue; the runtime is already gone.
     if (!this.closed) void this.serial(sessionKey(sessionId), () => this.setActivity(sessionId, 'closed')).catch(() => undefined);

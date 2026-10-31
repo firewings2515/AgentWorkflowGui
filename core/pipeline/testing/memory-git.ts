@@ -18,6 +18,8 @@ interface Tree {
   files: Map<string, string>;
   /** The files git was told about (`add`) during a merge: no longer unmerged. */
   staged: Set<string>;
+  /** Outside a merge: what `git add` put in the index (content, or undefined for a staged deletion). */
+  index?: Map<string, string | undefined> | undefined;
   merging?: { theirs: string; conflicts: string[] } | undefined;
   main: boolean;
 }
@@ -208,6 +210,12 @@ export class MemoryGit implements GitPort {
       const next = new Map<string, string>();
       for (const [f, c] of tree.files) if (!excluded(f)) next.set(f, c);
       for (const [f, c] of headFiles) if (excluded(f)) next.set(f, c);
+      // What is already in the index is committed whatever `add` leaves out (git's behaviour, r2 P1-4).
+      for (const [f, c] of tree.index ?? []) {
+        if (!excluded(f)) continue;
+        if (c === undefined) next.delete(f);
+        else next.set(f, c);
+      }
       if (tree.merging !== undefined) {
         const unresolved = tree.merging.conflicts.filter((f) => hasMarkers(next.get(f)));
         if (unresolved.length > 0) return { status: 'failed', detail: `Conflict markers are still in: ${unresolved.join(', ')}` };
@@ -221,8 +229,35 @@ export class MemoryGit implements GitPort {
       if (same) return { status: 'nothing', commit: head };
       const id = this.commit([head], next, message);
       this.branches.set(`${key(tree.repo)}|${tree.branch}`, id);
+      tree.index = undefined;
       return { status: 'committed', commit: id };
     });
+  }
+
+  /** `git add <file>` in a checkout (a setup or an agent staging something). */
+  stage(path: string, file: string): void {
+    const tree = this.trees.get(key(path));
+    if (tree === undefined) throw new Error(`no checkout at ${path}`);
+    (tree.index ??= new Map()).set(file, tree.files.get(file));
+  }
+
+  /** `git reset -- <files>`. */
+  unstage(path: string, files: readonly string[]): void {
+    const tree = this.trees.get(key(path));
+    for (const f of files) tree?.index?.delete(f);
+  }
+
+  /** `git checkout HEAD -- <files>`. */
+  restore(path: string, files: readonly string[]): void {
+    const tree = this.trees.get(key(path));
+    if (tree === undefined) throw new Error(`no checkout at ${path}`);
+    const head = this.filesOf(this.headOf(tree));
+    for (const f of files) {
+      const c = head.get(f);
+      if (c === undefined) tree.files.delete(f);
+      else tree.files.set(f, c);
+      tree.index?.delete(f);
+    }
   }
 
   merge(integration: WorktreeRef, branch: string, message: string): Promise<MergeResult> {

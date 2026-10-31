@@ -2,6 +2,7 @@
 // depending on another (V-19), a merge conflict and failed tests (V-21), setup outputs kept out of the commits,
 // worktrees removed after their merge (V-20). The runtimes and the setup/test commands are the fakes of the
 // workflow harness; the git commands and folders are real. Only the mkdtemp folder is touched.
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
@@ -137,4 +138,42 @@ it('V-19, V-20, V-21 on a real repository: parallel tasks, a dependency, a confl
   // The last integration worktree goes after C's own; nothing of the run is left running in the repository.
   await until(async () => (await instanceOf(w)).mergeQueue.every((m) => m.integration?.cleanup === 'removed'), 'integration worktrees removed');
   expect(await w.run({ type: 'workflow.complete', requestId: rid(), instanceId: INSTANCE, expectedRevision: (await instanceOf(w)).revision })).toMatchObject({ ok: true });
+});
+
+it('r2 P1-4 on a real repository: a file the setup adds and stages (`git add`) never reaches a commit; the agent\'s own work does', { timeout: 120_000 }, async () => {
+  const sandbox = createSandbox();
+  const repo = await sandbox.newRepo('staged');
+  await sandbox.commitFile(repo, 'src/app.txt', 'app\n', 'initial');
+  const db = openDatabase(join(sandbox.root, 'awg.sqlite'));
+  open.push({ db, sandbox });
+  const w: World = await worldOn(createRepositories(db), new SqliteDeliveryStore(db), pipelineTemplate(), { git: sandbox.adapter, files: gitWorktreeFiles() });
+  w.commands.script = (spec) => {
+    if (spec.purpose === 'setup') {
+      writeFileSync(join(spec.cwd, 'src', 'generated.txt'), 'made by the setup\n');
+      execFileSync('git', ['-c', 'core.longpaths=true', 'add', 'src/generated.txt'], { cwd: spec.cwd });
+    }
+    return { exitCode: 0, outputTail: 'ok' };
+  };
+  await w.repositories.projects.save({ ...project(), rootPath: repo }, null);
+  expect(await started(w, { cwd: repo })).toMatchObject({ ok: true });
+  const created = await w.engine.createTasks({ ruleId: 'split', tasks: [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }] }, { caller: ROOT, sourceCallRef: 'call-staged' });
+  if (created.status !== 'created') throw new Error(JSON.stringify(created));
+  const a = created.tasks[0]!.taskId;
+  const task = async () => (await instanceOf(w)).tasks.find((t) => t.id === a)!;
+  await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: a, content: 'build A' });
+  await until(async () => (await w.repositories.handoffs.listByInstance(INSTANCE)).some((h) => h.taskId === a && h.delivery.state === 'sent'), 'A started');
+  const path = (await task()).worktree!.path;
+  // Staged in the worktree's index before the handoff.
+  expect(await sandbox.git(path, 'diff', '--cached', '--name-only')).toContain('src/generated.txt');
+  writeFileSync(join(path, 'a.txt'), 'the agent\'s work\n');
+  const impl = (await w.repositories.instances.findNodeSession({ instanceId: INSTANCE, nodeId: IMPL, taskId: a }))!;
+  expect(await handoff(w, impl, { ruleId: 'to-merge', target: { kind: 'node', nodeId: MERGE }, taskId: a, content: 'done' })).toMatchObject({ status: 'accepted' });
+  const branchTree = await sandbox.git(repo, 'ls-tree', '-r', '--name-only', (await task()).worktree!.branch);
+  expect(branchTree).toContain('a.txt');
+  expect(branchTree).not.toContain('src/generated.txt');
+  await until(async () => (await task()).status === 'merged', 'merged');
+  const mainTree = await sandbox.git(repo, 'ls-tree', '-r', '--name-only', 'main');
+  expect(mainTree).toContain('a.txt');
+  expect(mainTree).not.toContain('src/generated.txt');
+  await until(async () => (await instanceOf(w)).mergeQueue.every((m) => m.integration?.cleanup === 'removed') && (await task()).worktree?.cleanup === 'removed', 'cleaned');
 });

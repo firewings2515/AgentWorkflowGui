@@ -118,6 +118,8 @@ const IN_PROGRESS: readonly WorkflowTask['status'][] = ['running', 'blocked', 'a
 const MAX_RESTARTS = 5;
 const TAIL = 4000;
 const RESOLVER_PREFIX = 'wf-resolve-';
+/** The title of the question asked when a setup's record is missing (r2 P2): it tells that question apart. */
+const RECORD_TITLE = "The record of a task's setup is missing";
 /** Why a merge failed when nothing can test it (G-3: never merged untested, never a made-up test result). */
 const NO_TEST = 'no test command is set for this project or workflow, and the target branch moves only after the tests pass in the integration worktree';
 
@@ -431,10 +433,19 @@ export class TaskPipeline {
     }
     // A writing node's changes are committed at its handoff; root and read-only nodes change nothing.
     if (from.isRoot || from.writePolicy === 'read-only' || task.status === 'pending') return undefined;
-    const exclude = await this.setupOutputs(task, ref.ref.path);
-    if (exclude === undefined) return rejected('invalid-input', 'the GUI could not tell what the setup script made in the worktree, so it did not commit; hand off again');
+    let exclude = await this.setupOutputs(task, ref.ref.path);
+    // The user already let it commit without the record (a crash came before that was written down): done now.
+    if ('missing' in exclude && (await this.recordWaived(instance.id, taskId))) {
+      await this.deps.files.saveSetupChanges(ref.ref.path, []);
+      exclude = await this.setupOutputs(task, ref.ref.path);
+    }
+    if ('missing' in exclude) {
+      await this.openSetupQuestion(instance, taskId, 'the record of what its setup made in the worktree is missing, so the GUI does not commit (setup outputs could slip in). Approve to commit from now on without that record (everything not ignored by .gitignore); decline to give the task up', 'record');
+      return rejected('invalid-input', 'the GUI cannot tell what the setup script made in the worktree, so it did not commit; the user was asked');
+    }
+    if ('failed' in exclude) return rejected('invalid-input', `the GUI could not tell what the setup script made in the worktree (${exclude.failed}), so it did not commit; hand off again`);
     const where = target.kind === 'merge' ? 'merge' : `"${target.label}"`;
-    const committed = await this.git.commitAll(ref.ref, `awg: ${from.label} → ${where} (${task.title})`, exclude);
+    const committed = await this.git.commitAll(ref.ref, `awg: ${from.label} → ${where} (${task.title})`, exclude.exclude);
     if (committed.status === 'failed') {
       const markers = committed.detail.includes('Conflict markers') ? ' Resolve the conflict markers (a file that must show both kinds needs a larger conflict-marker-size), then hand off again.' : '';
       return rejected('invalid-input', `the GUI could not commit the task's changes: ${committed.detail}.${markers}`);
@@ -442,24 +453,28 @@ export class TaskPipeline {
     return undefined;
   }
 
-  /** What the setup script made in the worktree: kept out of the GUI's commits (SP-07 G1, G2). */
   /**
    * What the setup made, as pathspecs the GUI's commit leaves out (r1 P1-6): every path the setup changed whose
    * content is still what the setup left (a whole new folder always); a path the agent changed since is the
    * agent's work and committed. Undefined when the record cannot be read: then nothing is committed.
    */
-  private async setupOutputs(task: WorkflowTask, path: string): Promise<string[] | undefined> {
-    if (task.setup?.endedAt === undefined) return [];
+  private async setupOutputs(task: WorkflowTask, path: string): Promise<{ exclude: string[] } | { missing: true } | { failed: string }> {
+    if (task.setup?.endedAt === undefined) return { exclude: [] };
     try {
-      const changes = (await this.deps.files.loadSetupChanges(path)) ?? [];
+      const changes = await this.deps.files.loadSetupChanges(path);
+      // A setup that finished always left its record; without it nothing is committed (r2 P2).
+      if (changes === undefined) return task.setup.state === 'succeeded' ? { missing: true } : { exclude: [] };
       const excluded: string[] = [];
       for (const change of changes) {
-        if (change.state === 'dir' || (await this.deps.files.stateOf(path, change.path)) === change.state) excluded.push(`:(literal)${change.path}`);
+        if (change.state === 'dir' || (await this.deps.files.stateOf(path, change.path)) === change.state) excluded.push(change.path);
       }
-      return excluded;
+      // Out of the index too: a setup output staged (by the setup, or an agent's `git add -A`) would be committed
+      // whatever `git add` leaves out (r2 P1-4). Only paths of the setup's record.
+      if (excluded.length > 0) await this.deps.files.unstage(path, excluded);
+      return { exclude: excluded.map((p) => `:(literal)${p}`) };
     } catch (error) {
       this.deps.log(`[pipeline] reading what the setup of ${task.id} made failed (${errorText(error)})`);
-      return undefined;
+      return { failed: errorText(error) };
     }
   }
 
@@ -605,18 +620,24 @@ export class TaskPipeline {
         : await this.runCommand({ command: task.setup.command, shell: commands.shell, cwd: ref.ref.path, key: `setup:${key(instanceId, taskId)}`, purpose: 'setup' }, key(instanceId, taskId));
     // What the setup changed is recorded before its result (r1 P1-6): a crash in between runs the setup again.
     let note = '';
-    let recorded = true;
+    let refused: string | undefined;
     if (!('failed' in ref)) {
       try {
         const changes = await this.deps.files.changes(ref.ref.path);
         await this.deps.files.saveSetupChanges(ref.ref.path, changes);
+        // A setup that changes files the repository tracks fails (G-13, main session's ruling): they would stay
+        // changed in the worktree and keep the GUI from merging into it.
         const tracked = changes.filter((c) => c.tracked).map((c) => c.path);
-        if (tracked.length > 0) note = `\n[GUI] The setup changed files the repository tracks; they are kept out of the GUI's commits while unchanged: ${tracked.join(', ')}`;
+        if (tracked.length > 0) {
+          refused = `the setup changed files the repository tracks: ${tracked.join(', ')}. Change the setup script so it leaves them alone, or put what it makes in .gitignore`;
+          note = `\n[GUI] ${refused}.`;
+        }
       } catch (error) {
-        recorded = false;
+        refused = 'what the setup changed could not be recorded';
         note = `\n[GUI] What the setup changed could not be recorded (${errorText(error)}); the task does not start, so nothing it made reaches a commit.`;
       }
     }
+    const recorded = refused === undefined;
     const passed = outcome.exitCode === 0 && recorded;
     const at = this.deps.now();
     const saved = await this.mutate(instanceId, (current) => {
@@ -629,7 +650,7 @@ export class TaskPipeline {
     if (saved === undefined) return;
     this.settingUp.delete(key(instanceId, taskId));
     if (passed) await this.deps.host.wakeTask(instanceId, taskId);
-    else await this.openSetupQuestion(saved, taskId, !recorded ? 'what the setup changed could not be recorded' : (outcome.detail ?? `the setup script exited with code ${String(outcome.exitCode)}`));
+    else await this.openSetupQuestion(saved, taskId, refused ?? outcome.detail ?? `the setup script exited with code ${String(outcome.exitCode)}`);
   }
 
   private async runCommand(spec: Parameters<CommandRunner['run']>[0], runKey: string): Promise<{ exitCode: number | null; outputTail: string; detail?: string }> {
@@ -658,15 +679,25 @@ export class TaskPipeline {
     if (instance !== undefined) await this.openSetupQuestion(instance, taskId, detail);
   }
 
-  private async openSetupQuestion(instance: WorkflowInstance, taskId: TaskId, detail: string): Promise<void> {
+  /** Whether the user's last answer about this task's setup let it commit without the setup's record (r2 P2). */
+  private async recordWaived(instanceId: InstanceId, taskId: TaskId): Promise<boolean> {
+    const last = (await this.repos.escalations.list())
+      .filter((e) => e.instanceId === instanceId && e.kind === 'setup-failed' && e.ref?.kind === 'task' && e.ref.taskId === taskId)
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1))
+      .at(-1);
+    return last?.state === 'approved' && last.title === RECORD_TITLE;
+  }
+
+  /** `record`: the setup's record is missing (r2 P2), so `detail` says itself what approve and decline do. */
+  private async openSetupQuestion(instance: WorkflowInstance, taskId: TaskId, detail: string, about: 'setup' | 'record' = 'setup'): Promise<void> {
     const task = instance.tasks.find((t) => t.id === taskId);
     await this.deps.host.openOnce(setupEscalationBase(instance.id, taskId), {
       instanceId: instance.id,
       rootSessionId: instance.rootSessionId,
       fromSessionId: instance.rootSessionId,
       kind: 'setup-failed',
-      title: 'A task could not be set up',
-      detail: `task "${task?.title ?? taskId}": ${detail}. Approve to run its setup again; decline to give the task up.`,
+      title: about === 'record' ? RECORD_TITLE : 'A task could not be set up',
+      detail: about === 'record' ? `task "${task?.title ?? taskId}": ${detail}.` : `task "${task?.title ?? taskId}": ${detail}. Approve to run its setup again; decline to give the task up.`,
       ref: { kind: 'task', taskId },
     });
   }
@@ -1395,6 +1426,21 @@ export class TaskPipeline {
       return;
     }
     const instance = await this.repos.instances.get(instanceId);
+    const before = instance?.tasks.find((t) => t.id === taskId);
+    const ref = instance === undefined ? undefined : await this.taskRef(instance, taskId);
+    // A task at work whose setup record went missing (r2 P2): the user lets it commit without one.
+    if (before?.status === 'running' && before.setup?.state === 'succeeded' && ref !== undefined) {
+      if ((await this.deps.files.loadSetupChanges(ref.path)) === undefined) await this.deps.files.saveSetupChanges(ref.path, []);
+      return;
+    }
+    // Before it runs again: the tracked files the last setup changed go back to the worktree's commit, those still
+    // as the setup left them (G-13); a file changed since is left alone.
+    if (before?.status === 'blocked' && before.blockedReason === 'setup-failed' && ref !== undefined) {
+      const changes = (await this.deps.files.loadSetupChanges(ref.path).catch(() => undefined)) ?? [];
+      const untouched: string[] = [];
+      for (const c of changes) if (c.tracked && (await this.deps.files.stateOf(ref.path, c.path)) === c.state) untouched.push(c.path);
+      if (untouched.length > 0) await this.deps.files.restore(ref.path, untouched);
+    }
     const commands = instance === undefined ? undefined : await this.commandsOf(instance);
     const at = this.deps.now();
     const saved = await this.mutate(instanceId, (current) => {
@@ -1468,9 +1514,9 @@ export class TaskPipeline {
     if (ref === undefined) return undefined;
     const exclude = await this.setupOutputs(task, ref.path);
     const committed =
-      exclude === undefined
+      !('exclude' in exclude)
         ? { status: 'failed' as const, detail: 'what the setup made could not be read' }
-        : await this.git.commitAll(ref, `awg: work kept when ${why} (${task.title})`, exclude).catch((error: unknown) => ({ status: 'failed' as const, detail: errorText(error) }));
+        : await this.git.commitAll(ref, `awg: work kept when ${why} (${task.title})`, exclude.exclude).catch((error: unknown) => ({ status: 'failed' as const, detail: errorText(error) }));
     if (committed.status === 'failed') {
       this.deps.log(`[pipeline] the work of task ${taskId} could not be committed; its worktree is kept (${committed.detail})`);
       return 'kept';

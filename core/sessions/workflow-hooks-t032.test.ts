@@ -138,6 +138,34 @@ describe('T032 workflow hooks of the session service', () => {
     expect(internals.runtimes.isOpen(ref!)).toBe(false);
   });
 
+  it('r2 P1-3: past the deadline it still waits for the release the graceful close began: it returns only once a slow onSessionClosed has finished', async () => {
+    const w = await workflowWorld();
+    await started(w);
+    await settle();
+    const internals = w.service as unknown as {
+      options: { sleep?: (ms: number) => Promise<void>; onSessionClosed?: (sessionId: string) => Promise<void> };
+      runtimes: { isOpen(ref: string): boolean };
+      binding(sessionId: string): Promise<string | undefined>;
+    };
+    // The deadline passes at once; the adapter's close is quick, the release after it (the Job ending) is slow.
+    internals.options.sleep = () => Promise.resolve();
+    let finished = false;
+    let calls = 0;
+    internals.options.onSessionClosed = async () => {
+      calls++;
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+      finished = true;
+    };
+    const ref = await internals.binding(ROOT);
+    await w.service.closeWorkflowRuntime(ROOT, 10);
+    expect(finished).toBe(true);
+    expect(calls).toBe(1);
+    expect(internals.runtimes.isOpen(ref!)).toBe(false);
+    // A second close (the pipeline's cleanup after a give-up, say) finds it released and returns at once.
+    await w.service.closeWorkflowRuntime(ROOT, 10);
+    expect(calls).toBe(1);
+  });
+
   it('closeWorkflowRuntime closes a workflow session gracefully through its adapter, and leaves ordinary sessions alone', async () => {
     const w = await workflowWorld();
     await started(w);

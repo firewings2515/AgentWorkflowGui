@@ -51,6 +51,9 @@ interface Entry {
   adapter: Promise<RuntimeAdapter>;
 }
 
+/** Releases under way (`onClosed` running), by native ref: everyone who asks waits for the same one. */
+type Releasing = Map<string, Promise<void>>;
+
 const notRunning = (detail: string): DispatchResult => ({
   state: 'unknown',
   reason: 'not-running',
@@ -64,6 +67,7 @@ export class SessionRuntimes {
   private readonly refs = new Map<string, SessionId>();
   /** Refs whose session is open in its adapter now. */
   private readonly open = new Set<string>();
+  private readonly releasing: Releasing = new Map();
   private readonly started = new WeakSet<RuntimeAdapter>();
   private readonly subscribed = new WeakSet<RuntimeAdapter>();
   private readonly views: Record<Runtime, RuntimeAdapter>;
@@ -186,19 +190,34 @@ export class SessionRuntimes {
     try {
       return await (await entry.adapter).closeSession(nativeSessionRef, timeoutMs);
     } finally {
-      // Released once: `forceRelease` may have done it while the adapter's close hung (T032).
-      if (this.open.delete(nativeSessionRef)) await this.options.onClosed?.(sessionId);
+      // Released once: `forceRelease` may have begun it while the adapter's close hung (T032).
+      await this.releaseOpen(nativeSessionRef, sessionId);
     }
   }
 
   /**
    * Releases a session whose graceful close did not end in time (T032 r1 P1-5): it counts as closed, and
-   * `onClosed` ends its Job, token and watchers now. A close still under way finds it released.
+   * `onClosed` ends its Job, token and watchers. Resolves once that release has finished, whoever began it: a
+   * graceful close that already began releasing is waited for, not skipped (r2 P1-3).
    */
-  async forceRelease(nativeSessionRef: string): Promise<void> {
+  forceRelease(nativeSessionRef: string): Promise<void> {
     const sessionId = this.refs.get(nativeSessionRef);
-    if (sessionId === undefined || !this.open.delete(nativeSessionRef)) return;
-    await this.options.onClosed?.(sessionId);
+    return sessionId === undefined ? Promise.resolve() : this.releaseOpen(nativeSessionRef, sessionId);
+  }
+
+  /** The one release of an open session (`onClosed` once); a second caller gets the release under way. */
+  private releaseOpen(nativeSessionRef: string, sessionId: SessionId): Promise<void> {
+    const underway = this.releasing.get(nativeSessionRef);
+    if (underway !== undefined) return underway;
+    if (!this.open.delete(nativeSessionRef)) return Promise.resolve();
+    const released = Promise.resolve()
+      .then(() => this.options.onClosed?.(sessionId))
+      .then(() => undefined)
+      .finally(() => {
+        if (this.releasing.get(nativeSessionRef) === released) this.releasing.delete(nativeSessionRef);
+      });
+    this.releasing.set(nativeSessionRef, released);
+    return released;
   }
 
   /** Closes every adapter this router created (R-14: after the sessions themselves were closed). */
