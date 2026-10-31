@@ -47,6 +47,9 @@ export type MergeResult = { status: 'merged'; commit: string } | { status: 'conf
  * it cannot move without touching someone's work; nothing changed. A branch checked out in any worktree is
  * never moved by its ref alone, which would leave that checkout's index and files behind its HEAD: that
  * checkout is fast-forwarded itself (`merge --ff-only`, refusing when it has local changes), else `refused`.
+ * "Local changes" are tracked ones: untracked files are left to git's own check, which refuses a fast-forward
+ * that would overwrite one (T030 r1, main session's ruling); refusing on any untracked file would block a target
+ * branch whose checkout merely has some.
  */
 export type AdvanceResult = { status: 'advanced' } | { status: 'moved'; current: string } | { status: 'refused'; detail: string } | GitFailure;
 
