@@ -1,9 +1,9 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import type { CommandResult, EventEnvelope, Snapshot } from '../../contracts';
+import type { CommandResult, EventEnvelope, FolderResult, Snapshot } from '../../contracts';
 import type { AppInfo, AwgBridge } from './bridge-types';
-import { APP_INFO_CHANNEL, COMMAND_CHANNEL, EVENT_CHANNEL, SNAPSHOT_CHANNEL } from './channels';
+import { APP_INFO_CHANNEL, COMMAND_CHANNEL, EVENT_CHANNEL, FOLDER_CHANNEL, SNAPSHOT_CHANNEL } from './channels';
 
-// Only these four functions cross into the page; `ipcRenderer` itself never does. Validation happens
+// Only these functions cross into the page; `ipcRenderer` itself never does. Validation happens
 // in the main process, which does not trust anything it receives from here.
 const bridge: AwgBridge = {
   getAppInfo: () => ipcRenderer.invoke(APP_INFO_CHANNEL) as Promise<AppInfo>,
@@ -18,6 +18,7 @@ const bridge: AwgBridge = {
       ipcRenderer.removeListener(EVENT_CHANNEL, forward);
     };
   },
+  folders: { request: (request) => ipcRenderer.invoke(FOLDER_CHANNEL, request) as Promise<FolderResult> },
 };
 
 contextBridge.exposeInMainWorld('awg', bridge);
