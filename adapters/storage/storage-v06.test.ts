@@ -159,3 +159,22 @@ describe('T028 r1', () => {
     }
   });
 });
+
+describe('T028 r2', () => {
+  it('P1: a target that is JSON but cannot name its session fails the query; an unbound one is no one\'s', async () => {
+    const db = openDatabase(path);
+    try {
+      const store = new SqliteDeliveryStore(db);
+      await store.accept(payloadInput({ operationId: op('op-unbound'), target: {} }));
+      expect(await store.listByTarget(SessionId.parse('session-target'))).toEqual([]);
+      await store.accept(payloadInput());
+      for (const damaged of ['null', '{"sessionId":42}', '[]']) {
+        db.prepare('UPDATE delivery SET target = ? WHERE operation_id = ?').run(damaged, 'op-1');
+        await expect(store.listByTarget(SessionId.parse('session-target'))).rejects.toThrow();
+        await expect(store.listByTarget(SessionId.parse('anyone'))).rejects.toThrow();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});

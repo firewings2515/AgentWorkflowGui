@@ -315,6 +315,7 @@ export const TaskPlan = z
     const fail = (rule: ContractRule) => addRuleIssue(ctx, rule);
     if (p.state === 'awaiting-confirmation' && p.escalationId === undefined) fail('taskplan.confirming-needs-escalation');
     const keys = p.items.map((i) => i.key).sort();
+    if (new Set(keys).size !== keys.length) fail('taskplan.keys-unique');
     const named = p.created.map((c) => c.key).sort();
     const oneEach = named.length === keys.length && named.every((k, i) => k === keys[i]) && new Set(p.created.map((c) => c.taskId)).size === p.created.length;
     if (p.state === 'created' ? !oneEach : p.created.length > 0) fail('taskplan.created-tasks');
@@ -370,6 +371,9 @@ export const WorkflowInstance = z
     // it merges, and the tasks of an ended run are made final by the command that ends it.
     const ended = inst.state === 'completed' || inst.state === 'cancelled';
     if (inst.endedAt !== undefined && !ended) addRuleIssue(ctx, 'instance.ended-at', ['endedAt']);
+    // A run ended under 0.6 carries endedAt; then nothing of it may still be in progress (T028 r2 P1).
+    if (inst.endedAt !== undefined && (inst.tasks.some((t) => !finalTaskStatuses.includes(t.status)) || inst.mergeQueue.some((m) => !finalMergeStates.includes(m.state))))
+      addRuleIssue(ctx, 'instance.ended-work-final', ['tasks']);
     const rounds = new Set<string>();
     inst.rounds.forEach((r, i) => {
       const key = JSON.stringify([r.taskId, r.nodeId, r.round]);

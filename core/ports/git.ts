@@ -44,7 +44,9 @@ export type MergeResult = { status: 'merged'; commit: string } | { status: 'conf
 /**
  * Fast-forward of the target branch to the tested commit (R-06 step 5). `moved`: the branch is no longer at
  * `expected` (someone else updated it), nothing changed and the merge starts again from step 1. `refused`:
- * it cannot move without touching someone's work (e.g. it is checked out with local changes); nothing changed.
+ * it cannot move without touching someone's work; nothing changed. A branch checked out in any worktree is
+ * never moved by its ref alone, which would leave that checkout's index and files behind its HEAD: that
+ * checkout is fast-forwarded itself (`merge --ff-only`, refusing when it has local changes), else `refused`.
  */
 export type AdvanceResult = { status: 'advanced' } | { status: 'moved'; current: string } | { status: 'refused'; detail: string } | GitFailure;
 

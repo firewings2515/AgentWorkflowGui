@@ -135,7 +135,7 @@ describe('contracts 0.6', () => {
       const c = pick(login.tasks, 2);
       expect(ok(WorkflowInstance, { ...login, tasks: [{ ...a, dependsOn: ['task-c'] }, ...login.tasks.slice(1, 2), c, ...login.tasks.slice(3)] })).toBe(true);
       // Only a run that ended has an end time.
-      expect(rules(WorkflowInstance, { ...login, endedAt: at })).toEqual(['instance.ended-at']);
+      expect(rules(WorkflowInstance, { ...login, endedAt: at })).toEqual(['instance.ended-at', 'instance.ended-work-final']);
     });
 
     it('at most one merge attempt is active; attempts are unique per task and in queue order', () => {
@@ -168,6 +168,9 @@ describe('contracts 0.6', () => {
       const sameTask = created.created?.map((c) => ({ ...c, taskId: 'task-a' }));
       expect(rules(TaskPlan, { ...created, created: sameTask })).toEqual(['taskplan.created-tasks']);
       expect(rules(TaskPlan, { ...waiting, created: created.created })).toEqual(['taskplan.created-tasks']);
+      // r2 P2: one key, one task.
+      const same = { ...created, items: created.items.map((i) => ({ ...i, key: 'same', dependsOn: [] })), created: created.created?.map((x) => ({ ...x, key: 'same' })) };
+      expect(rules(TaskPlan, same)).toContain('taskplan.keys-unique');
       expect(rules(TaskPlan, { ...waiting, decidedAt: at })).toEqual(['taskplan.decided-at']);
       expect(ok(TaskPlan, { ...waiting, state: 'declined', decidedAt: at })).toBe(true);
       expect(rules(WorkflowInstance, { ...login, taskPlans: [created, created] })).toEqual(['instance.task-plan-unique']);
@@ -195,6 +198,9 @@ describe('contracts 0.6', () => {
     it('an ended run may say when; the user ends it with a command', () => {
       const tasks = login.tasks.map((t) => (t.status === 'merged' ? t : { ...t, status: 'cancelled', blockedReason: undefined }));
       expect(ok(WorkflowInstance, { ...login, state: 'cancelled', endedAt: at, tasks, mergeQueue: [] })).toBe(true);
+      // r2 P1: a run ended under 0.6 has nothing in progress.
+      expect(rules(WorkflowInstance, { ...login, state: 'completed', endedAt: at })).toEqual(['instance.ended-work-final']);
+      expect(rules(WorkflowInstance, { ...login, state: 'cancelled', endedAt: at, tasks })).toEqual(['instance.ended-work-final']);
       for (const type of ['workflow.complete', 'workflow.cancel']) expect(ok(Command, { type, requestId: 'r', instanceId: login.id, expectedRevision: 4 })).toBe(true);
       expect(ok(Command, { type: 'task.retryCleanup', requestId: 'r', instanceId: login.id, taskId: 'task-d' })).toBe(true);
     });

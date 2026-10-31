@@ -312,8 +312,12 @@ export class SqliteDeliveryStore implements DeliveryStore {
     return this.run(() =>
       readTransaction(this.db, () =>
         (this.db
-          // A row whose target cannot be read is selected too, so loading it fails closed (T028 r1 P1-3).
-          .prepare("SELECT * FROM delivery WHERE NOT json_valid(target) OR json_extract(target, '$.sessionId') = ? ORDER BY accepted_ms, rowid")
+          // A row whose target cannot say which session it is (not JSON, not an object, a sessionId that is not
+          // text) is selected too, so loading it fails closed (T028 r1 P1-3, r2 P1). An unbound target has no
+          // sessionId and is no session's.
+          .prepare(
+            "SELECT * FROM delivery WHERE NOT json_valid(target) OR json_type(target) <> 'object' OR coalesce(json_type(target, '$.sessionId'), 'text') <> 'text' OR json_extract(target, '$.sessionId') = ? ORDER BY accepted_ms, rowid",
+          )
           .all(sessionId) as unknown as DeliveryRow[]).map((row) => this.load(row)),
       ),
     );

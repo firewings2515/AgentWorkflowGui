@@ -39,7 +39,11 @@ export interface FileLockTable {
    * Takes the lock for a write, after checking the session's read of the file against `currentHash`
    * (`undefined`: the file does not exist). `acquired` / `held-by-self` also start one write in progress,
    * which `writeEnded` ends exactly once; while any is in progress the holder's own changes are expected.
-   * Codex's file-change approval names every file of the change: each is acquired and ended on its own.
+   * Codex's file-change approval names every file of the change: each is acquired and ended on its own. When
+   * one of them is `held`, the writes already started for the others are ended as `failed` before the
+   * request waits or is refused (so a change to those files meanwhile is someone else's), and every file is
+   * acquired again, read check included, once the request may go (T028 r2 P2). A tool that failed after
+   * writing some files ends each file with what it actually left.
    */
   acquire(request: LockRequest, currentHash: PayloadHash | undefined): AcquireResult;
   /** Ends one write `acquire` started for this session and file. */
