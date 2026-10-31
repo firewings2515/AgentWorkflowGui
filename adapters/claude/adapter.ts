@@ -5,10 +5,12 @@
 //
 // Not here on purpose: retries of any kind (CR-2), the R-08 escalation decision (the layer above
 // answers each request), supervisor idle shutdown, and Job Objects for orphaned commands (R-14).
+import { spawn as spawnChild } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   type ClientMessageId,
   type Message,
@@ -77,7 +79,7 @@ import {
   toTokenCounts,
 } from './mapping';
 import { buildPermissionRequest, decisionToHookOutput, denyOutput, parsePreToolUse } from './permissions';
-import { type ClaudeSdk, isWireUuid, type WireHookOutput, type WireMcpServer, type WireOrigin, type WireQuery, type WireQueryOptions, type WireTranscript, type WireTranscriptEntry, type WireUserMessage } from './wire';
+import { type ClaudeSdk, isWireUuid, type WireHookOutput, type WireMcpServer, type WireOrigin, type WireQuery, type WireQueryOptions, type WireSpawnedProcess, type WireSpawnOptions, type WireTranscript, type WireTranscriptEntry, type WireUserMessage } from './wire';
 
 export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
   /** The SDK functions; `claudeAgentSdk` from ./sdk in production, a fake in tests. */
@@ -114,10 +116,23 @@ export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
    * run the tool and aborts the hook, which withdraws the request (live-checked, T009).
    */
   hookTimeoutSeconds?: number;
-  /** Folder for the short-lived query that lists models when no session is open (default: OS temp). */
+  /**
+   * Fixed folder for the short-lived query that lists models when no session is open (default:
+   * `awg-claude-probe` in the OS temp folder). Each probe makes a temp folder of its own in it for its
+   * claude.exe and removes exactly that folder afterwards (T035).
+   */
   probeCwd?: string;
   /** Replaces the cwd existence check (tests). */
   cwdExists?: (cwd: string) => boolean;
+  /** Replaces the removal of a probe's temp folder (tests). */
+  removeFolder?: (path: string) => Promise<void>;
+  /**
+   * Starts a probe's claude.exe (tests). Default: `spawnProcess` for `PROBE_SESSION_ID`, so it runs in a
+   * Job like a session's; without one, a plain child process, as the SDK starts it.
+   */
+  spawnProbe?: (options: WireSpawnOptions) => WireSpawnedProcess;
+  /** How long listModels waits for a probe's claude.exe to exit (default 5 s); its folder goes when it does. */
+  probeExitTimeoutMs?: number;
   log?: (level: 'debug' | 'warn', message: string, detail?: unknown) => void;
 }
 
@@ -182,6 +197,105 @@ const MAIN = 'main';
 const DEFAULT_MAX_OUTPUT = 64 * 1024;
 /** The environment variable that carries a session's GUI MCP token into its own claude.exe only. */
 export const GUI_TOKEN_ENV = 'AWG_GUI_MCP_TOKEN';
+/** Claude Code keeps its temp files, a scratch folder per session among them, under `<this>\claude` (T035). */
+export const CLI_TMPDIR_ENV = 'CLAUDE_CODE_TMPDIR';
+/** How long listModels waits for a probe's claude.exe to exit before it ends that process. */
+const PROBE_EXIT_MS = 5000;
+/**
+ * The Job a probe's claude.exe is started in through `spawnProcess`, like a session's (R-14); the Codex
+ * probe's is `models-codex` (app/main backend).
+ */
+export const PROBE_SESSION_ID = SessionId.parse('models-claude');
+
+/**
+ * claude.exe for a probe, started as the SDK's own spawn starts it. The SDK reads only stdout of a custom
+ * spawn, so stderr is read here (a full pipe would block claude.exe); the SDK's signal aborts only after
+ * its stdin-EOF grace period, so killing on it is safe (as `claudeProcessSpawn` in adapters/process).
+ */
+const plainSpawn =
+  (onStderr: (text: string) => void) =>
+  (options: WireSpawnOptions): WireSpawnedProcess => {
+    const child = spawnChild(options.command, options.args, { cwd: options.cwd, env: options.env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (text: string) => onStderr(text));
+    const { signal } = options;
+    const onAbort = () => child.kill('SIGTERM');
+    if (signal.aborted) onAbort();
+    else {
+      signal.addEventListener('abort', onAbort, { once: true });
+      child.once('exit', () => signal.removeEventListener('abort', onAbort));
+    }
+    return child;
+  };
+
+/**
+ * A spawn function that knows the process it started (T035 r1 P1, r2 P1): `exited` resolves when that
+ * process has exited, when its start failed, or once `closed()` says none will be started any more.
+ * `kill()` ends that process only; `detach()` drops the listeners on one that will not exit.
+ */
+const watchedProcess = (spawn: (options: WireSpawnOptions) => WireSpawnedProcess) => {
+  let child: WireSpawnedProcess | undefined;
+  let done = false;
+  const onExit = () => markExited();
+  // A process that could not be started never exits; any other error leaves it to its exit.
+  const onError = (error: NodeJS.ErrnoException) => {
+    if (error.syscall?.startsWith('spawn')) markExited();
+  };
+  const detach = () => {
+    child?.off('exit', onExit);
+    child?.off('error', onError);
+  };
+  let markExited = () => {};
+  const exited = new Promise<void>((resolve) => {
+    markExited = () => {
+      if (done) return;
+      done = true;
+      detach();
+      resolve();
+    };
+  });
+  return {
+    spawn: (options: WireSpawnOptions): WireSpawnedProcess => {
+      let started: WireSpawnedProcess;
+      try {
+        started = spawn(options);
+      } catch (error) {
+        markExited();
+        throw error;
+      }
+      child = started;
+      started.on('exit', onExit);
+      started.on('error', onError);
+      if (started.exitCode !== null || (started.signalCode ?? null) !== null) markExited();
+      return started;
+    },
+    exited,
+    /** The query is closed: no process will be started, so none started counts as exited. */
+    closed: () => {
+      if (child === undefined) markExited();
+    },
+    running: () => child !== undefined && !done,
+    kill: (): boolean => {
+      try {
+        return child?.kill('SIGTERM') ?? false;
+      } catch {
+        return false;
+      }
+    },
+    detach,
+  };
+};
+
+type WatchedProcess = ReturnType<typeof watchedProcess>;
+
+/** A model-listing probe whose temp folder goes once its claude.exe has exited (T035). */
+interface Probe {
+  /** Its own temp folder, when one could be made. */
+  folder: string | undefined;
+  cli: WatchedProcess;
+  /** Settles after the process exited and its folder was removed (or the removal failed and was logged). */
+  removed: Promise<void>;
+}
 
 /** Same folder, compared the way Windows does (case-insensitive, either separator, no trailing one). */
 const sameFolder = (a: string, b: string): boolean => {
@@ -238,6 +352,8 @@ export class ClaudeAdapter implements RuntimeAdapter {
   private readonly dispatched = new Set<string>();
   /** Origin of each payload this adapter dispatched, by its uuid, for the user message it becomes. */
   private readonly origins = new Map<string, MessageOrigin>();
+  /** Model-listing probes whose claude.exe has not exited yet (T035 r2 P1). */
+  private readonly probes = new Set<Probe>();
 
   constructor(private readonly options: ClaudeAdapterOptions) {}
 
@@ -253,12 +369,30 @@ export class ClaudeAdapter implements RuntimeAdapter {
     return Promise.resolve();
   }
 
-  /** R-14: every open session is interrupted before it is closed. */
+  /** R-14: every open session is interrupted before it is closed; a probe's claude.exe still running is ended. */
   async close(timeoutMs = 5000): Promise<{ forced: boolean }> {
     this.closing = true;
-    const results = await Promise.all([...this.sessions.values()].map((s) => this.closeLive(s, timeoutMs)));
+    const [results, probesLeft] = await Promise.all([Promise.all([...this.sessions.values()].map((s) => this.closeLive(s, timeoutMs))), this.closeProbes(timeoutMs)]);
     this.started = false;
-    return { forced: results.some((r) => r.forced) };
+    return { forced: probesLeft || results.some((r) => r.forced) };
+  }
+
+  /**
+   * Ends the claude.exe of every probe still running, each by the process this adapter started (T035 r2
+   * P1); its folder goes once it has exited. One that does not exit in time is let go: its listeners are
+   * dropped, its folder is left, and that is logged. Returns whether any was let go.
+   */
+  private async closeProbes(timeoutMs: number): Promise<boolean> {
+    const probes = [...this.probes];
+    for (const p of probes) if (p.cli.running() && !p.cli.kill()) this.log('warn', 'close: could not end a probe CLI', p.folder);
+    await within(Promise.all(probes.map((p) => p.removed)), timeoutMs);
+    const left = probes.filter((p) => p.cli.running());
+    for (const p of left) {
+      p.cli.detach();
+      this.probes.delete(p);
+      this.log('warn', 'close: a probe CLI did not exit; its temp folder is left', p.folder);
+    }
+    return left.length > 0;
   }
 
   /**
@@ -509,21 +643,77 @@ export class ClaudeAdapter implements RuntimeAdapter {
    * (nothing reaches the model and no transcript is written).
    */
   async listModels(): Promise<ModelOption[]> {
+    // A probe started after close() would outlive it (T035).
+    if (this.closing) throw new Error('listModels: ClaudeAdapter is closing');
     const open = [...this.sessions.values()].find((s) => !s.closing && !s.ended);
     if (open) return (await open.query.supportedModels()).map(toModelOption);
     const input = new InputQueue<WireUserMessage>();
     // No prompt is sent, so no tool should run; if one did, it is denied.
     const denyAll = () => Promise.resolve(denyOutput('AgentWorkflowGui: model listing runs no tools'));
-    const query = this.options.sdk.query({ prompt: input, options: this.queryOptions(this.options.probeCwd ?? tmpdir(), { readOnly: true }, {}, denyAll) });
+    // T035: the CLI leaves a scratch folder per session in its temp folder (`%TEMP%\claude\<cwd>\<id>\scratchpad`),
+    // one more on every start. The probe runs in a fixed folder, and its claude.exe gets a temp folder of its
+    // own made there, which is removed by its path once that process has exited; nothing else is touched.
+    const cwd = this.options.probeCwd ?? join(tmpdir(), 'awg-claude-probe');
+    let temp: string | undefined;
+    let query: WireQuery | undefined;
+    // The probe starts its claude.exe itself, so it sees the process exit (T035 r1 P1): the end of the
+    // SDK's stream is not that, as the SDK stops waiting for the exit after a short grace. It starts it the
+    // way sessions do (T035 r2 P1), in the GUI's Job for the probe, so the GUI's exit ends it too.
+    const spawn = this.options.spawnProbe ?? this.options.spawnProcess?.({ sessionId: PROBE_SESSION_ID }) ?? plainSpawn((text) => this.log('debug', 'claude stderr', text));
+    const cli = watchedProcess(spawn);
+    let probe: Probe | undefined;
     try {
+      try {
+        mkdirSync(cwd, { recursive: true });
+        temp = mkdtempSync(join(cwd, 'tmp-'));
+      } catch (error) {
+        this.log('warn', 'listModels: could not make the probe folder; the probe uses the OS temp folder', errorText(error));
+      }
+      probe = this.trackProbe(temp, cli);
+      const options = this.queryOptions(temp === undefined ? tmpdir() : cwd, { readOnly: true }, {}, denyAll);
+      const probeOptions = { ...options, ...(temp !== undefined && { env: { ...process.env, [CLI_TMPDIR_ENV]: temp } }), spawnClaudeCodeProcess: cli.spawn };
+      query = this.options.sdk.query({ prompt: input, options: probeOptions });
       const timeoutMs = this.options.startTimeoutMs ?? 60_000;
       const models = await within(query.supportedModels(), timeoutMs);
       if (!models) throw new Error(`listModels: the Claude CLI did not answer within ${timeoutMs} ms`);
       return models.value.map(toModelOption);
     } finally {
       input.close();
-      query.close();
+      try {
+        query?.close();
+      } catch (error) {
+        this.log('warn', 'query.close() threw', error);
+      }
+      cli.closed();
+      if (probe !== undefined) await this.settleProbe(probe);
     }
+  }
+
+  /** Keeps a probe until its claude.exe has exited, then removes its own temp folder; a failed removal is only logged (T035). */
+  private trackProbe(folder: string | undefined, cli: WatchedProcess): Probe {
+    const remove = async () => {
+      if (folder === undefined) return;
+      try {
+        await (this.options.removeFolder ?? ((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })))(folder);
+      } catch (error) {
+        this.log('warn', 'listModels: could not remove the probe temp folder', { folder, error: errorText(error) });
+      }
+    };
+    const probe: Probe = { folder, cli, removed: cli.exited.then(remove) };
+    this.probes.add(probe);
+    void probe.removed.then(() => this.probes.delete(probe));
+    return probe;
+  }
+
+  /**
+   * listModels waits for its probe's claude.exe to exit and its folder to go. One still running after the
+   * wait is ended (that process only); its folder goes once it has exited, or close() lets it go.
+   */
+  private async settleProbe(probe: Probe): Promise<void> {
+    if (await within(probe.removed, this.options.probeExitTimeoutMs ?? PROBE_EXIT_MS)) return;
+    if (!probe.cli.running()) return;
+    this.log('warn', 'listModels: the probe CLI has not exited; it is ended, and its temp folder removed once it exits', probe.folder);
+    if (!probe.cli.kill()) this.log('warn', 'listModels: could not end the probe CLI', probe.folder);
   }
 
   // ---- sessions -----------------------------------------------------------------------------------

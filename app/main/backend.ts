@@ -226,15 +226,22 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       });
     });
   const hooks = { onPermissionRequest: (handle: PermissionHandle) => (ref.service === undefined ? Promise.reject(new Error('not ready')) : ref.service.onPermissionRequest(handle)) };
+  // T035: the Claude adapter the model probe ran on (the shared one). The exit closes it even when no Claude
+  // session ever ran, so a probe's claude.exe is ended and its temp folder removed before the GUI goes.
+  let claudeProbeAdapter: RuntimeAdapter | undefined;
+  let probesStopped = false;
   const listModels =
     options.listModels ??
     (async (runtime: Runtime): Promise<ModelOption[]> => {
+      // No probe once the exit has begun.
+      if (probesStopped) throw new Error('the application is closing');
       // Listed outside any session: Codex in a Job of its own, ended right after.
       const probeId = `models-${runtime}` as SessionId;
       // Claude's adapter is the one all sessions share, so it keeps the service's hooks; the Codex probe
       // has an app-server of its own, where nothing can be allowed.
       const probeHooks = runtime === 'claude' ? hooks : { onPermissionRequest: (h: PermissionHandle) => h.answer({ outcome: 'decline', decidedBy: 'policy', at: now() }) };
       const adapter = createAdapter(runtime, probeId, probeHooks);
+      if (runtime === 'claude') claudeProbeAdapter = adapter;
       try {
         if (runtime === 'codex') await adapter.start();
         return await adapter.listModels();
@@ -368,9 +375,14 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       // R-14: the core stops taking anything new at once (a permission check under way is declined), then no new
       // tool calls, then every session closed gracefully, then whatever is left in a Job.
       service.beginClose();
+      probesStopped = true;
       await mcp.close().catch(() => undefined);
       // Bounded inside (each wait has its deadline); the database closes only after it returned (r1-P1-5).
       await service.shutdown(closeTimeoutMs);
+      // T035: the probe's Claude adapter, which closeAll leaves out when no Claude session ran; closing it
+      // again after closeAll finds nothing left. Bounded by the same deadline; before the Jobs are ended, so
+      // the probe's claude.exe exits through it and its folder goes.
+      await claudeProbeAdapter?.close(closeTimeoutMs).catch(() => undefined);
       const left: OwnedProcess[] = await host.listOwned().catch(() => []);
       for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
       watchers.stopAll();

@@ -14,6 +14,7 @@ import { agent } from '../../core/sessions/testing/harness';
 import { type Backend, type BackendProcessHost, type DamagedBackend, startBackend } from './backend';
 import { EventBus } from './event-bus';
 import { ClaudeAdapter } from '../../adapters/claude';
+import { FakeProcess } from '../../adapters/claude/testing/fake-process';
 import { FakeSdk } from '../../adapters/claude/testing/fake-sdk';
 
 let dir: string;
@@ -443,5 +444,53 @@ describe('review round 3 (T017-r3-result.md)', () => {
     const shutdown = result.shutdown();
     expect((await output).hookSpecificOutput?.permissionDecision).toBe('deny');
     await shutdown;
+  });
+});
+
+describe('T035 the exit closes the Claude adapter the model probe ran on', () => {
+  it('t035 with no Claude session ever, shutdown ends the probe’s claude.exe and removes its temp folder', async () => {
+    const sdk = new FakeSdk();
+    sdk.behaviour.models = [{ value: 'sonnet', displayName: 'Sonnet' }];
+    sdk.behaviour.spawnOnQuery = true;
+    const probeCwd = join(dir, 'probe');
+    // A claude.exe that stays after the probe's query is closed, until it is ended.
+    const processes: FakeProcess[] = [];
+    let claude: ClaudeAdapter | undefined;
+    const order: string[] = [];
+    const result = await startBackend({
+      dbPath: join(dir, 'awg.sqlite'),
+      bus: new EventBus(),
+      createHost: () => new FakeHost(order),
+      createAdapter: (runtime, _sessionId, hooks) =>
+        runtime === 'claude'
+          ? (claude ??= new ClaudeAdapter({
+              sdk,
+              onPermissionRequest: (h) => hooks.onPermissionRequest(h),
+              cwdExists: () => true,
+              probeCwd,
+              probeExitTimeoutMs: 60_000,
+              spawnProbe: () => {
+                const p = new FakeProcess();
+                p.exitOnKill = true;
+                processes.push(p);
+                return p;
+              },
+            }))
+          : new FakeAdapter(runtime, (h) => hooks.onPermissionRequest(h)),
+      resolveRealPath: (p) => p,
+      log: () => undefined,
+    });
+    if (result.status !== 'ready') throw new Error('not ready');
+    for (let i = 0; i < 200 && (processes.length === 0 || sdk.queries.length === 0 || !sdk.last.closed); i++) await new Promise((r) => setTimeout(r, 5));
+    expect(processes).toHaveLength(1);
+    expect(readdirSync(probeCwd)).toHaveLength(1);
+
+    order.length = 0;
+    await result.shutdown();
+    expect(processes[0]!.kills).toBe(1);
+    expect(processes[0]!.exitCode).toBe(1);
+    expect(readdirSync(probeCwd)).toEqual([]);
+    // No probe once the exit has begun.
+    await expect(claude!.listModels()).rejects.toThrow(/closing/);
   });
 });

@@ -4,7 +4,7 @@
 // (R-05); the session service applies the decision.
 //
 // Shell commands are read twice, as PowerShell and as Git Bash, unless they arrive in Codex's
-// `powershell.exe -Command "..."` or `-Command '...'` wrapper. Claude's Bash and PowerShell tools both arrive as `command`
+// `powershell.exe -Command "..."` or `-Command '...'` wrapper (or the script quoted as Codex quotes it). Claude's Bash and PowerShell tools both arrive as `command`
 // requests, and the request does not say which shell runs them, so both readings must be safe.
 import type { PermissionRequest } from '../../contracts';
 import type { PermissionPolicy, PolicyContext, PolicyDecision, PolicyRule } from '../ports';
@@ -12,6 +12,7 @@ import { type Effects, type Target, handlerFor } from './commands';
 import { type Shell, type Word, lex } from './lexer';
 import { type AbsPath, type PathStyle, fileKey, hasWildcard, isSecretPath, isWithinAny, mentionsSecret, normaliseAbsolute, resolvePath } from './paths';
 import { type Finding, REASONS, type ReasonKey, finding } from './reasons';
+import { shlexArgument } from './shlex';
 
 interface Scope {
   writable: AbsPath[];
@@ -192,18 +193,20 @@ const EXE_QUOTED = /^[ \t]*"([A-Za-z0-9 _.:\\/-]+)"/;
 const EXE_BARE = /^[ \t]*([A-Za-z0-9_.:\\/-]+)(?=[ \t])/;
 
 /**
- * The rest of the command after an executable token that names the system PowerShell exactly, else
- * undefined. The token is checked as written before it is normalised: a `.` or `..` segment could fold
- * away anything in front of it (`.../x;payload.cmd;#/../../../powershell.exe`), so it is never accepted.
+ * The rest of the command after an executable token that names the system PowerShell exactly, and whether
+ * that token is in double quotes, else undefined. The token is checked as written before it is normalised:
+ * a `.` or `..` segment could fold away anything in front of it (`.../x;payload.cmd;#/../../../powershell.exe`),
+ * so it is never accepted.
  */
-const afterPowerShell = (command: string): string | undefined => {
-  const m = EXE_QUOTED.exec(command) ?? EXE_BARE.exec(command);
+const afterPowerShell = (command: string): { rest: string; quoted: boolean } | undefined => {
+  const quoted = EXE_QUOTED.exec(command);
+  const m = quoted ?? EXE_BARE.exec(command);
   if (!m) return undefined;
   const path = m[1]!;
   if (path.split(/[\\/]/).some((segment) => segment === '.' || segment === '..')) return undefined;
   const exe = normaliseAbsolute(path);
   if (exe === undefined || !POWERSHELL_EXE.test(exe)) return undefined;
-  return command.slice(m[0].length);
+  return { rest: command.slice(m[0].length), quoted: quoted !== null };
 };
 
 /**
@@ -211,14 +214,19 @@ const afterPowerShell = (command: string): string | undefined => {
  * Returns the script when the command has that form with the system PowerShell, and whether it may be
  * read as PowerShell alone. The same text may come from Claude's Bash tool, where Bash first expands
  * `$`, backticks and `!` inside the double quotes and joins lines ending in `\`. Rule E: the wrapper is
- * opened only when the script has none of `\`, a line break, `$`, a backtick or `!`.
+ * opened only when the script has none of `\`, a line break, `$`, a backtick or `!`, unless it is quoted
+ * exactly as Codex quotes it (T035, `unwrapShlex`).
  */
 export const unwrapPowerShell = (command: string): { script: string; safe: boolean; alsoAs?: string } | undefined => {
-  const rest = afterPowerShell(command);
-  if (rest === undefined) return undefined;
-  const m = WRAPPER.exec(rest);
-  if (m) return { script: m[2]!, safe: !/[\\\r\n$`!]/.test(m[2]!) };
-  return unwrapSingleQuoted(rest);
+  const exe = afterPowerShell(command);
+  if (exe === undefined) return undefined;
+  const m = WRAPPER.exec(exe.rest);
+  if (m && !/[\\\r\n$`!]/.test(m[2]!)) return { script: m[2]!, safe: true };
+  const single = unwrapSingleQuoted(exe.rest);
+  if (single !== undefined) return single;
+  const joined = exe.quoted ? unwrapShlex(exe.rest) : undefined;
+  if (joined !== undefined) return joined;
+  return m ? { script: m[2]!, safe: false } : undefined;
 };
 
 /** The same wrapper with the script as exactly one single-quoted token that runs to the end of the command. */
@@ -237,6 +245,23 @@ const unwrapSingleQuoted = (rest: string): { script: string; safe: boolean; also
   if (!m) return undefined;
   const body = m[2]!;
   return { script: body.replaceAll("''", "'"), safe: true, ...(body.includes("''") && { alsoAs: body.replaceAll("''", '') }) };
+};
+
+/** The same wrapper with the script as one word to the end of the command, however it is quoted. */
+const WRAPPER_WORD = /^[ \t]+((?:-(?:NoProfile|NoLogo|NonInteractive)[ \t]+)*)-(?:Command|c)[ \t]+(.*?)[ \t]*$/is;
+
+/**
+ * T035 (T024 r1 P2-2): Codex 0.160 joins its argv with shlex 1.3.0, so a script with `'` and a Windows path
+ * comes in double quotes with `\` doubled and `"` escaped, and a script with `'` next to `!`, `$` or a
+ * backtick comes in several single- and double-quoted pieces. The word is opened only when it is exactly
+ * what shlex makes of the script it stands for: then Bash reads it as that script too. Only after a
+ * double-quoted executable, where PowerShell cannot run the line at all (its parser stops at the parameter
+ * after a string); a bare executable would let PowerShell read `\"` and `\\` its own way.
+ */
+const unwrapShlex = (rest: string): { script: string; safe: boolean } | undefined => {
+  const m = WRAPPER_WORD.exec(rest);
+  const script = m ? shlexArgument(m[2]!) : undefined;
+  return script === undefined ? undefined : { script, safe: true };
 };
 
 

@@ -1,4 +1,7 @@
 // Session lifecycle on the fake SDK: start / resume options, startup failures, models, crashes, close.
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { SessionId } from '../../contracts';
 import { CWD, echo, expectValidEvents, init, loadStored, REF, result, setup, started, startOptions, until } from './testing/harness';
@@ -117,12 +120,14 @@ describe('models', () => {
   });
 
   it('lists models with a short-lived query when no session is open', async () => {
-    const h = setup({ probeCwd: 'E:\\probe' });
+    const probeCwd = mkdtempSync(join(tmpdir(), 'awg-t035-probe-'));
+    const h = setup({ probeCwd });
     h.sdk.behaviour.models = [{ value: 'sonnet', displayName: 'Sonnet' }];
     await h.adapter.start();
     expect(await h.adapter.listModels()).toMatchObject([{ model: 'sonnet' }]);
+    rmSync(probeCwd, { recursive: true, force: true });
     const probe = h.sdk.last;
-    expect(probe.options).toMatchObject({ cwd: 'E:\\probe', settingSources: [], settings: { disableClaudeAiConnectors: true }, strictMcpConfig: true });
+    expect(probe.options).toMatchObject({ cwd: probeCwd, settingSources: [], settings: { disableClaudeAiConnectors: true }, strictMcpConfig: true });
     expect(probe.inputs).toEqual([]);
     expect(probe.closed).toBe(true);
   });
