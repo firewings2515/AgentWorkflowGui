@@ -6,9 +6,10 @@
 // Not here on purpose: retries of any kind (CR-2), the R-08 escalation decision (the layer above
 // answers each request), supervisor idle shutdown, and Job Objects for orphaned commands (R-14).
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   type ClientMessageId,
   type Message,
@@ -114,10 +115,16 @@ export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
    * run the tool and aborts the hook, which withdraws the request (live-checked, T009).
    */
   hookTimeoutSeconds?: number;
-  /** Folder for the short-lived query that lists models when no session is open (default: OS temp). */
+  /**
+   * Fixed folder for the short-lived query that lists models when no session is open (default:
+   * `awg-claude-probe` in the OS temp folder). Each probe makes a temp folder of its own in it for its
+   * claude.exe and removes exactly that folder afterwards (T035).
+   */
   probeCwd?: string;
   /** Replaces the cwd existence check (tests). */
   cwdExists?: (cwd: string) => boolean;
+  /** Replaces the removal of a probe's temp folder (tests). */
+  removeFolder?: (path: string) => Promise<void>;
   log?: (level: 'debug' | 'warn', message: string, detail?: unknown) => void;
 }
 
@@ -182,6 +189,10 @@ const MAIN = 'main';
 const DEFAULT_MAX_OUTPUT = 64 * 1024;
 /** The environment variable that carries a session's GUI MCP token into its own claude.exe only. */
 export const GUI_TOKEN_ENV = 'AWG_GUI_MCP_TOKEN';
+/** Claude Code keeps its temp files, a scratch folder per session among them, under `<this>\claude` (T035). */
+export const CLI_TMPDIR_ENV = 'CLAUDE_CODE_TMPDIR';
+/** How long a model-listing probe's claude.exe may take to end before its temp folder is removed anyway. */
+const PROBE_EXIT_MS = 5000;
 
 /** Same folder, compared the way Windows does (case-insensitive, either separator, no trailing one). */
 const sameFolder = (a: string, b: string): boolean => {
@@ -514,7 +525,23 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const input = new InputQueue<WireUserMessage>();
     // No prompt is sent, so no tool should run; if one did, it is denied.
     const denyAll = () => Promise.resolve(denyOutput('AgentWorkflowGui: model listing runs no tools'));
-    const query = this.options.sdk.query({ prompt: input, options: this.queryOptions(this.options.probeCwd ?? tmpdir(), { readOnly: true }, {}, denyAll) });
+    // T035: the CLI leaves a scratch folder per session in its temp folder (`%TEMP%\claude\<cwd>\<id>\scratchpad`),
+    // one more on every start. The probe runs in a fixed folder, and its claude.exe gets a temp folder of its
+    // own made there, which is removed by its path once the probe has ended; nothing else is touched.
+    const cwd = this.options.probeCwd ?? join(tmpdir(), 'awg-claude-probe');
+    let temp: string | undefined;
+    try {
+      mkdirSync(cwd, { recursive: true });
+      temp = mkdtempSync(join(cwd, 'tmp-'));
+    } catch (error) {
+      this.log('warn', 'listModels: could not make the probe folder; the probe uses the OS temp folder', errorText(error));
+    }
+    const options = this.queryOptions(temp === undefined ? tmpdir() : cwd, { readOnly: true }, {}, denyAll);
+    const query = this.options.sdk.query({ prompt: input, options: temp === undefined ? options : { ...options, env: { ...process.env, [CLI_TMPDIR_ENV]: temp } } });
+    // Ends when the CLI does.
+    const ended = (async () => {
+      for await (const message of query) void message;
+    })().catch(() => undefined);
     try {
       const timeoutMs = this.options.startTimeoutMs ?? 60_000;
       const models = await within(query.supportedModels(), timeoutMs);
@@ -523,6 +550,17 @@ export class ClaudeAdapter implements RuntimeAdapter {
     } finally {
       input.close();
       query.close();
+      if (temp !== undefined) await this.removeProbeTemp(temp, ended);
+    }
+  }
+
+  /** Removes a probe's own temp folder once its CLI has ended; a failure is only logged (T035). */
+  private async removeProbeTemp(folder: string, ended: Promise<void>): Promise<void> {
+    if (!(await within(ended, PROBE_EXIT_MS))) this.log('warn', 'listModels: the probe CLI did not end in time; removing its temp folder anyway', folder);
+    try {
+      await (this.options.removeFolder ?? ((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })))(folder);
+    } catch (error) {
+      this.log('warn', 'listModels: could not remove the probe temp folder', { folder, error: errorText(error) });
     }
   }
 

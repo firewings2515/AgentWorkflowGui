@@ -3,6 +3,7 @@
 import { PermissionRequest } from '../../../contracts';
 import type { PolicyContext, PolicyDecision } from '../../ports';
 import { permissionPolicy } from '../policy';
+import { shlexQuote } from '../shlex';
 
 export const ROOT = String.raw`E:\work\proj`;
 export const REFS = String.raw`E:\work\refs`;
@@ -35,6 +36,13 @@ export const codex = (script: string, fields: Fields = {}) => {
 export const CODEX_PS_EXE = String.raw`"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"`;
 export const codexSingle = (script: string, fields: Fields = {}) => {
   const cmd = `${CODEX_PS_EXE} -NoProfile -Command '${script}'`;
+  return request('command', `Run command: ${cmd}`, { command: cmd, ...fields });
+};
+
+/** A command as Codex 0.160 joins its argv for the request (shlex 1.3.0, T035), with or without -NoProfile. */
+export const codexShlex = (script: string, noProfile = true, fields: Fields = {}) => {
+  const argv = [String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, ...(noProfile ? ['-NoProfile'] : []), '-Command', script];
+  const cmd = argv.map(shlexQuote).join(' ');
   return request('command', `Run command: ${cmd}`, { command: cmd, ...fields });
 };
 
