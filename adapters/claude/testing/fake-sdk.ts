@@ -52,6 +52,8 @@ export interface FakeQueryBehaviour {
   /** close() ends the stream unless this is false (a process that does not exit). */
   closeEnds?: boolean;
   models?: WireModelInfo[];
+  /** query() calls the options' `spawnClaudeCodeProcess`, as the SDK does (default: it does not). */
+  spawnOnQuery?: boolean;
   /** Called on supportedModels(), before it answers. */
   onSupportedModels?: (query: FakeQuery) => void;
   setModelError?: Error;
@@ -177,6 +179,8 @@ export class FakeSdk implements ClaudeSdk {
   query(params: { prompt: AsyncIterable<WireUserMessage>; options: WireQueryOptions }): FakeQuery {
     const q = new FakeQuery(params.options, params.prompt, this.behaviour);
     this.queries.push(q);
+    // As the SDK does: the custom spawn starts claude.exe when the query is made.
+    if (this.behaviour.spawnOnQuery) params.options.spawnClaudeCodeProcess?.({ command: 'claude.exe', args: [], ...(params.options.cwd !== undefined && { cwd: params.options.cwd }), env: params.options.env ?? {}, signal: new AbortController().signal });
     return q;
   }
 

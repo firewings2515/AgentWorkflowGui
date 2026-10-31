@@ -643,6 +643,8 @@ export class ClaudeAdapter implements RuntimeAdapter {
    * (nothing reaches the model and no transcript is written).
    */
   async listModels(): Promise<ModelOption[]> {
+    // A probe started after close() would outlive it (T035).
+    if (this.closing) throw new Error('listModels: ClaudeAdapter is closing');
     const open = [...this.sessions.values()].find((s) => !s.closing && !s.ended);
     if (open) return (await open.query.supportedModels()).map(toModelOption);
     const input = new InputQueue<WireUserMessage>();

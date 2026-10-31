@@ -3,40 +3,14 @@
 // The probe now runs in a fixed folder, gives its claude.exe a temp folder of its own (CLAUDE_CODE_TMPDIR) and
 // removes exactly that folder by its path once that claude.exe has exited (r1: not when the SDK's stream ends).
 // The fake CLI makes the scratch folder the way the real one does, under the temp folder it was given.
-import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CLI_TMPDIR_ENV, type ClaudeAdapterOptions, PROBE_SESSION_ID } from './adapter';
+import { FakeProcess } from './testing/fake-process';
 import type { FakeQuery } from './testing/fake-sdk';
 import { setup, started, until } from './testing/harness';
-import type { WireSpawnedProcess } from './wire';
-
-/** A claude.exe that exits when the test says so, or on kill() once `exitOnKill` is set. */
-class FakeProcess extends EventEmitter implements WireSpawnedProcess {
-  readonly stdin = new PassThrough();
-  readonly stdout = new PassThrough();
-  killed = false;
-  kills = 0;
-  exitOnKill = false;
-  /** What kill() answers: false is a kill that failed. */
-  killWorks = true;
-  exitCode: number | null = null;
-  signalCode: NodeJS.Signals | null = null;
-  kill(): boolean {
-    this.kills++;
-    if (!this.killWorks) return false;
-    this.killed = true;
-    if (this.exitOnKill) setTimeout(() => this.exit(1), 5);
-    return true;
-  }
-  exit(code = 0): void {
-    this.exitCode = code;
-    this.emit('exit', code, null);
-  }
-}
 
 /**
  * The fake SDK starts claude.exe through the probe's spawn when the query is made, as the SDK does. With
@@ -384,5 +358,19 @@ describe('T035 r2 P1 a probe claude.exe is managed like a session one, and the G
     processes[0]!.exitOnKill = true;
     expect(await h.adapter.close(1000)).toEqual({ forced: false });
     expect(processes[0]!.exitCode).toBe(1);
+  });
+});
+
+describe('T035 r2 no probe is started once the adapter is closing', () => {
+  it('t035-r2 listModels after close() is refused: no claude.exe, no folder', async () => {
+    const probeCwd = join(root, 'probe');
+    const { h, processes } = probeSetup({ probeCwd });
+    h.sdk.behaviour.models = MODELS;
+    await h.adapter.start();
+    await h.adapter.close();
+    await expect(h.adapter.listModels()).rejects.toThrow(/closing/);
+    expect(h.sdk.queries).toHaveLength(0);
+    expect(processes).toHaveLength(0);
+    expect(existsSync(probeCwd)).toBe(false);
   });
 });
