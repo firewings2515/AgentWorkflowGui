@@ -3,8 +3,8 @@
 // and their branches — and moves a target branch only by fast-forward. It never pushes, never rewrites
 // history, never resets a target branch. Expected outcomes (conflict, moved branch, failed cleanup) are
 // results; a thrown error means git could not be run at all (run.ts's GitRunError).
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type {
   AdvanceResult,
   CleanupResult,
@@ -34,22 +34,60 @@ class GitStepError extends Error {
 const DEFAULT_IDENTITY = { name: 'AgentWorkflowGui', email: 'agent-workflow-gui@localhost' };
 /** Where the pipeline keeps its worktrees, below the repository (SP-07 G6: short paths). */
 const AWG_FOLDER = '.awg';
+/** The branch config entry that says which folder the pipeline made the branch's worktree in: the proof of ownership. */
+const OWNER_KEY = 'awgWorktree';
+/** A worktree's name under `.awg\wt`: one safe segment (no separators, no `..`, no trailing dot, no device names). */
+const SAFE_NAME = /^(?!(?:con|prn|aux|nul|com\d|lpt\d)(?:\.|$))[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/i;
+const lines = (text: string): string[] =>
+  text
+    .split('\n')
+    .map((line) => line.replace(/\r$/, ''))
+    .filter((line) => line !== '');
 
 const pending = (detail: string): CleanupResult => ({ status: 'pending-cleanup', detail: sanitizeDetail(detail) });
 
 /** git's message for a failed command. */
 const detailOf = (result: GitResult): string => sanitizeDetail(result.stderr.trim() || result.stdout.trim() || `git exited with code ${String(result.code)}`);
 
+/**
+ * A caller's pathspec as an exclusion for `git add`: `:(exclude)` plus whatever magic it brings (`:(glob)out/**`,
+ * `:(top)lock.json`, `:/lock.json`). A pathspec that is itself an exclusion (`:(exclude)x`, `:!x`, `:^x`) is refused:
+ * wrapped again it would mean "include", the opposite of what the caller wrote. So is an empty one.
+ */
+export function excludePathspec(pathspec: string): string {
+  const refuse = (): never => {
+    throw new GitStepError(`Not a pathspec to exclude: ${pathspec}`);
+  };
+  const spec = pathspec.trim();
+  if (spec === '') return refuse();
+  if (!spec.startsWith(':')) return `:(exclude)${spec.replaceAll('\\', '/')}`;
+  if (spec.startsWith(':(')) {
+    const close = /(?<!\\)\)/.exec(spec);
+    if (close === null) return refuse();
+    const magic = spec.slice(2, close.index).split(',');
+    if (magic.some((word) => word.trim() === 'exclude')) return refuse();
+    return `:(exclude,${magic.join(',')})${spec.slice(close.index + 1)}`;
+  }
+  // Short form: `:` then magic characters, optionally a closing `:`.
+  const short = /^:([!^/]*):?/.exec(spec);
+  const characters = short?.[1] ?? '';
+  if (short === null || characters.includes('!') || characters.includes('^')) return refuse();
+  const rest = spec.slice(short[0].length);
+  if (rest === '') return refuse();
+  return characters.includes('/') ? `:(exclude,top)${rest}` : `:(exclude)${rest}`;
+}
+
 /** The folder the pipeline puts its worktrees in: `<repo>\.awg\wt\<name>` (SP-07 G6). */
-export const worktreePath = (repo: string, name: string): string => join(repo, AWG_FOLDER, 'wt', name);
+export const worktreePath = (repo: string, name: string): string => {
+  if (!SAFE_NAME.test(name) || name.endsWith('.')) throw new Error(`Not a worktree name: ${name}`);
+  return join(repo, AWG_FOLDER, 'wt', name);
+};
 
 export class GitAdapter implements GitPort {
   private readonly run: GitRunner;
   private readonly identity: { name: string; email: string };
   /** One mutating command per repository at a time: git's own locks would otherwise fail the second as an error. */
   private readonly queues = new Map<string, Promise<unknown>>();
-  /** Folders a failed `worktree remove` left behind (git had already unregistered them): `retryCleanup` may delete these. */
-  private readonly leftovers = new Set<string>();
 
   constructor(options: GitAdapterOptions = {}) {
     this.run = options.run ?? createGitRunner(options);
@@ -79,6 +117,7 @@ export class GitAdapter implements GitPort {
         if (branchTip !== undefined) throw new GitStepError(`The branch ${worktree.branch} already exists`);
         this.hideFromRepo(worktree);
         await this.must(['worktree', 'add', '-b', worktree.branch, worktree.path, baseCommit], worktree.repo);
+        await this.must(['config', `branch.${worktree.branch}.${OWNER_KEY}`, canonicalKey(worktree.path)], worktree.repo);
         return { status: 'created', baseCommit };
       }),
     );
@@ -90,22 +129,22 @@ export class GitAdapter implements GitPort {
         await this.checkRef(worktree);
         await this.requireBranch(worktree);
         if (message.trim() === '') throw new GitStepError('The commit message is empty');
-        const excluded = exclude.map((pattern) => {
-          const spec = pattern.replaceAll('\\', '/').trim();
-          if (spec === '' || spec.startsWith(':')) throw new GitStepError(`Not a path to exclude: ${pattern}`);
-          return `:(exclude)${spec}`;
-        });
-        // Files git still lists as unmerged are committed only when no conflict markers are left in them.
-        const unresolved = this.withConflictMarkers(worktree.path, await this.unmergedFiles(worktree.path));
-        if (unresolved.length > 0) throw new GitStepError(`Conflict markers are still in: ${unresolved.join(', ')}`);
-        await this.must(['add', '-A', '--', '.', ...excluded], worktree.path);
+        const excluded = exclude.map(excludePathspec);
         // A merge in progress is concluded by committing, even when the result equals HEAD.
-        if (!(await this.merging(worktree.path))) {
+        const merging = await this.merging(worktree.path);
+        // The files that conflicted, read before the add: afterwards git no longer lists them as unmerged.
+        const conflicted = merging ? await this.conflictedFiles(worktree.path) : [];
+        await this.must(['add', '-A', '--', '.', ...excluded], worktree.path);
+        if (merging) {
+          const unresolved = await this.unresolvedConflicts(worktree.path, conflicted);
+          if (unresolved.length > 0) throw new GitStepError(`Conflict markers are still in: ${unresolved.join(', ')}`);
+        } else {
           const staged = await this.git(['diff', '--cached', '--quiet'], worktree.path);
           if (staged.code === 0) return { status: 'nothing', commit: await this.head(worktree.path) };
           if (staged.code !== 1) throw new GitStepError(detailOf(staged));
         }
         await this.must([...(await this.identityArguments(worktree.path)), 'commit', '--cleanup=whitespace', '-m', message], worktree.path);
+        if (merging) await this.forgetConflicts(worktree.path);
         return { status: 'committed', commit: await this.head(worktree.path) };
       }),
     );
@@ -122,6 +161,7 @@ export class GitAdapter implements GitPort {
         }
         if (await this.merging(integration.path)) throw new GitStepError('A merge is already in progress in the integration worktree');
         if (await this.hasTrackedChanges(integration.path)) throw new GitStepError('The integration worktree has uncommitted changes');
+        await this.forgetConflicts(integration.path);
         const result = await this.git(
           [...(await this.identityArguments(integration.path)), 'merge', '--no-ff', '--no-edit', '--cleanup=whitespace', '-m', message, `refs/heads/${branch}`],
           integration.path,
@@ -129,7 +169,10 @@ export class GitAdapter implements GitPort {
         if (result.code === 0) return { status: 'merged', commit: await this.head(integration.path) };
         if (result.code === 1) {
           const files = await this.unmergedFiles(integration.path);
-          if (files.length > 0) return { status: 'conflict', files };
+          if (files.length > 0) {
+            await this.rememberConflicts(integration.path, files);
+            return { status: 'conflict', files };
+          }
         }
         // Not a conflict (a hook said no, a file in the way): leave the worktree as it was before the merge.
         const detail = detailOf(result);
@@ -146,6 +189,7 @@ export class GitAdapter implements GitPort {
         if (!(await this.merging(integration.path))) throw new GitStepError('No merge is in progress');
         await this.must(['merge', '--abort'], integration.path);
         if (await this.merging(integration.path)) throw new GitStepError('The merge is still in progress after the abort');
+        await this.forgetConflicts(integration.path);
         return { status: 'aborted' as const };
       }),
     );
@@ -169,19 +213,36 @@ export class GitAdapter implements GitPort {
         if (checkouts.length === 0) {
           // Not checked out anywhere: moving the ref is all there is to do, and only from the value just checked.
           const update = await this.git(['update-ref', '-m', 'awg: fast-forward', full, target, current], repo);
-          if (update.code === 0) return { status: 'advanced' };
-          return this.afterRefused(repo, full, current, detailOf(update));
+          if (update.code !== 0) return this.afterRefused(repo, full, current, detailOf(update));
+          // git has no lock between "checked out nowhere" and the ref moving: a worktree that checked the branch
+          // out in that gap now has a HEAD ahead of its index and files. Seen here, it is reported, never hidden;
+          // a checkout that came after the move is at the new commit and is fine. The window that remains is the
+          // one between this look and the caller's next step.
+          for (const entry of (await this.worktrees(repo)).filter((e) => e.branch === full)) {
+            if (!(await this.checkoutAt(entry, target))) {
+              throw new GitStepError(
+                `${branch} moved, but it was checked out in ${entry.path} at the same moment; that checkout may be behind its HEAD and needs the user's attention`,
+              );
+            }
+          }
+          return { status: 'advanced' };
         }
         const [checkout] = checkouts;
         if (checkouts.length > 1 || checkout === undefined) return { status: 'refused', detail: `${branch} is checked out in more than one worktree` };
         if (checkout.prunable || !existsSync(checkout.path)) return { status: 'refused', detail: `${branch} is checked out in ${checkout.path}, which no longer exists` };
         // Moving the ref alone would leave that checkout's index and files behind its HEAD: update the checkout itself.
+        // Only modifications of tracked files count as local changes: an untracked file is left to git's own check,
+        // which refuses a fast-forward that would overwrite one (a user's main checkout nearly always has some).
         const busy = await this.operationInProgress(checkout.path);
         if (busy !== undefined) return { status: 'refused', detail: `${checkout.path} has a ${busy} in progress` };
         if (await this.hasTrackedChanges(checkout.path)) return { status: 'refused', detail: `${checkout.path} has local changes` };
         const merged = await this.git(['merge', '--ff-only', '--no-edit', target], checkout.path);
-        if (merged.code === 0) return { status: 'advanced' };
-        return this.afterRefused(repo, full, current, detailOf(merged));
+        // The branch is read again: "already up to date" also comes from a branch someone moved past `target`
+        // (A→C when asked for A→B), which is a moved branch, not an advance.
+        const now = await this.tip(repo, full);
+        if (merged.code === 0 && now === target) return { status: 'advanced' };
+        if (now !== undefined && now !== current) return { status: 'moved', current: now };
+        return { status: 'refused', detail: detailOf(merged) };
       }),
     );
   }
@@ -234,18 +295,22 @@ export class GitAdapter implements GitPort {
     if (registered !== undefined && registered.branch !== full) {
       return pending(`Refused: ${worktree.path} is a worktree of ${registered.branch ?? 'a detached HEAD'}, not of ${worktree.branch}`);
     }
+    // Ownership: createWorktree wrote the folder into the branch's config. Without that proof for this very path and
+    // branch nothing is removed or deleted: not a registered worktree, not a leftover folder, never a branch.
+    const branchExists = (await this.tip(worktree.repo, full)) !== undefined;
+    const owned = branchExists && (await this.owner(worktree.repo, worktree.branch)) === canonicalKey(worktree.path);
+    if (!owned && (registered !== undefined || existsSync(worktree.path) || (options.deleteBranch && branchExists))) {
+      return pending(`Refused: the branch ${worktree.branch} was not created by the pipeline for ${worktree.path}; nothing was removed`);
+    }
 
     if (registered !== undefined) {
       const removed = await this.git(['worktree', 'remove', '--force', worktree.path], worktree.repo);
-      if (removed.code !== 0) {
-        // A process holds something in the folder: git has already unregistered the worktree and deleted part of it (SP-07 G1).
-        this.leftovers.add(canonicalKey(worktree.path));
-        if (!retry) return pending(`git could not remove the worktree: ${detailOf(removed)}`);
-      }
+      // A process holds something in the folder: git has already unregistered the worktree and deleted part of it (SP-07 G1).
+      if (removed.code !== 0 && !retry) return pending(`git could not remove the worktree: ${detailOf(removed)}`);
     }
     if (existsSync(worktree.path)) {
       if (!retry) return pending('The worktree is unregistered but its folder is still there; retryCleanup deletes it');
-      const refusal = this.mayDelete(worktree, registered !== undefined);
+      const refusal = this.unsafeToDelete(worktree);
       if (refusal !== undefined) return pending(refusal);
       try {
         rmSync(worktree.path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
@@ -263,19 +328,33 @@ export class GitAdapter implements GitPort {
       if ((await this.worktrees(worktree.repo)).some((entry) => samePath(entry.path, worktree.path))) return pending('The worktree is still registered after the prune');
     }
 
-    if (options.deleteBranch && (await this.tip(worktree.repo, full)) !== undefined) {
-      // The caller asked for a merged task's branch; git itself refuses a branch that is checked out anywhere.
+    if (options.deleteBranch && branchExists) {
+      // The caller says the task is merged. `branch -d` would compare against the checked-out HEAD, which is not the
+      // target branch, so the same check is made here (another branch holds the commits) and `-D` does the deleting.
+      const tip = await this.tip(worktree.repo, full);
+      const holders = lines(await this.must(['for-each-ref', '--format=%(refname)', '--contains', tip ?? '', 'refs/heads'], worktree.repo)).filter((ref) => ref !== full);
+      if (holders.length === 0) return pending(`Refused: the commits of ${worktree.branch} are in no other branch, so deleting it would lose them`);
       const deleted = await this.git(['branch', '-D', worktree.branch], worktree.repo);
       if (deleted.code !== 0) return pending(`The branch could not be deleted: ${detailOf(deleted)}`);
     }
-    this.leftovers.delete(canonicalKey(worktree.path));
     return { status: 'removed' };
   }
 
-  /** Why the folder must not be deleted by Node, or undefined: only a registered worktree, a folder git just failed to remove, or one below `.awg`. */
-  private mayDelete(worktree: WorktreeRef, wasRegistered: boolean): string | undefined {
-    if (!wasRegistered && !this.leftovers.has(canonicalKey(worktree.path)) && !isInside(join(worktree.repo, AWG_FOLDER), worktree.path)) {
-      return `Refused: ${worktree.path} is not registered, not below ${AWG_FOLDER} and not a folder a removal left behind; delete it by hand`;
+  /** The folder a branch was created for (`createWorktree` writes it), as `canonicalKey` spells it. */
+  private async owner(repo: string, branch: string): Promise<string | undefined> {
+    const result = await this.git(['config', '--get', `branch.${branch}.${OWNER_KEY}`], repo);
+    return result.code === 0 ? result.stdout.trim() : undefined;
+  }
+
+  /** Why Node must not delete the folder, or undefined. */
+  private unsafeToDelete(worktree: WorktreeRef): string | undefined {
+    const awg = join(resolve(worktree.repo), AWG_FOLDER);
+    for (const folder of [awg, join(awg, 'wt'), resolve(worktree.path)]) {
+      try {
+        if (lstatSync(folder).isSymbolicLink()) return `Refused: ${folder} is a link`;
+      } catch {
+        // Missing: nothing to follow.
+      }
     }
     try {
       if (statSync(join(worktree.path, '.git')).isDirectory()) return `Refused: ${worktree.path} holds a repository of its own`;
@@ -327,6 +406,15 @@ export class GitAdapter implements GitPort {
     if (samePath(worktree.repo, worktree.path)) throw new GitStepError('The worktree path is the repository itself');
     if (isInside(worktree.path, worktree.repo)) throw new GitStepError('The worktree path contains the repository');
     if (isInside(join(worktree.repo, '.git'), worktree.path)) throw new GitStepError('The worktree path is inside .git');
+    // Below .awg only `<repo>\.awg\wt\<name>` itself is a worktree: no other folder there is the pipeline's to touch.
+    const awg = join(resolve(worktree.repo), AWG_FOLDER);
+    const lexical = resolve(worktree.path).toLowerCase();
+    if (lexical === awg.toLowerCase() || lexical.startsWith(`${awg.toLowerCase()}\\`) || isInside(awg, worktree.path)) {
+      const wanted = join(awg, 'wt', basename(resolve(worktree.path)));
+      if (lexical !== wanted.toLowerCase() || !SAFE_NAME.test(basename(wanted)) || basename(wanted).endsWith('.')) {
+        throw new GitStepError(`A worktree below ${AWG_FOLDER} must be ${join(AWG_FOLDER, 'wt', '<name>')}`);
+      }
+    }
     if (!(await this.validBranchName(worktree.repo, worktree.branch))) throw new GitStepError(`${worktree.branch} is not a branch name`);
   }
 
@@ -396,21 +484,75 @@ export class GitAdapter implements GitPort {
     return undefined;
   }
 
-  /** Of `files` (relative to `cwd`), those that still hold a `<<<<<<<` or `>>>>>>>` line of an unresolved conflict. */
-  private withConflictMarkers(cwd: string, files: readonly string[]): string[] {
-    return files.filter((file) => {
+  /** Where the files of the merge's conflicts are written down (in the worktree's own git folder). */
+  private async conflictRecord(cwd: string): Promise<string> {
+    return resolve(cwd, (await this.must(['rev-parse', '--git-path', 'awg-conflicts'], cwd)).trim());
+  }
+
+  /** The conflict's files are noted at the merge: once an agent `git add`s one, git no longer lists it as unmerged. */
+  private async rememberConflicts(cwd: string, files: readonly string[]): Promise<void> {
+    writeFileSync(await this.conflictRecord(cwd), files.join('\0'), 'utf8');
+  }
+
+  private async forgetConflicts(cwd: string): Promise<void> {
+    rmSync(await this.conflictRecord(cwd), { force: true });
+  }
+
+  /** Files that conflicted in the merge in progress: unmerged now, or noted when the merge reported them. */
+  private async conflictedFiles(cwd: string): Promise<string[]> {
+    let noted: string[] = [];
+    try {
+      noted = readFileSync(await this.conflictRecord(cwd), 'utf8').split('\0').filter((file) => file !== '');
+    } catch {
+      // Not written (a merge not made by this adapter): only what git lists now.
+    }
+    return [...new Set([...noted, ...(await this.unmergedFiles(cwd))])];
+  }
+
+  /**
+   * The conflicted files in which unresolved conflict markers are staged. git decides what a marker is
+   * (`diff --cached --check` knows the `conflict-marker-size` attribute); whitespace rules are switched off. A
+   * file counts as unresolved when git flags both a start (`<<<<<<<`) and an end (`>>>>>>>`) marker in it: a lone
+   * marker-looking line is ordinary text, kept. Only conflicted files are looked at, so text about markers in
+   * other files is never refused. Text in a conflicted file that has both kinds must use a larger
+   * `conflict-marker-size`.
+   */
+  private async unresolvedConflicts(cwd: string, files: readonly string[]): Promise<string[]> {
+    if (files.length === 0) return [];
+    const check = await this.git(
+      ['-c', 'core.whitespace=-trailing-space,-space-before-tab', '-c', 'core.quotepath=false', 'diff', '--cached', '--check', '--', ...files.map((file) => `:(literal)${file}`)],
+      cwd,
+    );
+    if (check.code !== 0 && check.code !== 2) throw new GitStepError(detailOf(check));
+    const kinds = new Map<string, Set<string>>();
+    for (const line of check.stdout.split('\n')) {
+      const found = /^(.+):(\d+): leftover conflict marker/.exec(line.replace(/\r$/, ''));
+      if (found === null) continue;
+      const [, file = '', number = '0'] = found;
+      let text: string;
       try {
-        return /^(<{7}|>{7})( |$)/m.test(readFileSync(join(cwd, file), 'latin1'));
+        text = readFileSync(join(cwd, file), 'latin1').split('\n')[Number(number) - 1] ?? '';
       } catch {
-        return false; // deleted by the resolution
+        continue;
       }
-    });
+      if (text.startsWith('<') || text.startsWith('>')) kinds.set(file, (kinds.get(file) ?? new Set<string>()).add(text.charAt(0)));
+    }
+    return [...kinds].filter(([, set]) => set.has('<') && set.has('>')).map(([file]) => file);
   }
 
   /** `-c user.name -c user.email` for the GUI's own commits, only when git has no identity to use. */
   private async identityArguments(cwd: string): Promise<string[]> {
     if ((await this.git(['var', 'GIT_COMMITTER_IDENT'], cwd)).code === 0) return [];
     return ['-c', `user.name=${this.identity.name}`, '-c', `user.email=${this.identity.email}`];
+  }
+
+  /** The checkout is at `commit` with nothing out of line: HEAD there and its index and files agree. */
+  private async checkoutAt(entry: WorktreeEntry, commit: string): Promise<boolean> {
+    try {
+      return existsSync(entry.path) && (await this.head(entry.path)) === commit && !(await this.hasTrackedChanges(entry.path));
+    } catch {
+      return false;
+    }
   }
 
   /** A fast-forward that did not happen: the branch moved meanwhile, or git refused for its own reason. */

@@ -24,6 +24,8 @@ export interface Sandbox {
   task(repo: string, name: string): WorktreeRef;
   /** The adapter's configuration without a user identity, so it has to supply one. */
   anonymousAdapter(): GitAdapter;
+  /** An adapter whose every command is preceded by `before`: another process doing something in the middle of an operation. */
+  hooked(before: (args: readonly string[], cwd: string) => Promise<void>): GitAdapter;
   children: ChildProcess[];
   dispose(): void;
 }
@@ -82,6 +84,15 @@ export function createSandbox(): Sandbox {
     commitFile,
     task: (repo, name) => ({ repo, path: worktreePath(repo, name), branch: `task/${name}` }),
     anonymousAdapter: () => new GitAdapter({ env: isolated(anonymous) }),
+    hooked: (before) => {
+      const inner = createGitRunner({ env: isolated(identified) });
+      return new GitAdapter({
+        run: async (args, options) => {
+          await before(args, options.cwd);
+          return inner(args, options);
+        },
+      });
+    },
     children,
     dispose() {
       for (const child of children) if (child.exitCode === null) child.kill();
