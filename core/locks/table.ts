@@ -143,6 +143,11 @@ export class MemoryLockTable implements FileLockTable {
     this.state(sessionId).reads.set(path, hash);
   }
 
+  /** The session read the file but its content cannot be hashed: no read check for it until the next read. */
+  forgetRead(sessionId: SessionId, path: string): void {
+    this.sessions.get(sessionId)?.reads.delete(path);
+  }
+
   turnEnded(sessionId: SessionId, turnId: TurnId | undefined): void {
     const state = this.state(sessionId);
     if (turnId !== undefined) {
@@ -195,10 +200,30 @@ export class MemoryLockTable implements FileLockTable {
     return () => this.listeners.delete(listener);
   }
 
-  /** Whether the session holds any lock (it is at work, for the same-folder scope). */
-  holdsAny(sessionId: SessionId): boolean {
-    for (const lock of this.locks.values()) if (lock.holderSessionId === sessionId) return true;
-    return false;
+  /**
+   * A turn of the session runs (not the port's: the coordinator reports it from `turn.updated`). A turn
+   * already seen to end stays ended, so a late `running` of it changes nothing.
+   */
+  turnStarted(sessionId: SessionId, turnId: TurnId): void {
+    const state = this.state(sessionId);
+    if (state.endedTurns.includes(turnId)) return;
+    state.inTurn = true;
+    state.turnId = turnId;
+  }
+
+  /**
+   * At work: a turn runs, or background work still does. The one definition both for when its locks go
+   * (once it is no longer at work) and for the same-folder scope of unlocked writes.
+   */
+  atWork(sessionId: SessionId): boolean {
+    const state = this.sessions.get(sessionId);
+    return state !== undefined && (state.inTurn || state.background > 0);
+  }
+
+  /** The running turn the session's locks belong to, when one is known. */
+  turnOf(sessionId: SessionId): TurnId | undefined {
+    const state = this.sessions.get(sessionId);
+    return state?.inTurn === true ? state.turnId : undefined;
   }
 
   private state(sessionId: SessionId): SessionState {
@@ -214,6 +239,7 @@ export class MemoryLockTable implements FileLockTable {
   private releaseIfDone(sessionId: SessionId): void {
     const state = this.state(sessionId);
     if (state.inTurn) return;
+    // Not at work any more (`atWork`) once the background work ended too.
     for (const lock of [...this.locks.values()]) {
       if (lock.holderSessionId !== sessionId) continue;
       // A write still in progress keeps its lock until it ended (e.g. a sub-agent's, after the turn).

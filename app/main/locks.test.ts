@@ -154,3 +154,11 @@ describe('hashFile', () => {
     expect(hashFile(dir)).toBe('unreadable');
   });
 });
+
+describe('hashFile size limit', () => {
+  it('does not read a file above the limit: it counts as unreadable', () => {
+    const fs = { size: () => ({ size: 11, isFile: true }), read: () => Buffer.from('never read') };
+    expect(hashFile('E:\\big.bin', fs, 10)).toBe('unreadable');
+    expect(hashFile('E:\\ok.bin', { ...fs, size: () => ({ size: 10, isFile: true }) }, 10)).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+});

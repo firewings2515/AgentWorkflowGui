@@ -33,6 +33,7 @@ import { WorkflowEngine } from '../../core/workflow';
 import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { hashFile, setTimer } from './file-hash';
+import { GitIgnoreRules } from './git-ignore';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
 
 /** What the main process needs from its process host: the port plus the spawn the adapters use (T013). */
@@ -199,8 +200,16 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     },
   };
   const mcp = await GuiMcpServer.start({ handlers, log: (message) => log(`[mcp] ${message}`) });
+  // What git ignores is no unlocked write (T033); its rules are read again when the watcher sees them change.
+  const ignored = new GitIgnoreRules();
   const watchers = new WorkspaceWatchers(
-    { changed: (sessionId, root, path) => ref.service?.workspaceChanged(sessionId, root, path), failed: (sessionId, root) => ref.service?.workspaceWatchFailed(sessionId, root) },
+    {
+      changed: (sessionId, root, path) => {
+        ignored.changed(path);
+        ref.service?.workspaceChanged(sessionId, root, path);
+      },
+      failed: (sessionId, root) => ref.service?.workspaceWatchFailed(sessionId, root),
+    },
     log,
     options.watch,
   );
@@ -275,7 +284,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     },
     sleep,
     // Same-folder file locks (T033, R-07): in memory only, so a restart starts with none.
-    locks: { hashFile: (path) => hashFile(path), setTimer },
+    locks: { hashFile: (path) => hashFile(path), setTimer, isIgnored: (path) => ignored.isIgnored(path) },
     listModels,
     isRuntimeAvailable: (runtime) => runtime === 'claude' || options.codexExecutable !== undefined || options.createAdapter !== undefined,
     onSessionOpened: (sessionId) => {

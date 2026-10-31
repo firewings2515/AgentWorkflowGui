@@ -53,6 +53,8 @@ export interface LockCoordinatorOptions {
   holdMs?: number;
   /** `wait_for_file` without `timeoutMs` (default 2 minutes). */
   waitMs?: number;
+  /** Whether git ignores the path (build output, node_modules, ...): such a change is no unlocked write. */
+  isIgnored?(path: string): boolean;
   log?(message: string): void;
 }
 
@@ -102,8 +104,6 @@ export class LockCoordinator {
   private readonly writes = new Map<string, PendingWrite>();
   /** Claude Reads approved and not finished: the file's hash right before the read. */
   private readonly reads = new Map<string, { path: string; before: FileState }>();
-  private readonly runningTurns = new Map<SessionId, TurnId>();
-  private readonly endedTurns = new Map<SessionId, TurnId[]>();
   private readonly background = new Map<SessionId, { commands: Set<string>; tasks: Set<string> }>();
   /** Held Codex approvals waiting for a lock, by request: to cancel when the runtime withdraws one. */
   private readonly waiting = new Map<string, { sessionId: SessionId; path: string }>();
@@ -117,7 +117,8 @@ export class LockCoordinator {
     this.table = new MemoryLockTable({
       now: () => options.now(),
       setTimer: (ms, fn) => options.setTimer(ms, fn),
-      inSameFolderScope: (path) => this.suspects(path).length > 0,
+      // Build output, node_modules and the like are nobody's work on a file (main session's G8 ruling).
+      inSameFolderScope: (path) => this.suspects(path).length > 0 && options.isIgnored?.(path) !== true,
       ...(options.log !== undefined && { log: (m: string) => options.log!(m) }),
     });
     this.table.subscribe((locks) => options.publish(locks));
@@ -179,12 +180,10 @@ export class LockCoordinator {
         const { turn } = event;
         if (turn.nativeTaskId !== undefined) return;
         if (turn.state === 'running') {
-          // A turn that ended stays ended: a late running of it is dropped (T024 r2-P1-3).
-          if (!(this.endedTurns.get(turn.sessionId) ?? []).includes(turn.id)) this.runningTurns.set(turn.sessionId, turn.id);
+          // A turn that ended stays ended: the table drops a late running of it (T024 r2-P1-3).
+          this.table.turnStarted(turn.sessionId, turn.id);
           return;
         }
-        this.endedTurns.set(turn.sessionId, [...(this.endedTurns.get(turn.sessionId) ?? []), turn.id].slice(-50));
-        if (this.runningTurns.get(turn.sessionId) === turn.id) this.runningTurns.delete(turn.sessionId);
         // A write of the turn that never reported its end was interrupted with it: nothing more is expected.
         for (const [key, write] of [...this.writes]) {
           if (write.sessionId !== turn.sessionId || write.nativeTaskId !== undefined) continue;
@@ -237,7 +236,9 @@ export class LockCoordinator {
         // makes the next write ask for a new read (SP-06 W4).
         const after = this.options.hashFile(read.path);
         const hash = toHash(read.before) ?? toHash(after);
+        // No hash (too large, unreadable): nothing to check against, and an older read no longer holds.
         if (hash !== undefined) this.table.recordRead(item.sessionId, read.path, hash);
+        else this.table.forgetRead(item.sessionId, read.path);
         return;
       }
       case 'nativeTask.updated': {
@@ -363,7 +364,7 @@ export class LockCoordinator {
   private tryWrite(handle: PermissionHandle, decision: PermissionDecision, session: LogicalSession, paths: string[]): LockStep | 'held' {
     const { request } = handle;
     const at = this.options.now();
-    const turnId = request.turnId ?? (request.nativeTaskId === undefined ? this.runningTurns.get(session.id) : undefined);
+    const turnId = request.turnId ?? (request.nativeTaskId === undefined ? this.table.turnOf(session.id) : undefined);
     const started: string[] = [];
     const undo = () => {
       for (const path of started) this.table.writeEnded(session.id, path, { kind: 'failed' });
@@ -518,14 +519,13 @@ export class LockCoordinator {
     return work;
   }
 
-  /** Same-folder sessions at work (a running turn, background work or a lock) whose folder holds `path`. */
+  /** Same-folder sessions at work (`MemoryLockTable.atWork`) whose folder holds `path`. */
   private suspects(path: string): SessionId[] {
     const out: SessionId[] = [];
     for (const s of this.sessions.values()) {
       if (!s.sameFolder || !isInside(path, s.root)) continue;
-      const work = this.background.get(s.id);
-      const busy = this.runningTurns.has(s.id) || (work !== undefined && work.commands.size + work.tasks.size > 0) || this.table.holdsAny(s.id);
-      if (busy) out.push(s.id);
+      // At work by the same definition that keeps its locks: a turn runs or background work does.
+      if (this.table.atWork(s.id)) out.push(s.id);
     }
     return out;
   }
@@ -534,7 +534,6 @@ export class LockCoordinator {
     for (const [key, write] of [...this.writes]) if (write.sessionId === sessionId) this.writes.delete(key);
     for (const key of [...this.reads.keys()]) if (key.startsWith(`${sessionId}\n`)) this.reads.delete(key);
     this.background.delete(sessionId);
-    this.runningTurns.delete(sessionId);
     this.table.releaseAll(sessionId, reason);
   }
 

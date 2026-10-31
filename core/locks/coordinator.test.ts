@@ -456,3 +456,57 @@ describe('unlocked writes (R-07, SP-06 W5/W6)', () => {
     expect(escalations[0]!.holderSessionId).toBeUndefined();
   });
 });
+
+describe('unlocked writes: what git ignores, and the at-work scope', () => {
+  const ignoredSetup = () => {
+    const clock = new ManualClock(AT);
+    const files = new Map<string, FileState>();
+    const escalations: LockEscalation[] = [];
+    const locks = new LockCoordinator({
+      now: clock.now,
+      setTimer: clock.setTimer,
+      hashFile: (path) => files.get(fk(path)) ?? 'missing',
+      resolveRealPath: (p) => p,
+      escalate: (e) => {
+        escalations.push(e);
+        return Promise.resolve(`esc-${String(escalations.length)}` as never);
+      },
+      publish: () => undefined,
+      isIgnored: (path) => path.includes('\\node_modules\\') || path.includes('\\out\\'),
+    });
+    locks.track(session(A));
+    return { files, escalations, locks };
+  };
+
+  it('skips an ignored path that no lock covers, but still checks a locked one', async () => {
+    const { files, escalations, locks } = ignoredSetup();
+    locks.observe(turnRun(A, T1));
+    files.set(fk('E:\\work\\node_modules\\x.js'), h(1));
+    locks.fileChanged(A, 'E:\\work\\node_modules\\x.js');
+    await flush();
+    expect(escalations).toEqual([]);
+    const OUT = 'E:\\work\\out\\main.js';
+    files.set(fk(OUT), h(1));
+    void locks.approve(handle(write(A, [OUT])), approve, session(A));
+    locks.observe(fileItem(write(A, [OUT], { itemId: 'none' }), 'failed'));
+    // A's write never reported its end; it ends with the turn, then background work keeps the lock.
+    locks.observe(bgCommand(A, 'bg-9', 'running'));
+    locks.observe(turnEnd(A, T1));
+    files.set(fk(OUT), h(2));
+    locks.fileChanged(A, OUT);
+    await flush();
+    expect(escalations).toEqual([expect.objectContaining({ kind: 'unlocked-write', path: fk(OUT), holderSessionId: A })]);
+  });
+
+  it('counts a session whose only work left is a background command as at work', async () => {
+    const { files, escalations, locks } = ignoredSetup();
+    locks.observe(bgCommand(A, 'bg-1', 'running'));
+    files.set(fk(G), h(4));
+    locks.fileChanged(A, G);
+    locks.observe(bgCommand(A, 'bg-1', 'completed'));
+    files.set(fk(F), h(4));
+    locks.fileChanged(A, F);
+    await flush();
+    expect(escalations.map((e) => e.path)).toEqual([fk(G)]);
+  });
+});

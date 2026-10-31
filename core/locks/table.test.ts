@@ -254,3 +254,27 @@ describe('locks.updated', () => {
     expect(published.some((locks) => locks[0]?.waitingForBackground === true && locks[0].waiters.length === 1)).toBe(true);
   });
 });
+
+describe('atWork (one definition for release and the unlocked-write scope)', () => {
+  it('is a running turn or running background work, and drops a late running of an ended turn', () => {
+    const { table } = setup();
+    expect(table.atWork(A)).toBe(false);
+    table.turnStarted(A, T1);
+    expect(table.atWork(A)).toBe(true);
+    expect(table.turnOf(A)).toBe(T1);
+    table.backgroundCommands(A, 1);
+    table.turnEnded(A, T1);
+    expect(table.atWork(A)).toBe(true);
+    table.backgroundCommands(A, 0);
+    expect(table.atWork(A)).toBe(false);
+    table.turnStarted(A, T1);
+    expect(table.atWork(A)).toBe(false);
+  });
+
+  it('forgets a read whose file can no longer be hashed, so the next write is not refused forever', () => {
+    const { table, take } = setup();
+    table.recordRead(A, F, h(1));
+    table.forgetRead(A, F);
+    expect(take(A, F, T1, null).status).toBe('acquired');
+  });
+});

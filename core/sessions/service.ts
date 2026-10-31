@@ -156,7 +156,7 @@ export interface SessionServiceOptions {
    * Same-folder file locks (T033, R-07): the file hash and the timers they need. Absent: nothing is locked
    * (tests that are not about locks).
    */
-  locks?: Pick<LockCoordinatorOptions, 'hashFile' | 'setTimer' | 'holdMs' | 'waitMs'>;
+  locks?: Pick<LockCoordinatorOptions, 'hashFile' | 'setTimer' | 'holdMs' | 'waitMs' | 'isIgnored'>;
   log?(message: string): void;
 }
 
