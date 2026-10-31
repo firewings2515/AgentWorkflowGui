@@ -57,6 +57,7 @@ import type {
   PermissionHandle,
   PermissionPolicy,
   RuntimeAdapter,
+  RuntimeAdapterHooks,
   RuntimeEvent,
   SessionSettings,
   StoredDelivery,
@@ -173,8 +174,13 @@ export interface SessionServiceOptions {
   hashPayload(text: string): PayloadHash | Promise<PayloadHash>;
   /** Node-side link resolution; null when it cannot be confirmed (PolicyContext.resolveRealPath). */
   resolveRealPath(absolutePath: string): string | null;
-  /** The adapter that serves a session (see SessionRuntimes); its `onPermissionRequest` must call this service's. */
-  createAdapter(runtime: Runtime, sessionId: SessionId): RuntimeAdapter;
+  /**
+   * The adapter that serves one opening of a session (see SessionRuntimes): a new one per call, so an earlier
+   * opening's late events and requests are told apart (T036 r2/r3). Its approval requests go to `hooks` (they know
+   * the opening they belong to); an adapter that calls this service's `onPermissionRequest` itself works too, without
+   * that knowledge.
+   */
+  createAdapter(runtime: Runtime, sessionId: SessionId, hooks: RuntimeAdapterHooks): RuntimeAdapter;
   /** A new GUI MCP mount for a session (T016 `mount()`); the old token stops working. */
   mountMcp(sessionId: SessionId): McpMount | Promise<McpMount>;
   listModels(runtime: Runtime): Promise<ModelOption[]>;
@@ -247,6 +253,8 @@ const RESEND_MISMATCH: Refusal = { reason: 'resend-mismatch', detail: 'this oper
 /** One queue per session for its commands and its runtime events (r1-P1-4). */
 const sessionKey = (sessionId: SessionId) => `session:${sessionId}`;
 const closingFailure = (requestId: Failure['requestId']) => fail(requestId, 'runtime_unavailable', 'The application is closing');
+/** Why a request of a released opening of its session is declined (T036 r3 P1-2). */
+const EARLIER_OPENING = 'the session was closed and opened again since this request; it is not approved';
 
 /** A user message this process sent, and how its runtime echo is recognised (r1-P1-9). */
 interface Echo {
@@ -335,6 +343,10 @@ export class SessionService {
   private readonly echoes = new Map<SessionId, Echo[]>();
   /** Sessions whose last event could not be stored: the renderer needs a new Snapshot (contracts gap). */
   private readonly unsynced = new Set<SessionId>();
+  /** Approval requests not answered yet, by the handle the gate got, with their runtime's own handle (T036 r3 P1-2). */
+  private readonly requests = new Map<PermissionHandle, { raw: PermissionHandle; isCurrent: () => boolean; sessionId: SessionId }>();
+  /** Whether each guarded handle's opening still serves its session, answered or not. */
+  private readonly currentOf = new WeakMap<PermissionHandle, () => boolean>();
   private closing = false;
   /** Set when shutdown finished: nothing is stored any more (the database closes next). */
   private closed = false;
@@ -390,11 +402,14 @@ export class SessionService {
       uuid: () => options.uuid(),
       log: (message) => options.log?.(message),
       isClosing: () => this.closing,
+      // A request of an earlier opening is declined at every step, before any lock is taken (T036 r3 P1-2).
+      isCurrent: (handle) => this.currentOf.get(handle)?.() ?? true,
       rootOf: (session) => this.rootOf(session),
       ...(this.locks !== undefined && { locks: this.locks }),
     });
     this.runtimes = new SessionRuntimes({
-      createAdapter: (runtime, sessionId) => options.createAdapter(runtime, sessionId),
+      createAdapter: (runtime, sessionId, hooks) => options.createAdapter(runtime, sessionId, hooks),
+      onPermissionRequest: (handle, isCurrent) => this.onPermissionRequest(handle, isCurrent),
       mountMcp: (sessionId) => options.mountMcp(sessionId),
       listModels: (runtime) => options.listModels(runtime),
       onOpened: (sessionId, cwd) => {
@@ -403,14 +418,21 @@ export class SessionService {
         options.onSessionOpened?.(sessionId, cwd);
         this.supervisor?.opened(sessionId);
       },
-      onClosed: (sessionId) => {
+      onClosed: async (sessionId) => {
         this.locks?.closed(sessionId);
         // The released opening reports no turn end any more, whether or not its exit event comes (T036 r2).
         this.ackedTurns.delete(sessionId);
         this.handoffTurns.delete(sessionId);
-        return options.onSessionClosed?.(sessionId);
+        // Nothing of it may be approved any more (T036 r3 P1-2).
+        await this.declineEarlier(sessionId);
+        try {
+          await options.onSessionClosed?.(sessionId);
+        } finally {
+          // Its Job has ended: what it left running is over (T036 r3, as a restart records it).
+          await this.endLeftOpen(sessionId).catch((error: unknown) => this.log(`recording what ${sessionId} left running failed (${errorName(error)})`));
+        }
       },
-      onEvent: (event) => this.record(event),
+      onEvent: (event, isCurrent) => this.record(event, isCurrent),
       log: (message) => this.log(message),
       ...(options.sleep !== undefined && { sleep: (ms: number) => this.options.sleep!(ms) }),
     });
@@ -636,14 +658,82 @@ export class SessionService {
     };
   }
 
-  /** `RuntimeAdapterHooks.onPermissionRequest` for every adapter. */
-  onPermissionRequest(handle: PermissionHandle): Promise<void> {
+  /**
+   * `RuntimeAdapterHooks.onPermissionRequest` for every adapter. `isCurrent` (from the router's hooks) tells whether
+   * the request's opening still serves its session (T036 r3 P1-2): the handle the gate gets declines instead of
+   * approving or holding once it does not, and the request counts against idleness until it is answered.
+   */
+  onPermissionRequest(handle: PermissionHandle, isCurrent: () => boolean = () => true): Promise<void> {
     // Once closing began nothing is approved, by the policy or anyone (r2-P1-6).
     if (this.closing) {
       handle.answer({ outcome: 'decline', decidedBy: 'policy', reason: 'the GUI is closing', at: this.options.now() });
       return Promise.resolve();
     }
-    return this.gate.onPermissionRequest(handle);
+    if (!isCurrent()) {
+      handle.answer({ outcome: 'decline', decidedBy: 'policy', reason: EARLIER_OPENING, at: this.options.now() });
+      return Promise.resolve();
+    }
+    const guarded = this.guard(handle, isCurrent);
+    return this.gate.onPermissionRequest(guarded).finally(() => {
+      // Answered or held by now, or declined (fail closed): one that is still open stays counted until it is answered.
+      if (!this.isOpenRequest(guarded)) this.requests.delete(guarded);
+    });
+  }
+
+  /**
+   * The handle the gate and the locks work with: once its opening no longer serves the session it holds nothing and
+   * approves nothing, and any answer becomes a decline (T036 r3 P1-2, R-05: an earlier opening's approval never
+   * counts). It stays in `requests` while open, for idleness and for `declineEarlier`.
+   */
+  private guard(raw: PermissionHandle, isCurrent: () => boolean): PermissionHandle {
+    const declineInstead = () =>
+      raw.answer({ outcome: 'decline', decidedBy: 'policy', reason: EARLIER_OPENING, at: this.options.now() });
+    const guarded: PermissionHandle = {
+      // The runtime's own, as it changes (held, answered).
+      get request() {
+        return raw.request;
+      },
+      hold: (hold, extra) => {
+        if (!isCurrent()) {
+          declineInstead();
+          this.requests.delete(guarded);
+          return false;
+        }
+        return raw.hold(hold, extra);
+      },
+      answer: (decision, extra) => {
+        this.requests.delete(guarded);
+        if (!isCurrent()) {
+          declineInstead();
+          return false;
+        }
+        return raw.answer(decision, extra);
+      },
+    };
+    this.requests.set(guarded, { raw, isCurrent, sessionId: raw.request.sessionId });
+    this.currentOf.set(guarded, isCurrent);
+    return guarded;
+  }
+
+  /** Whether a guarded request is still waiting for its answer (answered ones leave `requests`). */
+  private isOpenRequest(handle: PermissionHandle): boolean {
+    return this.requests.has(handle);
+  }
+
+  /**
+   * A released opening's requests (T036 r3 P1-2): each one still open is declined to its runtime, its lock wait ends
+   * and its escalation is closed, so nobody can approve it later.
+   */
+  private async declineEarlier(sessionId: SessionId): Promise<void> {
+    for (const [guarded, entry] of [...this.requests]) {
+      if (entry.sessionId !== sessionId || entry.isCurrent()) continue;
+      this.requests.delete(guarded);
+      entry.raw.answer({ outcome: 'decline', decidedBy: 'policy', reason: EARLIER_OPENING, at: this.options.now() });
+      const withdrawn: PermissionRequest = { ...guarded.request, state: 'withdrawn' };
+      delete withdrawn.hold;
+      this.locks?.observe({ type: 'permission.updated', request: withdrawn });
+      await this.gate.withdrawn(withdrawn);
+    }
   }
 
   /** A file changed in a session's workspace while its runtime ran (writtenPaths source 3). */
@@ -1579,7 +1669,8 @@ export class SessionService {
       nativeTasks: conversation.nativeTasks,
       ackedTurns: this.ackedTurns.get(sessionId)?.size ?? 0,
       handoffTurn: this.handoffTurns.has(sessionId),
-      heldRequests: this.gate.heldFor(sessionId).length,
+      // Held for the user, and any request still on its way to an answer (T036 r3: a pending one is waited for too).
+      heldRequests: new Set([...this.gate.heldFor(sessionId).map((r) => r.id), ...[...this.requests.values()].filter((r) => r.sessionId === sessionId && r.isCurrent()).map((r) => r.raw.request.id)]).size,
       deliveries,
       locks,
     };
@@ -2028,8 +2119,15 @@ export class SessionService {
    * queue, then pushed. Deltas are not stored and are pushed at once. An event whose write fails is not
    * pushed (r1-P1-7): the Snapshot and the event stream must not disagree.
    */
-  private record(event: RuntimeEvent): void {
+  private record(event: RuntimeEvent, isCurrent: (sessionId: SessionId) => boolean = () => true): void {
     if (this.closed) return;
+    // An earlier opening's event (T036 r3 P1-1) is history only: it never reaches the locks, the supervisor, the acks
+    // and handoffs, the activity, the usage or the workflow, which are about what goes on now.
+    const of = sessionOf(event);
+    if (of !== undefined && !isCurrent(of)) {
+      this.recordHistory(event, of);
+      return;
+    }
     // The locks see each event as it arrives, before any await of storing it: a write's end, a turn's end
     // and an exit change who may write at once (R-07, KNOWLEDGE §5).
     this.locks?.observe(event);
@@ -2062,6 +2160,124 @@ export class SessionService {
       // No AppEvent tells the renderer to reload its Snapshot (contracts gap): remembered for when there is one.
       this.unsynced.add(sessionId);
     });
+  }
+
+  /**
+   * What an earlier opening's event may still do (T036 r3 P1-1): record that something of it ended (a turn, an item,
+   * a sub-agent, a request) or a message it sent, in the session's queue like any write, unless it was recorded as
+   * ended already. Anything that would say something runs now (a `running` state, deltas, usage, model) is dropped.
+   */
+  private recordHistory(event: RuntimeEvent, sessionId: SessionId): void {
+    const ends =
+      (event.type === 'turn.updated' && event.turn.state !== 'running') ||
+      (event.type === 'item.updated' && event.item.endedAt !== undefined) ||
+      (event.type === 'nativeTask.updated' && event.task.state !== 'running') ||
+      (event.type === 'permission.updated' && (event.request.state === 'answered' || event.request.state === 'withdrawn')) ||
+      event.type === 'message.completed';
+    if (!ends) return;
+    void this.serial(sessionKey(sessionId), () => this.applyHistory(event)).catch((error: unknown) => {
+      this.log(`recording an earlier opening's ${event.type} of ${sessionId} failed (${errorName(error)}); it is not pushed`);
+      this.unsynced.add(sessionId);
+    });
+  }
+
+  private async applyHistory(event: RuntimeEvent): Promise<void> {
+    if (this.closed) return;
+    const { conversations } = this.repos;
+    switch (event.type) {
+      case 'turn.updated': {
+        const stored = (await conversations.get(event.turn.sessionId)).turns.find((t) => t.id === event.turn.id);
+        if (stored !== undefined && stored.state !== 'running') return;
+        this.contentWrite(event.turn.sessionId);
+        await conversations.upsertTurn(event.turn);
+        this.contentWritten(event.turn.sessionId);
+        break;
+      }
+      case 'item.updated': {
+        const { item } = event;
+        const stored = (await conversations.get(item.sessionId)).items.find((i) => i.id === item.id);
+        if (stored?.endedAt !== undefined) return;
+        this.contentWrite(item.sessionId);
+        await conversations.upsertItem(item);
+        this.contentWritten(item.sessionId);
+        // What it wrote is still written (writtenPaths: what this session changed, whichever opening did).
+        if (item.kind === 'fileChange' && item.state === 'applied') {
+          const session = await this.repos.sessions.get(item.sessionId);
+          this.written.add(
+            item.sessionId,
+            item.changes.flatMap((c) => [c.path, ...(c.movePath ? [c.movePath] : [])]),
+            session?.cwd ?? '',
+          );
+        }
+        break;
+      }
+      case 'nativeTask.updated': {
+        const stored = (await conversations.get(event.task.sessionId)).nativeTasks.find((t) => t.id === event.task.id);
+        if (stored !== undefined && stored.state !== 'running') return;
+        this.contentWrite(event.task.sessionId);
+        await conversations.upsertNativeTask(event.task);
+        this.contentWritten(event.task.sessionId);
+        break;
+      }
+      case 'permission.updated':
+        await conversations.upsertPermissionRequest(event.request);
+        this.forgetRequest(event.request);
+        if (event.request.state === 'withdrawn') await this.gate.withdrawn(event.request);
+        break;
+      case 'message.completed':
+        if (this.isEcho(event.message)) return;
+        this.contentWrite(event.message.sessionId);
+        await conversations.appendMessage(event.message);
+        this.contentWritten(event.message.sessionId);
+        break;
+      default:
+        return;
+    }
+    this.options.publish(event);
+  }
+
+  /** A request the runtime answered or withdrew no longer waits (T036 r3 P1-2). */
+  private forgetRequest(request: PermissionRequest): void {
+    if (request.state !== 'answered' && request.state !== 'withdrawn') return;
+    for (const [guarded] of this.requests) if (guarded.request.id === request.id && guarded.request.sessionId === request.sessionId) this.requests.delete(guarded);
+  }
+
+  /**
+   * After a release (its Job ended): what the released opening left running is over (T036 r3), recorded as a restart
+   * records a crashed run's (`start`), so the session's idleness and turn boundary do not wait for an end that its
+   * runtime can no longer report. A session is opened again only after its release finished, so nothing here is a
+   * later opening's.
+   */
+  private async endLeftOpen(sessionId: SessionId): Promise<void> {
+    if (this.closed) return;
+    const { conversations } = this.repos;
+    const conversation = await conversations.get(sessionId);
+    const at = this.options.now();
+    const changed: RuntimeEvent[] = [];
+    for (const turn of conversation.turns)
+      if (turn.state === 'running') {
+        const ended: Turn = { ...turn, state: 'interrupted', endedAt: at };
+        this.contentWrite(sessionId);
+        await conversations.upsertTurn(ended);
+        changed.push({ type: 'turn.updated', turn: ended });
+      }
+    for (const item of conversation.items) {
+      const ended = endedByExit(item, at);
+      if (ended === undefined) continue;
+      this.contentWrite(sessionId);
+      await conversations.upsertItem(ended);
+      changed.push({ type: 'item.updated', item: ended });
+    }
+    for (const task of conversation.nativeTasks)
+      if (task.state === 'running') {
+        const ended = { ...task, state: 'stopped' as const, endedAt: at };
+        this.contentWrite(sessionId);
+        await conversations.upsertNativeTask(ended);
+        changed.push({ type: 'nativeTask.updated', task: ended });
+      }
+    if (changed.length === 0) return;
+    this.contentWritten(sessionId);
+    for (const event of changed) this.options.publish(event);
   }
 
   private async apply(event: Exclude<RuntimeEvent, { type: 'runtime.exited' | 'message.delta' | 'item.outputDelta' }>): Promise<void> {
@@ -2115,6 +2331,7 @@ export class SessionService {
       }
       case 'permission.updated':
         await conversations.upsertPermissionRequest(event.request);
+        this.forgetRequest(event.request);
         if (event.request.state === 'withdrawn') await this.gate.withdrawn(event.request);
         await this.followHold(event.request);
         break;

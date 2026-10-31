@@ -18,6 +18,8 @@ import type {
   ReconcileRequest,
   ReconcileResult,
   ResumeSessionOptions,
+  RuntimeAdapter,
+  RuntimeAdapterHooks,
   StartSessionOptions,
 } from '../../ports';
 import { SessionService } from '../../sessions';
@@ -26,6 +28,13 @@ import { AGENT, agent, CWD } from '../../sessions/testing/harness';
 import { IdleSupervisor } from '../supervisor';
 
 export const IDLE_MS = 60_000;
+/** The supervisor's close deadline; unlike the router's own waits (5 s), so a test can let only it pass. */
+export const CLOSE_MS = 4000;
+/**
+ * A sleep where the close deadlines pass at once (the supervisor's, and the router's wait for an earlier close before
+ * a new opening, 5 s), but the collection of a retired adapter (10 s) never comes.
+ */
+export const onlyCloseDeadline = (ms: number): Promise<void> => (ms === CLOSE_MS || ms === 5000 ? Promise.resolve() : new Promise<void>(() => undefined));
 let uuids = 0;
 let turns = 0;
 export const AT = '2026-10-29T01:00:00.000Z';
@@ -132,6 +141,8 @@ export interface SupWorldOptions {
   locks?: boolean;
   /** A new Claude adapter per opening, as the main process gives, instead of one shared adapter. */
   claudePerSession?: boolean;
+  /** Replaces the fake for a runtime when it returns an adapter (core cannot import the real ones). */
+  createAdapter?: (runtime: Runtime, sessionId: SessionId, hooks: RuntimeAdapterHooks, world: SupWorld) => RuntimeAdapter | undefined;
 }
 
 const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: SupWorldOptions, previous?: SupWorld): SupWorld => {
@@ -212,9 +223,13 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
     resolveRealPath: realPath,
     // Codex: a new adapter per opening (the router asks again after each release). Claude: one shared adapter, or
     // with `claudePerSession` a new one per opening as the main process gives (T036 r2 P1-1).
-    createAdapter: (runtime: Runtime, sessionId: SessionId) => {
+    createAdapter: (runtime: Runtime, sessionId: SessionId, hooks: RuntimeAdapterHooks) => {
+      // A real adapter given by the test (app/main: the Claude adapter on a fake SDK), with the router's hooks.
+      const given = o.createAdapter?.(runtime, sessionId, hooks, world);
+      if (given !== undefined) return given;
       if (runtime === 'claude' && o.claudePerSession !== true) return world.claude;
-      const adapter = new HoldingAdapter(runtime, onPermission);
+      // Its requests go through the router's hooks, which know the opening they belong to (T036 r3 P1-2).
+      const adapter = new HoldingAdapter(runtime, (handle) => hooks.onPermissionRequest(handle));
       if (runtime === 'claude') world.claude = adapter;
       else world.codex.set(sessionId, adapter);
       world.all.set(sessionId, [...(world.all.get(sessionId) ?? []), adapter]);
@@ -238,7 +253,7 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
     now: () => clock.now(),
     idleMs: IDLE_MS,
     maxOpen: o.maxOpen ?? 0,
-    closeTimeoutMs: 5000,
+    closeTimeoutMs: CLOSE_MS,
     ownedCommands: (sessionId) => Promise.resolve(world.owned.get(sessionId) ?? 0),
     log: (message) => world.logs.push(message),
   });

@@ -9,7 +9,9 @@ import { permissionRequest } from '../../sessions/testing/fake-adapter';
 import { CWD } from '../../sessions/testing/harness';
 import {
   activityOf,
+  onlyCloseDeadline,
   adapterOf,
+  adaptersOf,
   AT,
   closesOf,
   resumedOf,
@@ -555,8 +557,9 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
         const old = adapterOf(w, runtime, a);
         const held = gate();
         old.closeGate = held.promise;
-        // The graceful close does not return in time: the session is released by force.
-        w.sleeper = () => Promise.resolve();
+        // The graceful close does not return in time: the session is released by force. The old adapter is retired but
+        // not collected yet (its close has not returned), so its late events still arrive.
+        w.sleeper = onlyCloseDeadline;
         await w.supervisor.tick();
         await settle();
         expect(w.closed).toEqual([a]);
@@ -607,6 +610,58 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       await idleFor(w2, IDLE_MS);
       expect(isOpen(w2, a)).toBe(false);
       expect(w2.logs.some((l) => l.includes('turn-acked'))).toBe(false);
+    });
+  });
+
+  describe(`idle supervisor: review r3 sequences (${name})`, () => {
+    it('P2: closing and resuming again and again leaves no retired adapter or listener behind', async () => {
+      const w = await make();
+      const a = await created(w, 'codex');
+      for (let round = 0; round < 4; round++) {
+        await exchange(w, 'codex', a, `round ${String(round)}`);
+        await idleFor(w, IDLE_MS);
+        expect(isOpen(w, a)).toBe(false);
+      }
+      await settle();
+      expect(w.service.runtimes.retiredCount).toBe(0);
+      const adapters = adaptersOf(w, 'codex', a);
+      expect(adapters).toHaveLength(4);
+      // Each was closed when it was let go (R-14), and none is listened to any more.
+      expect(adapters.every((x) => x.calls.includes('close'))).toBe(true);
+      adapters[0]!.emit({ type: 'runtime.exited', runtime: 'codex', sessionIds: [a], expected: false, code: 1, signal: null, at: AT });
+      adapters[0]!.emit({ type: 'turn.updated', turn: { id: TurnId.parse('turn-after-collect'), sessionId: a, state: 'completed', startedAt: AT, endedAt: AT } });
+      await settle();
+      expect(w.logs.some((l) => l.includes('late exit'))).toBe(false);
+      expect((await w.repositories.conversations.get(a)).turns.some((t) => t.id === 'turn-after-collect')).toBe(false);
+    });
+
+    it('an earlier opening’s late running turn and request change nothing now (history only)', async () => {
+      const w = await make({ locks: true });
+      const a = await created(w, 'codex');
+      await exchange(w, 'codex', a);
+      w.clock.advance(IDLE_MS);
+      const old = adapterOf(w, 'codex', a);
+      const held = gate();
+      old.closeGate = held.promise;
+      w.sleeper = onlyCloseDeadline;
+      await w.supervisor.tick();
+      await settle();
+      expect((await send(w, a, 'after')).ok).toBe(true);
+      expect(await w.service.mainTurnRunning(a)).toBe(true);
+      const before = (await activityOf(w, a))!;
+      // The earlier opening reports a turn running, then ending, and asks to run a command.
+      old.emit({ type: 'turn.updated', turn: { id: TurnId.parse('turn-old-late'), sessionId: a, state: 'running', startedAt: AT } });
+      const asked = old.ask(permissionRequest(a, { id: 'perm-old' as never, summary: 'npm test', command: 'npm test' }));
+      old.emit({ type: 'turn.updated', turn: { id: TurnId.parse('turn-old-late'), sessionId: a, state: 'interrupted', startedAt: AT, endedAt: AT } });
+      await settle();
+      // Its end is history; its running never was stored, the acked turn still runs, and the request is declined.
+      const turns = (await w.repositories.conversations.get(a)).turns;
+      expect(turns.find((t) => t.id === 'turn-old-late')?.state).toBe('interrupted');
+      expect(await w.service.mainTurnRunning(a)).toBe(true);
+      expect(await activityOf(w, a)).toBe(before);
+      expect(asked.decision).toMatchObject({ outcome: 'decline', decidedBy: 'policy' });
+      held.open();
+      await settle();
     });
   });
 

@@ -307,7 +307,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     uuid,
     hashPayload: sha256,
     resolveRealPath: (path) => options.resolveRealPath(path),
-    createAdapter: (runtime, sessionId) => createAdapter(runtime, sessionId, hooks),
+    // The router's hooks: each opening's requests know whether that opening still serves the session (T036 r3 P1-2).
+    createAdapter: (runtime, sessionId, sessionHooks) => createAdapter(runtime, sessionId, sessionHooks),
     mountMcp: (sessionId) => {
       const mount = mcp.mount(sessionId);
       tokens.add(mount.token);
