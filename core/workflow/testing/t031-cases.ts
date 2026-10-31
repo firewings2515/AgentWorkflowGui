@@ -33,7 +33,9 @@ import {
   WORKFLOW,
   type World,
 } from './harness';
-import type { HandoffMeta } from '../../ports';
+import { hashOf } from '../../delivery/testing/fixtures';
+import type { AcceptInput, HandoffMeta } from '../../ports';
+import { handoffCounts, isRework, nodeOf } from '../graph';
 import { crashOnce } from './r2-cases';
 
 export const RA = NodeId.parse('review-a');
@@ -47,7 +49,7 @@ const rule = (id: string, nodeId: NodeId) => ({ id, condition: id, payload: '', 
  * Plan (root) fans out to two read-only reviews, Claude and Codex, which both hand to Verdict; Verdict waits
  * for all upstream and reports to root.
  */
-export const fanTemplate = (join: Partial<InputRule> = {}): WorkflowTemplate => ({
+export const fanTemplate = (join: Partial<InputRule> = {}, confirmA = false): WorkflowTemplate => ({
   schemaVersion: CONTRACTS_VERSION,
   id: WORKFLOW,
   revision: 0,
@@ -57,7 +59,13 @@ export const fanTemplate = (join: Partial<InputRule> = {}): WorkflowTemplate => 
   isolation: 'same-folder',
   nodes: [
     node(PLAN, { label: 'Plan', agentId: PLANNER, isRoot: true, outputRules: [rule('to-a', RA), rule('to-b', RB)] }),
-    node(RA, { label: 'Review A', agentId: REVIEWER, writePolicy: 'read-only', inputRules: [{ id: 'change', condition: 'a change', waitForAllUpstream: false }], outputRules: [rule('verdict', JOIN)] }),
+    node(RA, {
+      label: 'Review A',
+      agentId: REVIEWER,
+      writePolicy: 'read-only',
+      inputRules: [{ id: 'change', condition: 'a change', waitForAllUpstream: false }],
+      outputRules: [{ ...rule('verdict', JOIN), requiresUserConfirmation: confirmA }],
+    }),
     node(RB, {
       label: 'Review B',
       agentId: REVIEWER,
@@ -81,6 +89,48 @@ export const fanTemplate = (join: Partial<InputRule> = {}): WorkflowTemplate => 
   ],
   updatedAt: '2026-10-31T00:00:00.000Z',
 });
+
+export const KEEP = NodeId.parse('keeper');
+
+/** The fan template with a second waiting node, Keeper, that both reviews can hand to as well (r1-P1-4). */
+const twoJoinTemplate = (): WorkflowTemplate => {
+  const base = fanTemplate();
+  const withK = base.nodes.map((n) => (n.id === RA || n.id === RB ? { ...n, outputRules: [...n.outputRules, rule('to-k', KEEP)] } : n));
+  const keeper = node(KEEP, {
+    label: 'Keeper',
+    agentId: PLANNER,
+    inputRules: [{ id: 'reviews', condition: 'the reviews', waitForAllUpstream: true }],
+    outputRules: [{ id: 'kept', condition: 'kept', payload: '', target: { kind: 'root' }, requiresUserConfirmation: false }],
+  });
+  return { ...base, nodes: [...withK, keeper], edges: [...base.edges, { source: RA, target: KEEP }, { source: RB, target: KEEP }] };
+};
+
+/**
+ * Makes the engine store handoffs as the T024 engine (`405355a`) did: round 0, no round frame, no expected set,
+ * counted one by one and rework by any earlier receipt (r1-P1-6/7). The returned function ends it.
+ */
+const asBaseline = (w: World) => {
+  const original = w.store.accept.bind(w.store);
+  w.store.accept = async (input: AcceptInput) => {
+    if (input.kind !== 'handoff' || input.handoff === undefined) return original(input);
+    const instance = await instanceOf(w);
+    const meta = input.handoff;
+    const target = nodeOf(instance.template, meta.toNodeId)!;
+    const handoffs = await w.repositories.handoffs.listByInstance(INSTANCE);
+    const rework = isRework(handoffs, meta.taskId, meta.toNodeId);
+    const { counts } = handoffCounts(instance, handoffs, meta.taskId, target, rework);
+    const payload = input.payload
+      .split('\n')
+      .filter((line) => !line.startsWith('Round '))
+      .join('\n');
+    const legacy: HandoffMeta = { ...meta, rework, round: 0 };
+    delete legacy.expectedUpstream;
+    return original({ ...input, payload, payloadHash: hashOf(payload), counts, handoff: legacy });
+  };
+  return () => {
+    w.store.accept = original;
+  };
+};
 
 const toA = { ruleId: 'to-a', target: to(RA) };
 const toB = { ruleId: 'to-b', target: to(RB) };
@@ -111,6 +161,19 @@ const fanOutAgain = async (w: World, turnId: string) => {
   await handoff(w, ROOT, { ...toB, content: 'review B again' });
   w.emitTurn(ROOT, turnId, 'completed');
   await settle();
+};
+
+/**
+ * Makes `method` of `target` reject with "crash" whenever `when` holds, as a GUI that died there: nothing of
+ * that process gets past it again. The returned function ends it, for the restart.
+ */
+const crashUntilRestart = <T extends object, K extends keyof T>(target: T, method: K, when: (...args: unknown[]) => boolean) => {
+  const original = target[method];
+  const bound = (original as (...args: unknown[]) => unknown).bind(target);
+  (target as Record<K, unknown>)[method] = (...args: unknown[]) => (when(...args) ? Promise.reject(new Error('crash')) : bound(...args));
+  return () => {
+    target[method] = original;
+  };
 };
 
 const roundsOf = async (w: World) => (await instanceOf(w)).rounds;
@@ -225,6 +288,150 @@ export const t031Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
         [2, false],
       ]);
       expect((await instanceOf(w)).tasks[0]?.reworkCount).toBe(3);
+    });
+
+    it('r1-P1-1 an arrival the user confirms later keeps the round of its call, not the work its sender got since', async () => {
+      const w = await make(fanTemplate({}, true));
+      const { ra, rb } = await fanOut(w);
+      await w.finishTurn(ROOT);
+      const asked = await handoff(w, ra, { ...verdict, content: 'A1' });
+      expect(asked).toMatchObject({ status: 'escalated', reason: 'needs-confirmation' });
+      await handoff(w, rb, { ...verdict, content: 'B1' });
+      // Root opens round 2 and Review A gets it before the user confirms A1.
+      await fanOutAgain(w, 'root-2');
+      expect(received(w, ra)).toEqual(['review A please', 'review A again']);
+      await w.run({ type: 'escalation.respond', requestId: rid(), escalationId: (asked as { escalationId: Escalation['id'] }).escalationId, decision: 'approve' });
+      await settle();
+      await handoff(w, rb, { ...verdict, content: 'B2' });
+      await settle();
+      expect((await arrivalsAt(w)).map((h) => [h.payload.split('\n\n').at(-1), h.round])).toEqual([
+        ['B1', 1],
+        ['A1', 1],
+        ['B2', 2],
+      ]);
+      expect((await roundsOf(w)).map((r) => [r.round, r.state, r.arrived.map((a) => a.fromNodeId)])).toEqual([
+        [1, 'ready', [RB, RA]],
+        [2, 'waiting', [RB]],
+      ]);
+      expect(received(w, await joinOf(w))).toEqual(['B1', 'A1']);
+    });
+
+    it('r1-P1-2 the end of the source turn told while its handoffs are being accepted does not split the fan-out', async () => {
+      const w = await make(fanTemplate());
+      w.holding.add(ROOT);
+      await started(w);
+      // The completed notice of root's turn comes after A's acceptance committed and before it returned.
+      const original = w.store.accept.bind(w.store);
+      let armed = true;
+      w.store.accept = async (input: AcceptInput) => {
+        const result = await original(input);
+        if (armed && input.kind === 'handoff') {
+          armed = false;
+          const turnId = w.open.get(ROOT)!;
+          w.open.delete(ROOT);
+          w.emitTurn(ROOT, turnId, 'completed');
+          await settle();
+        }
+        return result;
+      };
+      const both = await Promise.all([handoff(w, ROOT, { ...toA, content: 'review A please' }), handoff(w, ROOT, { ...toB, content: 'review B please' })]);
+      w.store.accept = original;
+      expect(both.map((r) => r.status)).toEqual(['accepted', 'accepted']);
+      await settle();
+      expect((await w.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.fromNodeId === PLAN).map((h) => h.round)).toEqual([1, 1]);
+      await handoff(w, await sessionOf(w, RA), { ...verdict, content: 'A: fine' });
+      await settle();
+      expect((await roundsOf(w))[0]).toMatchObject({ expectedUpstream: [RA, RB], state: 'waiting' });
+      expect(received(w, await joinOf(w))).toEqual([]);
+    });
+
+    it('r1-P1-3 two rounds ready while the waiting node is busy go one round after the other, not interleaved', async () => {
+      const w = await make(fanTemplate());
+      const { ra, rb } = await fanOut(w);
+      await w.finishTurn(ROOT);
+      await handoff(w, ra, { ...verdict, content: 'A1' });
+      await settle();
+      const join = await joinOf(w);
+      w.emitTurn(join, 'j-busy', 'running');
+      w.emitTurn(rb, 'b-busy', 'running');
+      await settle();
+      await fanOutAgain(w, 'root-2');
+      await handoff(w, ra, { ...verdict, content: 'A2' });
+      await handoff(w, rb, { ...verdict, content: 'B1' });
+      w.emitTurn(rb, 'b-busy', 'completed');
+      await settle();
+      await handoff(w, rb, { ...verdict, content: 'B2' });
+      await settle();
+      expect((await roundsOf(w)).map((r) => r.state)).toEqual(['ready', 'ready']);
+      expect(received(w, join)).toEqual([]);
+      w.emitTurn(join, 'j-busy', 'completed');
+      await settle();
+      expect(received(w, join)).toEqual(['A1', 'B1', 'A2', 'B2']);
+    });
+
+    it('r1-P1-4 a branch that reached one waiting node and went no further is blocked at the other', async () => {
+      const w = await make(twoJoinTemplate());
+      const { ra, rb } = await fanOut(w);
+      await w.finishTurn(ROOT);
+      await handoff(w, rb, { ...verdict, content: 'B to J' });
+      await handoff(w, rb, { ruleId: 'to-k', target: to(KEEP), content: 'B to K' });
+      // Review A hands to Verdict only, and its turn is over.
+      await handoff(w, ra, { ...verdict, content: 'A to J' });
+      await settle();
+      const rounds = await roundsOf(w);
+      expect(rounds.find((r) => r.nodeId === JOIN)).toMatchObject({ state: 'ready' });
+      expect(rounds.find((r) => r.nodeId === KEEP)).toMatchObject({ state: 'blocked', blockedReason: 'upstream-cancelled', blockedUpstream: RA });
+      expect((await openOf(w, 'round-blocked')).map((e) => e.ref)).toEqual([{ kind: 'round', taskId: (await instanceOf(w)).tasks[0]!.id, nodeId: KEEP, round: 1 }]);
+    });
+
+    it('r1-P1-5 a crash between accepting an arrival and writing its round does not restart the wait limit', async () => {
+      const w = await make(fanTemplate({ waitTimeoutMs: 60_000 }));
+      const { ra } = await fanOut(w);
+      await w.finishTurn(ROOT);
+      const restore = crashUntilRestart(w.repositories.instances, 'update', (instance) => (instance as { rounds: unknown[] }).rounds.length > 0);
+      await handoff(w, ra, { ...verdict, content: 'A: fine' });
+      await settle();
+      expect(await roundsOf(w)).toEqual([]);
+      restore();
+      advanceClock(61_000);
+      const after = await w.restart();
+      await settle();
+      const [round] = await roundsOf(after);
+      expect(round).toMatchObject({ state: 'blocked', blockedReason: 'timeout' });
+      expect(round?.openedAt).toBe((await arrivalsAt(after))[0]?.acceptedAt);
+    });
+
+    it('r1-P1-6 handoffs stored before T031 (round 0) still count one by one against the receive limit', async () => {
+      const w = await make(fanTemplate({ acceptanceLimit: 2 }));
+      const restore = asBaseline(w);
+      const { ra, rb } = await fanOut(w);
+      await w.finishTurn(ROOT);
+      await handoff(w, ra, { ...verdict, content: 'A one' });
+      await handoff(w, ra, { ...verdict, content: 'A two' });
+      await settle();
+      restore();
+      expect((await arrivalsAt(w)).map((h) => h.round)).toEqual([0, 0]);
+      const after = await w.restart();
+      await settle();
+      expect(await handoff(after, rb, { ...verdict, content: 'B' })).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
+      expect(await arrivalsAt(after)).toHaveLength(2);
+    });
+
+    it('r1-P1-7 the same call resent after the upgrade is a duplicate of the handoff the T024 engine stored', async () => {
+      const w = await make(fanTemplate());
+      const restore = asBaseline(w);
+      const { ra } = await fanOut(w);
+      await w.finishTurn(ROOT);
+      const first = await handoff(w, ra, { ...verdict, content: 'A: fine' }, { operationId: 'op-legacy', sourceCallRef: 'call-legacy' });
+      await settle();
+      restore();
+      const after = await w.restart();
+      await settle();
+      expect(await handoff(after, ra, { ...verdict, content: 'A: fine' }, { operationId: 'op-legacy', sourceCallRef: 'call-legacy' })).toMatchObject({
+        status: 'duplicate',
+        handoffId: (first as { handoffId: string }).handoffId,
+      });
+      expect(await handoff(after, ra, { ...verdict, content: 'A: fine' }, { operationId: 'op-legacy-2', sourceCallRef: 'call-legacy' })).toMatchObject({ status: 'duplicate' });
     });
 
     it('ordinary handoffs queued for a busy target still go one per turn in acceptance order (the gate change, T031)', async () => {
@@ -434,12 +641,13 @@ export const t031Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       await w.finishTurn(ROOT);
       await handoff(w, ra, { ...verdict, content: 'A: fine' });
       await settle();
-      crashOnce(w.repositories.instances, 'update', (instance) => (instance as { rounds: { state: string }[] }).rounds.some((r) => r.state === 'ready'));
+      const restore = crashUntilRestart(w.repositories.instances, 'update', (instance) => (instance as { rounds: { state: string }[] }).rounds.some((r) => r.state === 'ready'));
       expect(await handoff(w, rb, { ...verdict, content: 'B: fine' })).toMatchObject({ status: 'accepted', delivery: 'pending' });
       await settle();
       expect((await roundsOf(w))[0]?.state).toBe('waiting');
       const join = await joinOf(w);
       expect(received(w, join)).toEqual([]);
+      restore();
       const after = await w.restart();
       await settle();
       expect((await roundsOf(after))[0]?.state).toBe('ready');
@@ -451,11 +659,12 @@ export const t031Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       const { ra, rb } = await fanOut(w);
       await w.finishTurn(ROOT);
       await handoff(w, rb, { ...verdict, content: 'B: fine' });
-      crashOnce(w.repositories.escalations, 'upsert', (e) => (e as Escalation).kind === 'round-blocked');
+      const restore = crashUntilRestart(w.repositories.escalations, 'upsert', (e) => (e as Escalation).kind === 'round-blocked');
       await endTurnOf(w, ra, 'failed');
       expect((await roundsOf(w))[0]?.state).toBe('blocked');
       expect(await openOf(w, 'round-blocked')).toHaveLength(0);
       expect((await instanceOf(w)).tasks[0]?.status).toBe('blocked');
+      restore();
       const after = await w.restart();
       await settle();
       const open = await openOf(after, 'round-blocked');

@@ -19,8 +19,15 @@ export const waitLimitMs = (node: WorkflowNode | undefined): number | undefined 
   return limits.length === 0 ? undefined : Math.min(...limits);
 };
 
-/** Whether a handoff arrives at a waiting node (counted in its round) rather than being a member of a fan-out. */
-export const isArrival = (template: WorkflowTemplate, handoff: Pick<Handoff, 'toNodeId'>): boolean => waitsForAll(nodeOf(template, handoff.toNodeId));
+/**
+ * Round 0 is what every handoff stored before T031 carries (`HandoffMeta.round`: batch 4 always used 0): no
+ * fan-out is known for it, so it joins no round and counts as T024 counted it, one by one (T031 r1-P1-6).
+ */
+export const LEGACY_ROUND = 0;
+
+/** Whether a handoff arrives at a waiting node (counted in a round) rather than being a member of a fan-out. */
+export const isArrival = (template: WorkflowTemplate, handoff: Pick<Handoff, 'toNodeId' | 'round'>): boolean =>
+  handoff.round !== LEGACY_ROUND && waitsForAll(nodeOf(template, handoff.toNodeId));
 
 const byTime = (a: string | undefined, b: string | undefined) => (a === b ? 0 : (a ?? '') < (b ?? '') ? -1 : 1);
 
@@ -56,9 +63,10 @@ export interface ArrivalPlan {
 }
 
 /**
- * The round an arrival from `from` at waiting node `to` counts in. It joins the round of its lineage when that
- * lineage is a fan-out member and the round still takes `from`; `expectedUpstream` is left out while the
- * group is open (not fixed yet). Otherwise it is a round of its own (`fresh`) that expects only `from`.
+ * The round an arrival from `from` at waiting node `to` counts in. It joins the round of its lineage (the work
+ * the sender was on when it called, `lineage`, fixed at the call: r1-P1-1) when that lineage is a fan-out
+ * member and the round still takes `from`; `expectedUpstream` is left out while the group is open (not fixed
+ * yet). Otherwise, a stored handoff of round 0 included, it is a round of its own (`fresh`) expecting only `from`.
  */
 export const planArrival = (
   template: WorkflowTemplate,
@@ -69,9 +77,9 @@ export const planArrival = (
   to: NodeId,
   open: ReadonlySet<number>,
   fresh: number,
+  lineage: Handoff | undefined,
 ): ArrivalPlan => {
-  const lineage = lineageOf(handoffs, taskId, from);
-  if (lineage !== undefined && !isArrival(template, lineage)) {
+  if (lineage !== undefined && lineage.round !== LEGACY_ROUND && !isArrival(template, lineage)) {
     const r = lineage.round;
     const arrivals = handoffs.filter((h) => h.taskId === taskId && h.toNodeId === to && h.round === r);
     const stored = rounds.find((x) => x.taskId === taskId && x.nodeId === to && x.round === r);
@@ -161,7 +169,10 @@ export const deriveRounds = (template: WorkflowTemplate, taskId: TaskId, handoff
       const froms = arrivals.filter((h) => h.toNodeId === arrival.toNodeId && h.round === arrival.round).map((h) => h.fromNodeId);
       const expectedUpstream = [...new Set([...fixed, ...froms])];
       const limit = waitLimitMs(node);
-      round = { taskId, nodeId: arrival.toNodeId, round: arrival.round, expectedUpstream, arrived: [], state: 'waiting', openedAt: facts.now, ...(limit !== undefined && { deadline: plus(facts.now, limit) }) };
+      // The wait starts with the round's first arrival, wherever the round is first written (a restart
+      // included), so time the GUI was down counts toward the limit (r1-P1-5).
+      const openedAt = arrival.acceptedAt;
+      round = { taskId, nodeId: arrival.toNodeId, round: arrival.round, expectedUpstream, arrived: [], state: 'waiting', openedAt, ...(limit !== undefined && { deadline: plus(openedAt, limit) }) };
       rounds.push(round);
     }
     if (round.expectedUpstream.includes(arrival.fromNodeId) && !round.arrived.some((a) => a.fromNodeId === arrival.fromNodeId)) round.arrived.push({ fromNodeId: arrival.fromNodeId, handoffId: arrival.id });

@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { type Handoff, HandoffId, InstanceId, type JoinRound, NodeId, OperationId, SessionId, TaskId, type TurnState } from '../../contracts';
 import { PLAN } from './testing/harness';
 import { fanTemplate, JOIN, RA, RB } from './testing/t031-cases';
-import { deriveRounds, expectedOf, nextRound, planArrival } from './rounds';
+import { deriveRounds, expectedOf, lineageOf, nextRound, planArrival } from './rounds';
 
 const TASK = TaskId.parse('run-1:task');
 const template = fanTemplate();
@@ -61,22 +61,22 @@ describe('T031 round rules', () => {
     const toA = h(PLAN, RA, 1, { sentAt: 10 });
     const handoffs = [toA];
     expect(expectedOf(template, handoffs, TASK, 1, JOIN)).toEqual([RA]);
-    expect(planArrival(template, handoffs, [], TASK, RA, JOIN, new Set(), 2)).toEqual({ round: 1, expectedUpstream: [RA], first: true });
+    expect(planArrival(template, handoffs, [], TASK, RA, JOIN, new Set(), 2, lineageOf(handoffs, TASK, RA))).toEqual({ round: 1, expectedUpstream: [RA], first: true });
     // While the fan-out is open the set is not fixed yet.
-    expect(planArrival(template, handoffs, [], TASK, RA, JOIN, new Set([1]), 2)).toEqual({ round: 1, first: true });
+    expect(planArrival(template, handoffs, [], TASK, RA, JOIN, new Set([1]), 2, lineageOf(handoffs, TASK, RA))).toEqual({ round: 1, first: true });
   });
 
   it('an arrival without a fan-out behind it, or a second one from the same upstream, is a round of its own', () => {
-    expect(planArrival(template, [], [], TASK, RA, JOIN, new Set(), 4)).toEqual({ round: 4, expectedUpstream: [RA], first: true });
+    expect(planArrival(template, [], [], TASK, RA, JOIN, new Set(), 4, lineageOf([], TASK, RA))).toEqual({ round: 4, expectedUpstream: [RA], first: true });
     const handoffs = [h(PLAN, RA, 1, { sentAt: 10 }), h(PLAN, RB, 1, { sentAt: 11 }), h(RA, JOIN, 1)];
-    expect(planArrival(template, handoffs, [], TASK, RA, JOIN, new Set(), 5)).toEqual({ round: 5, expectedUpstream: [RA], first: true });
-    expect(planArrival(template, handoffs, [], TASK, RB, JOIN, new Set(), 5)).toEqual({ round: 1, expectedUpstream: [RA, RB], first: false });
+    expect(planArrival(template, handoffs, [], TASK, RA, JOIN, new Set(), 5, lineageOf(handoffs, TASK, RA))).toEqual({ round: 5, expectedUpstream: [RA], first: true });
+    expect(planArrival(template, handoffs, [], TASK, RB, JOIN, new Set(), 5, lineageOf(handoffs, TASK, RB))).toEqual({ round: 1, expectedUpstream: [RA, RB], first: false });
     expect(nextRound(handoffs, [], TASK, [3])).toBe(4);
   });
 
   it("the lineage is the last handoff that crossed the boundary, so a queued newer one does not move the sender's work", () => {
     const handoffs = [h(PLAN, RB, 1, { sentAt: 10 }), h(PLAN, RB, 2)];
-    expect(planArrival(template, handoffs, [], TASK, RB, JOIN, new Set(), 3).round).toBe(1);
+    expect(planArrival(template, handoffs, [], TASK, RB, JOIN, new Set(), 3, lineageOf(handoffs, TASK, RB)).round).toBe(1);
   });
 
   it('a round only moves forward: blocked stays blocked when the rest arrives, and its set never shrinks', () => {
@@ -93,9 +93,13 @@ describe('T031 round rules', () => {
     expect(deriveRounds(template, TASK, handoffs, [], facts())[0]).toMatchObject({ state: 'blocked', blockedReason: 'upstream-cancelled', blockedUpstream: RB });
     const timed = fanTemplate({ waitTimeoutMs: 100 });
     const waiting = [h(PLAN, RA, 1, { sentAt: 10 }), h(PLAN, RB, 1, { sentAt: 11 }), h(RA, JOIN, 1)];
-    const [round] = deriveRounds(timed, TASK, waiting, [], facts({}, at(1000)));
-    expect(round).toMatchObject({ state: 'waiting', deadline: at(1100) });
-    expect(deriveRounds(timed, TASK, waiting, [round!], facts({}, at(1099)))[0]?.state).toBe('waiting');
-    expect(deriveRounds(timed, TASK, waiting, [round!], facts({}, at(1100)))[0]).toMatchObject({ state: 'blocked', blockedReason: 'timeout' });
+    // The wait starts at the round's first arrival, wherever the round is first written (r1-P1-5).
+    const first = Date.parse(waiting[2]!.acceptedAt) - Date.UTC(2026, 9, 31);
+    const [round] = deriveRounds(timed, TASK, waiting, [], facts({}, at(first + 50)));
+    expect(round).toMatchObject({ state: 'waiting', openedAt: at(first), deadline: at(first + 100) });
+    expect(deriveRounds(timed, TASK, waiting, [round!], facts({}, at(first + 99)))[0]?.state).toBe('waiting');
+    expect(deriveRounds(timed, TASK, waiting, [round!], facts({}, at(first + 100)))[0]).toMatchObject({ state: 'blocked', blockedReason: 'timeout' });
+    // Written only after the limit passed (a crash between the acceptance and the round): blocked at once.
+    expect(deriveRounds(timed, TASK, waiting, [], facts({}, at(first + 500)))[0]).toMatchObject({ state: 'blocked', blockedReason: 'timeout' });
   });
 });

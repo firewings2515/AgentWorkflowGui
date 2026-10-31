@@ -67,7 +67,8 @@ export interface HandoffCounts {
 export const handoffCounts = (instance: WorkflowInstance, handoffs: readonly Handoff[], taskId: TaskId, toNode: WorkflowNode, rework: boolean, byRound = false): HandoffCounts => {
   const limit = receiveLimit(toNode);
   const received = handoffs.filter((h) => h.taskId === taskId && h.toNodeId === toNode.id);
-  const count = byRound ? new Set(received.map((h) => h.round)).size : received.length;
+  // Handoffs stored before T031 (round 0) count one by one, as T024 counted them (r1-P1-6).
+  const count = byRound ? new Set(received.filter((h) => h.round !== 0).map((h) => h.round)).size + received.filter((h) => h.round === 0).length : received.length;
   const receive = { key: receiveKey(instance.id, taskId, toNode.id), count, ...(limit !== undefined && { limit }), what: 'receive' as const };
   const current: HandoffCounts['current'] = [receive];
   if (rework) current.push({ key: reworkKey(instance.id, taskId), count: handoffs.filter((h) => h.taskId === taskId && h.rework).length, limit: instance.template.reworkLimit, what: 'rework' });

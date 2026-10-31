@@ -55,7 +55,7 @@ import {
   roundEscalationId,
   taskIdOf,
 } from './ids';
-import { concurrencyOf, deriveRounds, dispatchedAt, isArrival, nextRound, occupyingTasks, planArrival, roundNote, waitsForAll } from './rounds';
+import { concurrencyOf, deriveRounds, dispatchedAt, isArrival, LEGACY_ROUND, lineageOf, nextRound, occupyingTasks, planArrival, roundNote, waitsForAll } from './rounds';
 
 export interface WorkflowEngineOptions {
   sessions: SessionService;
@@ -138,6 +138,16 @@ interface PendingHandoff {
   caller: SessionId;
   input: HandoffToolInput;
   ctx: HandoffCallContext;
+  /** The handoff the caller was working on when it called: its round is fixed then, not at the approval (r1-P1-1). */
+  lineageId: Handoff['id'] | undefined;
+}
+
+/** What a handoff call carries from where it came in. */
+interface CallFacts {
+  /** The caller's own turn running when the call came in (read before anything else waited, r1-P1-2). */
+  turnAtCall?: Promise<string | undefined>;
+  /** Set for a handoff the user confirmed: the lineage its call had. */
+  confirmed?: { lineageId: Handoff['id'] | undefined };
 }
 
 /** Everything a handoff call resolves to before anything is written. */
@@ -157,6 +167,8 @@ export class WorkflowEngine implements WorkflowHooks {
   private readonly confirmations = new Map<EscalationId, PendingHandoff>();
   /** Open fan-out groups by (instance, task, source session). */
   private readonly groups = new Map<string, Group>();
+  /** `handoff` calls of a session on their way (r1-P1-2): its groups stay open meanwhile. */
+  private readonly inFlight = new Map<SessionId, number>();
   /** Concurrency slots this process let a handoff take before it crossed the dispatch boundary, by node then task. */
   private readonly reserved = new Map<string, Map<TaskId, Handoff['id']>>();
   /** Wait-limit timers of waiting rounds, by round key. */
@@ -327,18 +339,34 @@ export class WorkflowEngine implements WorkflowHooks {
    * is what its checks see; the store's counts decide in the end.
    */
   async handoff(input: HandoffToolInput, ctx: HandoffCallContext): Promise<HandoffToolResult> {
+    // Counted before anything is awaited: while a call of the session is on its way, the end of its turn
+    // closes none of its fan-outs, so every handoff of one turn stays in one group (r1-P1-2).
+    this.inFlight.set(ctx.caller, (this.inFlight.get(ctx.caller) ?? 0) + 1);
+    const turnAtCall = this.repos.conversations
+      .get(ctx.caller)
+      .then((c) => c.turns.filter((t) => t.nativeTaskId === undefined && t.state === 'running').at(-1)?.id)
+      .catch(() => undefined);
     try {
       if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
       const caller = await this.repos.sessions.get(ctx.caller);
       if (caller?.kind !== 'workflow') return NOT_IN_WORKFLOW;
-      return await this.serial(`instance:${caller.workflow.instanceId}`, () => this.handoffNow(caller, input, ctx, false));
+      return await this.serial(`instance:${caller.workflow.instanceId}`, () => this.handoffNow(caller, input, ctx, { turnAtCall }));
     } catch (error) {
       if (this.options.sessions.isClosing() || isClosedError(error)) return SHUTTING_DOWN;
       throw error;
+    } finally {
+      const left = (this.inFlight.get(ctx.caller) ?? 1) - 1;
+      if (left > 0) this.inFlight.set(ctx.caller, left);
+      else {
+        this.inFlight.delete(ctx.caller);
+        // The last call is in: a fan-out whose turn already ended closes now.
+        void this.afterTurn(ctx.caller).catch((error: unknown) => this.log(`checking the rounds after a handoff of ${ctx.caller} failed (${errorName(error)})`));
+      }
     }
   }
 
-  private async handoffNow(caller: WorkflowSession, input: HandoffToolInput, ctx: HandoffCallContext, confirmed: boolean): Promise<HandoffToolResult> {
+  private async handoffNow(caller: WorkflowSession, input: HandoffToolInput, ctx: HandoffCallContext, call: CallFacts): Promise<HandoffToolResult> {
+    const confirmed = call.confirmed !== undefined;
     if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
     // A `retryOf` of a handoff still waiting for the user is held to the same rules as any resend (r1-P1-5).
     const waiting = handoffConfirmationId(ctx.operationId);
@@ -367,8 +395,10 @@ export class WorkflowEngine implements WorkflowHooks {
     const arrival = waitsForAll(to);
     const groupKey = groupKeyOf(instance.id, taskId, caller.id);
     const fresh = nextRound(handoffs, instance.rounds, taskId, this.openRounds(instance.id, taskId));
+    // The work the caller was on when it called; a confirmed handoff keeps the one its call had (r1-P1-1).
+    const lineage = call.confirmed !== undefined ? handoffs.find((h) => h.id === call.confirmed?.lineageId) : lineageOf(handoffs, taskId, from.id);
     const placed = arrival
-      ? planArrival(instance.template, handoffs, instance.rounds, taskId, from.id, to.id, this.openRounds(instance.id, taskId), fresh)
+      ? planArrival(instance.template, handoffs, instance.rounds, taskId, from.id, to.id, this.openRounds(instance.id, taskId), fresh, lineage)
       : { round: this.groups.get(groupKey)?.round ?? fresh, first: true };
     const { round, first } = placed;
     const expectedUpstream = 'expectedUpstream' in placed ? placed.expectedUpstream : undefined;
@@ -377,7 +407,7 @@ export class WorkflowEngine implements WorkflowHooks {
     const over = first ? current.find((c) => c.limit !== undefined && c.count >= c.limit) : undefined;
     if (over !== undefined) return this.limitReached(instance, taskId, caller, to, over.key, over.what, over.limit ?? 0);
 
-    if (planned.requiresUserConfirmation && !confirmed) return this.askConfirmation(instance, caller, planned, input, ctx);
+    if (planned.requiresUserConfirmation && !confirmed) return this.askConfirmation(instance, caller, planned, input, ctx, lineage?.id);
 
     const targetSessionId = await this.nodeSession(instance, to, taskId, caller);
     if (targetSessionId === undefined) return rejected('unknown-target', 'the target session cannot be created');
@@ -434,7 +464,7 @@ export class WorkflowEngine implements WorkflowHooks {
         throw new Error('accepting the handoff could not be confirmed');
     }
     // The caller's fan-out takes it in its own turn; with no turn of its own running, nothing else can join.
-    if (!arrival) await this.joinGroup({ instanceId: instance.id, taskId, sessionId: caller.id, round }, groupKey);
+    if (!arrival) await this.joinGroup({ instanceId: instance.id, taskId, sessionId: caller.id, round }, groupKey, call.turnAtCall);
     const reworkCount = accepted.counts?.find((c) => c.key === reworkKey(instance.id, taskId))?.count;
     // A task held at a blocked round stays held (the user decides it).
     await this.updateTask(instance.id, taskId, (t) => ({ ...t, status: t.status === 'blocked' ? 'blocked' : 'running', currentNodeId: to.id, ...(reworkCount !== undefined && { reworkCount }) }));
@@ -454,20 +484,16 @@ export class WorkflowEngine implements WorkflowHooks {
 
   /**
    * Adds an accepted handoff to the caller's open fan-out, or opens one with its round, tied to the caller's own
-   * running turn. With none running (a handoff the user confirmed later, say), the group closes at once.
+   * turn that ran when the call came in (not one read now: its end may have been told meanwhile, r1-P1-2). The
+   * group closes once that turn has ended and no call of the caller is on its way; with no turn (a handoff the
+   * user confirmed later, say), as soon as nothing else of the caller is.
    */
-  private async joinGroup(group: Omit<Group, 'turnId'>, key: string): Promise<void> {
+  private async joinGroup(group: Omit<Group, 'turnId'>, key: string, turnAtCall: Promise<string | undefined> | undefined): Promise<void> {
     if (this.groups.has(key)) return;
     const opened: Group = { ...group };
     this.groups.set(key, opened);
-    try {
-      const turn = (await this.repos.conversations.get(group.sessionId)).turns.filter((t) => t.nativeTaskId === undefined && t.state === 'running').at(-1);
-      if (turn === undefined) this.groups.delete(key);
-      else opened.turnId = turn.id;
-    } catch (error) {
-      // Without its turn the group closes at the source's next turn end, or at a restart.
-      this.log(`reading the turns of ${group.sessionId} failed (${errorName(error)})`);
-    }
+    const turnId = await turnAtCall;
+    if (turnId !== undefined) opened.turnId = turnId;
   }
 
   /** Rounds of a task whose fan-out is still open: their expected set is not fixed yet. */
@@ -478,7 +504,8 @@ export class WorkflowEngine implements WorkflowHooks {
   /** Closes the session's groups whose turn has ended by the stored turns (a replayed old turn end closes nothing). */
   private async closeEndedGroups(sessionId: SessionId): Promise<boolean> {
     const own = [...this.groups.entries()].filter(([, g]) => g.sessionId === sessionId);
-    if (own.length === 0) return false;
+    // A call of the session still on its way belongs to its group (r1-P1-2); the last one closes it.
+    if (own.length === 0 || (this.inFlight.get(sessionId) ?? 0) > 0) return false;
     const turns = (await this.repos.conversations.get(sessionId)).turns;
     let closed = false;
     for (const [key, group] of own) {
@@ -720,7 +747,9 @@ export class WorkflowEngine implements WorkflowHooks {
       if (decision === 'approve') {
         const caller = await this.repos.sessions.get(pending.caller);
         if (caller?.kind === 'workflow') {
-          const result = await this.serial(`instance:${caller.workflow.instanceId}`, () => this.handoffNow(caller, pending.input, pending.ctx, true));
+          const result = await this.serial(`instance:${caller.workflow.instanceId}`, () => this.handoffNow(caller, pending.input, pending.ctx, { confirmed: { lineageId: pending.lineageId } }));
+          // Its own group (the caller's turn is long over): closed once nothing else of the caller is on its way.
+          await this.afterTurn(caller.id);
           if (result.status !== 'accepted' && result.status !== 'duplicate') this.log(`a confirmed handoff of ${caller.id} ended ${result.status}`);
         }
       }
@@ -824,19 +853,19 @@ export class WorkflowEngine implements WorkflowHooks {
     if (instance === undefined || instance.state === 'completed' || instance.state === 'cancelled') return false;
     if (instance.tasks.find((t) => t.id === meta.taskId)?.status === 'blocked') return false;
     const to = nodeOf(instance.template, meta.toNodeId);
-    if (waitsForAll(to)) {
+    const handoffs = await this.repos.handoffs.listByInstance(instance.id);
+    // A handoff stored before T031 (round 0) belongs to no round and goes as T024 sent it (r1-P1-6).
+    if (waitsForAll(to) && meta.round !== LEGACY_ROUND) {
       const round = instance.rounds.find((r) => r.taskId === meta.taskId && r.nodeId === meta.toNodeId && r.round === meta.round);
       if (round === undefined) {
         // Not written yet (a crash after the acceptance, or its fan-out still open): the check writes it.
         this.requestSync(instance.id);
         return false;
       }
-      if (round.state === 'waiting') return false;
-      if (round.state === 'blocked' && (round.escalationId === undefined || (await this.repos.escalations.get(round.escalationId))?.state !== 'approved')) return false;
+      if (round !== (await this.roundDelivering(instance, handoffs, meta))) return false;
     }
     const limit = concurrencyOf(to);
     if (limit === undefined) return true;
-    const handoffs = await this.repos.handoffs.listByInstance(instance.id);
     // From here to the reservation nothing is awaited, so two sessions' gates cannot both take the last slot.
     const nodeKey = JSON.stringify([instance.id, meta.toNodeId]);
     const reserved = this.reserved.get(nodeKey) ?? new Map<TaskId, Handoff['id']>();
@@ -852,6 +881,30 @@ export class WorkflowEngine implements WorkflowHooks {
     reserved.set(meta.taskId, meta.handoffId);
     this.reserved.set(nodeKey, reserved);
     return true;
+  }
+
+  /**
+   * The one round a waiting node's session is given now (r1-P1-3): a round that may go (ready, or blocked and
+   * approved by the user) with handoffs still to send; one already partly sent first, then the one that
+   * became ready first (by round number on a tie). Another round's handoffs wait until it is all sent, so two
+   * rounds never interleave, whatever order their handoffs were accepted in.
+   */
+  private async roundDelivering(instance: WorkflowInstance, handoffs: readonly Handoff[], meta: HandoffMeta): Promise<JoinRound | undefined> {
+    const to = nodeOf(instance.template, meta.toNodeId);
+    // Root has one session for every task; any other node one per task (R-06).
+    const shared = to?.kind === 'agent' && to.isRoot;
+    const own = (r: JoinRound) =>
+      handoffs.filter((h) => h.taskId === r.taskId && h.toNodeId === r.nodeId && h.round === r.round && h.outcome === undefined && isArrival(instance.template, h));
+    const candidates: JoinRound[] = [];
+    for (const round of instance.rounds) {
+      if (round.nodeId !== meta.toNodeId || (!shared && round.taskId !== meta.taskId)) continue;
+      if (!own(round).some((h) => h.delivery.state === 'pending')) continue;
+      if (round.state === 'waiting') continue;
+      if (round.state === 'blocked' && (round.escalationId === undefined || (await this.repos.escalations.get(round.escalationId))?.state !== 'approved')) continue;
+      candidates.push(round);
+    }
+    const started = candidates.find((r) => own(r).some((h) => h.delivery.state !== 'pending'));
+    return started ?? candidates.sort((a, b) => ((a.settledAt ?? '') < (b.settledAt ?? '') ? -1 : (a.settledAt ?? '') > (b.settledAt ?? '') ? 1 : a.round - b.round))[0];
   }
 
   /** A slot of a node came free: the other tasks' handoffs waiting for it are tried again (R-06). */
@@ -898,7 +951,7 @@ export class WorkflowEngine implements WorkflowHooks {
     return rejected('no-matching-rule', 'no output rule of this node has this ruleId and target');
   }
 
-  private async askConfirmation(instance: WorkflowInstance, caller: WorkflowSession, planned: Planned, input: HandoffToolInput, ctx: HandoffCallContext): Promise<HandoffToolResult> {
+  private async askConfirmation(instance: WorkflowInstance, caller: WorkflowSession, planned: Planned, input: HandoffToolInput, ctx: HandoffCallContext, lineageId: Handoff['id'] | undefined): Promise<HandoffToolResult> {
     const id = handoffConfirmationId(ctx.operationId);
     const escalation: Escalation = {
       id,
@@ -912,7 +965,7 @@ export class WorkflowEngine implements WorkflowHooks {
       state: 'open',
       createdAt: this.options.now(),
     };
-    this.confirmations.set(id, { caller: caller.id, input, ctx });
+    this.confirmations.set(id, { caller: caller.id, input, ctx, lineageId });
     await this.repos.escalations.upsert(escalation);
     this.options.publish({ type: 'escalation.updated', escalation });
     return { status: 'escalated', escalationId: id, reason: 'needs-confirmation' };
@@ -1120,11 +1173,9 @@ export class WorkflowEngine implements WorkflowHooks {
     const conversations = new Map<SessionId, Awaited<ReturnType<AppRepositories['conversations']['get']>>>();
     for (const member of handoffs) {
       if (isArrival(template, member) || member.delivery.state === 'unknown' || member.target.sessionId === undefined) continue;
-      // Only a branch of a round some waiting node has arrivals in, and that has not arrived there itself.
-      const arrivals = handoffs.filter((a) => a.taskId === member.taskId && a.round === member.round && isArrival(template, a));
-      if (arrivals.length === 0 || arrivals.some((a) => a.fromNodeId === member.toNodeId)) continue;
-      const settled = instance.rounds.some((r) => r.taskId === member.taskId && r.round === member.round && r.state !== 'waiting' && r.expectedUpstream.includes(member.toNodeId));
-      if (settled) continue;
+      // Only a branch of a round some waiting node has arrivals in. Whether it arrived is judged per waiting
+      // node (a branch that reached J has not reached K, r1-P1-4), so nothing else is left out here.
+      if (!handoffs.some((a) => a.taskId === member.taskId && a.round === member.round && isArrival(template, a))) continue;
       const provision = member.target.provision;
       if (member.delivery.state === 'pending') {
         if (provision === undefined || member.target.nativeSessionRef !== undefined) continue;
