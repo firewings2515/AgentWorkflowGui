@@ -62,6 +62,8 @@ export interface PipelineHost {
   guiHandoff(input: GuiHandoff): Promise<'accepted' | 'duplicate' | 'limit-exceeded' | 'failed'>;
   /** The task's handoffs that waited for it to start go now. */
   wakeTask(instanceId: InstanceId, taskId: TaskId): Promise<void>;
+  /** A merge ended (merged or given back): handoffs waiting for a node's slot are tried again (R-06, r1 P1-2). */
+  wakeNodes(instanceId: InstanceId): void;
 }
 
 export interface GuiHandoff {
@@ -413,7 +415,8 @@ export class TaskPipeline {
     }
     // A writing node's changes are committed at its handoff; root and read-only nodes change nothing.
     if (from.isRoot || from.writePolicy === 'read-only' || task.status === 'pending') return undefined;
-    const exclude = this.setupOutputs(task, ref.ref.path);
+    const exclude = await this.setupOutputs(task, ref.ref.path);
+    if (exclude === undefined) return rejected('invalid-input', 'the GUI could not tell what the setup script made in the worktree, so it did not commit; hand off again');
     const where = target.kind === 'merge' ? 'merge' : `"${target.label}"`;
     const committed = await this.git.commitAll(ref.ref, `awg: ${from.label} → ${where} (${task.title})`, exclude);
     if (committed.status === 'failed') {
@@ -424,13 +427,23 @@ export class TaskPipeline {
   }
 
   /** What the setup script made in the worktree: kept out of the GUI's commits (SP-07 G1, G2). */
-  private setupOutputs(task: WorkflowTask, path: string): string[] {
+  /**
+   * What the setup made, as pathspecs the GUI's commit leaves out (r1 P1-6): every path the setup changed whose
+   * content is still what the setup left (a whole new folder always); a path the agent changed since is the
+   * agent's work and committed. Undefined when the record cannot be read: then nothing is committed.
+   */
+  private async setupOutputs(task: WorkflowTask, path: string): Promise<string[] | undefined> {
     if (task.setup?.endedAt === undefined) return [];
     try {
-      return this.deps.files.createdBetween(path, task.setup.startedAt, task.setup.endedAt);
+      const changes = (await this.deps.files.loadSetupChanges(path)) ?? [];
+      const excluded: string[] = [];
+      for (const change of changes) {
+        if (change.state === 'dir' || (await this.deps.files.stateOf(path, change.path)) === change.state) excluded.push(`:(literal)${change.path}`);
+      }
+      return excluded;
     } catch (error) {
-      this.deps.log(`[pipeline] listing the setup outputs of ${task.id} failed (${errorText(error)})`);
-      return [];
+      this.deps.log(`[pipeline] reading what the setup of ${task.id} made failed (${errorText(error)})`);
+      return undefined;
     }
   }
 
@@ -574,19 +587,33 @@ export class TaskPipeline {
       'failed' in ref
         ? { exitCode: null, outputTail: '', detail: `the task worktree could not be made: ${ref.failed}` }
         : await this.runCommand({ command: task.setup.command, shell: commands.shell, cwd: ref.ref.path, key: `setup:${key(instanceId, taskId)}`, purpose: 'setup' }, key(instanceId, taskId));
-    const passed = outcome.exitCode === 0;
+    // What the setup changed is recorded before its result (r1 P1-6): a crash in between runs the setup again.
+    let note = '';
+    let recorded = true;
+    if (!('failed' in ref)) {
+      try {
+        const changes = await this.deps.files.changes(ref.ref.path);
+        await this.deps.files.saveSetupChanges(ref.ref.path, changes);
+        const tracked = changes.filter((c) => c.tracked).map((c) => c.path);
+        if (tracked.length > 0) note = `\n[GUI] The setup changed files the repository tracks; they are kept out of the GUI's commits while unchanged: ${tracked.join(', ')}`;
+      } catch (error) {
+        recorded = false;
+        note = `\n[GUI] What the setup changed could not be recorded (${errorText(error)}); the task does not start, so nothing it made reaches a commit.`;
+      }
+    }
+    const passed = outcome.exitCode === 0 && recorded;
     const at = this.deps.now();
     const saved = await this.mutate(instanceId, (current) => {
       const t = current.tasks.find((x) => x.id === taskId);
       // Only the setup this run started: a cancel or a newer run meanwhile wins.
       if (t?.setup?.state !== 'running' || t.setup.startedAt !== startedAt || t.status !== 'running') return undefined;
-      const setup = { ...t.setup, state: passed ? ('succeeded' as const) : ('failed' as const), endedAt: at, exitCode: outcome.exitCode, outputTail: tail(outcome.outputTail || (outcome.detail ?? '')) };
+      const setup = { ...t.setup, state: passed ? ('succeeded' as const) : ('failed' as const), endedAt: at, exitCode: outcome.exitCode, outputTail: tail((outcome.outputTail || (outcome.detail ?? '')) + note) };
       return TaskPipeline.withTask(current, taskId, (x) => (passed ? { ...x, setup } : { ...x, setup, status: 'blocked', blockedReason: 'setup-failed' }));
     });
     if (saved === undefined) return;
     this.settingUp.delete(key(instanceId, taskId));
     if (passed) await this.deps.host.wakeTask(instanceId, taskId);
-    else await this.openSetupQuestion(saved, taskId, outcome.detail ?? `the setup script exited with code ${String(outcome.exitCode)}`);
+    else await this.openSetupQuestion(saved, taskId, !recorded ? 'what the setup changed could not be recorded' : (outcome.detail ?? `the setup script exited with code ${String(outcome.exitCode)}`));
   }
 
   private async runCommand(spec: Parameters<CommandRunner['run']>[0], runKey: string): Promise<{ exitCode: number | null; outputTail: string; detail?: string }> {
@@ -631,11 +658,11 @@ export class TaskPipeline {
   // ---- the merge queue (V-21, CR-3) ---------------------------------------------------------------
 
   /**
-   * A handoff to the merge node (in the instance's queue, after `beforeHandoff` committed the task): the task
-   * joins the merge queue; same-folder tasks have nothing to merge and are completed. A resend finds the task
-   * already queued or merged and changes nothing.
+   * A handoff to the merge node, accepted at `acceptedAt` (in the instance's queue, after `beforeHandoff`
+   * committed the task): the task joins the merge queue; same-folder tasks have nothing to merge and are
+   * completed. Once per handoff: an attempt enqueued since it was accepted is that handoff's.
    */
-  async enqueue(instance: WorkflowInstance, taskId: TaskId, mergeNode: WorkflowNode): Promise<void> {
+  async enqueue(instance: WorkflowInstance, taskId: TaskId, mergeNode: WorkflowNode, acceptedAt: Timestamp): Promise<void> {
     const at = this.deps.now();
     if (!this.worktreeMode(instance)) {
       await this.mutate(instance.id, (current) => {
@@ -649,6 +676,8 @@ export class TaskPipeline {
     await this.mutate(instance.id, (current) => {
       const t = current.tasks.find((x) => x.id === taskId);
       if (t?.status !== 'running') return undefined;
+      // The handoff that asked for it already has its attempt (a resend, a restart, r1 P1-1).
+      if (current.mergeQueue.some((m) => m.taskId === taskId && m.enqueuedAt >= acceptedAt)) return undefined;
       const attempt = 1 + Math.max(-1, ...current.mergeQueue.filter((m) => m.taskId === taskId).map((m) => m.attempt));
       const seq = 1 + Math.max(-1, ...current.mergeQueue.map((m) => m.seq));
       const queued: MergeAttempt = { taskId, attempt, seq, state: 'queued', conflictFiles: [], restarts: 0, enqueuedAt: at };
@@ -927,6 +956,7 @@ export class TaskPipeline {
   /** What follows a merge, each part safe to repeat: dependents, root's report, cleanup. */
   private async afterMerged(instanceId: InstanceId, m: MergeAttempt): Promise<void> {
     await this.admit(instanceId);
+    this.deps.host.wakeNodes(instanceId);
     await this.reportMerged(instanceId, m);
     await this.cleanupMerged(instanceId, m);
   }
@@ -988,6 +1018,7 @@ export class TaskPipeline {
         : `The tests failed after merging this task into ${instance.targetBranch ?? 'the target branch'} in the integration worktree (\`${attempt.test?.command ?? ''}\`, exit code ${String(attempt.test?.exitCode ?? 'none')}). The target branch did not move. Fix the task and hand it on again.\n\nEnd of the test output:\n\`\`\`\`\n${attempt.test?.outputTail ?? ''}\n\`\`\`\``;
     const result = await this.deps.host.guiHandoff({ instanceId, taskId: m.taskId, from: mergeNode, to: impl, ruleId: why === 'conflict' ? 'merge-conflict' : 'merge-tests-failed', content, operationId, count: true });
     if (result === 'failed') this.deps.log(`[pipeline] giving task ${m.taskId} back failed`);
+    this.deps.host.wakeNodes(instanceId);
   }
 
   /** Ends an attempt whose task goes back to work (conflict, tests failed): the task runs again at its implementation node. */
@@ -1185,7 +1216,13 @@ export class TaskPipeline {
     const task = instance?.tasks.find((t) => t.id === taskId);
     if (instance === undefined || task === undefined) return fail(requestId, 'not_found', 'Unknown task');
     const attempts = instance.mergeQueue.filter((m) => m.taskId === taskId && m.integration?.cleanup === 'pending-cleanup');
-    if (task.worktree?.cleanup !== 'pending-cleanup' && attempts.length === 0) return fail(requestId, 'invalid_transition', 'Nothing of this task waits for cleanup');
+    // A task that ended without a merge and still has its worktree (a removal cut short, r1 P1-4) is released now.
+    const abandoned = isFinal(task) && task.status !== 'merged' && task.worktree?.cleanup === 'active';
+    if (abandoned) {
+      if ((await this.releaseWorktree(instanceId, taskId, `the task ended ${task.status}`)) === 'kept') {
+        return fail(requestId, 'invalid_transition', 'The task\'s work could not be committed to its branch, so its worktree is kept', { mayHaveSideEffects: true });
+      }
+    } else if (task.worktree?.cleanup !== 'pending-cleanup' && attempts.length === 0) return fail(requestId, 'invalid_transition', 'Nothing of this task waits for cleanup');
     // Only what is not in use any more: a task still at work keeps its worktree.
     if (task.worktree?.cleanup === 'pending-cleanup') {
       await this.closeRuntimes(await this.sessionsOf(instance, taskId));
@@ -1249,7 +1286,7 @@ export class TaskPipeline {
   /** What follows the end of a run, each part best effort (a restart's recover does it again). */
   private async afterEnd(instance: WorkflowInstance): Promise<void> {
     for (const handoff of await this.repos.handoffs.listByInstance(instance.id)) {
-      if (handoff.delivery.state !== 'pending' || handoff.outcome !== undefined) continue;
+      if (handoff.delivery.state !== 'pending' || handoff.outcome !== undefined || toMerge(instance, handoff)) continue;
       await this.store.recordOutcome(handoff.operationId, { kind: 'cancelled', detail: `the run was ${instance.state}`, at: this.deps.now() }).catch(() => undefined);
       const stored = await this.repos.handoffs.get(handoff.id);
       if (stored !== undefined) this.deps.publish({ type: 'handoff.updated', handoff: stored });
@@ -1263,21 +1300,14 @@ export class TaskPipeline {
     // branch; other work stays on its task's branch.
     for (const task of instance.tasks) {
       if (task.worktree?.cleanup !== 'active') continue;
-      await this.stopCommands(instance.id, task.id);
-      await this.closeRuntimes(await this.sessionsOf(instance, task.id));
       if (task.status === 'merged') {
+        await this.stopCommands(instance.id, task.id);
+        await this.closeRuntimes(await this.sessionsOf(instance, task.id));
         await this.cleanupTask(instance.id, task.id, true);
         continue;
       }
-      const ref = await this.taskRef(instance, task.id);
-      if (ref === undefined) continue;
       // The work stays on the task's branch: committed first, and the worktree goes only once that worked.
-      const committed = await this.git.commitAll(ref, `awg: work in progress when the run was ${instance.state} (${task.title})`, this.setupOutputs(task, ref.path)).catch((error: unknown) => ({ status: 'failed' as const, detail: errorText(error) }));
-      if (committed.status === 'failed') {
-        this.deps.log(`[pipeline] the work of task ${task.id} could not be committed; its worktree is kept (${committed.detail})`);
-        continue;
-      }
-      await this.cleanupTask(instance.id, task.id, false);
+      await this.releaseWorktree(instance.id, task.id, `the run was ${instance.state}`);
     }
     for (const m of instance.mergeQueue) if (m.integration?.cleanup === 'active') await this.cleanupIntegration(instance.id, m, m.state === 'merged');
   }
@@ -1309,6 +1339,35 @@ export class TaskPipeline {
       return ok(requestId);
     }
     return undefined;
+  }
+
+  /**
+   * The last decision of each blocked task's question, carried out when it was saved but not acted on (a crash
+   * between the two, r1 P1-3); a blocked task whose question is not there (or closed by the system) is asked again.
+   */
+  private async carryOutDecisions(instanceId: InstanceId): Promise<void> {
+    const instance = await this.repos.instances.get(instanceId);
+    if (instance === undefined || ended(instance)) return;
+    const escalations = (await this.repos.escalations.list()).filter((e) => e.instanceId === instanceId);
+    const decided = (e: Escalation | undefined): 'approved' | 'declined' | undefined => (e?.state === 'approved' || e?.state === 'declined' ? e.state : undefined);
+    for (const task of instance.tasks) {
+      if (task.status !== 'blocked') continue;
+      if (task.blockedReason === 'setup-failed') {
+        const last = escalations.filter((e) => e.kind === 'setup-failed' && e.ref?.kind === 'task' && e.ref.taskId === task.id).sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)).at(-1);
+        const decision = decided(last);
+        if (decision !== undefined) await this.afterSetupDecision(instanceId, task.id, decision);
+        else await this.openSetupQuestion(instance, task.id, 'its setup did not finish');
+        continue;
+      }
+      if (task.blockedReason === 'merge-failed' || task.blockedReason === 'merge-conflict' || task.blockedReason === 'tests-failed') {
+        const last = instance.mergeQueue.filter((m) => m.taskId === task.id).sort((a, b) => a.attempt - b.attempt).at(-1);
+        if (last === undefined) continue;
+        const question = escalations.find((e) => e.id === mergeEscalationId(instanceId, task.id, last.attempt));
+        const decision = decided(question);
+        if (decision !== undefined) await this.afterMergeDecision(instanceId, { taskId: task.id, attempt: last.attempt }, decision);
+        else if (question === undefined || question.state === 'resolved') await this.openMergeQuestion(instance, last, last.detail ?? 'the merge failed');
+      }
+    }
   }
 
   /** Approve: the setup runs again; decline: the task is given up, its work kept on its branch. */
@@ -1371,22 +1430,41 @@ export class TaskPipeline {
     });
     if (saved === undefined || before === undefined) return;
     await this.cancelTaskDeliveries(instanceId, taskId);
-    if (this.worktreeMode(saved)) {
-      const task = before.tasks.find((t) => t.id === taskId);
-      await this.stopCommands(instanceId, taskId);
-      await this.closeRuntimes(await this.sessionsOf(saved, taskId));
-      const ref = await this.taskRef(saved, taskId);
-      if (ref !== undefined && task !== undefined && task.worktree?.cleanup === 'active') {
-        const committed = await this.git.commitAll(ref, `awg: work kept when the task was given up (${task.title})`, this.setupOutputs(task, ref.path)).catch((error: unknown) => ({ status: 'failed' as const, detail: errorText(error) }));
-        if (committed.status !== 'failed') await this.cleanupTask(instanceId, taskId, false);
-      }
-    }
+    await this.releaseWorktree(instanceId, taskId, 'the task was given up');
     await this.admitNow(instanceId);
   }
 
+  /**
+   * The worktree of a task that ended without a merge (given up, cancelled, completed by the user): the GUI's
+   * processes in it end, its work is committed to its branch, and the worktree goes (the branch stays). Safe to
+   * repeat: a restart or `task.retryCleanup` finishes one cut short (r1 P1-4). A commit that fails keeps the
+   * worktree, so no work is lost.
+   */
+  private async releaseWorktree(instanceId: InstanceId, taskId: TaskId, why: string): Promise<CleanupResult | 'kept' | undefined> {
+    const instance = await this.repos.instances.get(instanceId);
+    const task = instance?.tasks.find((t) => t.id === taskId);
+    if (instance === undefined || task === undefined || !this.worktreeMode(instance) || task.worktree?.cleanup !== 'active' || task.status === 'merged') return undefined;
+    await this.stopCommands(instanceId, taskId);
+    await this.closeRuntimes(await this.sessionsOf(instance, taskId));
+    const ref = await this.taskRef(instance, taskId);
+    if (ref === undefined) return undefined;
+    const exclude = await this.setupOutputs(task, ref.path);
+    const committed =
+      exclude === undefined
+        ? { status: 'failed' as const, detail: 'what the setup made could not be read' }
+        : await this.git.commitAll(ref, `awg: work kept when ${why} (${task.title})`, exclude).catch((error: unknown) => ({ status: 'failed' as const, detail: errorText(error) }));
+    if (committed.status === 'failed') {
+      this.deps.log(`[pipeline] the work of task ${taskId} could not be committed; its worktree is kept (${committed.detail})`);
+      return 'kept';
+    }
+    return this.cleanupTask(instanceId, taskId, false);
+  }
+
   private async cancelTaskDeliveries(instanceId: InstanceId, taskId: TaskId): Promise<void> {
+    const instance = await this.repos.instances.get(instanceId);
     for (const handoff of await this.repos.handoffs.listByInstance(instanceId)) {
       if (handoff.taskId !== taskId || handoff.delivery.state !== 'pending' || handoff.outcome !== undefined) continue;
+      if (instance !== undefined && toMerge(instance, handoff)) continue;
       await this.store.recordOutcome(handoff.operationId, { kind: 'cancelled', detail: 'the task was given up', at: this.deps.now() }).catch(() => undefined);
       const stored = await this.repos.handoffs.get(handoff.id);
       if (stored !== undefined) this.deps.publish({ type: 'handoff.updated', handoff: stored });
@@ -1437,11 +1515,22 @@ export class TaskPipeline {
           await this.carryOutPlan(instance.id, plan.id);
         }
       });
+      // A handoff to the merge node accepted just before a crash joins the queue now (r1 P1-1).
+      await this.deps.host.serial(instance.id, async () => {
+        const now = (await this.repos.instances.get(instance.id)) ?? instance;
+        for (const handoff of await this.repos.handoffs.listByInstance(instance.id)) {
+          const node = nodeOf(now.template, handoff.toNodeId);
+          if (node?.kind !== 'merge' || handoff.outcome !== undefined || now.tasks.find((t) => t.id === handoff.taskId)?.status !== 'running') continue;
+          await this.enqueue(now, handoff.taskId, node, handoff.acceptedAt);
+        }
+      });
+      // Decisions the user made on a setup or a merge are carried out, even when a crash came between (r1 P1-3).
+      await this.deps.host.serial(instance.id, () => this.carryOutDecisions(instance.id));
       const current = (await this.repos.instances.get(instance.id)) ?? instance;
       for (const task of current.tasks) if (task.status === 'running' && task.setup?.state === 'running') this.startSetup(current.id, task.id);
-      for (const task of current.tasks) if (task.status === 'blocked' && task.blockedReason === 'setup-failed') await this.openSetupQuestion(current, task.id, 'its setup did not finish');
+      // A task that ended without a merge keeps no worktree (r1 P1-4).
+      for (const task of current.tasks) if ((task.status === 'failed' || task.status === 'cancelled' || task.status === 'completed') && task.worktree?.cleanup === 'active') await this.releaseWorktree(current.id, task.id, `the task ended ${task.status}`);
       for (const m of current.mergeQueue) {
-        if (m.state === 'failed') await this.openMergeQuestion(current, m, m.detail ?? 'the merge failed');
         if (m.state === 'conflict' || m.state === 'tests-failed') await this.giveBack(current.id, m, m.state === 'conflict' ? 'conflict' : 'tests');
         if (m.state === 'merged') await this.afterMerged(current.id, m);
         if (m.integration?.cleanup === 'active' && ['conflict', 'tests-failed', 'failed', 'cancelled'].includes(m.state)) await this.cleanupIntegration(current.id, m, false);
@@ -1453,6 +1542,9 @@ export class TaskPipeline {
 }
 
 const key = (instanceId: InstanceId, taskId: TaskId) => JSON.stringify([instanceId, taskId]);
+
+/** A handoff to the merge node: recorded and counted, never delivered (its task goes to the merge queue). */
+const toMerge = (instance: WorkflowInstance, handoff: Handoff): boolean => nodeOf(instance.template, handoff.toNodeId)?.kind === 'merge';
 
 /** The node that implements a task: the last writing node (not root) a handoff of it went to. */
 export const implementationNode = (instance: WorkflowInstance, handoffs: readonly Handoff[], taskId: TaskId): AgentNode | undefined => {

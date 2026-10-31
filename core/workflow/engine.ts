@@ -211,6 +211,7 @@ export class WorkflowEngine implements WorkflowHooks {
               closeEscalation: (escalation, state, by) => this.close(escalation, state, by),
               guiHandoff: (input) => this.guiHandoff(input),
               wakeTask: (instanceId, taskId) => this.wakeTask(instanceId, taskId),
+              wakeNodes: (instanceId) => this.wakeNodes(instanceId),
             },
           });
   }
@@ -559,18 +560,72 @@ export class WorkflowEngine implements WorkflowHooks {
    * resend finds the task already queued (or merged) and gets the same answer; nothing goes to a session.
    */
   private async toMerge(caller: WorkflowSession, planned: MergePlanned, input: HandoffToolInput, ctx: HandoffCallContext, confirmed: boolean): Promise<HandoffToolResult> {
-    const { instance, taskId, from, to } = planned;
-    if (this.pipeline === undefined) return rejected('unsupported', 'merge nodes come with task pipelining');
-    const accepted: HandoffToolResult = { status: 'accepted', handoffId: handoffIdOf(ctx.operationId), operationId: ctx.operationId, delivery: 'sent' };
-    const task = instance.tasks.find((t) => t.id === taskId);
-    if (task?.status === 'awaiting-merge' || task?.status === 'merging' || task?.status === 'merged') return accepted;
+    const { taskId, from, to } = planned;
+    let { instance } = planned;
+    const pipeline = this.pipeline;
+    if (pipeline === undefined) return rejected('unsupported', 'merge nodes come with task pipelining');
+    // A resend of the same call, or a `retryOf` (CR2 §4, r1 P1-1): the operation it made, never a second commit
+    // or attempt; a crash after the acceptance and before the task joined the queue is finished here.
+    const known = (await this.store.get(ctx.operationId)) ?? (await this.store.findBySourceCallRef(ctx.sourceCallRef));
+    if (known !== undefined) {
+      const result = await this.resent(known, caller, planned);
+      if (result.status === 'duplicate' && known.outcome === undefined) await pipeline.enqueue(instance, taskId, to, known.acceptedAt);
+      return result;
+    }
     if (planned.requiresUserConfirmation && !confirmed) return this.askConfirmation(instance, caller, planned, input, ctx, undefined, undefined);
-    const refused = await this.pipeline.beforeHandoff(instance, taskId, from, to);
+    const refused = await pipeline.beforeHandoff(instance, taskId, from, to);
     if (refused !== undefined) return refused;
-    await this.pipeline.enqueue((await this.repos.instances.get(instance.id)) ?? instance, taskId, to);
-    // The caller handed its task on: a slot of its node may have come free for another task (R-06).
+    instance = (await this.repos.instances.get(instance.id)) ?? instance;
+    // Recorded and counted like any handoff (R-04, r1 P1-7): the merge node's receive limit and the task's
+    // rework limit hold. It goes to no session: the GUI's merge queue takes the task; it stays pending.
+    const handoffs = await this.repos.handoffs.listByInstance(instance.id);
+    const rework = isRework(handoffs, taskId, to.id);
+    const { counts, current } = handoffCounts(instance, handoffs, taskId, to, rework);
+    const over = current.find((c) => c.limit !== undefined && c.count >= c.limit);
+    if (over !== undefined) return this.limitReached(instance, taskId, caller, to, over.key, over.what, over.limit ?? 0);
+    const handoffId = handoffIdOf(ctx.operationId);
+    const context = await this.options.sessions.payloadContext(caller.id, { kind: 'handoff', fromSessionId: caller.id, handoffId });
+    if (context === undefined) return rejected('unknown-target', 'the calling session cannot be found');
+    if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
+    const payload = this.payloadOf({ ...planned, instance });
+    const accepted = await this.delivery.accept({
+      kind: 'handoff',
+      operationId: ctx.operationId,
+      sourceCallRef: ctx.sourceCallRef,
+      sender: caller.id,
+      payloadHash: await this.options.hashPayload(payload),
+      payload,
+      proposalRevision: instance.workflowRevision,
+      target: {},
+      at: this.options.now(),
+      context,
+      counts,
+      handoff: { handoffId, instanceId: instance.id, taskId, fromNodeId: from.id, toNodeId: to.id, fromSessionId: caller.id, ruleId: planned.ruleId, rework, round: nextRound(handoffs, instance.rounds, taskId, this.openRounds(instance.id, taskId)) },
+    });
+    switch (accepted.status) {
+      case 'accepted':
+        break;
+      case 'duplicate':
+        return this.resent(accepted.record, caller, planned);
+      case 'conflict':
+        return accepted.existing.sender !== undefined && accepted.existing.sender !== caller.id ? NOT_OWNER : RESEND_MISMATCH;
+      case 'limit-exceeded': {
+        const what = current.find((c) => c.key === accepted.key)?.what ?? 'receive';
+        return this.limitReached(instance, taskId, caller, to, accepted.key, what, accepted.limit);
+      }
+      case 'invalid':
+        this.log(`a handoff of ${caller.id} to the merge node was not accepted (${accepted.issues.length} issue(s))`);
+        return rejected('invalid-input', 'the handoff cannot be accepted');
+      case 'commit-uncertain':
+        throw new Error('accepting the handoff could not be confirmed');
+    }
+    const reworkCount = accepted.counts?.find((c) => c.key === reworkKey(instance.id, taskId))?.count;
+    if (reworkCount !== undefined) await this.updateTask(instance.id, taskId, (t) => ({ ...t, reworkCount }));
+    await pipeline.enqueue((await this.repos.instances.get(instance.id)) ?? instance, taskId, to, accepted.record.acceptedAt);
+    await this.publishHandoff(handoffId);
+    // The caller handed its task on (T031 counts its outgoing handoff): its node's slot is free for another task.
     if (concurrencyOf(from) !== undefined) this.wakeNode(instance.id, from.id);
-    return accepted;
+    return { status: 'accepted', handoffId, operationId: ctx.operationId, delivery: 'pending' };
   }
 
   /**
@@ -648,6 +703,16 @@ export class WorkflowEngine implements WorkflowHooks {
     });
   }
 
+  /** Every node with a concurrency limit: its waiting handoffs are tried again (T032, after a merge ended). */
+  private wakeNodes(instanceId: InstanceId): void {
+    void this.repos.instances.get(instanceId).then(
+      (instance) => {
+        for (const node of instance === undefined ? [] : agentNodes(instance.template)) if (concurrencyOf(node) !== undefined) this.wakeNode(instanceId, node.id);
+      },
+      (error: unknown) => this.log(`waking the nodes of ${instanceId} failed (${errorName(error)})`),
+    );
+  }
+
   /** A task that started (T032): the handoffs that waited for it go now, one per target session (SP-05). */
   private async wakeTask(instanceId: InstanceId, taskId: TaskId): Promise<void> {
     const sessions = new Set<SessionId>();
@@ -658,7 +723,7 @@ export class WorkflowEngine implements WorkflowHooks {
   }
 
   /** The handoff's payload: an arrival at a waiting node names its round, from what its record stores (CR-4). */
-  private payloadOf(planned: Planned, round?: { round: number; expectedUpstream?: readonly NodeId[] | undefined }): string {
+  private payloadOf(planned: Planned | MergePlanned, round?: { round: number; expectedUpstream?: readonly NodeId[] | undefined }): string {
     const note = round === undefined ? undefined : roundNote(planned.instance.template, planned.to, round.round, round.expectedUpstream);
     return handoffText(planned.from, planned.ruleId, planned.taskId, planned.content, note);
   }
@@ -728,7 +793,7 @@ export class WorkflowEngine implements WorkflowHooks {
   }
 
   /** A known operation: the same handoff from the same caller is a duplicate; anything else is refused. */
-  private async resent(record: StoredDelivery, caller: WorkflowSession, planned: Planned): Promise<HandoffToolResult> {
+  private async resent(record: StoredDelivery, caller: WorkflowSession, planned: Planned | MergePlanned): Promise<HandoffToolResult> {
     if (record.kind !== 'handoff' || record.handoff === undefined) return rejected('invalid-input', 'this operation is not a handoff');
     if (record.sender !== caller.id) return NOT_OWNER;
     const meta = record.handoff;
@@ -981,7 +1046,7 @@ export class WorkflowEngine implements WorkflowHooks {
     return undefined;
   }
 
-  private async limitReached(instance: WorkflowInstance, taskId: TaskId, caller: WorkflowSession, to: AgentNode, key: string, what: 'receive' | 'rework', limit: number): Promise<HandoffToolResult> {
+  private async limitReached(instance: WorkflowInstance, taskId: TaskId, caller: WorkflowSession, to: { label: string }, key: string, what: 'receive' | 'rework', limit: number): Promise<HandoffToolResult> {
     // The GUI stops handing off this task until the user decides (R-05): what is still queued of it is
     // cancelled, so no later turn end sends it (r2-P1-1).
     await this.updateTask(instance.id, taskId, (t) =>
@@ -1009,6 +1074,8 @@ export class WorkflowEngine implements WorkflowHooks {
     let cancelled = 0;
     for (const handoff of await this.repos.handoffs.listByInstance(instance.id)) {
       if (handoff.taskId !== taskId || handoff.delivery.state !== 'pending' || handoff.outcome !== undefined) continue;
+      // A handoff to the merge node is never delivered: its task is in the merge queue, nothing waits to be sent (T032).
+      if (nodeOf(instance.template, handoff.toNodeId)?.kind === 'merge') continue;
       // Best effort: the delivery gate asks `mayDeliver` too, so one whose cancel failed is not sent either.
       const written = await this.store
         .recordOutcome(handoff.operationId, { kind: 'cancelled', detail: 'the task stopped at a handoff limit', at: this.options.now() })

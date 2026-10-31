@@ -16,7 +16,7 @@ import {
 } from '../../../contracts';
 import { hashOf } from '../../delivery/testing/fixtures';
 import { crashOnce } from '../../workflow/testing/r2-cases';
-import { BUILDER, clock, CWD, handoff, IMPL, INSTANCE, instanceOf, node, PLAN, PLANNER, rid, ROOT, settle, started, WORKFLOW, type World } from '../../workflow/testing/harness';
+import { BUILDER, CWD, handoff, IMPL, INSTANCE, instanceOf, node, PLAN, PLANNER, rid, ROOT, settle, started, WORKFLOW, type World } from '../../workflow/testing/harness';
 import { integrationRef, resolveOperationOf, resolverSessionIdOf, taskWorktreeRef } from '../naming';
 
 export const MERGE = NodeId.parse('merge');
@@ -282,10 +282,7 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
     it('the GUI commits at the handoff, without what the setup made; conflict markers are refused back to the agent', async () => {
       const w = await begin(make);
       w.commands.script = (spec) => {
-        if (spec.purpose === 'setup') {
-          w.git.write(spec.cwd, 'node_modules/pkg.js', 'x');
-          w.files.made.push({ path: spec.cwd, name: 'node_modules', at: clock() });
-        }
+        if (spec.purpose === 'setup') w.git.write(spec.cwd, 'node_modules/pkg.js', 'x');
         return { exitCode: 0, outputTail: 'ok' };
       };
       const t = await made(w, [item('a', 'A')]);
@@ -302,6 +299,47 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect(w.git.fileAt(branchTip, 'node_modules/pkg.js')).toBeUndefined();
       await until(async () => (await statusOf(w, t.a!)) === 'merged', 'merged');
       expect(w.git.fileAt(main(w), 'node_modules/pkg.js')).toBeUndefined();
+    });
+
+    it('r1 P1-6: a tracked file the setup changed and a file it added in an existing folder stay out of commits, unless the agent changed them; the setup result says so', async () => {
+      const w = await begin(make);
+      w.commands.script = (spec) => {
+        if (spec.purpose === 'setup') {
+          w.git.write(spec.cwd, 'README.md', 'readme with a local port\n');
+          w.git.write(spec.cwd, 'src/generated.txt', 'generated\n');
+          w.git.write(spec.cwd, 'src/config.local', 'port=1\n');
+        }
+        return { exitCode: 0, outputTail: 'ok' };
+      };
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      expect((await taskOf(w, t.a!)).setup?.outputTail).toContain('README.md');
+      const path = (await taskOf(w, t.a!)).worktree!.path;
+      // The agent changes one of the setup's files (its own work now) and adds its own.
+      w.git.write(path, 'src/config.local', 'port=2 (agent)\n');
+      expect(await finish(w, t.a!, { 'feature.txt': 'f\n' })).toMatchObject({ status: 'accepted' });
+      await until(async () => (await statusOf(w, t.a!)) === 'merged', 'merged');
+      expect(w.git.fileAt(main(w), 'README.md')).toBe('readme\n');
+      expect(w.git.fileAt(main(w), 'src/generated.txt')).toBeUndefined();
+      expect(w.git.fileAt(main(w), 'src/config.local')).toBe('port=2 (agent)\n');
+      expect(w.git.fileAt(main(w), 'feature.txt')).toBe('f\n');
+    });
+
+    it('r1 P1-6: when what the setup made cannot be recorded the task does not start; when it cannot be read nothing is committed', async () => {
+      const w = await begin(make);
+      const t = await made(w, [item('a', 'A'), item('b', 'B')]);
+      w.files.failNext = 'changes';
+      await give(w, t.a!);
+      await until(async () => (await openEscalations(w, 'setup-failed')).length === 1, 'asked');
+      expect(await delivered(w, t.a!)).toBe(0);
+      await give(w, t.b!);
+      await until(async () => (await delivered(w, t.b!)) === 1, 'B delivered');
+      const branch = (await taskOf(w, t.b!)).worktree!.branch;
+      const tip = w.git.tip(CWD, branch);
+      w.files.failNext = 'load';
+      expect(await finish(w, t.b!, { 'b.txt': 'b\n' })).toMatchObject({ status: 'rejected', rejection: { reason: 'invalid-input' } });
+      expect(w.git.tip(CWD, branch)).toBe(tip);
     });
 
     it('V-21: a conflict the agent cannot resolve goes back to the task; the target branch stays, dependents wait; once fixed it merges', async () => {
@@ -694,12 +732,18 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       await give(w, t.a!);
       await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
       const impl = await implOf(w, t.a!);
-      const call = { ruleId: 'to-merge', target: { kind: 'node' as const, nodeId: MERGE }, taskId: t.a! };
+      const call = { ruleId: 'to-merge', target: { kind: 'node' as const, nodeId: MERGE }, taskId: t.a!, content: 'merge it' };
       const first = await handoff(w, impl, call, { operationId: 'op-merge', sourceCallRef: 'call-merge' });
-      expect(await handoff(w, impl, call, { operationId: 'op-merge', sourceCallRef: 'call-merge' })).toEqual(first);
+      expect(first).toMatchObject({ status: 'accepted', delivery: 'pending' });
+      if (first.status !== 'accepted') return;
+      expect(await handoff(w, impl, call, { operationId: 'op-merge', sourceCallRef: 'call-merge' })).toMatchObject({ status: 'duplicate', handoffId: first.handoffId, operationId: first.operationId });
+      // Recorded like any handoff (R-04): to the merge node, counted, never delivered.
+      expect((await w.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.toNodeId === MERGE)).toEqual([expect.objectContaining({ operationId: first.operationId, delivery: expect.objectContaining({ state: 'pending' }) as unknown })]);
       await until(async () => (await openEscalations(w, 'merge-failed')).length === 1, 'asked (no test command)');
       const r = await w.restart();
-      expect(await handoff(r, impl, call, { operationId: 'op-merge', sourceCallRef: 'call-merge' })).toMatchObject({ status: 'rejected' });
+      expect(await handoff(r, impl, call, { operationId: 'op-merge', sourceCallRef: 'call-merge' })).toMatchObject({ status: 'duplicate', handoffId: first.handoffId });
+      // Another content under the same call is refused.
+      expect(await handoff(r, impl, { ...call, content: 'other' }, { operationId: 'op-merge', sourceCallRef: 'call-merge' })).toMatchObject({ status: 'rejected', rejection: { reason: 'resend-mismatch' } });
       expect(await attemptsOf(r, t.a!)).toHaveLength(1);
       const [question] = await openEscalations(r, 'merge-failed');
       await r.repositories.projects.save({ ...project(), revision: 0 }, 0);
@@ -707,8 +751,162 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect(await respond(r, question!.id, 'approve')).toMatchObject({ ok: false });
       await until(async () => (await statusOf(r, t.a!)) === 'merged', 'merged');
       expect((await attemptsOf(r, t.a!)).map((m) => m.state)).toEqual(['failed', 'merged']);
-      expect(await handoff(r, impl, call, { operationId: 'op-merge', sourceCallRef: 'call-merge' })).toMatchObject({ status: 'accepted' });
+      expect(await handoff(r, impl, call, { operationId: 'op-merge', sourceCallRef: 'call-merge' })).toMatchObject({ status: 'duplicate' });
       expect(await attemptsOf(r, t.a!)).toHaveLength(2);
+    });
+
+    it('r1 P1-1: the old merge call resent after the task was given back commits nothing and queues nothing', async () => {
+      const w = await begin(make);
+      let red = true;
+      w.commands.script = (spec) => (spec.purpose === 'test' && red ? { exitCode: 1, outputTail: 'red' } : { exitCode: 0, outputTail: 'ok' });
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      const impl = await implOf(w, t.a!);
+      const call = { ruleId: 'to-merge', target: { kind: 'node' as const, nodeId: MERGE }, taskId: t.a!, content: 'merge it' };
+      const path = (await taskOf(w, t.a!)).worktree!.path;
+      w.git.write(path, 'a.txt', 'first\n');
+      await handoff(w, impl, call, { operationId: 'op-old', sourceCallRef: 'call-old' });
+      await until(async () => (await delivered(w, t.a!)) === 2, 'given back');
+      const branch = (await taskOf(w, t.a!)).worktree!.branch;
+      const tip = w.git.tip(CWD, branch);
+      // Unfinished rework in the worktree, then the old call again (a restart's resend).
+      w.git.write(path, 'a.txt', 'half done\n');
+      const r = await w.restart();
+      expect(await handoff(r, impl, call, { operationId: 'op-old', sourceCallRef: 'call-old' })).toMatchObject({ status: 'duplicate' });
+      await settle();
+      expect(r.git.tip(CWD, branch)).toBe(tip);
+      expect(await attemptsOf(r, t.a!)).toHaveLength(1);
+      expect(await statusOf(r, t.a!)).toBe('running');
+      // The real next handoff does go.
+      red = false;
+      r.git.write(path, 'a.txt', 'done\n');
+      expect(await handoff(r, impl, call, { operationId: 'op-new', sourceCallRef: 'call-new' })).toMatchObject({ status: 'accepted' });
+      await until(async () => (await statusOf(r, t.a!)) === 'merged', 'merged');
+    });
+
+    it('r1 P1-1: a crash after the merge handoff was accepted and before its task joined the queue: a restart queues it once', async () => {
+      const w = await begin(make);
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      crashOnce(w.repositories.instances, 'update', (next) => (next as WorkflowInstance).tasks.some((x) => x.status === 'awaiting-merge'));
+      await expect(finish(w, t.a!, { 'a.txt': 'a\n' })).rejects.toThrow('crash');
+      expect(await attemptsOf(w, t.a!)).toHaveLength(0);
+      const r = await w.restart();
+      await until(async () => (await statusOf(r, t.a!)) === 'merged', 'merged');
+      expect(await attemptsOf(r, t.a!)).toHaveLength(1);
+    });
+
+    it('r1 P1-2: handing a task to the merge node frees its implementation node for the next task', async () => {
+      const w = await begin(make, { concurrency: 1 });
+      w.commands.script = (spec) => (spec.purpose === 'test' ? 'hang' : { exitCode: 0, outputTail: 'ok' });
+      const t = await made(w, [item('a', 'A'), item('b', 'B')]);
+      await give(w, t.a!);
+      await give(w, t.b!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'A delivered');
+      await settle();
+      expect(await delivered(w, t.b!)).toBe(0);
+      await finish(w, t.a!, { 'a.txt': 'a\n' });
+      // A is being tested (its merge active): B gets the slot all the same.
+      await until(async () => (await delivered(w, t.b!)) === 1, 'B delivered while A is tested');
+      expect((await attemptsOf(w, t.a!))[0]?.state).toBe('testing');
+    });
+
+    it('r1 P1-7: the merge node\'s receive limit holds; past it the task stops and root is asked', async () => {
+      const template = pipelineTemplate();
+      const merge = template.nodes.find((n) => n.id === MERGE)!;
+      merge.inputRules = [{ id: 'done', condition: 'a finished task', acceptanceLimit: 1, waitForAllUpstream: false }];
+      const w = await make(template);
+      await w.repositories.projects.save(project(), null);
+      await started(w);
+      w.commands.script = (spec) => (spec.purpose === 'test' ? { exitCode: 1, outputTail: 'red' } : { exitCode: 0, outputTail: 'ok' });
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      await finish(w, t.a!, { 'a.txt': 'a\n' });
+      await until(async () => (await delivered(w, t.a!)) === 2, 'given back');
+      expect(await finish(w, t.a!, { 'a.txt': 'b\n' })).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
+      expect(await attemptsOf(w, t.a!)).toHaveLength(1);
+      expect(await taskOf(w, t.a!)).toMatchObject({ status: 'blocked', blockedReason: 'limit-exceeded' });
+      expect(await openEscalations(w, 'limit-exceeded')).toHaveLength(1);
+    });
+
+    it('r1 P1-3: an approved setup question cut off by a crash is carried out at the restart, not asked again', async () => {
+      const w = await begin(make);
+      let fail = true;
+      w.commands.script = (spec) => (spec.purpose === 'setup' && fail ? { exitCode: 1, outputTail: 'boom' } : { exitCode: 0, outputTail: 'ok' });
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await openEscalations(w, 'setup-failed')).length === 1, 'asked');
+      const [question] = await openEscalations(w, 'setup-failed');
+      fail = false;
+      crashOnce(w.repositories.instances, 'update');
+      await respond(w, question!.id, 'approve').catch(() => undefined);
+      expect(await statusOf(w, t.a!)).toBe('blocked');
+      const r = await w.restart();
+      await until(async () => (await delivered(r, t.a!)) === 1, 'set up and delivered after the restart');
+      expect(await openEscalations(r, 'setup-failed')).toHaveLength(0);
+    });
+
+    it('r1 P1-3: an approved merge question cut off by a crash queues the merge at the restart', async () => {
+      const w = await begin(make, {}, { setup: 'npm ci' });
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      await finish(w, t.a!, { 'a.txt': 'a\n' });
+      await until(async () => (await openEscalations(w, 'merge-failed')).length === 1, 'asked');
+      const [question] = await openEscalations(w, 'merge-failed');
+      await w.repositories.projects.save({ ...project(), revision: 0 }, 0);
+      crashOnce(w.repositories.instances, 'update');
+      await respond(w, question!.id, 'approve').catch(() => undefined);
+      expect(await attemptsOf(w, t.a!)).toHaveLength(1);
+      const r = await w.restart();
+      await until(async () => (await statusOf(r, t.a!)) === 'merged', 'merged after the restart');
+      expect((await attemptsOf(r, t.a!)).map((m) => m.state)).toEqual(['failed', 'merged']);
+    });
+
+    it('r1 P1-3/P1-4: a declined setup question cut off by a crash gives the task up at the restart, its worktree removed and its work kept', async () => {
+      const w = await begin(make);
+      w.commands.script = (spec) => (spec.purpose === 'setup' ? { exitCode: 1, outputTail: 'boom' } : { exitCode: 0, outputTail: 'ok' });
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await openEscalations(w, 'setup-failed')).length === 1, 'asked');
+      const [question] = await openEscalations(w, 'setup-failed');
+      crashOnce(w.repositories.instances, 'update');
+      await respond(w, question!.id, 'decline').catch(() => undefined);
+      expect(await statusOf(w, t.a!)).toBe('blocked');
+      const r = await w.restart();
+      await until(async () => (await taskOf(r, t.a!)).worktree?.cleanup === 'removed', 'given up and removed');
+      expect(await statusOf(r, t.a!)).toBe('failed');
+    });
+
+    it('r1 P1-4: a crash after a task was given up and before its worktree went: the restart removes it; task.retryCleanup can too', async () => {
+      const w = await begin(make);
+      w.commands.script = (spec) => (spec.purpose === 'setup' ? { exitCode: 1, outputTail: 'boom' } : { exitCode: 0, outputTail: 'ok' });
+      const t = await made(w, [item('a', 'A'), item('b', 'B')]);
+      await give(w, t.a!);
+      await give(w, t.b!);
+      await until(async () => (await openEscalations(w, 'setup-failed')).length === 2, 'asked twice');
+      const questions = await openEscalations(w, 'setup-failed');
+      const pathA = (await taskOf(w, t.a!)).worktree!.path;
+      w.git.write(pathA, 'notes.txt', 'kept\n');
+      // The commit of A's work never returns (the GUI went down there).
+      w.git.hang('commitAll');
+      void respond(w, questions.find((q) => q.ref?.kind === 'task' && q.ref.taskId === t.a)!.id, 'decline');
+      await until(async () => (await statusOf(w, t.a!)) === 'failed', 'A failed');
+      expect((await taskOf(w, t.a!)).worktree?.cleanup).toBe('active');
+      const r = await w.restart();
+      await until(async () => (await taskOf(r, t.a!)).worktree?.cleanup === 'removed', 'A removed after the restart');
+      const a = await taskOf(r, t.a!);
+      expect(r.git.fileAt(r.git.tip(CWD, a.worktree!.branch), 'notes.txt')).toBe('kept\n');
+      // B the same way, but finished with task.retryCleanup instead of a restart.
+      r.git.hang('commitAll');
+      void respond(r, questions.find((q) => q.ref?.kind === 'task' && q.ref.taskId === t.b)!.id, 'decline');
+      await until(async () => (await statusOf(r, t.b!)) === 'failed', 'B failed');
+      expect((await taskOf(r, t.b!)).worktree?.cleanup).toBe('active');
+      expect(await r.run({ type: 'task.retryCleanup', requestId: rid(), instanceId: INSTANCE, taskId: t.b! })).toMatchObject({ ok: true });
+      expect((await taskOf(r, t.b!)).worktree?.cleanup).toBe('removed');
     });
 
     it('same-folder runs: create_tasks makes tasks without worktrees; the merge node completes a task and its dependent starts', async () => {

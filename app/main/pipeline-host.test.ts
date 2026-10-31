@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WindowsProcessHost } from '../../adapters/process';
-import { isPipelineFolder, jobCommandRunner, shellCommand, worktreeFiles } from './pipeline-host';
+import { createGitRunner } from '../../adapters/git';
+import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner, shellCommand } from './pipeline-host';
 
 const folders: string[] = [];
 const hosts: WindowsProcessHost[] = [];
@@ -83,21 +84,49 @@ describe('pipeline folders (T032 live run 1)', () => {
   });
 });
 
-describe('worktree files (T032)', () => {
-  it('lists the top-level entries made within the setup window, not those made before or after, nor .git', async () => {
-    const path = folder();
-    writeFileSync(join(path, 'tracked.txt'), 'x');
-    writeFileSync(join(path, '.git'), 'gitdir: x');
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    const from = new Date().toISOString();
-    mkdirSync(join(path, 'node_modules'));
-    writeFileSync(join(path, 'node_modules', 'a.js'), 'a');
-    writeFileSync(join(path, '.env.local'), 'PORT=1');
-    const to = new Date(Date.now() + 1).toISOString();
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    writeFileSync(join(path, 'agent.txt'), 'later');
-    expect(worktreeFiles.createdBetween(path, from, to)).toEqual(['.env.local', 'node_modules']);
-    expect(worktreeFiles.exists(path)).toBe(true);
-    expect(worktreeFiles.exists(join(path, 'nope'))).toBe(false);
-  });
+describe('worktree files (T032 r1 P1-6)', () => {
+  it('lists what changed in a linked worktree (a new folder as one entry, files in existing folders, tracked edits and deletions) and keeps it in the worktree\'s own git folder', async () => {
+    const root = folder();
+    const repo = join(root, 'repo');
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    const git = createGitRunner({ env: { GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.invalid' } });
+    const must = async (cwd: string, ...args: string[]) => {
+      const r = await git(args, { cwd });
+      if (r.code !== 0) throw new Error(r.stderr);
+    };
+    writeFileSync(join(repo, 'README.md'), 'readme\n');
+    writeFileSync(join(repo, 'src', 'app.txt'), 'app\n');
+    writeFileSync(join(repo, 'gone.txt'), 'gone\n');
+    await must(repo, 'init', '-q', '-b', 'main');
+    await must(repo, 'add', '-A');
+    await must(repo, 'commit', '-q', '-m', 'initial');
+    const wt = join(root, 'wt');
+    await must(repo, 'worktree', 'add', '-q', '-b', 'task', wt);
+    const files = gitWorktreeFiles(git);
+    expect(await files.changes(wt)).toEqual([]);
+    // What a setup does: a new folder, a new file in an existing folder, a tracked edit, a deletion.
+    mkdirSync(join(wt, 'node_modules', 'pkg'), { recursive: true });
+    writeFileSync(join(wt, 'node_modules', 'pkg', 'index.js'), 'x');
+    writeFileSync(join(wt, 'src', 'generated.txt'), 'generated\n');
+    writeFileSync(join(wt, 'README.md'), 'readme, port 1\n');
+    rmSync(join(wt, 'gone.txt'));
+    const changes = await files.changes(wt);
+    expect(changes.map((c) => [c.path, c.state === 'dir' || c.state === 'deleted' ? c.state : 'hash', c.tracked])).toEqual([
+      ['README.md', 'hash', true],
+      ['gone.txt', 'deleted', true],
+      ['node_modules', 'dir', false],
+      ['src/generated.txt', 'hash', false],
+    ]);
+    expect(await files.stateOf(wt, 'README.md')).toBe(changes[0]?.state);
+    expect(await files.stateOf(wt, 'node_modules')).toBe('dir');
+    // Kept in the worktree's own git folder (not in the worktree, not in git status), and read back.
+    expect(await files.loadSetupChanges(wt)).toBeUndefined();
+    await files.saveSetupChanges(wt, changes);
+    expect(await files.loadSetupChanges(wt)).toEqual(changes);
+    expect((await files.changes(wt)).length).toBe(4);
+    writeFileSync(join(wt, 'README.md'), 'readme, changed by the agent\n');
+    expect(await files.stateOf(wt, 'README.md')).not.toBe(changes[0]?.state);
+    expect(files.exists(wt)).toBe(true);
+    expect(files.exists(join(wt, 'nope'))).toBe(false);
+  }, 30_000);
 });

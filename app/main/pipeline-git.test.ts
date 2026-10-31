@@ -11,7 +11,7 @@ import { createSandbox, type Sandbox } from '../../adapters/git/testing/sandbox'
 import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../adapters/storage';
 import { MERGE, pipelineTemplate, project } from '../../core/pipeline/testing/t032-cases';
 import { handoff, IMPL, INSTANCE, instanceOf, rid, ROOT, started, worldOn, type World } from '../../core/workflow/testing/harness';
-import { worktreeFiles } from './pipeline-host';
+import { gitWorktreeFiles } from './pipeline-host';
 
 const open: { db: DatabaseSync; sandbox: Sandbox }[] = [];
 afterEach(async () => {
@@ -40,19 +40,16 @@ it('V-19, V-20, V-21 on a real repository: parallel tasks, a dependency, a confl
   await sandbox.commitFile(repo, 'src/app.txt', 'app\n', 'initial');
   const db = openDatabase(join(sandbox.root, 'awg.sqlite'));
   open.push({ db, sandbox });
-  // The harness clock is not the computer's, so the setup window the pipeline asks about is mapped to when each
-  // setup really ran; the files' creation times themselves are the real ones.
-  const ran = new Map<string, { from: string; to: string }>();
-  const files = { exists: (path: string) => worktreeFiles.exists(path), createdBetween: (path: string) => worktreeFiles.createdBetween(path, ran.get(path)!.from, ran.get(path)!.to) };
-  const w: World = await worldOn(createRepositories(db), new SqliteDeliveryStore(db), pipelineTemplate(), { git: sandbox.adapter, files });
-  // The setup script makes node_modules (not ignored by the repository); C's first test run fails.
+  const w: World = await worldOn(createRepositories(db), new SqliteDeliveryStore(db), pipelineTemplate(), { git: sandbox.adapter, files: gitWorktreeFiles() });
+  // The setup script makes node_modules (not ignored by the repository) and a file in an existing folder (r1 P1-6);
+  // C's first test run fails. (A setup that rewrites a tracked file is covered by the memory cases: such a file
+  // stays changed in the worktree, which keeps the GUI from merging into it; the setup result names it.)
   let cRuns = 0;
   w.commands.script = (spec) => {
     if (spec.purpose === 'setup') {
-      const from = new Date().toISOString();
       mkdirSync(join(spec.cwd, 'node_modules'), { recursive: true });
       writeFileSync(join(spec.cwd, 'node_modules', 'pkg.js'), 'module.exports = 1;\n');
-      ran.set(spec.cwd, { from, to: new Date(Date.now() + 1).toISOString() });
+      writeFileSync(join(spec.cwd, 'src', 'generated.txt'), 'made by the setup\n');
       return { exitCode: 0, outputTail: 'added 1 package' };
     }
     if (existsSync(join(spec.cwd, 'c.txt')) && cRuns++ === 0) return { exitCode: 1, outputTail: 'not ok 1 - c works' };
@@ -97,6 +94,7 @@ it('V-19, V-20, V-21 on a real repository: parallel tasks, a dependency, a confl
   expect(await sandbox.git(repo, 'show', 'main:src/app.txt')).toBe('app from A\n');
   // The setup's node_modules never reached a commit.
   expect(await sandbox.git(repo, 'ls-tree', '-r', '--name-only', 'main')).not.toContain('node_modules');
+  expect(await sandbox.git(repo, 'ls-tree', '-r', '--name-only', 'main')).not.toContain('src/generated.txt');
   await until(async () => (await task(a)).worktree?.cleanup === 'removed', 'A cleaned');
   expect(existsSync(await pathOf(a))).toBe(false);
 

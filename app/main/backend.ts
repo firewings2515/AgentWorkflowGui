@@ -34,7 +34,7 @@ import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { hashFile, setTimer } from './file-hash';
 import { GitIgnoreRules } from './git-ignore';
-import { isPipelineFolder, jobCommandRunner, worktreeFiles } from './pipeline-host';
+import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
 
 /** What the main process needs from its process host: the port plus the spawn the adapters use (T013). */
@@ -345,7 +345,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     pipeline: {
       git,
       commands: jobCommandRunner(host, { log }),
-      files: worktreeFiles,
+      files: gitWorktreeFiles(),
       resolveRealPath: (path) => options.resolveRealPath(path),
     },
     log,

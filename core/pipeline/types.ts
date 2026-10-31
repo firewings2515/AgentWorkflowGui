@@ -1,7 +1,7 @@
 // What the task pipeline (T032, R-06, CR-3) needs besides the GitPort: running the project's setup and test
 // commands in a worktree, and a look at a worktree's folder. Both are the pipeline's own small interfaces,
 // implemented in the main process (core has no processes and no file system).
-import type { ProjectCommands, Timestamp } from '../../contracts';
+import type { ProjectCommands } from '../../contracts';
 
 export type CommandShell = NonNullable<ProjectCommands['shell']>;
 
@@ -34,12 +34,27 @@ export interface CommandRunner {
   run(spec: CommandSpec): RunningCommand;
 }
 
+/**
+ * One path the setup script changed in a worktree (r1 P1-6): its content then (`sha256:<hex>`), `deleted`, or
+ * `dir` for a whole folder that was not there (an untracked folder git lists as one entry, e.g. node_modules).
+ * `tracked`: git tracked the path before (setup changed a file of the repository).
+ */
+export interface SetupChange {
+  /** Relative to the worktree, `/` separated. */
+  path: string;
+  state: string;
+  tracked: boolean;
+}
+
 export interface WorktreeFiles {
   /** Whether a folder exists (a session's cwd, a worktree). */
   exists(path: string): boolean;
-  /**
-   * Top-level entries of a worktree created within [from, to]: what the setup script made (SP-07 G1, G2).
-   * Names relative to the worktree, with `/` separators.
-   */
-  createdBetween(path: string, from: Timestamp, to: Timestamp): string[];
+  /** Every path that differs from the worktree's commit (git ignores what `.gitignore` ignores). */
+  changes(worktree: string): Promise<SetupChange[]>;
+  /** The state of one path now, in the terms of `SetupChange.state` (`dir` when it is a folder). */
+  stateOf(worktree: string, path: string): Promise<string>;
+  /** Keeps what a setup changed with the worktree (its own git folder), so a restart still knows. */
+  saveSetupChanges(worktree: string, changes: readonly SetupChange[]): Promise<void>;
+  /** What `saveSetupChanges` kept; undefined when nothing was. */
+  loadSetupChanges(worktree: string): Promise<SetupChange[] | undefined>;
 }

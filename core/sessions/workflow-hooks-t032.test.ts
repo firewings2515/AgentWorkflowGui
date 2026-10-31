@@ -108,6 +108,36 @@ describe('T032 workflow hooks of the session service', () => {
     expect(await r.run({ type: 'escalation.respond', requestId: rid(), escalationId: asked.escalationId, decision: 'approve' })).toMatchObject({ ok: true });
   });
 
+  it('r1 P1-5: a close that hangs ends at its deadline, counted from the call though the session\'s queue is stuck; the runtime is released and onSessionClosed ran first', async () => {
+    const w = await workflowWorld();
+    await started(w);
+    await settle();
+    const internals = w.service as unknown as {
+      options: { sleep?: (ms: number) => Promise<void>; onSessionClosed?: (sessionId: string) => void };
+      runtimes: { isOpen(ref: string): boolean };
+      binding(sessionId: string): Promise<string | undefined>;
+    };
+    const closed: string[] = [];
+    const slept: number[] = [];
+    internals.options.sleep = (ms) => {
+      slept.push(ms);
+      return Promise.resolve();
+    };
+    internals.options.onSessionClosed = (sessionId) => void closed.push(sessionId);
+    const ref = await internals.binding(ROOT);
+    expect(ref !== undefined && internals.runtimes.isOpen(ref)).toBe(true);
+    // The session's queue is held by a dispatch that never returns, and the adapter's own close never ends.
+    w.claude.dispatchOnce = () => new Promise(() => undefined);
+    w.claude.closeSession = () => new Promise(() => undefined);
+    const root = await w.repositories.sessions.get(ROOT);
+    void w.run({ type: 'session.send', requestId: rid(), sessionId: ROOT, messageId: MessageId.parse('m-stuck'), expectedRevision: root!.revision, text: 'stuck', attachments: [] });
+    await settle();
+    await w.service.closeWorkflowRuntime(ROOT, 1234);
+    expect(slept).toContain(1234);
+    expect(closed).toEqual([ROOT]);
+    expect(internals.runtimes.isOpen(ref!)).toBe(false);
+  });
+
   it('closeWorkflowRuntime closes a workflow session gracefully through its adapter, and leaves ordinary sessions alone', async () => {
     const w = await workflowWorld();
     await started(w);
@@ -119,6 +149,7 @@ describe('T032 workflow hooks of the session service', () => {
     expect(w.claude.calls.filter((c) => c === 'closeSession').length).toBe(before);
     await w.service.closeWorkflowRuntime(ROOT);
     expect(w.claude.calls.filter((c) => c === 'closeSession').length).toBe(before + 1);
+    await settle();
     expect((await w.repositories.sessions.get(ROOT))?.activity).toBe('closed');
     // Closed already: nothing more to do.
     await w.service.closeWorkflowRuntime(ROOT);

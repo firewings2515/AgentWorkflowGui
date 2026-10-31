@@ -1,8 +1,7 @@
 // The pipeline's commands and folders in memory (T032 tests). A script decides how each command ends: an exit
-// code and output, or never (a crash while it ran, the process gone with the GUI). Folders come from the
-// memory git; what a setup made is recorded with the time it was made.
-import type { Timestamp } from '../../../contracts';
-import type { CommandOutcome, CommandRunner, CommandSpec, RunningCommand, WorktreeFiles } from '../types';
+// code and output, or never (a crash while it ran, the process gone with the GUI). Folders and their changes
+// come from the memory git; what a setup changed is kept per worktree, like the main process keeps it.
+import type { CommandOutcome, CommandRunner, CommandSpec, RunningCommand, SetupChange, WorktreeFiles } from '../types';
 import type { MemoryGit } from './memory-git';
 
 export type Script = (spec: CommandSpec) => CommandOutcome | 'hang' | Promise<CommandOutcome>;
@@ -36,21 +35,52 @@ export class FakeCommands implements CommandRunner {
   }
 }
 
+const folderKey = (path: string) => path.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase();
+const stateOfContent = (content: string | undefined) => (content === undefined ? 'deleted' : `sha256:${content}`);
+
 export class FakeFiles implements WorktreeFiles {
-  /** Top-level entries made in a folder, with when. */
-  readonly made: { path: string; name: string; at: Timestamp }[] = [];
   /** Folders that exist although no checkout is there (left by a failed removal). */
   readonly extra = new Set<string>();
+  /** What each worktree's setup changed, as saved. */
+  readonly saved = new Map<string, SetupChange[]>();
+  /** Makes the next `changes` (or `loadSetupChanges`) call throw. */
+  failNext: 'changes' | 'load' | undefined;
 
   constructor(private readonly git: MemoryGit) {}
 
   exists(path: string): boolean {
-    const k = path.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase();
+    const k = folderKey(path);
     return this.git.folders.has(k) || this.extra.has(k);
   }
 
-  createdBetween(path: string, from: Timestamp, to: Timestamp): string[] {
-    const k = path.toLowerCase();
-    return [...new Set(this.made.filter((m) => m.path.toLowerCase() === k && m.at >= from && m.at <= to).map((m) => m.name))];
+  changes(worktree: string): Promise<SetupChange[]> {
+    if (this.failNext === 'changes') {
+      this.failNext = undefined;
+      return Promise.reject(new Error('git status failed'));
+    }
+    const files = this.git.tree(worktree)?.files ?? new Map<string, string>();
+    const head = this.git.headFiles(worktree);
+    const out: SetupChange[] = [];
+    for (const path of new Set([...files.keys(), ...head.keys()])) {
+      if (files.get(path) !== head.get(path)) out.push({ path, state: stateOfContent(files.get(path)), tracked: head.has(path) });
+    }
+    return Promise.resolve(out.sort((a, b) => (a.path < b.path ? -1 : 1)));
+  }
+
+  stateOf(worktree: string, path: string): Promise<string> {
+    return Promise.resolve(stateOfContent(this.git.tree(worktree)?.files.get(path)));
+  }
+
+  saveSetupChanges(worktree: string, changes: readonly SetupChange[]): Promise<void> {
+    this.saved.set(folderKey(worktree), [...changes]);
+    return Promise.resolve();
+  }
+
+  loadSetupChanges(worktree: string): Promise<SetupChange[] | undefined> {
+    if (this.failNext === 'load') {
+      this.failNext = undefined;
+      return Promise.reject(new Error('unreadable'));
+    }
+    return Promise.resolve(this.saved.get(folderKey(worktree)));
   }
 }

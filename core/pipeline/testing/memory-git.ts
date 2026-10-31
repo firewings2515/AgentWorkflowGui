@@ -72,6 +72,13 @@ export class MemoryGit implements GitPort {
     return this.trees.get(key(path));
   }
 
+  /** The files of the commit a checkout has checked out. */
+  headFiles(path: string): Map<string, string> {
+    const tree = this.trees.get(key(path));
+    if (tree === undefined) throw new Error(`no checkout at ${path}`);
+    return this.filesOf(this.headOf(tree));
+  }
+
   /** An agent (or anyone) writes a file in a checkout; `add` stages it as `git add` would during a merge. */
   write(path: string, file: string, content: string | undefined, add = false): void {
     const tree = this.trees.get(key(path));
@@ -196,7 +203,8 @@ export class MemoryGit implements GitPort {
       if (tree === undefined || tree.branch !== worktree.branch) return { status: 'failed', detail: `${worktree.path} is not a worktree of ${worktree.branch}` };
       const head = this.headOf(tree);
       const headFiles = this.filesOf(head);
-      const excluded = (file: string) => exclude.some((e) => file === e || file.startsWith(`${e}/`));
+      const specs = exclude.map((e) => e.replace(/^:\(literal\)/, ''));
+      const excluded = (file: string) => specs.some((e) => file === e || file.startsWith(`${e}/`));
       const next = new Map<string, string>();
       for (const [f, c] of tree.files) if (!excluded(f)) next.set(f, c);
       for (const [f, c] of headFiles) if (excluded(f)) next.set(f, c);

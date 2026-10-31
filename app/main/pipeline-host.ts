@@ -1,11 +1,12 @@
 // What the task pipeline (T032) needs of the host: the project's setup and test commands run in a worktree, each
 // in a Job of its own (R-14: a GUI that dies takes them with it, and orphans are found by PID and creation time),
 // and a look at a worktree's folder.
-import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, lstatSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
 import { SessionId } from '../../contracts';
-import type { CommandOutcome, CommandRunner, CommandSpec, RunningCommand, WorktreeFiles } from '../../core/pipeline';
+import { createGitRunner, type GitRunner } from '../../adapters/git';
+import type { CommandOutcome, CommandRunner, CommandSpec, RunningCommand, SetupChange, WorktreeFiles } from '../../core/pipeline';
 import type { BackendProcessHost } from './backend';
 
 const TAIL = 4000;
@@ -91,22 +92,71 @@ export const isPipelineFolder = (path: string): boolean => {
   return false;
 };
 
-/** Folders on disk: whether one exists, and the top-level entries a setup made (by their creation time). */
-export const worktreeFiles: WorktreeFiles = {
-  exists: (path) => existsSync(path),
-  createdBetween(path, from, to) {
-    const start = Date.parse(from);
-    const end = Date.parse(to);
-    const made: string[] = [];
-    for (const name of readdirSync(path)) {
-      if (name === '.git') continue;
-      try {
-        const born = lstatSync(join(path, name)).birthtimeMs;
-        if (born >= start && born <= end) made.push(name);
-      } catch {
-        // Gone meanwhile.
-      }
-    }
-    return made.sort();
-  },
+/** The state of a path in a worktree: the hash of its content, `dir`, or `deleted` (`SetupChange.state`). */
+export const pathState = (worktree: string, path: string): string => {
+  const full = join(worktree, ...path.split('/'));
+  let stats;
+  try {
+    stats = lstatSync(full);
+  } catch {
+    return 'deleted';
+  }
+  if (stats.isDirectory()) return 'dir';
+  return `sha256:${createHash('sha256').update(readFileSync(full)).digest('hex')}`;
 };
+
+/** The file that keeps what a worktree's setup changed: in the worktree's own git folder, never in the worktree. */
+const recordOf = (worktree: string): string => {
+  const dotGit = join(worktree, '.git');
+  if (statSync(dotGit).isDirectory()) return join(dotGit, 'awg-setup-changes.json');
+  const pointer = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, 'utf8'))?.[1]?.trim();
+  if (pointer === undefined) throw new Error(`${dotGit} names no git folder`);
+  return join(isAbsolute(pointer) ? pointer : resolve(worktree, pointer), 'awg-setup-changes.json');
+};
+
+/**
+ * Every path of `git status --porcelain -z` (what `.gitignore` ignores is left out; a folder that is new as a whole
+ * is one `dir` entry). The output is read in full or not at all.
+ */
+export const statusChanges = async (run: GitRunner, worktree: string): Promise<SetupChange[]> => {
+  const result = await run(['status', '--porcelain=v1', '-z', '--untracked-files=normal'], { cwd: worktree });
+  if (result.code !== 0) throw new Error(`git status failed: ${result.stderr.trim() || String(result.code)}`);
+  if (result.truncated) throw new Error('git status printed too much to read in full');
+  const fields = result.stdout.split('\0');
+  const out: SetupChange[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const entry = fields[i] ?? '';
+    if (entry.length < 4) continue;
+    const code = entry.slice(0, 2);
+    const path = entry.slice(3);
+    if (code === '??') {
+      out.push(path.endsWith('/') ? { path: path.slice(0, -1), state: 'dir', tracked: false } : { path, state: pathState(worktree, path), tracked: false });
+      continue;
+    }
+    out.push({ path, state: pathState(worktree, path), tracked: !code.startsWith('A') });
+    // A rename or copy names its source next: gone from where it was.
+    if (code.startsWith('R') || code.startsWith('C')) {
+      const from = fields[++i] ?? '';
+      if (from !== '' && code.startsWith('R')) out.push({ path: from, state: pathState(worktree, from), tracked: true });
+    }
+  }
+  return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+};
+
+/** Folders on disk and what a setup changed in a worktree (r1 P1-6), through git's own status. */
+export const gitWorktreeFiles = (run: GitRunner = createGitRunner()): WorktreeFiles => ({
+  exists: (path) => existsSync(path),
+  changes: (worktree) => statusChanges(run, worktree),
+  stateOf: (worktree, path) => Promise.resolve(pathState(worktree, path)),
+  saveSetupChanges(worktree, changes) {
+    writeFileSync(recordOf(worktree), JSON.stringify(changes), 'utf8');
+    return Promise.resolve();
+  },
+  loadSetupChanges(worktree) {
+    const file = recordOf(worktree);
+    if (!existsSync(file)) return Promise.resolve(undefined);
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    if (!Array.isArray(parsed)) throw new Error(`${file} is not a list`);
+    return Promise.resolve(parsed as SetupChange[]);
+  },
+});

@@ -1462,18 +1462,23 @@ export class SessionService {
 
   /**
    * Ends a workflow session's runtime before the pipeline removes its folder (T032, SP-07 G1): the adapter's own
-   * graceful close (R-14), bounded by `timeoutMs`, then its Job, token and watchers go as on any close. Only
-   * workflow sessions; anything else is left alone. In the session's queue, after what it was doing.
+   * graceful close (R-14) with `timeoutMs` counted from this call, not from the session's turn in its queue; past
+   * it the session is released by force (`onSessionClosed` ends its Job). Returns once the runtime is released and
+   * `onSessionClosed` has run (r1 P1-5). Only workflow sessions; anything else is left alone.
    */
-  closeWorkflowRuntime(sessionId: SessionId, timeoutMs = 5000): Promise<void> {
-    return this.serial(sessionKey(sessionId), async () => {
-      const session = await this.repos.sessions.get(sessionId);
-      if (session?.kind !== 'workflow') return;
-      const ref = await this.binding(sessionId);
-      if (ref === undefined || !this.runtimes.isOpen(ref)) return;
-      await this.within(this.runtimes.closeSession(ref, timeoutMs), timeoutMs);
-      if (!this.closed) await this.setActivity(sessionId, 'closed');
-    });
+  async closeWorkflowRuntime(sessionId: SessionId, timeoutMs = 5000): Promise<void> {
+    const session = await this.repos.sessions.get(sessionId);
+    if (session?.kind !== 'workflow') return;
+    const ref = await this.binding(sessionId);
+    if (ref === undefined || !this.runtimes.isOpen(ref)) return;
+    const graceful = this.runtimes.closeSession(ref, timeoutMs).then(
+      () => true,
+      () => true,
+    );
+    const ended = this.options.sleep === undefined ? await graceful : await Promise.race([graceful, this.options.sleep(timeoutMs).then(() => false)]);
+    if (!ended || this.runtimes.isOpen(ref)) await this.runtimes.forceRelease(ref);
+    // The record follows in the session's queue; the runtime is already gone.
+    if (!this.closed) void this.serial(sessionKey(sessionId), () => this.setActivity(sessionId, 'closed')).catch(() => undefined);
   }
 
   /** Whether the session's own turn runs, by the stored turns (an old event cannot undo them): its turn boundary. */

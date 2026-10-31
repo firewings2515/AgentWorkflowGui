@@ -186,9 +186,19 @@ export class SessionRuntimes {
     try {
       return await (await entry.adapter).closeSession(nativeSessionRef, timeoutMs);
     } finally {
-      this.open.delete(nativeSessionRef);
-      await this.options.onClosed?.(sessionId);
+      // Released once: `forceRelease` may have done it while the adapter's close hung (T032).
+      if (this.open.delete(nativeSessionRef)) await this.options.onClosed?.(sessionId);
     }
+  }
+
+  /**
+   * Releases a session whose graceful close did not end in time (T032 r1 P1-5): it counts as closed, and
+   * `onClosed` ends its Job, token and watchers now. A close still under way finds it released.
+   */
+  async forceRelease(nativeSessionRef: string): Promise<void> {
+    const sessionId = this.refs.get(nativeSessionRef);
+    if (sessionId === undefined || !this.open.delete(nativeSessionRef)) return;
+    await this.options.onClosed?.(sessionId);
   }
 
   /** Closes every adapter this router created (R-14: after the sessions themselves were closed). */
