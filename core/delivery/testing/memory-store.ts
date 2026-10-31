@@ -30,7 +30,7 @@ import {
   type WriteResult,
 } from '../../ports';
 
-type Method = 'accept' | 'updateTarget' | 'claim' | 'recordSent' | 'recordResolution' | 'recordOutcome' | 'get' | 'findBySourceCallRef' | 'listByState';
+type Method = 'accept' | 'updateTarget' | 'claim' | 'recordSent' | 'recordResolution' | 'recordOutcome' | 'get' | 'findBySourceCallRef' | 'listByState' | 'listByTarget';
 
 /**
  * `error`: the transaction fails before COMMIT, nothing is applied. `uncertain`: COMMIT fails and was in
@@ -267,6 +267,15 @@ export class MemoryDeliveryStore implements DeliveryStore {
     return this.run('listByState', () => ({
       value: [...this.rows.values()]
         .filter((r) => r.state === state)
+        .sort((a, b) => (a.acceptedAt < b.acceptedAt ? -1 : a.acceptedAt > b.acceptedAt ? 1 : 0))
+        .map((r) => this.load(r)),
+    }));
+  }
+
+  listByTarget(sessionId: SessionId): Promise<StoredDelivery[]> {
+    return this.run('listByTarget', () => ({
+      value: [...this.rows.values()]
+        .filter((r) => (JSON.parse(r.target) as DeliveryTarget).sessionId === sessionId)
         .sort((a, b) => (a.acceptedAt < b.acceptedAt ? -1 : a.acceptedAt > b.acceptedAt ? 1 : 0))
         .map((r) => this.load(r)),
     }));

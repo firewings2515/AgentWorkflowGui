@@ -8,6 +8,13 @@ import { addRuleIssue, type ContractRule } from './rules';
 export const TransferState = z.enum(['draft', 'awaiting-confirmation', 'stale', 'approved', 'failed', 'cancelled']);
 
 /**
+ * Why a proposal was cancelled (C-21): `user` cancelled it or its delivery; `source-changed` after the
+ * confirmation, before the payload went (prepare it again); `failed` its target creation failed after the
+ * payload crossed the dispatch boundary, so it cannot be `failed`.
+ */
+export const TransferCancelReason = z.enum(['user', 'source-changed', 'failed']);
+
+/**
  * Transfer to a new session in another tool (R-02). Content follows the fixed frame verified in SP-09.
  * The schema enforces the confirmation gate (CR-5): before approval nothing is provisioned, created or
  * delivered; the approval binds the revision; the payload waits for the created target (CR2 §3).
@@ -39,6 +46,8 @@ export const TransferProposal = z
     /** Target creation failed for good; the work stays in the source session (R-02). */
     failure: z.strictObject({ message: z.string() }).optional(),
     cancelledAt: Timestamp.optional(),
+    /** Absent on proposals cancelled before contracts 0.6. */
+    cancelReason: TransferCancelReason.optional(),
     createdAt: Timestamp,
   })
   .superRefine((p, ctx) => {
@@ -53,6 +62,7 @@ export const TransferProposal = z
     if ((p.state === 'approved' || p.state === 'failed') && !approved) fail('transfer.state-needs-approval');
     if ((p.state === 'failed') !== (p.failure !== undefined)) fail('transfer.failure-when-failed');
     if ((p.state === 'cancelled') !== (p.cancelledAt !== undefined)) fail('transfer.cancelled-at');
+    if (p.cancelReason !== undefined && p.state !== 'cancelled') fail('transfer.cancel-reason-only-cancelled');
     // Target creation failed, so the payload never crossed the dispatch boundary.
     if (p.state === 'failed' && p.delivery && (p.delivery.state !== 'pending' || p.delivery.attempts.length > 0)) fail('transfer.failed-dispatched-nothing');
     // Cancelling stops follow-up work; a delivery reconciled as sent afterwards is still recorded (CR2 §2).
@@ -69,4 +79,5 @@ export type UiPreferences = z.infer<typeof UiPreferences>;
 
 // Inferred types for schemas that are not typed next to their definition.
 export type TransferState = z.infer<typeof TransferState>;
+export type TransferCancelReason = z.infer<typeof TransferCancelReason>;
 export type Theme = z.infer<typeof Theme>;

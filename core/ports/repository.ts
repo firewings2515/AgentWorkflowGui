@@ -18,6 +18,8 @@ import type {
   PeerMessage,
   PeerMessageId,
   PermissionRequest,
+  ProjectId,
+  ProjectSettings,
   Revision,
   SessionId,
   SessionItem,
@@ -53,6 +55,8 @@ export interface DefinitionRepository<T, Id> {
 
 export type AgentRepository = DefinitionRepository<AgentDefinition, AgentId>;
 export type WorkflowRepository = DefinitionRepository<WorkflowTemplate, WorkflowId>;
+/** Project settings (C-17, O-06), saved like the definitions. */
+export type ProjectRepository = DefinitionRepository<ProjectSettings, ProjectId>;
 
 export interface SessionRepository {
   list(): Promise<LogicalSession[]>;
@@ -184,6 +188,7 @@ export interface SnapshotData {
   handoffs: Handoff[];
   peerMessages: PeerMessage[];
   transfers: TransferProposal[];
+  projects: ProjectSettings[];
 }
 
 export interface AppRepositories {
@@ -198,5 +203,6 @@ export interface AppRepositories {
   handoffs: HandoffRepository;
   peerMessages: PeerMessageRepository;
   transfers: TransferRepository;
+  projects: ProjectRepository;
   readSnapshotData(): Promise<SnapshotData>;
 }

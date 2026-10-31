@@ -8,6 +8,7 @@ export const workflowRuleMessages: Record<WorkflowRule, string> = {
   'workflow.one-root': '請指定且只指定一個 Agent 節點作為 root。',
   'workflow.edge-missing-node': '連線的來源或目的地節點不存在，請移除此連線或補回節點。',
   'workflow.output-needs-edge': 'Output 目的地缺少連線，請重新選取目的地或建立連線。',
+  'workflow.tasks-rule-on-root': '只有 root 節點可以有「拆分 task」的 output 規則。',
 };
 export interface WorkflowIssue { path: string; message: string; nodeId?: string; rule?: ContractRule }
 

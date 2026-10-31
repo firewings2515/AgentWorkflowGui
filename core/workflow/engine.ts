@@ -243,7 +243,11 @@ export class WorkflowEngine implements WorkflowHooks {
       state: 'running',
       ...(crossToolConsent && { crossToolConsentAt: at }),
       template,
+      taskLimit: 3,
       tasks: [task],
+      rounds: [],
+      mergeQueue: [],
+      taskPlans: [],
       createdAt: at,
     };
     if (sessions.isClosing()) return fail(requestId, 'runtime_unavailable', 'The application is closing', { mayHaveSideEffects: wrote });
@@ -394,10 +398,10 @@ export class WorkflowEngine implements WorkflowHooks {
       if (nodeOf(template, input.target.nodeId) === undefined) return rejected('unknown-target', 'no such node');
       if (!hasEdge(template, from.id, input.target.nodeId)) return rejected('not-connected', 'there is no edge from this node to the target');
     }
-    const rule = from.outputRules.find((r) => r.id === input.ruleId && sameTarget(r.target, input.target));
+    const rule = from.outputRules.find((r) => r.id === input.ruleId && r.target.kind !== 'tasks' && sameTarget(r.target, input.target));
     if (rule === undefined) return this.noRuleMatched(instance, taskId, caller, from);
     const root = rootNode(template);
-    const toId: NodeId = rule.target.kind === 'root' ? root.id : rule.target.nodeId;
+    const toId: NodeId = rule.target.kind === 'node' ? rule.target.nodeId : root.id;
     if (toId === from.id) return rejected('invalid-input', 'a node cannot hand off to itself');
     const to = nodeOf(template, toId);
     if (to === undefined) return rejected('unknown-target', 'no such node');

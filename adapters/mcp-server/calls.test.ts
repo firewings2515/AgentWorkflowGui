@@ -116,7 +116,7 @@ describe('CallRunner', () => {
     const bad = await calls.run(A, 'handoff', { ...handoffArgs, ruleId: '', extra: secret }, 'meta:x:1', live());
     expect(bad).toMatchObject({ result: { status: 'rejected', rejection: { reason: 'invalid-input' } } });
     expect(JSON.stringify(bad)).not.toContain(secret);
-    const cycle = await calls.run(A, 'create_tasks', { tasks: [{ key: 'a', title: 't', dependsOn: ['a'] }] }, 'meta:x:2', live());
+    const cycle = await calls.run(A, 'create_tasks', { ruleId: 'split', tasks: [{ key: 'a', title: 't', dependsOn: ['a'] }] }, 'meta:x:2', live());
     expect(cycle).toMatchObject({ result: { rejection: { reason: 'invalid-input' } } });
     expect(JSON.stringify(cycle)).toContain('tasks.0.dependsOn: a task depends on itself');
     expect(handlers.handoff).not.toHaveBeenCalled();
@@ -133,7 +133,7 @@ describe('CallRunner', () => {
     });
     const handoff = vi.fn<McpToolHandlers['handoff']>(() => Promise.resolve({ status: 'bogus' } as unknown as HandoffToolResult));
     const calls = runner(makeHandlers({ create_tasks, handoff }));
-    const tasks = { tasks: [{ key: 'a', title: 'A' }] };
+    const tasks = { ruleId: 'split', tasks: [{ key: 'a', title: 'A' }] };
     expect(await calls.run(A, 'create_tasks', tasks, 'meta:x:1', live())).toEqual({ kind: 'failed' });
     expect(await calls.run(A, 'create_tasks', tasks, 'meta:x:1', live())).toEqual({ kind: 'failed' });
     expect(created).toBe(1);

@@ -623,6 +623,16 @@ export class SessionService {
       case 'transfer.cancel':
         if (this.transfer !== undefined) return this.transfer.execute(command);
         return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
+      case 'project.save': {
+        const saved = await this.repos.projects.save(command.project, command.expectedRevision);
+        if (saved.status === 'stale') return fail(command.requestId, 'stale_revision', 'The project has changed since it was loaded', { retryable: true });
+        return ok(command.requestId, { revision: saved.record.revision });
+      }
+      // Ending a run and the task pipeline come with T032 (contracts 0.6).
+      case 'workflow.complete':
+      case 'workflow.cancel':
+      case 'task.retryCleanup':
+        return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
     }
   }
 

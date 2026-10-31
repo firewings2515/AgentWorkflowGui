@@ -3,7 +3,7 @@
 import { z } from 'zod';
 
 /** Bump on any breaking change; contract changes go through the main session. */
-export const CONTRACTS_VERSION = '0.5.0';
+export const CONTRACTS_VERSION = '0.6.0';
 
 /**
  * Carried by every serialized boundary (Snapshot, event envelope, saved definitions) so stored data
@@ -26,6 +26,10 @@ export const HandoffId = id<'HandoffId'>();
 export const PeerMessageId = id<'PeerMessageId'>();
 export const EscalationId = id<'EscalationId'>();
 export const TransferId = id<'TransferId'>();
+/** A task list proposed by root's `create_tasks`, waiting for the user or created (R-06, O-07). */
+export const TaskPlanId = id<'TaskPlanId'>();
+/** A project folder with its setup script and test command (R-06, O-06). */
+export const ProjectId = id<'ProjectId'>();
 export const NativeTaskId = id<'NativeTaskId'>();
 export const PermissionRequestId = id<'PermissionRequestId'>();
 export const ArtifactId = id<'ArtifactId'>();
@@ -53,6 +57,8 @@ export type HandoffId = z.infer<typeof HandoffId>;
 export type PeerMessageId = z.infer<typeof PeerMessageId>;
 export type EscalationId = z.infer<typeof EscalationId>;
 export type TransferId = z.infer<typeof TransferId>;
+export type TaskPlanId = z.infer<typeof TaskPlanId>;
+export type ProjectId = z.infer<typeof ProjectId>;
 export type NativeTaskId = z.infer<typeof NativeTaskId>;
 export type PermissionRequestId = z.infer<typeof PermissionRequestId>;
 export type ArtifactId = z.infer<typeof ArtifactId>;

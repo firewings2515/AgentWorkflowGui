@@ -48,6 +48,7 @@ describe('openDatabase', () => {
         'owned_process',
         'permission_request',
         'preference',
+        'project',
         'provision',
         'receive_admission',
         'schema_migration',
@@ -272,8 +273,9 @@ describe('v3: data stored under contracts 0.4 (T020 review r1 P1-5)', () => {
     try {
       expect(versions(db).map((v) => v.version)).toEqual(MIGRATIONS.map((m) => m.version));
       const data = await createRepositories(db).readSnapshotData();
-      expect(data.agents.map((a) => a.schemaVersion)).toEqual(['0.5.0']);
-      expect(data.workflows.map((w) => w.schemaVersion)).toEqual(['0.5.0']);
+      // v3 brought them to 0.5, v6 to 0.6.
+      expect(data.agents.map((a) => a.schemaVersion)).toEqual(['0.6.0']);
+      expect(data.workflows.map((w) => w.schemaVersion)).toEqual(['0.6.0']);
       expect(data.conversations.permissionRequests[0]).toMatchObject({ kind: 'mcpElicitation', server: elicitation.elicitation?.serverName });
     } finally {
       db.close();

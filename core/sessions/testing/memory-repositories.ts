@@ -18,6 +18,8 @@ import type {
   WorkflowId,
   WorkflowInstance,
   WorkflowTemplate,
+  ProjectId,
+  ProjectSettings,
 } from '../../../contracts';
 import type { AppRepositories, Conversation, DefinitionRepository, NodeSessionKey, SaveResult, SnapshotData } from '../../ports';
 
@@ -58,6 +60,7 @@ const emptyConversation = (): Conversation => ({ turns: [], messages: [], items:
 export class MemoryRepositories implements AppRepositories {
   readonly agents = new Definitions<AgentDefinition, AgentId>();
   readonly workflows = new Definitions<WorkflowTemplate, WorkflowId>();
+  readonly projects = new Definitions<ProjectSettings, ProjectId>();
   readonly sessionRecords = new Map<SessionId, LogicalSession>();
   readonly conversationRecords = new Map<SessionId, Conversation>();
   readonly escalationRecords = new Map<string, Escalation>();
@@ -221,6 +224,7 @@ export class MemoryRepositories implements AppRepositories {
       handoffs: this.handoffRecords.map(copy),
       peerMessages: this.peerMessageRecords.map(copy),
       transfers: await this.transfers.list(),
+      projects: await this.projects.list(),
     };
   }
 }

@@ -4,7 +4,7 @@ export type { WorkflowIssue } from './workflow-validation';
 
 export type GraphSelection = { kind: 'node'; id: string } | { kind: 'edge'; source: string; target: string } | null;
 export const destinationKey = (nodeId: string, ruleId: string) => JSON.stringify([nodeId, ruleId]);
-export const destinationValue = (target: OutputRule['target']) => target.kind === 'root' ? 'root' : `node:${target.nodeId}`;
+export const destinationValue = (target: OutputRule['target']) => target.kind === 'node' ? `node:${target.nodeId}` : target.kind;
 export const writePolicyLabels = { write: '可寫', 'read-only': '唯讀', 'exec-only': '只能執行指令' };
 export const isolationLabels = { worktree: '每個 task 獨立 worktree', 'same-folder': '共用資料夾 · 寫入鎖定' };
 

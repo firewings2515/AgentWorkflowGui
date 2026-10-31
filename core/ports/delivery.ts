@@ -236,6 +236,12 @@ export interface DeliveryStore {
    * Records carry their context or spec, so nothing else is needed to do either.
    */
   listByState(state: DeliveryRecord['state']): Promise<StoredDelivery[]>;
+  /**
+   * The records whose current target is this GUI session (C-20): payloads bound or waiting for it, and the
+   * provision creating it. In acceptance order. Answers "does this session have work in flight" without
+   * reading every record.
+   */
+  listByTarget(sessionId: SessionId): Promise<StoredDelivery[]>;
 }
 
 /** The store could not confirm its commit; treat the operation as not done and do not call the runtime. */

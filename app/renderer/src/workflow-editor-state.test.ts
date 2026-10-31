@@ -158,6 +158,7 @@ describe('T019 domain / canvas boundary', () => {
     invalid.nodes.push(structuredClone(invalid.nodes[0]!));
     invalid.edges.push({ source: NodeId.parse('missing'), target: NodeId.parse('n-plan') });
     invalid.edges = invalid.edges.filter(edge => edge.source !== 'n-plan');
+    invalid.nodes[1]!.outputRules.push({ id: 'split', condition: '拆分', payload: 'task 清單', target: { kind: 'tasks' }, requiresUserConfirmation: true });
     const issues = workflowIssues(invalid);
     expect(new Set(issues.map(issue => issue.rule))).toEqual(new Set(Object.keys(workflowRuleMessages)));
     expect(issues).toContainEqual({ path: 'nodes', rule: 'workflow.node-id-unique', message: '節點 ID 不可重複。' });

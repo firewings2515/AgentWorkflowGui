@@ -8,7 +8,7 @@ import { SqliteHandoffRepository, SqlitePeerMessageRepository } from './delivery
 import { SqliteTransferRepository } from './transfer-repository';
 import { DEFAULT_BLOB_THRESHOLD_BYTES, run, type StorageContext } from './codec';
 import { SqliteConversationRepository } from './conversation-repository';
-import { agentRepository, workflowRepository } from './definition-repository';
+import { agentRepository, projectRepository, workflowRepository } from './definition-repository';
 import { SqliteSessionRepository } from './session-repository';
 import { SqliteEscalationRepository, SqliteOwnedProcessRepository, SqlitePreferencesRepository } from './small-repositories';
 import { readTransaction } from './transaction';
@@ -23,6 +23,7 @@ export const createRepositories = (db: DatabaseSync, options: RepositoryOptions 
   const ctx: StorageContext = { db, blobThresholdBytes: options.blobThresholdBytes ?? DEFAULT_BLOB_THRESHOLD_BYTES };
   const agents = agentRepository(ctx);
   const workflows = workflowRepository(ctx);
+  const projects = projectRepository(ctx);
   const sessions = new SqliteSessionRepository(ctx);
   const conversations = new SqliteConversationRepository(ctx);
   const escalations = new SqliteEscalationRepository(ctx);
@@ -45,6 +46,7 @@ export const createRepositories = (db: DatabaseSync, options: RepositoryOptions 
     handoffs,
     peerMessages,
     transfers,
+    projects,
     readSnapshotData: () =>
       run(() =>
         readTransaction(db, (): SnapshotData => {
@@ -52,6 +54,7 @@ export const createRepositories = (db: DatabaseSync, options: RepositoryOptions 
           return {
             agents: agents.loadAll(),
             workflows: workflows.loadAll(),
+            projects: projects.loadAll(),
             sessions: sessions.loadAll(),
             conversations: conversations.load(),
             escalations: escalations.loadAll(),

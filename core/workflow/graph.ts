@@ -23,7 +23,7 @@ export const runtimesOf = (template: WorkflowTemplate): Set<Runtime> => new Set(
 /** Edges carry no conditions: an edge only means "handoff allowed" (R-04). */
 export const hasEdge = (template: WorkflowTemplate, from: NodeId, to: NodeId): boolean => template.edges.some((e) => e.source === from && e.target === to);
 
-export const sameTarget = (a: OutputTarget, b: OutputTarget): boolean => a.kind === b.kind && (a.kind === 'root' || (b.kind === 'node' && a.nodeId === b.nodeId));
+export const sameTarget = (a: OutputTarget, b: OutputTarget): boolean => a.kind === b.kind && (a.kind !== 'node' || (b.kind === 'node' && a.nodeId === b.nodeId));
 
 /**
  * The receive limit of a node for one task. A handoff names no input rule, so the GUI cannot know which of
@@ -68,6 +68,7 @@ export const handoffCounts = (instance: WorkflowInstance, handoffs: readonly Han
 
 const targetText = (template: WorkflowTemplate, target: OutputTarget): string => {
   if (target.kind === 'root') return '{"kind":"root"} (report to root)';
+  if (target.kind === 'tasks') return '{"kind":"tasks"} (create_tasks)';
   const label = nodeOf(template, target.nodeId)?.label ?? target.nodeId;
   return `${JSON.stringify(target)} (node "${label}")`;
 };

@@ -2,10 +2,10 @@
 // is identified by the session's token, never by anything in the input. Results say what the GUI did;
 // they never carry another session's content.
 import { z } from 'zod';
-import { EscalationId, HandoffId, OperationId, PeerMessageId, SessionId, TaskId } from './common';
+import { EscalationId, HandoffId, OperationId, PeerMessageId, SessionId, TaskId, TaskPlanId } from './common';
 import { DeliveryState } from './delivery';
 import { addRuleIssue } from './rules';
-import { OutputTarget } from './workflow';
+import { HandoffTarget, TaskPlanItem, hasDependencyCycle } from './workflow';
 
 /** Why the GUI refused a tool call; the agent may correct and call again. */
 export const McpRejection = z.strictObject({
@@ -36,7 +36,7 @@ const retryOf = OperationId.optional();
 /** `handoff(ruleId, target, content, taskId)`: a formal handoff to another node or to root (R-04). */
 export const HandoffToolInput = z.strictObject({
   ruleId: z.string().min(1),
-  target: OutputTarget,
+  target: HandoffTarget,
   content: z.string().min(1),
   /** Absent only for the root session, which has no task. */
   taskId: TaskId.optional(),
@@ -58,21 +58,15 @@ export const HandoffToolResult = z.discriminatedUnion('status', [
 ]);
 export type HandoffToolResult = z.infer<typeof HandoffToolResult>;
 
-/** `create_tasks(tasks[], dependsOn)`: root splits the work into tasks (R-06). Keys name tasks within this call. */
+/**
+ * `create_tasks(ruleId, tasks[])`: root splits the work into tasks (R-06). Keys name tasks within this call;
+ * `ruleId` is root's `tasks` output rule, whose `requiresUserConfirmation` decides whether the user
+ * confirms the list first (O-07). Dependencies must not form a cycle.
+ */
 export const CreateTasksToolInput = z
   .strictObject({
-    tasks: z
-      .array(
-        z.strictObject({
-          key: z.string().min(1),
-          title: z.string().min(1),
-          /** Keys of other tasks in this call. */
-          dependsOn: z.array(z.string().min(1)).default([]),
-          /** Tasks that already exist in the instance. */
-          dependsOnExisting: z.array(TaskId).default([]),
-        }),
-      )
-      .min(1),
+    ruleId: z.string().min(1),
+    tasks: z.array(TaskPlanItem).min(1),
   })
   .superRefine((input, ctx) => {
     const keys = new Set(input.tasks.map((t) => t.key));
@@ -80,13 +74,14 @@ export const CreateTasksToolInput = z
     input.tasks.forEach((t, i) => {
       if (t.dependsOn.some((d) => d === t.key || !keys.has(d))) addRuleIssue(ctx, 'mcp.create-tasks-dependency', ['tasks', i, 'dependsOn']);
     });
+    if (hasDependencyCycle(input.tasks)) addRuleIssue(ctx, 'mcp.create-tasks-cycle', ['tasks']);
   });
 export type CreateTasksToolInput = z.infer<typeof CreateTasksToolInput>;
 
 /** The built-in template asks the user first (O-07), so `awaiting-confirmation` is the default answer. */
 export const CreateTasksToolResult = z.discriminatedUnion('status', [
   z.strictObject({ status: z.literal('created'), tasks: z.array(z.strictObject({ key: z.string().min(1), taskId: TaskId })) }),
-  z.strictObject({ status: z.literal('awaiting-confirmation'), escalationId: EscalationId }),
+  z.strictObject({ status: z.literal('awaiting-confirmation'), taskPlanId: TaskPlanId, escalationId: EscalationId }),
   z.strictObject({ status: z.literal('rejected'), rejection: McpRejection }),
 ]);
 export type CreateTasksToolResult = z.infer<typeof CreateTasksToolResult>;

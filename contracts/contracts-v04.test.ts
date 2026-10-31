@@ -144,9 +144,10 @@ describe('MCP tools (C-10)', () => {
   });
 
   it('create_tasks keys are unique and dependencies stay inside the call', () => {
-    expect(CreateTasksToolInput.safeParse({ tasks: [{ key: 'a', title: 'A' }, { key: 'b', title: 'B', dependsOn: ['a'] }] }).success).toBe(true);
-    expect(ruleIssues(CreateTasksToolInput, { tasks: [{ key: 'a', title: 'A' }, { key: 'a', title: 'A2' }] }).map((i) => i.rule)).toContain('mcp.create-tasks-ids-unique');
-    const missing = ruleIssues(CreateTasksToolInput, { tasks: [{ key: 'a', title: 'A', dependsOn: [MARKER] }] });
+    // 0.6 names root's `tasks` rule (C-16).
+    expect(CreateTasksToolInput.safeParse({ ruleId: 'split', tasks: [{ key: 'a', title: 'A' }, { key: 'b', title: 'B', dependsOn: ['a'] }] }).success).toBe(true);
+    expect(ruleIssues(CreateTasksToolInput, { ruleId: 'split', tasks: [{ key: 'a', title: 'A' }, { key: 'a', title: 'A2' }] }).map((i) => i.rule)).toContain('mcp.create-tasks-ids-unique');
+    const missing = ruleIssues(CreateTasksToolInput, { ruleId: 'split', tasks: [{ key: 'a', title: 'A', dependsOn: [MARKER] }] });
     expect(missing).toContainEqual({ rule: 'mcp.create-tasks-dependency', path: 'tasks.0.dependsOn', message: expect.any(String) as string });
     expect(JSON.stringify(missing)).not.toContain(MARKER);
   });

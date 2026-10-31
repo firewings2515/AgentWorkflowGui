@@ -308,6 +308,16 @@ export class SqliteDeliveryStore implements DeliveryStore {
     );
   }
 
+  listByTarget(sessionId: SessionId): Promise<StoredDelivery[]> {
+    return this.run(() =>
+      readTransaction(this.db, () =>
+        (this.db
+          .prepare("SELECT * FROM delivery WHERE (CASE WHEN json_valid(target) THEN json_extract(target, '$.sessionId') END) = ? ORDER BY accepted_ms, rowid")
+          .all(sessionId) as unknown as DeliveryRow[]).map((row) => this.load(row)),
+      ),
+    );
+  }
+
   recordOutcome(operationId: OperationId, outcome: OperationOutcome): Promise<WriteResult> {
     return this.run(() => writeTransaction<WriteResult>(this.db, () => {
       const row = this.row(operationId);

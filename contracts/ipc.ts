@@ -11,17 +11,21 @@ import {
   ItemId,
   MessageId,
   NativeTaskId,
+  ProjectId,
   RequestId,
   Revision,
   Runtime,
   SchemaVersion,
   SessionId,
+  TaskId,
   Timestamp,
   TransferId,
   TurnId,
   WorkflowId,
 } from './common';
 import { PermissionRequest, SessionItem } from './items';
+import { FileLock } from './locks';
+import { ProjectSettings } from './project';
 import { ruleIssue } from './rules';
 import { Artifact, Attachment, LogicalSession, Message, NativeTask, PeerMessage, SessionActivity, TokenUsage, Turn } from './session';
 import { TransferProposal, UiPreferences } from './transfer';
@@ -67,6 +71,16 @@ export const Command = z.discriminatedUnion('type', [
     (c) => c.decision !== 'retry' || c.acceptDuplicateRisk,
     ruleIssue('delivery-resolve.retry-needs-risk-ack'),
   ),
+  /**
+   * The user ends a run (C-22; D-17: the user, not an agent, decides the work is done). `complete` marks every
+   * task not yet final `completed`; `cancel` marks them `cancelled`. Both stop further handoffs and are
+   * refused with `invalid_transition` while a merge is active or a delivery's outcome is unknown.
+   */
+  cmd('workflow.complete', { instanceId: InstanceId, expectedRevision: Revision }),
+  cmd('workflow.cancel', { instanceId: InstanceId, expectedRevision: Revision }),
+  /** Retry removing a task's or a merge attempt's worktree recorded as `pending-cleanup` (SP-07). */
+  cmd('task.retryCleanup', { instanceId: InstanceId, taskId: TaskId }),
+  cmd('project.save', { project: ProjectSettings, expectedRevision: Revision.nullable() }),
   cmd('transfer.prepare', { transferId: TransferId, sourceSessionId: SessionId, target: ModelSelection, noteSource: z.enum(['agent', 'gui-digest']) }),
   cmd('transfer.confirm', { transferId: TransferId, expectedRevision: Revision }),
   cmd('transfer.cancel', { transferId: TransferId }),
@@ -156,6 +170,10 @@ export const AppEvent = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('agent.deleted'), agentId: AgentId, at: Timestamp }),
   /** A saved workflow template (C-05), after `workflow.save`. */
   z.strictObject({ type: z.literal('workflow.updated'), workflow: WorkflowTemplate }),
+  /** A saved project (C-17), after `project.save`. */
+  z.strictObject({ type: z.literal('project.updated'), project: ProjectSettings }),
+  /** Every file lock held now (R-07): the whole list, so a missed event never leaves a stale lock on screen. */
+  z.strictObject({ type: z.literal('locks.updated'), locks: z.array(FileLock), at: Timestamp }),
   /**
    * What the renderer holds may differ from what is stored (C-05), e.g. an event could not be written and
    * was not pushed: read the Snapshot again. `reason` is a fixed code, never data.
@@ -217,9 +235,40 @@ export const Snapshot = z.strictObject({
   peerMessages: z.array(PeerMessage),
   escalations: z.array(Escalation),
   transfers: z.array(TransferProposal),
+  projects: z.array(ProjectSettings).default([]),
+  /** Held in memory only (R-07): empty after a restart. */
+  locks: z.array(FileLock).default([]),
   preferences: UiPreferences,
 });
 export type Snapshot = z.infer<typeof Snapshot>;
+
+/**
+ * Folder requests (C-24), on their own channel beside commands: they open native windows and change no
+ * data. `folder.pick` shows the folder dialog and returns only the folder the user chose. `folder.open`
+ * shows a folder in the file explorer, named by what it belongs to, never by a path from the renderer, so
+ * only folders the app already knows can be opened.
+ */
+export const FolderTarget = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('session-cwd'), sessionId: SessionId }),
+  z.strictObject({ kind: z.literal('task-worktree'), instanceId: InstanceId, taskId: TaskId }),
+  z.strictObject({ kind: z.literal('project'), projectId: ProjectId }),
+  /** The folder of the app's database (the `damaged` screen points at it, C-06). */
+  z.strictObject({ kind: z.literal('app-data') }),
+]);
+export type FolderTarget = z.infer<typeof FolderTarget>;
+
+export const FolderRequest = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('folder.pick'), requestId: RequestId, title: z.string().max(200).optional() }),
+  z.strictObject({ type: z.literal('folder.open'), requestId: RequestId, target: FolderTarget }),
+]);
+export type FolderRequest = z.infer<typeof FolderRequest>;
+
+export const FolderResult = z.discriminatedUnion('ok', [
+  /** `path`: the chosen folder for `folder.pick`, `null` when the dialog was cancelled; absent for `folder.open`. */
+  z.strictObject({ ok: z.literal(true), requestId: RequestId, path: z.string().min(1).nullable().optional() }),
+  z.strictObject({ ok: z.literal(false), requestId: RequestId.nullable(), code: z.enum(['not_found', 'invalid_request', 'internal_error']), message: z.string() }),
+]);
+export type FolderResult = z.infer<typeof FolderResult>;
 
 // Inferred types for schemas that are not typed next to their definition.
 export type ErrorCode = z.infer<typeof ErrorCode>;

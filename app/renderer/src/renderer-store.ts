@@ -89,6 +89,8 @@ export function applyEnvelope(state: RendererState, envelope: EventEnvelope): Re
     case 'agent.updated': snapshot.agents = upsert(snapshot.agents, event.agent); break;
     case 'agent.deleted': snapshot.agents = snapshot.agents.filter(agent => agent.id !== event.agentId); break;
     case 'workflow.updated': snapshot.workflows = upsert(snapshot.workflows, event.workflow); break;
+    case 'project.updated': snapshot.projects = upsert(snapshot.projects, event.project); break;
+    case 'locks.updated': snapshot.locks = event.locks; break;
     // The subscription reloads the authoritative Snapshot before applying this sequence.
     case 'snapshot.invalidated': break;
     case 'model.observed': snapshot.sessions = snapshot.sessions.map(session => session.id === event.sessionId ? { ...session, observedModel: event.observed } : session); break;
