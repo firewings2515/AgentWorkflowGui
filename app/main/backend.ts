@@ -29,7 +29,7 @@ import { permissionPolicy } from '../../core/policy';
 import type { AppRepositories, GitPort, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter } from '../../core/ports';
 import { Redactor, SessionService } from '../../core/sessions';
 import { TransferService } from '../../core/transfer';
-import { executeCommand, WorkflowEngine } from '../../core/workflow';
+import { WorkflowEngine } from '../../core/workflow';
 import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { hashFile, setTimer } from './file-hash';
@@ -326,8 +326,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   });
   ref.service = service;
   // T024: workflow.start, the workflow tools and workflow escalations; it reaches storage through the service.
-  // T032: the task pipeline's worktrees, setup and test commands and merge queue. Before a folder is removed,
-  // the runtime of a session working in it is ended with its Job (the service has no single-session close).
+  // T032: the task pipeline's worktrees, setup and test commands and merge queue. Before a folder is removed, the
+  // runtime of a session working in it is closed by the service (R-14), then its Job.
   const git = options.createGit?.() ?? new GitAdapter();
   const workflow = new WorkflowEngine({
     sessions: service,
@@ -340,9 +340,6 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       git,
       commands: jobCommandRunner(host, { log }),
       files: worktreeFiles,
-      closeRuntime: async (sessionId) => {
-        await host.closeJob(sessionId);
-      },
     },
     log,
   });
@@ -417,8 +414,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     async execute(command: Command): Promise<CommandResult> {
       if (closing !== undefined) return failure(command.requestId, 'runtime_unavailable', 'The application is closing');
       try {
-        // T032: ending a run and retrying a cleanup are the workflow engine's; a merged task's sessions are read only.
-        return await executeCommand(service, workflow, command);
+        return await service.execute(command);
       } catch (error) {
         log(`[backend] ${command.type} failed (${describe(error)})`);
         const storage = error instanceof Error && (error.name === 'StoredDataError' || error.name === 'InvalidRecordError');

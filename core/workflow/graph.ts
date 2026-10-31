@@ -110,6 +110,9 @@ export const briefing = (instance: WorkflowInstance, node: AgentNode, taskId: Ta
     lines.push(
       '',
       'You split the work into tasks with the `create_tasks` tool of the `gui` MCP server: the ruleId of your rule with target {"kind":"tasks"}, and per task a key, a title and the keys of the tasks it depends on. The tool says whether the user confirms the list first. Then hand each task its work with `handoff`, naming its taskId; you may do that at once, also for a task whose dependencies are not merged yet.',
+      ...(template.isolation === 'worktree'
+        ? ['There is no task until you create them: in this run every task gets its own worktree, so first call `create_tasks`, then hand off each task with its taskId. A handoff without a taskId is refused until then.']
+        : []),
       `The GUI does the waiting: it starts at most ${String(instance.taskLimit)} tasks at a time, starts a task only once the tasks it depends on are merged, gives each task its own worktree and setup, and merges a finished task into the target branch only after its tests pass there.`,
     );
     if (instance.tasks.length > 0) lines.push(`Tasks of this run: ${instance.tasks.map((t) => `\`${t.id}\` "${t.title}" (${t.status})`).join('; ')}.`);

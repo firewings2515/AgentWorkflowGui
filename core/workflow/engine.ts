@@ -198,6 +198,8 @@ export class WorkflowEngine implements WorkflowHooks {
         ? undefined
         : new TaskPipeline({
             ...options.pipeline,
+            // A session's runtime ends gracefully before its folder goes (R-14, SP-07 G1).
+            closeRuntime: (sessionId) => options.pipeline?.closeRuntime?.(sessionId) ?? options.sessions.closeWorkflowRuntime(sessionId),
             sessions: options.sessions,
             publish: (event) => options.publish(event),
             now: () => options.now(),
@@ -705,7 +707,7 @@ export class WorkflowEngine implements WorkflowHooks {
     if (own !== undefined && input.taskId !== undefined && input.taskId !== own) return rejected('invalid-input', 'a node hands off its own task only');
     // Root names the task when the run has several (T032); with one, that one.
     const taskId = own ?? input.taskId ?? (instance.tasks.length === 1 ? instance.tasks[0]?.id : undefined);
-    if (taskId === undefined && instance.tasks.length === 0) return rejected('unknown-target', 'this run has no task yet: create the tasks with create_tasks first');
+    if (taskId === undefined && instance.tasks.length === 0) return rejected('invalid-input', 'this run has no task yet: create the tasks with create_tasks first, then hand each one off naming its taskId');
     if (taskId === undefined) return rejected('invalid-input', 'this run has several tasks: name the task (taskId) this handoff is for');
     if (!instance.tasks.some((t) => t.id === taskId)) return rejected('unknown-target', 'no such task');
     // The edge first (R-04 step 2), so a target the graph does not connect is named as such (V-23).

@@ -31,7 +31,6 @@ import { FakeAdapter } from '../../sessions/testing/fake-adapter';
 import { MemoryRepositories } from '../../sessions/testing/memory-repositories';
 import { FakeCommands, FakeFiles } from '../../pipeline/testing/fakes';
 import { MemoryGit } from '../../pipeline/testing/memory-git';
-import { executeCommand } from '../commands';
 import { WorkflowEngine } from '../engine';
 
 export const CWD = 'E:\\work\\project';
@@ -352,7 +351,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
       files: real?.files ?? world.files,
       closeRuntime: (sessionId) => {
         world.closed.push(sessionId);
-        return Promise.resolve();
+        return world.service.closeWorkflowRuntime(sessionId);
       },
     },
     log: (m) => world.logs.push(m),
@@ -373,7 +372,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     world.emitTurn(sessionId, id, 'completed');
     await settle();
   };
-  world.run = (command) => executeCommand(world.service, world.engine, command);
+  world.run = (command) => world.service.execute(command);
   world.restart = async () => {
     const next = build(repositories, store, world, real);
     await next.service.start();

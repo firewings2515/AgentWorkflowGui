@@ -112,6 +112,8 @@ const IN_PROGRESS: readonly WorkflowTask['status'][] = ['running', 'blocked', 'a
 const MAX_RESTARTS = 5;
 const TAIL = 4000;
 const RESOLVER_PREFIX = 'wf-resolve-';
+/** Why a merge failed when nothing can test it (G-3: never merged untested, never a made-up test result). */
+const NO_TEST = 'no test command is set for this project or workflow, and the target branch moves only after the tests pass in the integration worktree';
 
 export const isResolverSession = (sessionId: SessionId): boolean => sessionId.startsWith(RESOLVER_PREFIX);
 
@@ -848,7 +850,7 @@ export class TaskPipeline {
   private async test(instance: WorkflowInstance, m: MergeAttempt): Promise<void> {
     const commands = await this.commandsOf(instance);
     const integ = await this.integRef(instance, m);
-    if (commands.test === undefined) return this.failAttempt(instance.id, m, 'no test command is set for this project or workflow; the target branch moves only after tests pass', 'testing');
+    if (commands.test === undefined) return this.failAttempt(instance.id, m, NO_TEST, 'testing');
     if (integ === undefined) return this.failAttempt(instance.id, m, 'the integration worktree is gone', 'testing');
     const outcome = await this.runCommand({ command: commands.test, shell: commands.shell, cwd: integ.path, key: `test:${key(instance.id, m.taskId)}:${String(m.attempt)}`, purpose: 'test' }, `test:${key(instance.id, m.taskId)}`);
     const passed = outcome.exitCode === 0;
@@ -1048,7 +1050,7 @@ export class TaskPipeline {
       fromSessionId: instance.rootSessionId,
       kind: 'merge-failed',
       title: 'A task could not be merged',
-      detail: `task "${task?.title ?? m.taskId}", attempt ${String(m.attempt)}: ${detail}. The target branch did not move. Approve to queue the merge again; decline to give the task up.`,
+      detail: `task "${task?.title ?? m.taskId}", attempt ${String(m.attempt)}: ${detail}. The target branch did not move. ${detail === NO_TEST ? 'Add a test command to the project settings (or the workflow\'s setup override), then approve: the merge is queued again from the task as it is, nothing of it is redone. Decline gives the task up.' : 'Approve to queue the merge again; decline to give the task up.'}`,
       ref: { kind: 'merge', taskId: m.taskId, attempt: m.attempt },
       state: 'open',
       createdAt: this.deps.now(),

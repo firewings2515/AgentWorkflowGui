@@ -172,7 +172,13 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       });
       expect(await w.engine.createTasks({ ruleId: 'to-impl', tasks: [item('a', 'A')] }, { caller: ROOT, sourceCallRef: 'c-rule' })).toMatchObject({ status: 'rejected', rejection: { reason: 'no-matching-rule' } });
       // Root names the task once the run has tasks; before, it is told to create them.
-      expect(await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL } })).toMatchObject({ status: 'rejected', rejection: { reason: 'unknown-target' } });
+      const none = await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL } });
+      expect(none).toMatchObject({ status: 'rejected', rejection: { reason: 'invalid-input' } });
+      expect(none.status === 'rejected' && none.rejection.detail).toContain('create_tasks first');
+      // Root is told the order in its briefing.
+      const root = await w.repositories.sessions.get(ROOT);
+      const told = root?.kind === 'workflow' ? await w.engine.briefing(root) : undefined;
+      expect(told).toContain('There is no task until you create them');
     });
 
     it('V-19: B does not wait for A; C starts only after A is merged, from the target branch with A in it', async () => {
@@ -415,9 +421,17 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect(main(w)).toBe(before);
       const [question] = await openEscalations(w, 'merge-failed');
       expect(question?.ref).toEqual({ kind: 'merge', taskId: t.a, attempt: 0 });
+      expect(question?.detail).toContain('Add a test command to the project settings');
+      // No test result is made up: the attempt failed without one.
+      expect((await attemptsOf(w, t.a!))[0]).toMatchObject({ state: 'failed' });
+      expect((await attemptsOf(w, t.a!))[0]?.test).toBeUndefined();
       await w.repositories.projects.save({ ...project(), revision: 0 }, 0);
+      const implementing = await delivered(w, t.a!);
       await respond(w, question!.id, 'approve');
       await until(async () => (await statusOf(w, t.a!)) === 'merged', 'merged');
+      // Merged from the task as it was: nothing went back to its node.
+      expect(await delivered(w, t.a!)).toBe(implementing);
+      expect(w.git.fileAt(main(w), 'a.txt')).toBe('a\n');
     });
 
     it('a worktree held by a process is left pending cleanup; task.retryCleanup finishes it', async () => {

@@ -95,6 +95,16 @@ export interface WorkflowHooks {
    * to anything else. Every other user message is `deliver`.
    */
   userMessageFate(record: StoredDelivery): Promise<'deliver' | 'wait' | 'cancel'>;
+  /**
+   * Ending a run and retrying a cleanup (T032, C-22); undefined when the engine does not take them (they are then
+   * `unsupported`, as without hooks).
+   */
+  execute?(command: CommandOf<'workflow.complete' | 'workflow.cancel' | 'task.retryCleanup'>): Promise<CommandResult> | undefined;
+  /**
+   * Why the user may not send to this session now (R-06: a merged task's session once its worktree is removed,
+   * or a session whose folder is gone), or undefined when it may.
+   */
+  sessionAccess?(sessionId: SessionId): Promise<string | undefined>;
 }
 
 export type TransferCommand = CommandOf<'transfer.prepare' | 'transfer.confirm' | 'transfer.cancel'>;
@@ -697,11 +707,11 @@ export class SessionService {
         this.options.publish({ type: 'project.updated', project: saved.record });
         return ok(command.requestId, { revision: saved.record.revision });
       }
-      // Ending a run and the task pipeline come with T032 (contracts 0.6).
+      // Ending a run and the task pipeline (T032): the workflow engine's, when attached.
       case 'workflow.complete':
       case 'workflow.cancel':
       case 'task.retryCleanup':
-        return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
+        return this.workflow?.execute?.(command) ?? fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
     }
   }
 
@@ -755,6 +765,11 @@ export class SessionService {
     if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
     if (session.revision !== expectedRevision) return fail(requestId, 'stale_revision', 'The session has changed since it was loaded', { retryable: true });
     if (attachments.length > 0) return fail(requestId, 'unsupported', 'Attachments are not available yet');
+    // A workflow session the engine keeps read only (T032, R-06): said plainly, never resumed in a folder that is gone.
+    if (session.kind === 'workflow') {
+      const refused = await this.workflow?.sessionAccess?.(sessionId);
+      if (refused !== undefined) return fail(requestId, 'invalid_transition', refused);
+    }
     return this.sendUserMessage(requestId, session, messageId, text);
   }
 
@@ -1437,6 +1452,22 @@ export class SessionService {
   }
 
   // ---- transfers (T023) -----------------------------------------------------------------------------
+
+  /**
+   * Ends a workflow session's runtime before the pipeline removes its folder (T032, SP-07 G1): the adapter's own
+   * graceful close (R-14), bounded by `timeoutMs`, then its Job, token and watchers go as on any close. Only
+   * workflow sessions; anything else is left alone. In the session's queue, after what it was doing.
+   */
+  closeWorkflowRuntime(sessionId: SessionId, timeoutMs = 5000): Promise<void> {
+    return this.serial(sessionKey(sessionId), async () => {
+      const session = await this.repos.sessions.get(sessionId);
+      if (session?.kind !== 'workflow') return;
+      const ref = await this.binding(sessionId);
+      if (ref === undefined || !this.runtimes.isOpen(ref)) return;
+      await this.within(this.runtimes.closeSession(ref, timeoutMs), timeoutMs);
+      if (!this.closed) await this.setActivity(sessionId, 'closed');
+    });
+  }
 
   /** Whether the session's own turn runs, by the stored turns (an old event cannot undo them): its turn boundary. */
   async mainTurnRunning(sessionId: SessionId): Promise<boolean> {
