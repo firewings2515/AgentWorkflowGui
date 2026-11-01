@@ -10,6 +10,7 @@ import {
   PermissionRequest,
   SessionItem,
   Turn,
+  type HistoryPage,
   type SessionId,
 } from '../../contracts';
 import type { Conversation, ConversationRepository } from '../../core/ports';
@@ -58,6 +59,11 @@ export class SqliteConversationRepository implements ConversationRepository {
 
   upsertTurn(turn: Turn): Promise<void> {
     return run(() => this.upsert(KINDS.turn, turn));
+  }
+
+  /** Paging (C-26) comes with T038; until then the Snapshot holds whole histories and no cursor is handed out. */
+  page(): Promise<HistoryPage | 'invalid-cursor'> {
+    return Promise.resolve('invalid-cursor');
   }
 
   appendMessage(message: Message): Promise<void> {

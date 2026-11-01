@@ -24,7 +24,7 @@ describe('window chrome (R-15)', () => {
 
   it('follows only a saved-preferences event', () => {
     const at = '2026-10-31T10:00:00+08:00';
-    const saved: EventEnvelope = { schemaVersion: CONTRACTS_VERSION, seq: 1, event: { type: 'preferences.updated', preferences: { theme: 'light' }, at } };
+    const saved: EventEnvelope = { schemaVersion: CONTRACTS_VERSION, seq: 1, event: { type: 'preferences.updated', preferences: { theme: 'light', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } }, at } };
     const other: EventEnvelope = { schemaVersion: CONTRACTS_VERSION, seq: 2, event: { type: 'snapshot.invalidated', reason: 'recovered', at } };
     expect(themeOf(saved)).toBe('light');
     expect(themeOf(other)).toBeUndefined();

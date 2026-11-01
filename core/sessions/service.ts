@@ -844,6 +844,10 @@ export class SessionService {
       case 'workflow.cancel':
       case 'task.retryCleanup':
         return this.workflow?.execute?.(command) ?? fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
+      // Backups (C-28): the main process's storage, wired in T040.
+      case 'backup.restore':
+      case 'backup.cancelRestore':
+        return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
     }
   }
 

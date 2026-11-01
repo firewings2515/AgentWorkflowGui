@@ -4,6 +4,7 @@
 // workflow instance with handoffs, its task lists and merge queue (merged, conflict, testing, a worktree left
 // to clean up), a same-folder run whose join node waits for the second of two read-only reviewers (CR-4), a
 // project, a file lock with a waiter (R-07), cross-session messages (one with unknown delivery), and escalations.
+// 0.7: the planning session's history continues before what is shown (C-26), and the last daily backup (C-28).
 import type { z } from 'zod';
 import { CONTRACTS_VERSION } from '../common';
 import type { DeliveryRecord } from '../delivery';
@@ -306,7 +307,9 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
     { path: 'e:/work/demo/refs/summary.md', holderSessionId: 's-research', holderTurnId: 'turn-r1', acquiredAt: t('10:20'),
       waiters: [{ sessionId: 's-plan-notes', via: 'wait_for_file', since: t('10:25'), deadline: t('10:35') }] },
   ],
-  preferences: { theme: 'dark' },
+  preferences: { theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } },
+  historyPages: [{ sessionId: 's-plan-notes', olderCursor: 'cursor-plan-notes-1' }],
+  storage: { lastBackupAt: t('09:00') },
 };
 
 /** Parsed fixture (branded IDs applied). Throws at import time if the fixture drifts from the contracts. */

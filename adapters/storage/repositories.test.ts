@@ -378,10 +378,10 @@ describe('escalations', () => {
 
 describe('preferences', () => {
   it('defaults to the dark theme until something is saved', async () => {
-    expect(await repos.preferences.get()).toEqual({ theme: 'dark' });
-    expect(await repos.preferences.set({ theme: 'light' })).toEqual({ theme: 'light' });
-    expect(await repos.preferences.get()).toEqual({ theme: 'light' });
-    await repos.preferences.set({ theme: 'dark' });
+    expect(await repos.preferences.get()).toEqual({ theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } });
+    expect(await repos.preferences.set({ theme: 'light', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } })).toEqual({ theme: 'light', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } });
+    expect(await repos.preferences.get()).toEqual({ theme: 'light', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } });
+    await repos.preferences.set({ theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } });
     expect(db.prepare('SELECT count(*) AS n FROM preference').get()).toEqual({ n: 1 });
   });
 
@@ -463,7 +463,7 @@ describe('snapshot data and reopening', () => {
     for (const w of fx.workflows) await repos.workflows.save(w, null);
     await seedConversations();
     for (const e of fx.escalations) await repos.escalations.upsert(e);
-    await repos.preferences.set({ theme: 'light' });
+    await repos.preferences.set({ theme: 'light', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } });
   };
 
   it('reads everything the Snapshot takes from these repositories in one go', async () => {
@@ -479,7 +479,7 @@ describe('snapshot data and reopening', () => {
     expect(byId(data.conversations.permissionRequests)).toEqual(byId(fx.permissionRequests));
     expect(byId(data.conversations.artifacts)).toEqual(byId(fx.artifacts));
     expect(byId(data.escalations)).toEqual(byId(fx.escalations));
-    expect(data.preferences).toEqual({ theme: 'light' });
+    expect(data.preferences).toEqual({ theme: 'light', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } });
   });
 
   it('returns defaults and empty lists from an empty database', async () => {
@@ -489,12 +489,13 @@ describe('snapshot data and reopening', () => {
       sessions: [],
       conversations: { turns: [], messages: [], items: [], nativeTasks: [], permissionRequests: [], artifacts: [] },
       escalations: [],
-      preferences: { theme: 'dark' },
+      preferences: { theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } },
       instances: [],
       handoffs: [],
       peerMessages: [],
       transfers: [],
       projects: [],
+      historyPages: [],
     });
   });
 

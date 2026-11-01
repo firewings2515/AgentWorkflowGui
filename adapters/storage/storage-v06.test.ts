@@ -45,10 +45,10 @@ describe('v6: data stored under contracts 0.5', () => {
     const db = openDatabase(path);
     try {
       const data = await createRepositories(db).readSnapshotData();
-      expect(data.agents.map((a) => a.schemaVersion)).toEqual(['0.6.0']);
-      expect(data.workflows.map((w) => w.schemaVersion)).toEqual(['0.6.0']);
+      expect(data.agents.map((a) => a.schemaVersion)).toEqual(['0.7.0']);
+      expect(data.workflows.map((w) => w.schemaVersion)).toEqual(['0.7.0']);
       expect(data.instances).toHaveLength(1);
-      expect(data.instances[0]).toMatchObject({ template: { schemaVersion: '0.6.0' }, rounds: [], mergeQueue: [], taskPlans: [], taskLimit: 3 });
+      expect(data.instances[0]).toMatchObject({ template: { schemaVersion: '0.7.0' }, rounds: [], mergeQueue: [], taskPlans: [], taskLimit: 3 });
       expect(data.projects).toEqual([]);
     } finally {
       db.close();
@@ -56,7 +56,7 @@ describe('v6: data stored under contracts 0.5', () => {
   });
 
   it('saves projects with compare-and-set, kept across a reopen', async () => {
-    const project = { ...fixtureSnapshotInput.projects![0]!, schemaVersion: '0.6.0' as const };
+    const project = { ...fixtureSnapshotInput.projects![0]!, schemaVersion: '0.7.0' as const };
     let db = openDatabase(path);
     try {
       const repos = createRepositories(db);

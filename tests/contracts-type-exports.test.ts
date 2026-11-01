@@ -34,8 +34,8 @@ describe('contracts type exports', () => {
   for (const file of files) {
     it(`${file} exports a type for every schema`, () => {
       const { values, types } = exportedNames(file);
-      // Schemas are the exported values except plain constants (CONTRACTS_VERSION) and helpers (lowercase).
-      const schemas = values.filter((name) => /^[A-Z]/.test(name) && name !== 'CONTRACTS_VERSION');
+      // Schemas are the exported values except plain constants (UPPER_CASE, e.g. CONTRACTS_VERSION) and helpers (lowercase).
+      const schemas = values.filter((name) => /^[A-Z]/.test(name) && !/^[A-Z0-9_]+$/.test(name));
       expect(schemas.filter((name) => !types.has(name))).toEqual([]);
     });
   }

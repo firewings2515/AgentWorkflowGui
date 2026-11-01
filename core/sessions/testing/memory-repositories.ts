@@ -64,7 +64,7 @@ export class MemoryRepositories implements AppRepositories {
   readonly sessionRecords = new Map<SessionId, LogicalSession>();
   readonly conversationRecords = new Map<SessionId, Conversation>();
   readonly escalationRecords = new Map<string, Escalation>();
-  preferencesRecord: UiPreferences = { theme: 'dark' };
+  preferencesRecord: UiPreferences = { theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } };
   readonly processRecords: OwnedProcess[] = [];
   readonly instanceRecords = new Map<string, WorkflowInstance>();
   readonly nodeSessions = new Map<string, SessionId>();
@@ -122,6 +122,8 @@ export class MemoryRepositories implements AppRepositories {
     upsertPermissionRequest: (request: Conversation['permissionRequests'][number]) => this.upsert('permissionRequests', request),
     upsertArtifact: (artifact: Conversation['artifacts'][number]) => this.upsert('artifacts', artifact),
     get: (sessionId: SessionId) => Promise.resolve(copy(this.conversationRecords.get(sessionId) ?? emptyConversation())),
+    // Paging (C-26): these repositories always return whole histories, so they never hand out a cursor.
+    page: () => Promise.resolve('invalid-cursor' as const),
   };
 
   readonly escalations = {
@@ -225,6 +227,7 @@ export class MemoryRepositories implements AppRepositories {
       peerMessages: this.peerMessageRecords.map(copy),
       transfers: await this.transfers.list(),
       projects: await this.projects.list(),
+      historyPages: [],
     };
   }
 }

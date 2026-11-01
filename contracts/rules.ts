@@ -98,6 +98,15 @@ const ruleMessages = {
   'escalation.round-ref': 'a blocked-round escalation points at its round',
   'escalation.lock-ref': 'a lock escalation points at its lock',
   'escalation.task-plan-confirmation': 'a task list is decided by a confirmation',
+  // ipc.ts (0.7)
+  'activity.cause-only-closed': 'a close cause is given only with activity closed',
+  'batch.seq-increasing': 'envelopes of a batch are in increasing seq order',
+  'batch.seq-range': 'a batch covers fromSeq to toSeq and ends with toSeq',
+  'batch.one-version': 'envelopes of a batch carry its schema version',
+  'snapshot.history-page-unique': 'one history page entry per session',
+  'history.one-session': 'every record of a history page belongs to its session',
+  // storage.ts
+  'storage.restore-pending-or-failed': 'a pending restore and a failed restore are not shown together',
   // mcp.ts
   'mcp.create-tasks-ids-unique': 'task keys must be unique',
   'mcp.create-tasks-dependency': 'a task depends on itself or on a key not in the list',

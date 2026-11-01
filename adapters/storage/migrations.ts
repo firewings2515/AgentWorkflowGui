@@ -297,6 +297,19 @@ const storage06V7 = `
 CREATE INDEX delivery_by_target ON delivery (${TARGET_SESSION_V7}, accepted_ms);
 `;
 
+/**
+ * v8: records written under contracts 0.6 read under 0.7 (T037). Agents, workflow templates, projects and the
+ * template pinned in each instance carry the contracts version; everything new in 0.7 is optional or has a
+ * default (preferences without `supervisor` read with its defaults). Paging indexes, backups and the
+ * `system-notice` delivery kind come with T038.
+ */
+const contracts07V8 = `
+UPDATE agent SET body = json_set(body, '$.schemaVersion', '0.7.0') WHERE json_extract(body, '$.schemaVersion') = '0.6.0';
+UPDATE workflow SET body = json_set(body, '$.schemaVersion', '0.7.0') WHERE json_extract(body, '$.schemaVersion') = '0.6.0';
+UPDATE project SET body = json_set(body, '$.schemaVersion', '0.7.0') WHERE json_extract(body, '$.schemaVersion') = '0.6.0';
+UPDATE workflow_instance SET body = json_set(body, '$.template.schemaVersion', '0.7.0') WHERE json_extract(body, '$.template.schemaVersion') = '0.6.0';
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
@@ -305,6 +318,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 5, name: 'storage-0.5-review', sql: storageReviewV5 },
   { version: 6, name: 'contracts-0.6', sql: contracts06V6 },
   { version: 7, name: 'storage-0.6', sql: storage06V7 },
+  { version: 8, name: 'contracts-0.7', sql: contracts07V8 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;

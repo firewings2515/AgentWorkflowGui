@@ -218,8 +218,9 @@ describe('other session commands', () => {
 
   it('saves preferences and pushes them; workflow and transfer commands are not available yet', async () => {
     const w = await world();
-    expect((await w.run({ type: 'preferences.set', requestId: rid(), preferences: { theme: 'light' } })).ok).toBe(true);
-    expect(w.events).toContainEqual(expect.objectContaining({ type: 'preferences.updated', preferences: { theme: 'light' } }));
+    const light = { theme: 'light', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } } as const;
+    expect((await w.run({ type: 'preferences.set', requestId: rid(), preferences: light })).ok).toBe(true);
+    expect(w.events).toContainEqual(expect.objectContaining({ type: 'preferences.updated', preferences: light }));
     expect(failed(await w.run({ type: 'transfer.cancel', requestId: rid(), transferId: 't' as never }))).toBe('unsupported');
   });
 });

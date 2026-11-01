@@ -263,7 +263,7 @@ describe('the assembled backend', () => {
     expect(damagedSnapshot.app).toMatchObject({ status: 'damaged', reason: expect.stringMatching(/^StoredDataError: agent/) as unknown });
     expect(damagedSnapshot.sessions).toEqual([]);
     expect(JSON.stringify(damagedSnapshot)).not.toContain('DATA_MARKER');
-    expect(await result.facade.execute({ type: 'preferences.set', requestId: rid(), preferences: { theme: 'light' } })).toMatchObject({ ok: false, code: 'storage_failed' });
+    expect(await result.facade.execute({ type: 'preferences.set', requestId: rid(), preferences: { theme: 'light', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } } })).toMatchObject({ ok: false, code: 'storage_failed' });
     expect(logs.join('\n')).not.toContain('DATA_MARKER');
     expect(result.reason).not.toContain('DATA_MARKER');
   });
