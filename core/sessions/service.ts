@@ -844,9 +844,10 @@ export class SessionService {
       case 'workflow.cancel':
       case 'task.retryCleanup':
         return this.workflow?.execute?.(command) ?? fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
-      // Backups (C-28): the main process's storage, wired in T040.
+      // Backups (C-28, wired in T040) and runtime detection (C-33, wired in T045) belong to the main process.
       case 'backup.restore':
       case 'backup.cancelRestore':
+      case 'runtime.detect':
         return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
     }
   }

@@ -94,6 +94,7 @@ export function applyEnvelope(state: RendererState, envelope: EventEnvelope): Re
     // The subscription reloads the authoritative Snapshot before applying this sequence.
     case 'snapshot.invalidated': break;
     case 'storage.updated': snapshot.storage = event.storage; break;
+    case 'runtime.status': snapshot.runtimes = [...snapshot.runtimes.filter(status => status.runtime !== event.status.runtime), event.status]; break;
     case 'app.readOnly': snapshot.app = { status: 'read-only', reason: event.reason, location: event.location }; break;
     case 'model.observed': snapshot.sessions = snapshot.sessions.map(session => session.id === event.sessionId ? { ...session, observedModel: event.observed } : session); break;
     case 'runtime.exited': next.runtimeExits = { ...state.runtimeExits, [event.runtime]: event }; break;

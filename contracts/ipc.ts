@@ -29,6 +29,7 @@ import { PermissionRequest, SessionItem } from './items';
 import { FileLock } from './locks';
 import { ProjectSettings } from './project';
 import { addRuleIssue, ruleIssue } from './rules';
+import { RuntimeStatus } from './runtimes';
 import { BackupInfo, ReadOnlyReason, StorageInfo } from './storage';
 import { Artifact, Attachment, LogicalSession, Message, NativeTask, PeerMessage, SessionActivity, TokenUsage, Turn } from './session';
 import { TransferProposal, UiPreferences } from './transfer';
@@ -96,6 +97,11 @@ export const Command = z.discriminatedUnion('type', [
   cmd('backup.restore', { backupId: BackupId }),
   /** Withdraws the pending restore before the next start. */
   cmd('backup.cancelRestore', {}),
+  /**
+   * Looks for the runtime again (C-33), or for both when `runtime` is absent: after the user installed, updated or
+   * signed in. The result comes as `runtime.status`; nothing is installed or signed in by the GUI.
+   */
+  cmd('runtime.detect', { runtime: Runtime.optional() }),
 ]);
 export type Command = z.infer<typeof Command>;
 
@@ -203,6 +209,8 @@ export const AppEvent = z.discriminatedUnion('type', [
    * was not pushed: read the Snapshot again. `reason` is a fixed code, never data.
    */
   z.strictObject({ type: z.literal('snapshot.invalidated'), reason: z.enum(['event-write-failed', 'recovered', 'event-overflow']), at: Timestamp }),
+  /** A runtime was looked for again (C-33): its whole status. */
+  z.strictObject({ type: z.literal('runtime.status'), status: RuntimeStatus }),
   /** Backups or a restore changed (C-28): the whole StorageInfo, so a missed event leaves nothing stale. */
   z.strictObject({ type: z.literal('storage.updated'), storage: StorageInfo, at: Timestamp }),
   /** The data became read-only while the app ran (C-29), e.g. the disk filled up; it never turns ready again before a restart. */
@@ -318,9 +326,13 @@ export const Snapshot = z.strictObject({
   preferences: UiPreferences,
   historyPages: z.array(HistoryPageInfo).default([]),
   storage: StorageInfo.default({}),
+  /** What was found of each runtime (C-33); empty before the first detection. */
+  runtimes: z.array(RuntimeStatus).default([]),
 }).superRefine((s, ctx) => {
   const ids = s.historyPages.map((p) => p.sessionId);
   if (new Set(ids).size !== ids.length) addRuleIssue(ctx, 'snapshot.history-page-unique');
+  const runtimes = s.runtimes.map((r) => r.runtime);
+  if (new Set(runtimes).size !== runtimes.length) addRuleIssue(ctx, 'snapshot.runtime-unique');
 });
 export type Snapshot = z.infer<typeof Snapshot>;
 
