@@ -3,7 +3,7 @@
 import { z } from 'zod';
 
 /** Bump on any breaking change; contract changes go through the main session. */
-export const CONTRACTS_VERSION = '0.6.0';
+export const CONTRACTS_VERSION = '0.7.0';
 
 /**
  * Carried by every serialized boundary (Snapshot, event envelope, saved definitions) so stored data
@@ -33,6 +33,13 @@ export const ProjectId = id<'ProjectId'>();
 export const NativeTaskId = id<'NativeTaskId'>();
 export const PermissionRequestId = id<'PermissionRequestId'>();
 export const ArtifactId = id<'ArtifactId'>();
+/** A verified backup of the app's database (C-28); chosen by the main process, never a path. */
+export const BackupId = id<'BackupId'>();
+/**
+ * Opaque position in a session's history (C-26): handed out by the main process with a page and passed back
+ * unchanged to read the page before it. It means nothing outside the session it was given for.
+ */
+export const HistoryCursor = id<'HistoryCursor'>();
 export const RequestId = id<'RequestId'>();
 /** Logical operation fixed when a handoff / message / transfer is accepted; reused by every retry (CR-2). */
 export const OperationId = id<'OperationId'>();
@@ -62,6 +69,8 @@ export type ProjectId = z.infer<typeof ProjectId>;
 export type NativeTaskId = z.infer<typeof NativeTaskId>;
 export type PermissionRequestId = z.infer<typeof PermissionRequestId>;
 export type ArtifactId = z.infer<typeof ArtifactId>;
+export type BackupId = z.infer<typeof BackupId>;
+export type HistoryCursor = z.infer<typeof HistoryCursor>;
 export type RequestId = z.infer<typeof RequestId>;
 export type OperationId = z.infer<typeof OperationId>;
 export type AttemptId = z.infer<typeof AttemptId>;

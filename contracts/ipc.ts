@@ -6,7 +6,9 @@ import { z } from 'zod';
 import { AgentDefinition, ModelOption, ModelSelection, ObservedModel } from './agent';
 import {
   AgentId,
+  BackupId,
   EscalationId,
+  HistoryCursor,
   InstanceId,
   ItemId,
   MessageId,
@@ -26,7 +28,8 @@ import {
 import { PermissionRequest, SessionItem } from './items';
 import { FileLock } from './locks';
 import { ProjectSettings } from './project';
-import { ruleIssue } from './rules';
+import { addRuleIssue, ruleIssue } from './rules';
+import { BackupInfo, ReadOnlyReason, StorageInfo } from './storage';
 import { Artifact, Attachment, LogicalSession, Message, NativeTask, PeerMessage, SessionActivity, TokenUsage, Turn } from './session';
 import { TransferProposal, UiPreferences } from './transfer';
 import { Escalation, Handoff, WorkflowInstance, WorkflowTemplate } from './workflow';
@@ -85,6 +88,14 @@ export const Command = z.discriminatedUnion('type', [
   cmd('transfer.confirm', { transferId: TransferId, expectedRevision: Revision }),
   cmd('transfer.cancel', { transferId: TransferId }),
   cmd('preferences.set', { preferences: UiPreferences }),
+  /**
+   * Restores a listed backup at the next start (C-28): only an ID from `backup.list`, never a path. The data in
+   * use is backed up first (`pre-restore`); a backup that fails its checks then is not applied (StorageInfo).
+   * Accepted in `read-only` too, so a full disk or a failed migration can be recovered from.
+   */
+  cmd('backup.restore', { backupId: BackupId }),
+  /** Withdraws the pending restore before the next start. */
+  cmd('backup.cancelRestore', {}),
 ]);
 export type Command = z.infer<typeof Command>;
 
@@ -97,6 +108,7 @@ export const ErrorCode = z.enum([
   'invalid_transition',
   'unknown_outcome',
   'storage_failed',
+  'storage_read_only', // the data can be read but not written now (AppStatus `read-only`, C-29)
   'not_found',
   'already_exists', // a create command reused an existing ID
   'invalid_request',
@@ -133,7 +145,19 @@ export const LimitWindow = z.strictObject({ percentUsed: z.number().min(0).max(1
 /** Push events. Each carries the target ID it belongs to; views filter by it (HC-05). */
 export const AppEvent = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('session.updated'), session: LogicalSession }),
-  z.strictObject({ type: z.literal('session.activity'), sessionId: SessionId, activity: SessionActivity, at: Timestamp }),
+  /**
+   * `cause` tells why a runtime was closed (C-30, T036 G-3): `idle` after the idle time, `process-limit` to stay
+   * within `maxOpenRuntimes`. Only with `closed`; absent for other closes (exit, crash handling).
+   */
+  z
+    .strictObject({
+      type: z.literal('session.activity'),
+      sessionId: SessionId,
+      activity: SessionActivity,
+      cause: z.enum(['idle', 'process-limit']).optional(),
+      at: Timestamp,
+    })
+    .refine((e) => e.cause === undefined || e.activity === 'closed', ruleIssue('activity.cause-only-closed')),
   z.strictObject({ type: z.literal('turn.updated'), turn: Turn }),
   z.strictObject({
     type: z.literal('message.delta'),
@@ -178,7 +202,11 @@ export const AppEvent = z.discriminatedUnion('type', [
    * What the renderer holds may differ from what is stored (C-05), e.g. an event could not be written and
    * was not pushed: read the Snapshot again. `reason` is a fixed code, never data.
    */
-  z.strictObject({ type: z.literal('snapshot.invalidated'), reason: z.enum(['event-write-failed', 'recovered']), at: Timestamp }),
+  z.strictObject({ type: z.literal('snapshot.invalidated'), reason: z.enum(['event-write-failed', 'recovered', 'event-overflow']), at: Timestamp }),
+  /** Backups or a restore changed (C-28): the whole StorageInfo, so a missed event leaves nothing stale. */
+  z.strictObject({ type: z.literal('storage.updated'), storage: StorageInfo, at: Timestamp }),
+  /** The data became read-only while the app ran (C-29), e.g. the disk filled up; it never turns ready again before a restart. */
+  z.strictObject({ type: z.literal('app.readOnly'), reason: ReadOnlyReason, location: z.string().min(1), at: Timestamp }),
   /** A new model observation for a session, including reroutes (R-12); Codex reports only "configured". */
   z.strictObject({ type: z.literal('model.observed'), sessionId: SessionId, observed: ObservedModel, at: Timestamp }),
   /**
@@ -203,6 +231,35 @@ export const EventEnvelope = z.strictObject({ schemaVersion: SchemaVersion, seq:
 export type EventEnvelope = z.infer<typeof EventEnvelope>;
 
 /**
+ * The only events a batch may merge (C-27): a delta is folded into a later delta of the same message (or item
+ * output), taking that later envelope's seq, when no other event about the same session lies between them.
+ * Every other event, above all permission requests, turn ends, escalations, handoffs and transfers, is
+ * delivered unmerged, in seq order, and never dropped.
+ */
+export const MERGEABLE_EVENT_TYPES = ['message.delta', 'item.outputDelta'] as const satisfies readonly AppEvent['type'][];
+
+/**
+ * What the main process sends to a window (C-27): the envelopes of seqs `fromSeq`..`toSeq`, in order. A seq in
+ * that range with no envelope was a delta merged into a later one. Batches follow each other without gaps: a
+ * renderer whose last applied seq is not `fromSeq - 1` missed a batch and reads the Snapshot again. When a
+ * window falls too far behind, the main process stops batching for it and sends `snapshot.invalidated`
+ * (`event-overflow`) instead of dropping anything.
+ */
+export const EventBatch = z
+  .strictObject({
+    schemaVersion: SchemaVersion,
+    fromSeq: z.number().int().positive(),
+    toSeq: z.number().int().positive(),
+    envelopes: z.array(EventEnvelope).min(1),
+  })
+  .superRefine((b, ctx) => {
+    const seqs = b.envelopes.map((e) => e.seq);
+    if (seqs.some((s, i) => i > 0 && s <= (seqs[i - 1] ?? 0))) addRuleIssue(ctx, 'batch.seq-increasing');
+    if (b.fromSeq > b.toSeq || (seqs[0] ?? 0) < b.fromSeq || seqs.at(-1) !== b.toSeq) addRuleIssue(ctx, 'batch.seq-range');
+  });
+export type EventBatch = z.infer<typeof EventBatch>;
+
+/**
  * Whether the main process could open its data (C-06). `damaged`: the database or a record failed its
  * checks at start; nothing else runs, the Snapshot's lists are empty and every command fails with
  * `storage_failed`. `reason` is a fixed code (the failing table and rule, never stored content);
@@ -211,10 +268,30 @@ export type EventEnvelope = z.infer<typeof EventEnvelope>;
 export const AppStatus = z.discriminatedUnion('status', [
   z.strictObject({ status: z.literal('ready') }),
   z.strictObject({ status: z.literal('damaged'), reason: z.string().min(1), location: z.string().min(1) }),
+  /**
+   * The data can be read but not written (C-29): the Snapshot is complete, writing commands fail with
+   * `storage_read_only` and nothing is dispatched to a runtime; `backup.restore` is still accepted.
+   */
+  z.strictObject({ status: z.literal('read-only'), reason: ReadOnlyReason, location: z.string().min(1) }),
 ]);
 export type AppStatus = z.infer<typeof AppStatus>;
 
-/** Read-only snapshot the renderer loads on start / reconnect (UI re-mount never resends commands). */
+/**
+ * Where a session's history continues before what the Snapshot holds (C-26). `olderCursor` null: the Snapshot
+ * holds all of it.
+ */
+export const HistoryPageInfo = z.strictObject({ sessionId: SessionId, olderCursor: HistoryCursor.nullable() });
+export type HistoryPageInfo = z.infer<typeof HistoryPageInfo>;
+
+/**
+ * Read-only snapshot the renderer loads on start / reconnect (UI re-mount never resends commands).
+ *
+ * Paging (C-26): for a session listed in `historyPages`, the lists hold only its most recent page of history,
+ * in whole turns (every message, item, native task, permission request and artifact of a turn in the page; a
+ * record without a turn is placed by its time). Whatever is still open is always included, wherever it falls:
+ * running turns, pending permission requests, native tasks not ended. Older pages are read with
+ * `session.history`. A session not listed has all of its history here.
+ */
 export const Snapshot = z.strictObject({
   schemaVersion: SchemaVersion,
   app: AppStatus.default({ status: 'ready' }),
@@ -239,8 +316,58 @@ export const Snapshot = z.strictObject({
   /** Held in memory only (R-07): empty after a restart. */
   locks: z.array(FileLock).default([]),
   preferences: UiPreferences,
+  historyPages: z.array(HistoryPageInfo).default([]),
+  storage: StorageInfo.default({}),
+}).superRefine((s, ctx) => {
+  const ids = s.historyPages.map((p) => p.sessionId);
+  if (new Set(ids).size !== ids.length) addRuleIssue(ctx, 'snapshot.history-page-unique');
 });
 export type Snapshot = z.infer<typeof Snapshot>;
+
+/**
+ * One older page of a session's history (C-26), shaped like the Snapshot's lists and holding whole turns.
+ * `olderCursor` null: nothing older remains.
+ */
+export const HistoryPage = z
+  .strictObject({
+    sessionId: SessionId,
+    turns: z.array(Turn),
+    messages: z.array(Message),
+    items: z.array(SessionItem),
+    nativeTasks: z.array(NativeTask),
+    permissionRequests: z.array(PermissionRequest),
+    artifacts: z.array(Artifact),
+    olderCursor: HistoryCursor.nullable(),
+  })
+  .superRefine((p, ctx) => {
+    const records = [...p.turns, ...p.messages, ...p.items, ...p.nativeTasks, ...p.permissionRequests, ...p.artifacts];
+    if (records.some((r) => r.sessionId !== p.sessionId)) addRuleIssue(ctx, 'history.one-session');
+  });
+export type HistoryPage = z.infer<typeof HistoryPage>;
+
+/**
+ * Read-only queries (C-26, C-28), on their own channel beside commands: they change no data and are answered
+ * in read-only mode too. `session.history` reads the page before `before`, a cursor this session got from the
+ * Snapshot or an earlier page; a cursor of another session is `invalid_request`.
+ */
+export const QueryRequest = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('session.history'), requestId: RequestId, sessionId: SessionId, before: HistoryCursor, limit: z.number().int().min(1).max(500) }),
+  /** Verified backups, newest first. */
+  z.strictObject({ type: z.literal('backup.list'), requestId: RequestId }),
+]);
+export type QueryRequest = z.infer<typeof QueryRequest>;
+
+export const QueryResult = z.union([
+  z.strictObject({ ok: z.literal(true), type: z.literal('session.history'), requestId: RequestId, page: HistoryPage }),
+  z.strictObject({ ok: z.literal(true), type: z.literal('backup.list'), requestId: RequestId, backups: z.array(BackupInfo) }),
+  z.strictObject({
+    ok: z.literal(false),
+    requestId: RequestId.nullable(),
+    code: z.enum(['not_found', 'invalid_request', 'storage_failed', 'internal_error']),
+    message: z.string(),
+  }),
+]);
+export type QueryResult = z.infer<typeof QueryResult>;
 
 /**
  * Folder requests (C-24), on their own channel beside commands: they open native windows and change no

@@ -74,7 +74,19 @@ export type TransferProposal = z.infer<typeof TransferProposal>;
 
 /** Appearance (R-15): dark by default. */
 export const Theme = z.enum(['dark', 'light']);
-export const UiPreferences = z.strictObject({ theme: Theme.default('dark') });
+/**
+ * When the supervisor closes idle runtime processes (C-30, T036 G-1). `idleCloseMinutes`: an idle session's
+ * runtime is closed after this long (it resumes on demand). `maxOpenRuntimes`: past this many open runtimes,
+ * the idle one used longest ago is closed first; busy ones are never closed for it.
+ */
+export const SupervisorSettings = z.strictObject({
+  idleCloseMinutes: z.number().int().min(1).max(1440).default(15),
+  maxOpenRuntimes: z.number().int().min(1).max(32).default(6),
+});
+export type SupervisorSettings = z.infer<typeof SupervisorSettings>;
+
+/** Preferences saved before 0.7 have no `supervisor` and read with its defaults. */
+export const UiPreferences = z.strictObject({ theme: Theme.default('dark'), supervisor: SupervisorSettings.default({ idleCloseMinutes: 15, maxOpenRuntimes: 6 }) });
 export type UiPreferences = z.infer<typeof UiPreferences>;
 
 // Inferred types for schemas that are not typed next to their definition.

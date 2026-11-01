@@ -5,7 +5,6 @@ import type { z } from 'zod';
 import {
   AppEvent,
   Command,
-  CONTRACTS_VERSION,
   CreateTasksToolInput,
   CreateTasksToolResult,
   Escalation,
@@ -50,8 +49,7 @@ const docs = pick(fixtureSnapshotInput.instances, 1);
 const template = pick(fixtureSnapshotInput.workflows, 0);
 
 describe('contracts 0.6', () => {
-  it('C-25: is version 0.6.0, and the fixture shows tasks, rounds, the merge queue, a project and a lock', () => {
-    expect(CONTRACTS_VERSION).toBe('0.6.0');
+  it('C-25: the fixture shows tasks, rounds, the merge queue, a project and a lock', () => {
     const [inst, pair] = fixtureSnapshot.instances;
     expect(inst?.tasks.map((t) => t.status)).toEqual(['running', 'running', 'pending', 'merged', 'blocked', 'merging']);
     expect(inst?.mergeQueue.map((m) => m.state)).toEqual(['merged', 'conflict', 'testing']);

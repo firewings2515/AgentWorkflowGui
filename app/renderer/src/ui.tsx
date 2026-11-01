@@ -19,7 +19,7 @@ const labels = {
   draft: '準備中', 'awaiting-confirmation': '等待確認', stale: '已過期', approved: '已核准',
   'awaiting-merge': '等待合併', merging: '合併中', proposed: '等待套用', applied: '已套用',
   held: '暫緩處理', answered: '已回覆', withdrawn: '已撤回', open: '待處理', resolved: '已解決',
-  ready: '就緒', damaged: '資料損壞', accepted: '已接納', duplicate: '重複請求', escalated: '已提請處理',
+  ready: '就緒', damaged: '資料損壞', 'read-only': '唯讀', accepted: '已接納', duplicate: '重複請求', escalated: '已提請處理',
   created: '已建立', reported: '已回報', free: '已釋放', 'not-locked': '未鎖定', timeout: '已逾時',
 } satisfies Record<ContractStatus | 'not-sent', string>;
 export function statusLabel(value: string): string {

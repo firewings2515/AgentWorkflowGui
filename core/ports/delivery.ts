@@ -29,8 +29,11 @@ import type { DispatchEntry, SessionSettings } from './runtime';
 /**
  * What is being delivered. `provision` creates a target session; it is its own operation with its own
  * three-state record, and payload deliveries to that target wait until it is sent (CR2_DELIVERY_FIX §3).
+ * `system-notice` (C-31, T032 G-11 B): the GUI itself tells a session something it must know to go on, e.g.
+ * root that the user approved its task list and which task IDs were created. It is never the user's words and
+ * never a peer's: its origin is `system`, and it is delivered and reconciled like any payload.
  */
-export type DeliveryKind = 'handoff' | 'peer-message' | 'transfer' | 'user-message' | 'provision';
+export type DeliveryKind = 'handoff' | 'peer-message' | 'transfer' | 'user-message' | 'system-notice' | 'provision';
 export type PayloadKind = Exclude<DeliveryKind, 'provision'>;
 
 /** Everything a restarted GUI needs to dispatch or reconcile a payload without other state. */
@@ -46,7 +49,8 @@ export interface PayloadContext {
   session: SessionSettings & { mcp?: never };
   /**
    * Who the payload comes from (C-01), so a restarted GUI dispatches a pending peer or handoff payload with
-   * its original origin (R-03: never as the user). Absent means the user; only `user-message` may omit it.
+   * its original origin (R-03: never as the user). Absent means the user; only `user-message` may omit it, and
+   * a `system-notice` carries `{ kind: 'system' }`.
    */
   origin?: MessageOrigin;
 }

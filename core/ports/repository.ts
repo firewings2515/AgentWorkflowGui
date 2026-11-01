@@ -8,6 +8,9 @@ import type {
   Escalation,
   EscalationId,
   Handoff,
+  HistoryCursor,
+  HistoryPage,
+  HistoryPageInfo,
   HandoffId,
   InstanceId,
   LogicalSession,
@@ -90,6 +93,12 @@ export interface ConversationRepository {
   upsertPermissionRequest(request: PermissionRequest): Promise<void>;
   upsertArtifact(artifact: Artifact): Promise<void>;
   get(sessionId: SessionId): Promise<Conversation>;
+  /**
+   * The page of the session's history before `before` (C-26): whole turns, at most `limitTurns` of them, with
+   * their records; a record without a turn goes by its time. Indexed by session, never a scan of every record.
+   * `invalid-cursor` for a cursor this store did not hand out for this session.
+   */
+  page(sessionId: SessionId, before: HistoryCursor, limitTurns: number): Promise<HistoryPage | 'invalid-cursor'>;
 }
 
 export interface EscalationRepository {
@@ -175,7 +184,9 @@ export interface TransferRepository {
 
 /**
  * Everything the Snapshot holds that lives in these repositories, read in one transaction so it is
- * consistent.
+ * consistent. With `recentTurns`, `conversations` holds of each session only its last `recentTurns` turns and
+ * their records, plus whatever is still open (running turns, pending permission requests, native tasks not
+ * ended), and `historyPages` says where each shortened history continues (C-26); without it, everything.
  */
 export interface SnapshotData {
   agents: AgentDefinition[];
@@ -189,6 +200,11 @@ export interface SnapshotData {
   peerMessages: PeerMessage[];
   transfers: TransferProposal[];
   projects: ProjectSettings[];
+  historyPages: HistoryPageInfo[];
+}
+
+export interface SnapshotOptions {
+  recentTurns?: number;
 }
 
 export interface AppRepositories {
@@ -204,5 +220,5 @@ export interface AppRepositories {
   peerMessages: PeerMessageRepository;
   transfers: TransferRepository;
   projects: ProjectRepository;
-  readSnapshotData(): Promise<SnapshotData>;
+  readSnapshotData(options?: SnapshotOptions): Promise<SnapshotData>;
 }

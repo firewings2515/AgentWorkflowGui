@@ -21,6 +21,7 @@ export const McpRejection = z.strictObject({
     'resend-mismatch', // a resend of a known call or operation changed its content or target (C-07)
     'busy', // the GUI is at a capacity limit; the agent may call again later (C-07)
     'unsupported', // the tool is not available in this version (e.g. `create_tasks` before task pipelining)
+    'folder-missing', // the target session's folder is gone (its task was merged and cleaned up); never resumed elsewhere (C-30)
   ]),
   detail: z.string(),
 });

@@ -9,6 +9,7 @@ const explanations: Record<ErrorCode, string> = {
   invalid_transition: '目前狀態不允許此操作。',
   unknown_outcome: '結果未知，請先核對目前狀態，勿重複送出。',
   storage_failed: '儲存失敗，草稿仍保留。',
+  storage_read_only: '資料目前是唯讀，無法寫入；草稿仍保留。',
   not_found: '找不到指定目標，請重新讀取資料。',
   already_exists: '目標 ID 已存在，請重新讀取並核對。',
   invalid_request: '操作內容不符合契約，請檢查輸入。',

@@ -138,7 +138,9 @@ export const damagedFacade = (reason: string, location: string): AppFacade => ({
     transfers: [],
     projects: [],
     locks: [],
-    preferences: { theme: 'dark' },
+    preferences: { theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } },
+    historyPages: [],
+    storage: {},
   }),
   execute: (command: Command) => failure(command.requestId, 'storage_failed', STORAGE_DAMAGED),
 });
@@ -442,6 +444,9 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         // File locks (R-07) live in memory only: the lock table's list now.
         locks: service.locks?.list() ?? [],
         preferences: data.preferences,
+        // Paging and backups (C-26, C-28) are wired in T040: every session's whole history for now.
+        historyPages: [],
+        storage: {},
       };
     },
     async execute(command: Command): Promise<CommandResult> {

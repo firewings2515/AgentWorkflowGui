@@ -4,10 +4,11 @@
 // workflow instance with handoffs, its task lists and merge queue (merged, conflict, testing, a worktree left
 // to clean up), a same-folder run whose join node waits for the second of two read-only reviewers (CR-4), a
 // project, a file lock with a waiter (R-07), cross-session messages (one with unknown delivery), and escalations.
+// 0.7: the planning session's history continues before what is shown (C-26), and the last daily backup (C-28).
 import type { z } from 'zod';
 import { CONTRACTS_VERSION } from '../common';
 import type { DeliveryRecord } from '../delivery';
-import { Snapshot } from '../ipc';
+import { QueryResult, Snapshot } from '../ipc';
 import type { WorkflowTemplate } from '../workflow';
 
 const v = CONTRACTS_VERSION;
@@ -306,8 +307,32 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
     { path: 'e:/work/demo/refs/summary.md', holderSessionId: 's-research', holderTurnId: 'turn-r1', acquiredAt: t('10:20'),
       waiters: [{ sessionId: 's-plan-notes', via: 'wait_for_file', since: t('10:25'), deadline: t('10:35') }] },
   ],
-  preferences: { theme: 'dark' },
+  preferences: { theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } },
+  historyPages: [{ sessionId: 's-plan-notes', olderCursor: 'cursor-plan-notes-1' }],
+  storage: { lastBackupAt: t('09:00') },
 };
 
 /** Parsed fixture (branded IDs applied). Throws at import time if the fixture drifts from the contracts. */
 export const fixtureSnapshot = Snapshot.parse(fixtureSnapshotInput);
+
+/**
+ * The same data opened read-only after the disk filled up (C-29), with a restore the user asked for waiting for
+ * the next start (C-28), so the read-only banner and the restore notice can be built before the backend.
+ */
+export const fixtureReadOnlySnapshot = Snapshot.parse({
+  ...fixtureSnapshotInput,
+  app: { status: 'read-only', reason: 'disk-full', location: 'C:/Users/demo/AppData/Roaming/AgentWorkflowGui/awg.db' },
+  storage: { lastBackupAt: t('09:00'), pendingRestore: { backupId: 'bk-1023-daily', requestedAt: t('11:40') } },
+});
+
+/** What `backup.list` answers (C-28), newest first: the day's backup, one before a migration, an older daily one. */
+export const fixtureBackupList = QueryResult.parse({
+  ok: true,
+  type: 'backup.list',
+  requestId: 'q-backups',
+  backups: [
+    { id: 'bk-1024-daily', createdAt: t('09:00'), reason: 'daily', storageVersion: 8, sizeBytes: 2_621_440 },
+    { id: 'bk-1023-migration', createdAt: '2026-10-23T21:14:00+08:00', reason: 'pre-migration', storageVersion: 7, sizeBytes: 2_490_368 },
+    { id: 'bk-1023-daily', createdAt: '2026-10-23T08:58:00+08:00', reason: 'daily', storageVersion: 7, sizeBytes: 2_488_320 },
+  ],
+});

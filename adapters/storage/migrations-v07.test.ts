@@ -5,7 +5,7 @@ import { fixtureSnapshot as fx } from '../../contracts/fixtures/snapshot';
 import { StoredDataError } from './codec';
 import { DELIVERY_BY_TARGET_SQL } from './delivery-target-query';
 import { SqliteDeliveryStore } from './delivery-store';
-import { MIGRATIONS, migrate } from './migrations';
+import { MIGRATIONS, latestVersion, migrate } from './migrations';
 import { createRepositories } from './repositories';
 import { at, claimInput, op, payloadInput, provisionInput } from './testing/fixtures';
 
@@ -64,12 +64,12 @@ describe('v5 → v6 → v7 compatibility', () => {
             })),
           };
           write.run(id, instance.revision, expected.length, JSON.stringify(instance));
-          expected.push(WorkflowInstance.parse({ ...instance, template: { ...template, schemaVersion: '0.6.0' } }));
+          expected.push(WorkflowInstance.parse({ ...instance, template: { ...template, schemaVersion: '0.7.0' } }));
         }
       }
     }
-    expect(migrate(db)).toBe(7);
-    expect(migrate(db)).toBe(7);
+    expect(migrate(db)).toBe(latestVersion());
+    expect(migrate(db)).toBe(latestVersion());
     const repos = createRepositories(db);
     expect(expected).toHaveLength(64);
     expect(await repos.instances.list()).toEqual(expected);
@@ -118,7 +118,7 @@ describe('v5 → v6 → v7 compatibility', () => {
       proposals.push(proposal);
     }
     const before = { deliveries: db.prepare('SELECT * FROM delivery').all(), attempts: db.prepare('SELECT * FROM dispatch_attempt').all(), proposals: db.prepare('SELECT * FROM transfer_proposal').all() };
-    expect(migrate(db)).toBe(7);
+    expect(migrate(db)).toBe(latestVersion());
     expect(db.prepare('SELECT * FROM delivery').all()).toEqual(before.deliveries);
     expect(db.prepare('SELECT * FROM dispatch_attempt').all()).toEqual(before.attempts);
     expect(db.prepare('SELECT * FROM transfer_proposal').all()).toEqual(before.proposals);
@@ -141,7 +141,7 @@ describe('v5 → v6 → v7 compatibility', () => {
     const store = new SqliteDeliveryStore(db);
     await store.accept(payloadInput());
     db.prepare('UPDATE delivery SET target = ?').run(target);
-    expect(migrate(db)).toBe(7);
+    expect(migrate(db)).toBe(latestVersion());
     await expect(store.listByTarget(SessionId.parse('anyone'))).rejects.toBeInstanceOf(StoredDataError);
     await expect(createRepositories(db).readSnapshotData()).rejects.toBeInstanceOf(StoredDataError);
   });
@@ -163,8 +163,8 @@ describe('v7 migration rollback', () => {
     expect(db.prepare('SELECT * FROM delivery').all()).toEqual(before.delivery);
     expect(db.prepare('SELECT * FROM schema_migration').all()).toEqual(before.versions);
     db.exec('DROP TRIGGER fail_v7');
-    expect(migrate(db)).toBe(7);
-    expect((await createRepositories(db).agents.get(agent.id))?.schemaVersion).toBe('0.6.0');
+    expect(migrate(db)).toBe(latestVersion());
+    expect((await createRepositories(db).agents.get(agent.id))?.schemaVersion).toBe('0.7.0');
   });
 
   it('fails closed on damaged v5 JSON during v6, leaving v7 unapplied and original bytes intact', () => {

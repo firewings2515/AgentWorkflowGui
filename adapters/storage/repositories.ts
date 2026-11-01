@@ -63,6 +63,7 @@ export const createRepositories = (db: DatabaseSync, options: RepositoryOptions 
             handoffs: handoffs.loadAll(records),
             peerMessages: peerMessages.loadAll(records),
             transfers: transfers.loadAll(),
+            historyPages: [],
           };
         }),
       ),
