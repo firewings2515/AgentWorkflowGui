@@ -1,24 +1,29 @@
+import { readOnlyProps } from './read-only';
 import { useEffect, useRef, useState } from 'react';
 import type { AppInfo } from '../../preload/bridge-types';
 import { Menu } from './ui';
 import type { MenuAction } from './ui';
 import type { Theme } from './theme';
 
-type ActionId = 'create' | 'workflow' | 'tab' | 'quit' | 'workbench' | 'editor' | 'agents' | 'dark' | 'light' | 'reload' | 'about';
+type ActionId = 'create' | 'workflow' | 'tab' | 'quit' | 'workbench' | 'editor' | 'agents' | 'dark' | 'light' | 'reload' | 'about' | 'backups' | 'settings';
 const ctrlActions: Partial<Record<string, ActionId>> = { KeyT: 'tab', Digit1: 'workbench', Digit2: 'editor', Digit3: 'agents' };
 const keyCodes: Record<string, string> = { n: 'KeyN', t: 'KeyT', '1': 'Digit1', '2': 'Digit2', '3': 'Digit3', f5: 'F5' };
 
-export function AppMenu({ theme, commandDisabled, themeDisabled, tabDisabled, reloadDisabled, onCreate, onWorkflow, onTab, onNavigate, onTheme, onReload }: {
+export function AppMenu({ readOnly = false, theme, commandDisabled, themeDisabled, tabDisabled, reloadDisabled, onCreate, onWorkflow, onTab, onNavigate, onTheme, onReload, onBackups, onSettings }: {
+  readOnly?: boolean;
   theme: Theme;
   commandDisabled: boolean; themeDisabled: boolean; tabDisabled: boolean; reloadDisabled: boolean;
   onCreate: () => void; onWorkflow: () => void; onTab: () => void; onNavigate: (page: 'workbench' | 'workflow' | 'agents') => void;
   onTheme: (theme: Theme) => void; onReload: () => void;
+  onBackups?: () => void; onSettings?: () => void;
 }) {
   const [about, setAbout] = useState(false);
   const actions: (MenuAction & { id: ActionId })[] = [
-    { id: 'create', group: '檔案', label: '新增 session', hint: 'Ctrl+N', disabled: commandDisabled, onSelect: onCreate },
-    { id: 'workflow', group: '檔案', label: '啟動 Workflow', hint: 'Ctrl+Shift+N', disabled: commandDisabled, onSelect: onWorkflow },
+    { id: 'create', group: '檔案', label: '新增 session', hint: 'Ctrl+N', disabled: commandDisabled, ...readOnlyProps(readOnly), onSelect: onCreate },
+    { id: 'workflow', group: '檔案', label: '啟動 Workflow', hint: 'Ctrl+Shift+N', disabled: commandDisabled, ...readOnlyProps(readOnly), onSelect: onWorkflow },
     { id: 'tab', group: '檔案', label: '新增工作區 tab', hint: 'Ctrl+T', disabled: tabDisabled, onSelect: onTab },
+    { id: 'backups', group: '檔案', label: '備份與還原', disabled: !onBackups, onSelect: () => onBackups?.() },
+    { id: 'settings', group: '檔案', label: '設定', disabled: !onSettings, onSelect: () => onSettings?.() },
     { id: 'quit', group: '檔案', label: '結束', onSelect: () => window.close() },
     { id: 'workbench', group: '檢視', label: '工作台', hint: 'Ctrl+1', onSelect: () => onNavigate('workbench') },
     { id: 'editor', group: '檢視', label: 'Workflow 編輯器', hint: 'Ctrl+2', onSelect: () => onNavigate('workflow') },

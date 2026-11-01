@@ -1,3 +1,4 @@
+import { readOnlyProps } from './read-only';
 import { useState } from 'react';
 import { Command, RequestId } from '../../../contracts';
 import type { Escalation, EscalationKind, PermissionRequest, SessionId, Snapshot } from '../../../contracts';
@@ -64,7 +65,7 @@ function EscalationCard({ escalation, permission, snapshot, store, ipcState }: {
     : plan.state === 'created' ? '此 task 清單已建立 task，不再等待確認，無法再次回覆。'
     : plan.escalationId !== escalation.id ? '此 task 清單的確認項目已變更，與目前項目不符，無法回覆。請重新讀取資料。'
     : undefined;
-  const disabled = !store || ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || permissionUnavailable
+  const disabled = !store || ipcState?.connection !== 'ready' || snapshot.app.status !== 'ready' || permissionUnavailable
     || !!planUnavailable || store.isBlocked(type, target) || accepted;
   const respond = (decision: 'approve' | 'decline') => {
     if (disabled) return;
@@ -103,16 +104,16 @@ function EscalationCard({ escalation, permission, snapshot, store, ipcState }: {
     <form onSubmit={event => event.preventDefault()} onKeyDown={event => {
       if (event.key === 'Enter' && (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement)) event.preventDefault();
     }}>
-      <fieldset disabled={disabled}>
+      <fieldset {...readOnlyProps(snapshot.app.status === 'read-only')} disabled={disabled}>
         <legend className="sr-only">回覆 {escalation.title}</legend>
         {delivery ? <>
           <p className="command-warning">尚無可靠的送達結果。取消後也不代表已執行的工作能撤回。</p>
           <label className="check-label"><input type="checkbox" checked={risk} onChange={event => setRisk(event.target.checked)} />我了解重試可能重複送達</label>
-          <div className="escalation-actions"><button type="button" onClick={() => resolve('wait')}>繼續等待</button><button type="button" onClick={() => resolve('cancel')}>取消送達</button><button type="button" disabled={!risk} onClick={() => resolve('retry')}>重試送達</button></div>
+          <div className="escalation-actions"><button {...readOnlyProps(snapshot.app.status === 'read-only')} type="button" onClick={() => resolve('wait')}>繼續等待</button><button {...readOnlyProps(snapshot.app.status === 'read-only')} type="button" onClick={() => resolve('cancel')}>取消送達</button><button {...readOnlyProps(snapshot.app.status === 'read-only')} type="button" disabled={!risk} onClick={() => resolve('retry')}>重試送達</button></div>
         </> : <>
           {permission?.elicitation?.mode === 'form' && <ElicitationFields elicitation={permission.elicitation} value={content} onChange={setContent} />}
           <label>回覆說明（選填）<textarea rows={2} value={note} onChange={event => setNote(event.target.value)} /></label>
-          <div className="escalation-actions"><button type="button" className="primary" onClick={event => { if (event.currentTarget.form?.reportValidity()) respond('approve'); }}>核准</button><button type="button" onClick={() => respond('decline')}>拒絕</button></div>
+          <div className="escalation-actions"><button {...readOnlyProps(snapshot.app.status === 'read-only')} type="button" className="primary" onClick={event => { if (event.currentTarget.form?.reportValidity()) respond('approve'); }}>核准</button><button {...readOnlyProps(snapshot.app.status === 'read-only')} type="button" onClick={() => respond('decline')}>拒絕</button></div>
         </>}
       </fieldset>
     </form>

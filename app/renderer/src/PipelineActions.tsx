@@ -1,3 +1,4 @@
+import { readOnlyProps } from './read-only';
 import { useState } from 'react';
 import { RequestId } from '../../../contracts';
 import type { WorkflowInstance, WorkflowTask } from '../../../contracts';
@@ -13,10 +14,10 @@ export function PipelineActions({ instance, task, store, ipcState }: PipelineCon
   const target = task ? `task:${JSON.stringify([instance.id, task.id])}` : `instance:${instance.id}`;
   const activities = Object.values(ipcState?.commands ?? {}).filter(a => types.some(type => type === a.command.type) && commandTarget(a.command) === target);
   const last = activities.at(-1);
-  const blocked = !store || ipcState?.connection !== 'ready' || ipcState.snapshot?.app.status === 'damaged'
+  const blocked = !store || ipcState?.connection !== 'ready' || ipcState.snapshot?.app.status !== 'ready'
     || types.some(type => store.isBlocked(type, target)) || activities.some(a => a.result?.ok || (a.result && blocksResubmit(a.result)));
   return <div className="pipeline-actions">
-    {types.map(type => <button key={type} disabled={blocked} onClick={() => {
+    {types.map(type => <button key={type} {...readOnlyProps(ipcState?.snapshot?.app.status === 'read-only')} disabled={blocked} onClick={() => {
       if (blocked) return;
       if (type === 'task.retryCleanup' && task) void store.send({ type, requestId: RequestId.parse(crypto.randomUUID()), instanceId: instance.id, taskId: task.id });
       else if (type !== 'task.retryCleanup') setPending({ type, instanceId: instance.id, revision: instance.revision });
@@ -26,7 +27,7 @@ export function PipelineActions({ instance, task, store, ipcState }: PipelineCon
         ? `確定結束「${instance.title}」為已完成？未完成的 task 將視為已完成，不再合併。`
         : `確定取消「${instance.title}」？取消執行群組後無法復原，此操作不可逆。`}</p>
       <button type="button" onClick={() => setPending(undefined)}>返回，不送出</button>
-      <button type="button" disabled={blocked} onClick={() => {
+      <button type="button" {...readOnlyProps(ipcState?.snapshot?.app.status === 'read-only')} disabled={blocked} onClick={() => {
         if (blocked) return;
         setPending(undefined);
         void store.send({ type: confirmation.type, requestId: RequestId.parse(crypto.randomUUID()), instanceId: instance.id, expectedRevision: instance.revision });

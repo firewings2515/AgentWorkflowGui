@@ -1,3 +1,4 @@
+import { readOnlyProps } from './read-only';
 import { useState } from 'react';
 import { InstanceId, RequestId, SessionId } from '../../../contracts';
 import type { CommandResult, Snapshot, WorkflowTemplate } from '../../../contracts';
@@ -23,7 +24,7 @@ export function WorkflowStart({ snapshot, store, ipcState, onOpen }: {
   const stale = !!template && !snapshot.workflows.some(item => item.id === template.id && item.revision === template.revision);
   const crossTool = new Set(template?.nodes.flatMap(node => node.kind === 'agent' ? [node.model.runtime] : [])).size > 1;
   const blocked = Object.values(ipcState?.blockedCommands ?? {}).some(item => item.command.type === 'workflow.start');
-  const disabled = !store || ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || pending || blocked || !!result?.ok || confirmed;
+  const disabled = !store || ipcState?.connection !== 'ready' || snapshot.app.status !== 'ready' || pending || blocked || !!result?.ok || confirmed;
   const select = (next: WorkflowTemplate | undefined) => { setTemplate(next); setConsent(false); setReceipt(undefined); };
   return <section className="workflow-start" aria-label="啟動 Workflow">
     <p>從已儲存的範本開始。啟動時會固定範本版本與此執行群組的跨工具同意範圍。</p>
@@ -40,7 +41,7 @@ export function WorkflowStart({ snapshot, store, ipcState, onOpen }: {
         workflowId: template.id, workflowRevision: template.revision, title, cwd, firstMessage, crossToolConsent: consent,
       }).then(result => { setReceipt({ result, requestId, instanceId, rootSessionId }); setPending(false); });
     }}>
-      <fieldset disabled={disabled}>
+      <fieldset {...readOnlyProps(snapshot.app.status === 'read-only')} disabled={disabled}>
         <legend>啟動設定</legend>
         <label>Workflow 範本<select value={template?.id ?? ''} onChange={event => select(snapshot.workflows.find(item => item.id === event.target.value))}>
           {!template && <option value="">選擇範本</option>}
@@ -61,7 +62,7 @@ export function WorkflowStart({ snapshot, store, ipcState, onOpen }: {
         <label>第一則訊息<textarea required rows={4} value={firstMessage} onChange={event => setFirstMessage(event.target.value)} /></label>
         {crossTool && <label className="check-label"><input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />我同意此版本、此執行群組內的跨工具交接（handoff、send_message、report_to_root）。</label>}
         <p className="muted">手動更換工具或傳給群組外的 session，仍需另行確認。</p>
-        <button className="primary" type="submit" disabled={!template || stale || !title.trim() || !cwd.trim() || !firstMessage.trim() || (crossTool && !consent)}>啟動 Workflow</button>
+        <button {...readOnlyProps(snapshot.app.status === 'read-only')} className="primary" type="submit" disabled={!template || stale || !title.trim() || !cwd.trim() || !firstMessage.trim() || (crossTool && !consent)}>啟動 Workflow</button>
       </fieldset>
     </form>
     {pending && <p role="status">正在啟動…</p>}

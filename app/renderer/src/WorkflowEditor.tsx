@@ -1,3 +1,4 @@
+import { readOnlyProps } from './read-only';
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { NodeId } from '../../../contracts';
 import type { AgentDefinition, ModelOption, WorkflowNode, WorkflowTemplate } from '../../../contracts';
@@ -59,8 +60,8 @@ function DeleteGraphDialog({ workflow, selection, onCancel, onConfirm }: {
   </dialog>;
 }
 
-export function WorkflowEditor({ repository, demo, agents, models, selectedId, visible, onSelect }: {
-  repository: WorkflowRepository; demo?: WorkflowDemoControls | undefined; agents: readonly AgentDefinition[]; models: readonly ModelOption[];
+export function WorkflowEditor({ repository, demo, agents, models, selectedId, visible, onSelect, readOnly = false }: {
+  readOnly?: boolean; repository: WorkflowRepository; demo?: WorkflowDemoControls | undefined; agents: readonly AgentDefinition[]; models: readonly ModelOption[];
   selectedId: string; visible: boolean; onSelect: (id: string) => void;
 }) {
   const workflows = useSyncExternalStore(repository.subscribe, repository.getSnapshot);
@@ -139,6 +140,7 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
     requestFocus(issue.path || 'nodes');
   };
   const save = async (externalUpdate = false) => {
+    if (readOnly) return;
     if (!draft || !workflow || pending || draft.blocked || repository.isBlocked?.(selectedId) || stale || locks.current.has(selectedId)) return;
     if (!externalUpdate) {
       if (unapplied.length) {
@@ -198,10 +200,11 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
   };
 
   return <section ref={shell} className="workflow-editor" hidden={!visible} aria-label="Workflow 編輯內容">
+    {readOnly && <p className="storage-banner">唯讀模式：可查看或編輯草稿，無法儲存 Workflow。</p>}
     <header className="workflow-toolbar"><div><span className="eyebrow">設定 / Workflow</span><h2 ref={heading} tabIndex={-1}>{workflow?.name || (workflow ? '未命名 Workflow' : '找不到指定的 Workflow 範本')}</h2>
       <p className="muted">{workflow ? `revision ${draft?.expectedRevision} · ${draft?.dirty ? '有未儲存草稿' : '已載入範本'}` : workflows.length ? `範本 ID：${selectedId}` : '尚無 Workflow 範本'}</p></div>
       <div className="workflow-actions"><label>範本<select aria-label="Workflow 範本" value={saved?.id ?? ''} onChange={event => { setDeleteTarget(null); onSelect(event.target.value); }}><option disabled value="">選取範本</option>{workflows.map(item => <option key={item.id} value={item.id}>{item.name}{drafts[item.id]?.dirty ? ' · 草稿' : ''}</option>)}</select></label>
-        {workflow && <button id={workflowFieldId('save')} className="primary" disabled={pending || draft?.blocked || repository.isBlocked?.(selectedId) || stale} onClick={() => { void save(); }}>{pending ? '儲存中…' : '儲存 Workflow'}</button>}
+        {workflow && <button id={workflowFieldId('save')} className="primary" {...readOnlyProps(readOnly)} disabled={readOnly || pending || draft?.blocked || repository.isBlocked?.(selectedId) || stale} onClick={() => { void save(); }}>{pending ? '儲存中…' : '儲存 Workflow'}</button>}
       </div>
     </header>
     {draft && workflow && <>
@@ -276,7 +279,7 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
               <button type="button" disabled={!draft.connectionTarget} onClick={() => { connect(selectedNode.id, draft.connectionTarget); patch(selectedId, { connectionTarget: '' }); document.getElementById('workflow-connect-target')?.focus(); }}>新增連線</button><p className="muted">選好目的地後按「新增連線」。也可在畫布從右側圓點拉線到另一節點左側。</p></div>}
             {selection && <button className="workflow-delete" onClick={() => setDeleteTarget(selection)}>刪除所選{selection.kind === 'node' ? '節點' : '連線'}</button>}
           </fieldset>
-          {demo && <details className="workflow-demo"><summary>示意模式測試</summary><label className="workflow-check"><input type="checkbox" disabled={pending} checked={draft.failNext} onChange={event => { demo.setSaveFailure(selectedId, event.target.checked); patch(selectedId, { failNext: event.target.checked }); }} />下次儲存模擬失敗</label><button disabled={pending || stale} onClick={() => { void save(true); }}>模擬他人已更新此 Workflow</button></details>}
+          {demo && !readOnly && <details className="workflow-demo"><summary>示意模式測試</summary><label className="workflow-check"><input type="checkbox" disabled={pending} checked={draft.failNext} onChange={event => { demo.setSaveFailure(selectedId, event.target.checked); patch(selectedId, { failNext: event.target.checked }); }} />下次儲存模擬失敗</label><button disabled={pending || stale} onClick={() => { void save(true); }}>模擬他人已更新此 Workflow</button></details>}
           <p className="muted workflow-help">Tab 移動焦點；畫布節點可按 Enter 選取、方向鍵移動、Delete 刪除。Model 只作新 session 的初始設定。</p>
         </aside>
       </div>

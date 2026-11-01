@@ -118,11 +118,11 @@ function SingleTaskProgress({ snapshot, instance, task, onOpen, store, ipcState 
       </section>
     </div>
     <section aria-label="交接紀錄"><h3>交接紀錄</h3>
-      {handoffs.length === 0 ? <Empty>尚無交接紀錄。</Empty> : <div className="handoff-table" role="region" aria-label="交接紀錄表格" tabIndex={0}><table><thead><tr><th>接納時間</th><th>來源 → 目標</th><th>規則／返工</th><th>送達狀態</th><th>操作結果</th><th>內容</th></tr></thead><tbody>
+      {handoffs.length === 0 ? <Empty>尚無交接紀錄。</Empty> : <div className="handoff-table" role="region" aria-label="交接紀錄表格" tabIndex={0}><table><thead><tr><th>接納時間</th><th>來源 → 目標</th><th>輪次</th><th>規則／返工</th><th>送達狀態</th><th>操作結果</th><th>內容</th></tr></thead><tbody>
         {handoffs.map(h => {
           const rule = instance.template.nodes.find(n => n.id === h.fromNodeId)?.outputRules.find(r => r.id === h.ruleId);
           return <tr key={h.id}><td><time dateTime={h.acceptedAt}>{timestamp(h.acceptedAt)}</time></td><td>{label(h.fromNodeId)} → {label(h.toNodeId)}</td>
-            <td>{h.ruleId}{rule && <p>{rule.condition}</p>}<p>{h.rework ? '返工交接' : '一般交接'}</p></td>
+            <td>第 {h.round} 輪</td><td>{h.ruleId}{rule && <p>{rule.condition}</p>}<p>{h.rework ? '返工交接' : '一般交接'}</p></td>
             <td><Status value={h.delivery.state} /></td><td>{h.outcome ? <><Status value={h.outcome.kind} /><p>{h.outcome.detail}</p></> : '尚無操作結果'}</td>
             <td><details><summary>查看交接內容</summary><pre>{h.payload}</pre></details></td></tr>;
         })}

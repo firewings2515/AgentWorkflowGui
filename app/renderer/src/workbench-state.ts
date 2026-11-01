@@ -7,11 +7,16 @@ export const detailPanels = [
   { id: 'info', label: 'Session 資訊' },
 ] as const;
 export type DetailTab = (typeof detailPanels)[number]['id'];
+export interface TranscriptPosition {
+  anchor: { id: string; offset: number } | null;
+  following: boolean;
+}
 export interface SessionViewContext {
   draft: string;
   detailTab: DetailTab;
   detailsVisible: boolean;
   scrollTop: number;
+  reading?: TranscriptPosition;
 }
 export interface WorkspaceView {
   id: string;
