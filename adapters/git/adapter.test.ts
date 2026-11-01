@@ -827,7 +827,7 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
       const evil = await evilMerge(repo, task.branch, task.branch);
       await sandbox.git(repo, 'branch', '-f', task.branch, evil);
       const result = await sandbox.adapter.retryCleanup(task, { deleteBranch: true });
-      expect(result).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('moved or copied') as unknown });
+      expect(result).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('lose') as unknown });
       expect((await sandbox.git(repo, 'rev-parse', task.branch)).trim()).toBe(evil);
       // Put back where it was, the merged task's branch goes as before.
       const back = (await sandbox.git(repo, 'rev-parse', `${evil}^2`)).trim();
@@ -846,6 +846,132 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
       expect((await sandbox.adapter.commitAll(integ, 'resolved', [])).status).toBe('committed');
       expect((await sandbox.git(repo, 'config', '--get', `branch.${integ.branch}.awgTip`)).trim()).toBe((await sandbox.git(repo, 'rev-parse', integ.branch)).trim());
       expect(await sandbox.adapter.removeWorktree(integ, { deleteBranch: true })).toEqual({ status: 'removed' });
+    });
+  });
+
+  describe('T043 r2 P1-1: a tip is claimed only by a commit the adapter made', () => {
+    const awgTip = async (repo: string, ref: WorktreeRef) => (await sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgTip`)).trim();
+    const commitTreeOf = async (repo: string, treeOf: string, parents: string[]): Promise<string> =>
+      (await sandbox.git(repo, 'commit-tree', `${treeOf}^{tree}`, ...parents.flatMap((p) => ['-p', p]), '-m', 'made outside')).trim();
+
+    it('a merge that turns out "Already up to date" because someone else merged first does not claim their commit', async () => {
+      const repo = await sandbox.newRepo();
+      const task = await taskWith(repo, 'r2at', 'a.txt', 'a\n');
+      const integ = await integration(repo, 'm-r2a');
+      const before = await awgTip(repo, integ);
+      let evil = '';
+      // After the adapter looked, before git merges: a merge of main and the task, with content of its own.
+      const racing = sandbox.hooked(async (args) => {
+        if (args.includes('merge') && args.includes('--no-ff') && evil === '') {
+          evil = await commitTreeOf(repo, task.branch, ['main', task.branch]);
+          await sandbox.git(repo, 'update-ref', `refs/heads/${integ.branch}`, evil);
+        }
+      });
+      const result = await racing.merge(integ, task.branch, 'merge a');
+      expect(result).toMatchObject({ status: 'merged', commit: evil });
+      expect(await awgTip(repo, integ)).toBe(before); // not claimed
+      expect((await sandbox.adapter.removeWorktree(integ, { deleteBranch: true })).status).toBe('pending-cleanup');
+      expect((await sandbox.git(repo, 'rev-parse', integ.branch)).trim()).toBe(evil);
+    });
+
+    it('commitAll with nothing to commit does not claim a commit someone else made meanwhile', async () => {
+      const repo = await sandbox.newRepo();
+      const task = await taskWith(repo, 'r2bt', 'b.txt', 'b\n');
+      const integ = await integration(repo, 'm-r2b');
+      const before = await awgTip(repo, integ);
+      let evil = '';
+      const racing = sandbox.hooked(async (args) => {
+        // Right before the check for staged changes: the branch is moved to a merge with the very tree the worktree has.
+        if (args[0] === 'diff' && args.includes('--cached') && args.includes('--quiet') && evil === '') {
+          evil = await commitTreeOf(repo, 'main', ['main', task.branch]);
+          await sandbox.git(repo, 'update-ref', `refs/heads/${integ.branch}`, evil);
+        }
+      });
+      expect(await racing.commitAll(integ, 'nothing to do', [])).toEqual({ status: 'nothing', commit: evil });
+      expect(await awgTip(repo, integ)).toBe(before);
+      expect((await sandbox.adapter.removeWorktree(integ, { deleteBranch: true })).status).toBe('pending-cleanup');
+      expect(await sandbox.adapter.resolveBranch(repo, integ.branch)).toBe(evil);
+    });
+
+    it('an integration branch moved before the operation is refused: no merge, no commit', async () => {
+      const repo = await sandbox.newRepo();
+      const task = await taskWith(repo, 'r2ct', 'c.txt', 'c\n');
+      const integ = await integration(repo, 'm-r2c');
+      const evil = await commitTreeOf(repo, 'main', ['main', task.branch]);
+      await sandbox.git(repo, 'update-ref', `refs/heads/${integ.branch}`, evil);
+      const merged = await sandbox.adapter.merge(integ, task.branch, 'merge c');
+      expect(merged).toMatchObject({ status: 'failed', detail: expect.stringContaining('moved outside the pipeline') as unknown });
+      sandbox.write(integ.path, 'x.txt', 'x\n');
+      expect(await sandbox.adapter.commitAll(integ, 'by hand', [])).toMatchObject({ status: 'failed' });
+      expect((await sandbox.git(repo, 'rev-parse', integ.branch)).trim()).toBe(evil);
+    });
+
+    it('a commit made on top of the tip by someone else between the look and the commit is not claimed either', async () => {
+      const repo = await sandbox.newRepo();
+      const integ = await integration(repo, 'm-r2d');
+      const before = await awgTip(repo, integ);
+      sandbox.write(integ.path, 'd.txt', 'd\n');
+      let evil = '';
+      const racing = sandbox.hooked(async (args) => {
+        if (args.includes('commit') && args.includes('--cleanup=whitespace') && evil === '') {
+          // A commit on top of the tip (so the first parent is right), then the adapter's own commit goes on top of that.
+          evil = (await sandbox.git(repo, 'commit-tree', 'main^{tree}', '-p', before, '-m', 'sneaked in')).trim();
+          await sandbox.git(repo, 'update-ref', `refs/heads/${integ.branch}`, evil);
+        }
+      });
+      expect((await racing.commitAll(integ, 'handoff d', [])).status).toBe('committed');
+      expect(await awgTip(repo, integ)).toBe(before); // the new commit's first parent is not the tip the adapter started from
+    });
+
+    it('a commit the adapter makes on the tip is claimed, with its parents and message', async () => {
+      const repo = await sandbox.newRepo();
+      const integ = await integration(repo, 'm-r2e');
+      sandbox.write(integ.path, 'e.txt', 'e\n');
+      const committed = await sandbox.adapter.commitAll(integ, 'handoff e', []);
+      expect(committed.status).toBe('committed');
+      expect(await awgTip(repo, integ)).toBe((await sandbox.git(repo, 'rev-parse', integ.branch)).trim());
+      // A task branch keeps no tip: agents commit there themselves.
+      const task = await taskWith(repo, 'r2et', 'e2.txt', 'e2\n');
+      await expect(sandbox.git(repo, 'config', '--get', `branch.${task.branch}.awgTip`)).rejects.toThrow();
+    });
+  });
+
+  describe('T043 r2 P2: a cleanup that could not finish its last steps is not a finished cleanup', () => {
+    const failing = (match: (args: readonly string[]) => boolean) =>
+      sandbox.hooked(
+        () => Promise.resolve(),
+        (args, result) => (match(args) ? { ...result, code: 128, stderr: 'could not lock config file' } : undefined),
+      );
+
+    it('the branch records cannot be removed: pending, the marker stays, the next cleanup removes both', async () => {
+      const repo = await sandbox.newRepo();
+      const ref = await taskWith(repo, 'p2ea', 'a.txt', 'a\n');
+      await mergeIntoMain(repo, ref);
+      expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).status).toBe('removed');
+      // git's own lock on its config file, as another git process would hold it: the real command fails.
+      const lock = join(repo, '.git', 'config.lock');
+      const locked = sandbox.hooked((args) => {
+        if (args.includes('--remove-section')) writeFileSync(lock, '');
+        return Promise.resolve();
+      });
+      const first = await locked.retryCleanup(ref, { deleteBranch: true });
+      rmSync(lock, { force: true });
+      expect(first).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('could not be removed') as unknown });
+      expect(await sandbox.git(repo, 'rev-parse', '--verify', '-q', `refs/awg/pending-delete/${ref.branch}`)).not.toBe('');
+      expect((await sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgBranch`)).trim()).not.toBe('');
+      expect(await sandbox.adapter.retryCleanup(ref, { deleteBranch: true })).toEqual({ status: 'removed' });
+      await expect(sandbox.git(repo, 'rev-parse', '--verify', '-q', `refs/awg/pending-delete/${ref.branch}`)).rejects.toThrow();
+      await expect(sandbox.git(repo, 'config', '--get-regexp', `branch\\.${ref.branch}\\.`)).rejects.toThrow();
+    });
+
+    it('an old marker that cannot be withdrawn: pending (also with deleteBranch false), the marker stays until it can', async () => {
+      const repo = await sandbox.newRepo();
+      const ref = await taskWith(repo, 'p2eb', 'b.txt', 'b\n');
+      await sandbox.git(repo, 'update-ref', `refs/awg/pending-delete/${ref.branch}`, (await sandbox.git(repo, 'rev-parse', ref.branch)).trim());
+      const refused = await failing((args) => args[0] === 'update-ref' && args[1] === '-d' && args[2]?.startsWith('refs/awg/') === true).removeWorktree(ref, { deleteBranch: false });
+      expect(refused).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('could not be withdrawn') as unknown });
+      expect(await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).toEqual({ status: 'removed' });
+      await expect(sandbox.git(repo, 'rev-parse', '--verify', '-q', `refs/awg/pending-delete/${ref.branch}`)).rejects.toThrow();
     });
   });
 

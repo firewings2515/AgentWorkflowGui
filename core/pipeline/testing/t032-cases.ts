@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CONTRACTS_VERSION,
   type Escalation,
+  MessageId,
   NodeId,
   ProjectId,
   type ProjectSettings,
@@ -1315,6 +1316,43 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       await r.finishTurn(impl);
       await until(async () => (await taskOf(r, t.a!)).worktree?.cleanup === 'removed', 'removed after the turn');
       expect(r.closed).toContain(impl);
+    });
+
+    it('T043 r2 P1-2: a message sent while the cleanup closes the runtimes is dispatched after it, and finds the folder gone; no turn is cut off', async () => {
+      const w = await begin(make);
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      w.git.locked.add((await taskOf(w, t.a!)).worktree!.path.toLowerCase());
+      await finish(w, t.a!, { 'a.txt': 'a\n' });
+      await until(async () => (await taskOf(w, t.a!)).worktree?.cleanup === 'pending-cleanup', 'pending');
+      const impl = await implOf(w, t.a!);
+      const r = await w.restart(); // still held: stays pending
+      expect((await taskOf(r, t.a!)).worktree?.cleanup).toBe('pending-cleanup');
+      r.git.locked.clear();
+      // The user's message arrives between the decision "nobody is at work" and the closing of the runtime.
+      const original = r.service.closeWorkflowRuntime.bind(r.service);
+      let sent: Promise<unknown> | undefined;
+      r.service.closeWorkflowRuntime = async (sessionId, timeoutMs) => {
+        if (sessionId === impl && sent === undefined) {
+          const session = (await r.repositories.sessions.get(impl))!;
+          sent = r.run({ type: 'session.send', requestId: rid(), sessionId: impl, messageId: MessageId.parse('m-t043-late'), expectedRevision: session.revision, text: 'late message', attachments: [] });
+          await settle();
+        }
+        return original(sessionId, timeoutMs);
+      };
+      await r.engine.recover();
+      await until(async () => (await taskOf(r, t.a!)).worktree?.cleanup === 'removed', 'removed');
+      await settle();
+      // Nothing was started in the folder that was being released: the message did not reach a runtime, and no turn
+      // of the session was interrupted.
+      expect([...r.codex.values(), r.claude].flatMap((adapter) => adapter.dispatched.map((d) => d.text))).not.toContain('late message');
+      const turns = (await r.repositories.conversations.get(impl)).turns;
+      expect(turns.some((x) => x.state === 'interrupted' || x.state === 'running')).toBe(false);
+      // The sender gets a plain answer, and so does the next one.
+      expect(await sent).toMatchObject({ ok: false });
+      const session = (await r.repositories.sessions.get(impl))!;
+      expect(await r.run({ type: 'session.send', requestId: rid(), sessionId: impl, messageId: MessageId.parse('m-t043-after'), expectedRevision: session.revision, text: 'after', attachments: [] })).toMatchObject({ ok: false, message: expect.stringContaining('worktree') as unknown });
     });
 
     it('T043: a task still at work keeps its worktree: nothing is removed or retried at startup', async () => {

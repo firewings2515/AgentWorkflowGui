@@ -1219,14 +1219,17 @@ export class TaskPipeline {
     const task = instance?.tasks.find((t) => t.id === m.taskId);
     if (instance === undefined || (task?.worktree?.cleanup !== 'active' && attempt?.integration?.cleanup !== 'active')) return;
     const sessions = await this.sessionsOf(instance, m.taskId);
-    // A session may still be in the turn that handed the task on (the merge can be quicker than its turn): the
-    // cleanup waits for that turn to end (`turnEnded`, or a restart) rather than cut it off (T032 live run 1).
-    for (const sessionId of sessions) if (await this.deps.sessions.mainTurnRunning(sessionId)) return;
-    // The GUI's own processes in the folders end first (SP-07 G1).
-    await this.closeRuntimes(sessions);
-    await this.stopCommands(instanceId, m.taskId);
-    await this.cleanupTask(instanceId, m.taskId, true);
-    await this.cleanupIntegration(instanceId, m, true);
+    // The check and the cleanup are one step in the sessions' queues (T043 r2 P1-2): nothing starts a turn between them.
+    await this.deps.sessions.exclusive(sessions, async () => {
+      // A session may still be in the turn that handed the task on (the merge can be quicker than its turn): the
+      // cleanup waits for that turn to end (`turnEnded`, or a restart) rather than cut it off (T032 live run 1).
+      for (const sessionId of sessions) if (await this.deps.sessions.mainTurnRunning(sessionId)) return;
+      // The GUI's own processes in the folders end first (SP-07 G1).
+      await this.closeRuntimes(sessions);
+      await this.stopCommands(instanceId, m.taskId);
+      await this.cleanupTask(instanceId, m.taskId, true);
+      await this.cleanupIntegration(instanceId, m, true);
+    });
   }
 
   private async cleanupTask(instanceId: InstanceId, taskId: TaskId, deleteBranch: boolean, retry = false): Promise<CleanupResult | undefined> {
@@ -1654,7 +1657,8 @@ export class TaskPipeline {
    * Not at a time when the sessions of the folder are at work (r1 P1-3): recovery has already sent the deliveries it
    * found pending, so a session may be in a turn, or a message may be on its way, when this runs. Such a worktree is
    * left (still pending) and tried again when that session's turn ends (`turnEnded`), at the next start, or by
-   * `task.retryCleanup`. The check is made again right after the runtimes were closed, before git is asked.
+   * `task.retryCleanup`. The decision, the closing of the runtimes and the cleanup are one step in the sessions' queues
+   * (`SessionService.exclusive`).
    * `onlyTask`: just that task's worktrees (a turn of its sessions ended).
    */
   private async retryPending(instanceId: InstanceId, onlyTask?: TaskId): Promise<void> {
@@ -1664,20 +1668,25 @@ export class TaskPipeline {
       for (const task of instance.tasks) {
         if (task.worktree?.cleanup !== 'pending-cleanup' || !isFinal(task) || (onlyTask !== undefined && task.id !== onlyTask)) continue;
         const sessions = await this.sessionsOf(instance, task.id);
-        if (await this.inUse(sessions)) {
-          this.deps.log(`[pipeline] the worktree of task ${task.id} stays pending: a session of it is at work`);
-          continue;
-        }
-        await this.stopCommands(instanceId, task.id);
-        await this.closeRuntimes(sessions);
-        if (await this.inUse(sessions)) continue;
-        await this.cleanupTask(instanceId, task.id, task.status === 'merged', true);
+        // Deciding that no session is at work, closing the runtimes and releasing the folder are one step in the
+        // sessions' queues (r2 P1-2): a message sent meanwhile is dispatched afterwards, and finds the folder gone.
+        await this.deps.sessions.exclusive(sessions, async () => {
+          if (await this.inUse(sessions)) {
+            this.deps.log(`[pipeline] the worktree of task ${task.id} stays pending: a session of it is at work`);
+            return;
+          }
+          await this.stopCommands(instanceId, task.id);
+          await this.closeRuntimes(sessions);
+          await this.cleanupTask(instanceId, task.id, task.status === 'merged', true);
+        });
       }
       for (const m of instance.mergeQueue) {
         if (m.integration?.cleanup !== 'pending-cleanup' || activeMergeStates.includes(m.state) || (onlyTask !== undefined && m.taskId !== onlyTask)) continue;
         // Only the attempt's resolver works in an integration worktree.
-        if (await this.inUse([await resolverSessionIdOf(this.deps.hash, instanceId, m.taskId, m.attempt)])) continue;
-        await this.cleanupIntegration(instanceId, m, true, true);
+        const resolver = await resolverSessionIdOf(this.deps.hash, instanceId, m.taskId, m.attempt);
+        await this.deps.sessions.exclusive([resolver], async () => {
+          if (!(await this.inUse([resolver]))) await this.cleanupIntegration(instanceId, m, true, true);
+        });
       }
     } catch (error) {
       this.deps.log(`[pipeline] retrying the pending cleanups of ${instanceId} failed (${errorText(error)})`);
