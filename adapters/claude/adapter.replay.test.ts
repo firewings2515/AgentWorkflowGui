@@ -15,6 +15,15 @@ describe('process (T013, R-14)', () => {
   });
 });
 
+describe('the user’s own Claude Code (T045)', () => {
+  it('hands the SDK the executable it was given as pathToClaudeCodeExecutable, and none otherwise', async () => {
+    const own = await started({ executable: 'C:/Users/me/.local/bin/claude.exe' });
+    expect(own.sdk.last.options.pathToClaudeCodeExecutable).toBe('C:/Users/me/.local/bin/claude.exe');
+    const builtIn = await started();
+    expect('pathToClaudeCodeExecutable' in builtIn.sdk.last.options).toBe(false);
+  });
+});
+
 describe('streaming turns (SP-01)', () => {
   it('opens a policy-isolated session, streams two turns and closes by interrupting first', async () => {
     const h = await started({ mcpServers: ({ sessionId }) => ({ gui: { type: 'http', url: 'http://127.0.0.1:1/mcp', headers: { Authorization: `Bearer ${sessionId}` } } }) });

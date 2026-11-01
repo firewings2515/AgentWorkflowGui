@@ -104,6 +104,14 @@ const ruleMessages = {
   'batch.seq-range': 'a batch covers fromSeq to toSeq and ends with toSeq',
   'snapshot.history-page-unique': 'one history page entry per session',
   'history.one-session': 'every record of a history page belongs to its session',
+  // runtimes.ts (C-33)
+  'runtime-status.executable': 'an executable is given exactly when the runtime is installed',
+  'runtime-status.source': 'a source is given exactly with an executable',
+  'runtime-status.version': 'a runtime found and checked has its version',
+  'runtime-status.signed-out': 'a signed-out runtime reports signed-out auth',
+  'runtime-status.available-signed-in': 'an available runtime is not signed out',
+  'runtime-status.models-only-available': 'only an available runtime lists models',
+  'snapshot.runtime-unique': 'one status per runtime',
   // storage.ts
   'storage.restore-pending-or-failed': 'a pending restore and a failed restore are not shown together',
   // mcp.ts

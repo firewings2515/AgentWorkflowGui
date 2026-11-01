@@ -26,6 +26,7 @@ import type { RendererStore, RendererState } from './renderer-store';
 import { ConnectionStatus } from './ConnectionStatus';
 import { WorkflowStart } from './WorkflowStart';
 import { SessionCreate } from './SessionCreate';
+import { SettingsPage } from './SettingsPage';
 import type { SessionCreateDraft } from './SessionCreate';
 import { AppMenu } from './AppMenu';
 import './styles.css';
@@ -50,6 +51,7 @@ export const pageRegistry = [
   { id: 'workflow', title: 'Workflow 編輯器', pattern: /^\/workflows\/([^/]+)\/edit$/, navigation: true },
   { id: 'agents', title: 'Agent 管理', pattern: /^\/agents(?:\/([^/]+))?$/, navigation: true },
   { id: 'progress', title: 'Workflow 執行進度', pattern: /^\/workflow-instances\/([^/]+)$/, navigation: false },
+  { id: 'settings', title: '設定', pattern: /^\/settings$/, navigation: true },
 ] as const;
 const currentRoute = () => window.location.hash.slice(1) || '/workbench';
 const focusView = (viewId: string) => requestAnimationFrame(() => document.getElementById(`${viewId}-heading`)?.focus());
@@ -107,7 +109,7 @@ function AppContent({ snapshot, store, serviceStore, ipcState }: { snapshot: Sna
   const workspaceViewIds = workspace.views.map(view => view.id).join(',');
   const activeView = workspace.views.find(view => view.id === workspace.activeViewId);
   const workflowRoute = snapshot.workflows[0] ? `/workflows/${encodeURIComponent(snapshot.workflows[0].id)}/edit` : '/workflows/unavailable/edit';
-  const routes: Record<string, string> = { workbench: '/workbench', workflow: workflowRoute, agents: '/agents' };
+  const routes: Record<string, string> = { workbench: '/workbench', workflow: workflowRoute, agents: '/agents', settings: '/settings' };
 
   useEffect(() => {
     const sync = () => setRoute(currentRoute());
@@ -241,7 +243,8 @@ function AppContent({ snapshot, store, serviceStore, ipcState }: { snapshot: Sna
         </div>
       </div>
       <AgentCatalog readOnly={snapshot.app.status === 'read-only'} repository={agentRepository} demo={agentDemo} selectedId={page?.id === 'agents' ? entityId : ''} visible={page?.id === 'agents'} onSelect={id => navigate(id ? `/agents/${encodeURIComponent(id)}` : '/agents')} />
-      <WorkflowEditor readOnly={snapshot.app.status === 'read-only'} repository={workflowRepository} demo={workflowDemo} agents={agentOptions} models={snapshot.modelOptions} selectedId={page?.id === 'workflow' ? entityId : ''} visible={page?.id === 'workflow'} onSelect={id => navigate(`/workflows/${encodeURIComponent(id)}/edit`)} />
+      <WorkflowEditor readOnly={snapshot.app.status === 'read-only'} repository={workflowRepository} demo={workflowDemo} agents={agentOptions} models={snapshot.modelOptions} runtimes={snapshot.runtimes} selectedId={page?.id === 'workflow' ? entityId : ''} visible={page?.id === 'workflow'} onSelect={id => navigate(`/workflows/${encodeURIComponent(id)}/edit`)} />
+      {page?.id === 'settings' && <SettingsPage snapshot={snapshot} store={store} ipcState={ipcState} />}
       {page?.id === 'start' && <WorkflowStart snapshot={snapshot} store={store} ipcState={ipcState} onOpen={id => { navigate('/workbench'); openSession(id); }} />}
       {page?.id === 'create' && <SessionCreate snapshot={snapshot} store={store} ipcState={ipcState} draft={createDraft} onDraft={setCreateDraft} onOpen={id => { setCreateDraft({ agentId: '', modelKey: '', cwd: '', parentId: '' }); navigate('/workbench'); openSession(id); }} />}
       {page?.id === 'progress' && <WorkflowProgress snapshot={snapshot} instanceId={entityId} store={store} ipcState={ipcState} onOpen={openProgressSession} onBack={() => {

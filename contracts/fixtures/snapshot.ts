@@ -4,7 +4,8 @@
 // workflow instance with handoffs, its task lists and merge queue (merged, conflict, testing, a worktree left
 // to clean up), a same-folder run whose join node waits for the second of two read-only reviewers (CR-4), a
 // project, a file lock with a waiter (R-07), cross-session messages (one with unknown delivery), and escalations.
-// 0.7: the planning session's history continues before what is shown (C-26), and the last daily backup (C-28).
+// 0.7: the planning session's history continues before what is shown (C-26), and the last daily backup (C-28);
+// one runtime available and one too old (C-33).
 import type { z } from 'zod';
 import { CONTRACTS_VERSION } from '../common';
 import type { DeliveryRecord } from '../delivery';
@@ -310,6 +311,13 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
   preferences: { theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } },
   historyPages: [{ sessionId: 's-plan-notes', olderCursor: 'cursor-plan-notes-1' }],
   storage: { lastBackupAt: t('09:00') },
+  // C-33: Claude Code found on PATH and signed in with a subscription; Codex installed but too old.
+  runtimes: [
+    { runtime: 'claude', state: 'available', executable: 'C:/Users/demo/.local/bin/claude.exe', source: 'path', version: '2.1.309', requiredVersion: '2.1.309',
+      auth: 'subscription', modelCount: 3, checkedAt: t('09:01') },
+    { runtime: 'codex', state: 'too-old', executable: 'C:/Users/demo/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe', source: 'path', version: '0.150.0',
+      requiredVersion: '0.160.0', auth: 'unknown', modelCount: 0, checkedAt: t('09:01'), detail: 'Codex 0.150.0 比需要的 0.160.0 舊，請更新 Codex。' },
+  ],
 };
 
 /** Parsed fixture (branded IDs applied). Throws at import time if the fixture drifts from the contracts. */

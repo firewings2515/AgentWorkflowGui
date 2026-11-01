@@ -6,12 +6,13 @@ import type { Theme } from '../../contracts';
 import { APP_INFO_CHANNEL, FOLDER_CHANNEL } from '../preload/channels';
 import { registerAppIpc } from './app-ipc';
 import { type Backend, type DamagedBackend, startBackend } from './backend';
-import { resolveCodexExecutable } from './codex-exe';
+import { sdkBundledClaude } from './claude-exe';
 import { EventBus } from './event-bus';
 import { handleFolderRequest } from './folders';
 import { handleTrusted } from './ipc';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
 import { resolveRealPath } from './real-path';
+import { createRuntimeLocator } from './runtime-locator';
 import { supervisorSettings } from './supervisor-settings';
 import { hiddenMenuTemplate, themeOf, WINDOW_BACKGROUND } from './window-chrome';
 import { createWebPreferences } from './window-options';
@@ -122,8 +123,9 @@ void app.whenReady().then(async () => {
     dbPath,
     bus,
     createHost: (repository) => new WindowsProcessHost({ repository, log: (_level, message) => log(`[process] ${message}`) }),
-    packaged: { isPackaged: app.isPackaged, resourcesPath: process.resourcesPath },
-    codexExecutable: resolveCodexExecutable(),
+    // The user's own Claude Code and Codex (T045). The installer carries no claude.exe, so a packaged app never falls
+    // back to the Agent SDK's copy; a development run may.
+    runtimes: createRuntimeLocator({ ...(!app.isPackaged && { sdkBundledClaude: () => sdkBundledClaude(app.getAppPath()) }), log }),
     resolveRealPath,
     supervisor: supervisorSettings(process.env),
     log,

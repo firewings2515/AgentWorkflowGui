@@ -1,0 +1,19 @@
+/* Settings → Runtime (T045). Colours come from the theme tokens in styles.css, so both themes follow. */
+.settings-page { height: 100%; overflow: auto; padding: 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.settings-heading { margin: 0 0 12px; font-size: 16px; }
+.runtime-panel { max-width: 960px; }
+.runtime-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: 16px; margin-top: 14px; }
+.runtime-card { display: grid; gap: 10px; align-content: start; min-width: 0; padding: 14px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+.runtime-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.runtime-card h3 { margin: 0; font-size: 15px; }
+.runtime-state { font-size: 12px; white-space: nowrap; color: var(--muted); }
+.runtime-state[data-state='available'] { color: var(--success); }
+.runtime-state[data-state='not-installed'], .runtime-state[data-state='failed'] { color: var(--error); }
+.runtime-state[data-state='too-old'], .runtime-state[data-state='signed-out'] { color: var(--warning); }
+.runtime-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; margin: 0; }
+.runtime-fields dt { color: var(--muted); }
+.runtime-fields dd { margin: 0; min-width: 0; }
+.runtime-path { overflow-wrap: anywhere; font-size: 12px; }
+.runtime-detail { margin: 0; padding: 8px 10px; border-left: 3px solid var(--warning); background: var(--raised); color: var(--text); border-radius: 4px; }
+.runtime-card button { justify-self: start; }
+.runtime-notice { list-style: none; margin: 4px 0 8px; padding: 0; display: grid; gap: 4px; }

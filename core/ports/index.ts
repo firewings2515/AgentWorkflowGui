@@ -7,3 +7,4 @@ export * from './repository';
 export * from './git';
 export * from './locks';
 export * from './storage';
+export * from './runtime-status';

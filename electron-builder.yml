@@ -22,18 +22,20 @@ files:
   - '!node_modules/d3-*{,/**}'
   - '!node_modules/zustand{,/**}'
   - '!node_modules/classcat{,/**}'
+  # The Claude CLI the Agent SDK ships (@anthropic-ai/claude-agent-sdk-<platform>-<arch>, ~285 MB, proprietary licence) is
+  # not distributed (T045): the app starts the user's own Claude Code. The SDK package itself (JS only) stays.
+  - '!node_modules/@anthropic-ai/claude-agent-sdk-*{,/**}'
   # Documentation and sources go; licence and notice files stay (scripts/check-licenses.mjs checks them).
   - '!node_modules/**/*.{map,ts,tsx}'
   - '!node_modules/**/{README,CHANGELOG,HISTORY,CONTRIBUTING,SECURITY,CODE_OF_CONDUCT}{,.*}.md'
   - '!node_modules/**/{test,tests,__tests__,docs,example,examples}{,/**}'
 
-# Native code and executables cannot run from inside app.asar. koffi's .node and the Claude CLI that the Agent
-# SDK ships are unpacked next to it (app/main/packaged-paths.ts maps the SDK's path to the unpacked file).
+# Native code cannot run from inside app.asar: koffi's .node is unpacked next to it. No executable is shipped; Claude
+# Code and Codex are the user's own installs (app/main/claude-exe.ts, codex-exe.ts).
 asar: true
 asarUnpack:
   - node_modules/koffi/**
   - node_modules/@koromix/**
-  - node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/**
 
 extraResources:
   - from: build-resources/THIRD_PARTY_LICENSES.txt
