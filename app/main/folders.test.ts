@@ -13,7 +13,7 @@ const deps = (extra: Partial<FolderDeps> = {}): FolderDeps & { opened: string[] 
       opened.push(path);
       return Promise.resolve('');
     },
-    exists: () => true,
+    isFolder: () => true,
     ...extra,
   };
 };
@@ -48,7 +48,7 @@ describe('folder requests (C-24)', () => {
     expect(await handleFolderRequest({ type: 'folder.open', requestId: 'r', target: { kind: 'session-cwd', sessionId: 'nobody' } }, d)).toMatchObject({ ok: false, code: 'not_found' });
     // task-c has no worktree yet.
     expect(await handleFolderRequest({ type: 'folder.open', requestId: 'r', target: { kind: 'task-worktree', instanceId: 'inst-login', taskId: 'task-c' } }, d)).toMatchObject({ ok: false, code: 'not_found' });
-    const gone = deps({ exists: () => false });
+    const gone = deps({ isFolder: () => false });
     expect(await handleFolderRequest({ type: 'folder.open', requestId: 'r', target: { kind: 'app-data' } }, gone)).toMatchObject({ ok: false, code: 'not_found' });
     expect(d.opened).toEqual([]);
     expect(await handleFolderRequest('nonsense', d)).toMatchObject({ ok: false, requestId: null, code: 'invalid_request' });

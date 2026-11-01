@@ -10,7 +10,7 @@ import type { PermissionRequest } from '../../contracts';
 import type { PermissionPolicy, PolicyContext, PolicyDecision, PolicyRule } from '../ports';
 import { type Effects, type Target, handlerFor } from './commands';
 import { type Shell, type Word, lex } from './lexer';
-import { type AbsPath, type PathStyle, fileKey, hasWildcard, isSecretPath, isWithinAny, mentionsSecret, normaliseAbsolute, resolvePath } from './paths';
+import { type AbsPath, type PathStyle, fileKey, hasWildcard, isSecretPath, isWithinAny, mentionsSecret, normaliseAbsolute, parentOf, resolvePath } from './paths';
 import { type Finding, REASONS, type ReasonKey, finding } from './reasons';
 import { shlexArgument } from './shlex';
 
@@ -101,26 +101,63 @@ class Checker {
       return this.add('unrecognised', 'unknown-target');
     }
     for (const cwd of cwds) {
-      const base = t.base === undefined ? cwd : resolvePath(t.base, cwd, style);
-      // Without a base folder only an absolute path resolves.
-      const path = t.base !== undefined && base === undefined ? undefined : resolvePath(t.text, base, style);
-      if (path === undefined) {
-        this.add('unrecognised', 'unknown-target');
-        continue;
+      const bases = t.base === undefined ? [cwd] : this.places(t.base, cwd, style);
+      for (const base of bases) {
+        // Without a base folder only an absolute path resolves.
+        const paths = t.base !== undefined && base === undefined ? [undefined] : this.places(t.text, base, style);
+        for (const path of paths) {
+          if (path === undefined) {
+            this.add('unrecognised', 'unknown-target');
+            continue;
+          }
+          this.check(path, access);
+          // Node may load any of these instead; each is resolved and checked like the script itself.
+          if (access === 'run' && t.node) for (const suffix of NODE_SUFFIXES) this.check(`${path}${suffix}`, 'run');
+        }
       }
-      this.check(path, access);
-      // Node may load any of these instead; each is resolved and checked like the script itself.
-      if (access === 'run' && t.node) for (const suffix of NODE_SUFFIXES) this.check(`${path}${suffix}`, 'run');
     }
   }
 
   folder(access: 'read' | 'write', at: Word | undefined, cwds: readonly (AbsPath | undefined)[], style: PathStyle) {
     for (const cwd of cwds) {
-      const base = at === undefined ? cwd : resolvePath(at.text, cwd, style);
-      const real = base === undefined ? undefined : this.real(base);
-      if (base === undefined || real === undefined) this.add('unrecognised', 'unknown-target');
-      else for (const p of real === base ? [base] : [base, real]) this.inScope(p, access);
+      for (const base of at === undefined ? [cwd] : this.places(at.text, cwd, style)) {
+        const real = base === undefined ? undefined : this.real(base);
+        if (base === undefined || real === undefined) this.add('unrecognised', 'unknown-target');
+        else for (const p of real === base ? [base] : [base, real]) this.inScope(p, access);
+      }
     }
+  }
+
+  /**
+   * Where `raw` may lead from `cwd`: the path with `..` folded as written, which is how Win32 and every native
+   * program read it, and in a Bash reading also the path Git Bash itself opens (T042). MSYS follows a link
+   * before it takes `..` (`link/../x` is next to the link's target), and its programs' working folder is the
+   * real one, so a `..` there starts from the real path of what precedes it. `undefined`: cannot be resolved.
+   */
+  places(raw: string, cwd: AbsPath | undefined, style: PathStyle): (AbsPath | undefined)[] {
+    const written = resolvePath(raw, cwd, style);
+    if (style !== 'sh' || written === undefined) return [written];
+    const text = raw.replaceAll('\\', '/');
+    const segments = text.split('/');
+    if (!segments.includes('..')) return [written];
+    let at = cwd;
+    let pending = text.startsWith('/') ? '/' : '';
+    for (const segment of segments) {
+      if (segment === '') continue;
+      if (segment !== '..') {
+        pending = pending === '' || pending.endsWith('/') ? `${pending}${segment}` : `${pending}/${segment}`;
+        continue;
+      }
+      const here = pending === '' ? at : resolvePath(pending, at, style);
+      const real = here === undefined ? undefined : this.real(here);
+      // `/c/..` is the MSYS root, not a drive: nothing to place there.
+      const parent = real === undefined ? undefined : parentOf(real);
+      if (parent === undefined) return [written, undefined];
+      at = parent;
+      pending = '';
+    }
+    const physical = pending === '' ? at : resolvePath(pending, at, style);
+    return physical === written ? [written] : [written, physical];
   }
 
   /** A program named by its path: never auto-approved, and called out when this session wrote it. */
@@ -176,7 +213,8 @@ class Checker {
       fx.writes.push(...writes);
       this.effects(fx, cwds, style);
       if (fx.cd) {
-        const moved = cwds.map((c) => resolvePath(fx.cd!.text, c, style));
+        // `cd -P` in Git Bash takes the physical path (T042): every place it may lead is kept.
+        const moved = cwds.flatMap((c) => this.places(fx.cd!.text, c, style));
         if (fx.cd.wild || moved.some((c) => c === undefined || this.real(c) === undefined)) this.add('unrecognised', 'unknown-target');
         else cwds = [...new Set([...cwds, ...moved])];
       }

@@ -34,6 +34,7 @@ vi.mock('electron', () => {
     dialog: { showMessageBox: vi.fn(), showOpenDialog: vi.fn() },
     nativeTheme: { themeSource: 'dark' },
     shell: { showItemInFolder: vi.fn(), openPath: vi.fn() },
+    session: { defaultSession: { setPermissionRequestHandler: vi.fn(), setPermissionCheckHandler: vi.fn(), on: vi.fn() } },
   };
 });
 vi.mock('./backend', () => ({ startBackend: hoisted.startBackend }));

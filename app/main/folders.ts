@@ -11,7 +11,8 @@ export interface FolderDeps {
   pickFolder(title: string | undefined): Promise<string | null>;
   /** Shows the folder in the file explorer; an error message, or '' on success (Electron `shell.openPath`). */
   openPath(path: string): Promise<string>;
-  exists(path: string): boolean;
+  /** True only for an existing folder: a file is never handed to `openPath`, which would run it (T042 F2). */
+  isFolder(path: string): boolean;
 }
 
 const requestIdOf = (raw: unknown): RequestId | null => {
@@ -43,7 +44,7 @@ export async function handleFolderRequest(raw: unknown, deps: FolderDeps): Promi
   try {
     if (request.type === 'folder.pick') return { ok: true, requestId: request.requestId, path: await deps.pickFolder(request.title) };
     const path = folderOf(await deps.snapshot(), request.target, deps.dataFolder);
-    if (path === undefined || !deps.exists(path)) return fail('not_found', 'The folder is not known or no longer exists');
+    if (path === undefined || !deps.isFolder(path)) return fail('not_found', 'The folder is not known, is not a folder or no longer exists');
     const error = await deps.openPath(path);
     return error === '' ? { ok: true, requestId: request.requestId } : fail('internal_error', 'The file explorer could not open the folder');
   } catch {

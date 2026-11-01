@@ -37,6 +37,30 @@ export const parsePreToolUse = (input: unknown, toolUseIdArg: string | undefined
 export const permissionKindOfTool = (toolName: string): PermissionRequest['kind'] =>
   COMMAND_TOOLS.includes(toolName) ? 'command' : FILE_TOOLS.includes(toolName) ? 'fileChange' : 'permissions';
 
+// A glob segment that matches more than its own text (`*`, `?`, `[a]`, `{a,b}`, extglobs).
+const GLOB_SEGMENT = /[*?[\]{}()!+@]/;
+
+/**
+ * Where a Glob call reaches beyond its `path` (T042 A11): the pattern's fixed folder part, joined to `path`
+ * as the tool joins them, so `C:/Users/x/.ssh/*` or `../../*` is checked like a path. A `..` or a drive among
+ * the wildcards cannot be placed; then the whole pattern is given, which the policy cannot approve. A plain
+ * relative pattern (`**\/*.ts`) adds nothing: the search stays in `path` or the working folder.
+ */
+export const globReach = (input: Record<string, unknown>): string[] => {
+  const pattern = str(input.pattern);
+  if (pattern === undefined || pattern === '') return [];
+  const segments = pattern.replaceAll('\\', '/').split('/');
+  const wild = segments.findIndex((s) => GLOB_SEGMENT.test(s));
+  const fixed = wild < 0 ? segments : segments.slice(0, wild);
+  const rest = wild < 0 ? [] : segments.slice(wild);
+  const absolute = /^([a-z]:|\/|~)/i.test(pattern);
+  const path = str(input.path);
+  const joined = (part: string) => (absolute || path === undefined || path === '' ? part : `${path}/${part}`);
+  if (rest.includes('..') || rest.some((s) => s.includes(':'))) return [joined(pattern)];
+  const prefix = fixed.join('/');
+  return prefix === '' ? [] : [joined(prefix)];
+};
+
 export const buildPermissionRequest = (call: PreToolUse, ctx: { id: PermissionRequestId; placement: Placement; createdAt: Timestamp }): PermissionRequest => {
   const input = isObject(call.toolInput) ? call.toolInput : {};
   const kind = permissionKindOfTool(call.toolName);
@@ -52,7 +76,7 @@ export const buildPermissionRequest = (call: PreToolUse, ctx: { id: PermissionRe
     summary: toolSummary(call.toolName, input) || call.toolName,
     ...opt('command', kind === 'command' && isNonEmptyString(input.command) ? input.command : undefined),
     ...opt('cwd', call.cwd),
-    paths: toolPaths(input),
+    paths: [...toolPaths(input), ...(call.toolName === 'Glob' ? globReach(input) : [])],
     state: 'pending',
     createdAt: ctx.createdAt,
   });
