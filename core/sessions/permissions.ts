@@ -52,6 +52,11 @@ export interface PermissionGateOptions {
   /** True once the GUI began closing: from then on nothing is approved, by the policy or the user (r3-P1-2). */
   isClosing?(): boolean;
   /**
+   * False once the request's opening no longer serves its session (T036 r3 P1-2): from then on it is declined like
+   * on closing, at every step and before any lock is taken. Absent: always current.
+   */
+  isCurrent?(handle: PermissionHandle): boolean;
+  /**
    * Where a session's escalations go (R-05): a workflow session's to its instance's root (T024). Defaults
    * to the session itself, which is right for ordinary sessions.
    */
@@ -282,11 +287,20 @@ export class PermissionGate {
     this.options.publish(closed);
   }
 
-  /** Declines the request when closing began; true when it did. */
+  /**
+   * Declines the request when closing began, or when its opening was released since (T036 r3 P1-2); true when it did.
+   * Asked after every wait and right before an approval goes to the locks, with nothing awaited in between.
+   */
   private declinedForClosing(handle: PermissionHandle): boolean {
-    if (this.options.isClosing?.() !== true) return false;
-    handle.answer(this.policyDecision('decline', 'the GUI is closing'));
-    return true;
+    if (this.options.isClosing?.() === true) {
+      handle.answer(this.policyDecision('decline', 'the GUI is closing'));
+      return true;
+    }
+    if (this.options.isCurrent?.(handle) === false) {
+      handle.answer(this.policyDecision('decline', 'the session was closed and opened again since this request'));
+      return true;
+    }
+    return false;
   }
 
   private policyDecision(outcome: 'approve' | 'decline', reason?: string): PermissionDecision {

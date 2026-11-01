@@ -57,10 +57,12 @@ import type {
   PermissionHandle,
   PermissionPolicy,
   RuntimeAdapter,
+  RuntimeAdapterHooks,
   RuntimeEvent,
   SessionSettings,
   StoredDelivery,
 } from '../ports';
+import type { IdleFacts } from '../supervisor/idle';
 import { PermissionGate } from './permissions';
 import { SessionRuntimes } from './runtimes';
 import { WrittenPaths, type WrittenPathsOptions } from './written-paths';
@@ -138,6 +140,26 @@ export interface TransferHooks {
   deliveryResolved(operationId: OperationId, decision: 'wait' | 'cancel' | 'retry'): Promise<void>;
 }
 
+/**
+ * What the idle supervisor (T036, core/supervisor) is told by this service, attached by the main process. It
+ * decides when an idle runtime is closed; this service closes it and resumes it on the next delivery.
+ */
+export interface SupervisorHooks {
+  /**
+   * The session is in use: a delivery is about to be claimed for it, or one of its runtime events came. Returns
+   * the release of its runtime under way, to wait for before resuming it; undefined when there is none.
+   */
+  touch(sessionId: SessionId): Promise<void> | undefined;
+  /** A session's runtime came up (start or resume). */
+  opened(sessionId: SessionId): void;
+}
+
+/** Runtime events that show a session in use (T036); periodic ones (usage, model) and its exit do not. */
+const USE_EVENTS = new Set<RuntimeEvent['type']>(['session.activity', 'turn.updated', 'message.delta', 'message.completed', 'item.updated', 'item.outputDelta', 'permission.updated', 'nativeTask.updated']);
+
+/** Why a session whose folder is gone is not resumed (R-06, SP-07 G5: never in another folder). */
+const folderGone = (cwd: string) => `This session's folder ${cwd} no longer exists, so it cannot be resumed there (nor in any other folder); its conversation can only be viewed.`;
+
 /** How a workflow payload enters its target: a formal handoff waits for the target's turn to end (SP-05). */
 export type WorkflowEntry = 'after-turn' | 'insert-if-busy';
 
@@ -152,8 +174,13 @@ export interface SessionServiceOptions {
   hashPayload(text: string): PayloadHash | Promise<PayloadHash>;
   /** Node-side link resolution; null when it cannot be confirmed (PolicyContext.resolveRealPath). */
   resolveRealPath(absolutePath: string): string | null;
-  /** The adapter that serves a session (see SessionRuntimes); its `onPermissionRequest` must call this service's. */
-  createAdapter(runtime: Runtime, sessionId: SessionId): RuntimeAdapter;
+  /**
+   * The adapter that serves one opening of a session (see SessionRuntimes): a new one per call, so an earlier
+   * opening's late events and requests are told apart (T036 r2/r3). Its approval requests go to `hooks` (they know
+   * the opening they belong to); an adapter that calls this service's `onPermissionRequest` itself works too, without
+   * that knowledge.
+   */
+  createAdapter(runtime: Runtime, sessionId: SessionId, hooks: RuntimeAdapterHooks): RuntimeAdapter;
   /** A new GUI MCP mount for a session (T016 `mount()`); the old token stops working. */
   mountMcp(sessionId: SessionId): McpMount | Promise<McpMount>;
   listModels(runtime: Runtime): Promise<ModelOption[]>;
@@ -226,6 +253,8 @@ const RESEND_MISMATCH: Refusal = { reason: 'resend-mismatch', detail: 'this oper
 /** One queue per session for its commands and its runtime events (r1-P1-4). */
 const sessionKey = (sessionId: SessionId) => `session:${sessionId}`;
 const closingFailure = (requestId: Failure['requestId']) => fail(requestId, 'runtime_unavailable', 'The application is closing');
+/** Why a request of a released opening of its session is declined (T036 r3 P1-2). */
+const EARLIER_OPENING = 'the session was closed and opened again since this request; it is not approved';
 
 /** A user message this process sent, and how its runtime echo is recognised (r1-P1-9). */
 interface Echo {
@@ -314,11 +343,20 @@ export class SessionService {
   private readonly echoes = new Map<SessionId, Echo[]>();
   /** Sessions whose last event could not be stored: the renderer needs a new Snapshot (contracts gap). */
   private readonly unsynced = new Set<SessionId>();
+  /** Approval requests not answered yet, by the handle the gate got, with their runtime's own handle (T036 r3 P1-2). */
+  private readonly requests = new Map<PermissionHandle, { raw: PermissionHandle; isCurrent: () => boolean; sessionId: SessionId }>();
+  /** Whether each guarded handle's opening still serves its session, answered or not. */
+  private readonly currentOf = new WeakMap<PermissionHandle, () => boolean>();
   private closing = false;
   /** Set when shutdown finished: nothing is stored any more (the database closes next). */
   private closed = false;
   private workflow: WorkflowHooks | undefined;
   private transfer: TransferHooks | undefined;
+  private supervisor: SupervisorHooks | undefined;
+  /** The resume of each session under way (T036 r1 P1-3). */
+  private readonly resumes = new Map<SessionId, Promise<void>>();
+  /** Why the last resume of a session was refused (its folder is gone, R-06), until one succeeds (T036). */
+  private readonly resumeRefused = new Map<SessionId, string>();
   /**
    * Turns a dispatch's ack named that were not seen to end yet, per session (T023 r1-P1-4): the session is
    * not at its turn boundary while one is here, even before the runtime reported it running. Only an end of
@@ -364,34 +402,53 @@ export class SessionService {
       uuid: () => options.uuid(),
       log: (message) => options.log?.(message),
       isClosing: () => this.closing,
+      // A request of an earlier opening is declined at every step, before any lock is taken (T036 r3 P1-2).
+      isCurrent: (handle) => this.currentOf.get(handle)?.() ?? true,
       rootOf: (session) => this.rootOf(session),
       ...(this.locks !== undefined && { locks: this.locks }),
     });
     this.runtimes = new SessionRuntimes({
-      createAdapter: (runtime, sessionId) => options.createAdapter(runtime, sessionId),
+      createAdapter: (runtime, sessionId, hooks) => options.createAdapter(runtime, sessionId, hooks),
+      onPermissionRequest: (handle, isCurrent) => this.onPermissionRequest(handle, isCurrent),
       mountMcp: (sessionId) => options.mountMcp(sessionId),
       listModels: (runtime) => options.listModels(runtime),
       onOpened: (sessionId, cwd) => {
         // The locks need its folder and mode before its first write or its folder's first change (R-07).
         if (this.locks !== undefined) void this.repos.sessions.get(sessionId).then((s) => s && this.locks?.track(s)).catch(() => undefined);
         options.onSessionOpened?.(sessionId, cwd);
+        this.supervisor?.opened(sessionId);
       },
-      onClosed: (sessionId) => {
+      onClosed: async (sessionId) => {
         this.locks?.closed(sessionId);
-        return options.onSessionClosed?.(sessionId);
+        // The released opening reports no turn end any more, whether or not its exit event comes (T036 r2).
+        this.ackedTurns.delete(sessionId);
+        this.handoffTurns.delete(sessionId);
+        // Nothing of it may be approved any more (T036 r3 P1-2).
+        await this.declineEarlier(sessionId);
+        try {
+          await options.onSessionClosed?.(sessionId);
+        } finally {
+          // Its Job has ended: what it left running is over (T036 r3, as a restart records it).
+          await this.endLeftOpen(sessionId).catch((error: unknown) => this.log(`recording what ${sessionId} left running failed (${errorName(error)})`));
+        }
       },
-      onEvent: (event) => this.record(event),
+      onEvent: (event, isCurrent) => this.record(event, isCurrent),
+      log: (message) => this.log(message),
       ...(options.sleep !== undefined && { sleep: (ms: number) => this.options.sleep!(ms) }),
     });
     // A transfer's claim is refused when its gate's view went out of date, decided synchronously in the call
     // that makes the claim (T023 r2-P1-1); every other claim goes straight to the store.
     const store = this.store;
+    // A live ack's turn is followed before its `sent` is written, on every way a delivery is sent (T036 r1 P1-1): once
+    // the store says sent, the session is never seen idle while that turn has not been seen to end.
     const claimGuarded = new Proxy(store, {
       get: (target, key): unknown =>
         key === 'claim'
           ? (input: ClaimInput): Promise<ClaimResult> =>
               this.transfer !== undefined && !this.transfer.claimAllowed(input.operationId) ? Promise.resolve({ status: 'revision-changed' }) : target.claim(input)
-          : Reflect.get(target, key),
+          : key === 'recordSent'
+            ? (...args: Parameters<DeliveryStore['recordSent']>) => this.recordSentFollowing(target, ...args)
+            : Reflect.get(target, key),
     });
     this.delivery = new DeliveryService({
       store: claimGuarded,
@@ -418,6 +475,11 @@ export class SessionService {
   /** The transfer service (T023); without one, `transfer.*` answers `unsupported`. */
   attachTransfer(hooks: TransferHooks): void {
     this.transfer = hooks;
+  }
+
+  /** The idle supervisor (T036); without one, runtimes stay open until exit or a task's cleanup. */
+  attachSupervisor(hooks: SupervisorHooks): void {
+    this.supervisor = hooks;
   }
 
   // ---- lifecycle ------------------------------------------------------------------------------------
@@ -596,14 +658,82 @@ export class SessionService {
     };
   }
 
-  /** `RuntimeAdapterHooks.onPermissionRequest` for every adapter. */
-  onPermissionRequest(handle: PermissionHandle): Promise<void> {
+  /**
+   * `RuntimeAdapterHooks.onPermissionRequest` for every adapter. `isCurrent` (from the router's hooks) tells whether
+   * the request's opening still serves its session (T036 r3 P1-2): the handle the gate gets declines instead of
+   * approving or holding once it does not, and the request counts against idleness until it is answered.
+   */
+  onPermissionRequest(handle: PermissionHandle, isCurrent: () => boolean = () => true): Promise<void> {
     // Once closing began nothing is approved, by the policy or anyone (r2-P1-6).
     if (this.closing) {
       handle.answer({ outcome: 'decline', decidedBy: 'policy', reason: 'the GUI is closing', at: this.options.now() });
       return Promise.resolve();
     }
-    return this.gate.onPermissionRequest(handle);
+    if (!isCurrent()) {
+      handle.answer({ outcome: 'decline', decidedBy: 'policy', reason: EARLIER_OPENING, at: this.options.now() });
+      return Promise.resolve();
+    }
+    const guarded = this.guard(handle, isCurrent);
+    return this.gate.onPermissionRequest(guarded).finally(() => {
+      // Answered or held by now, or declined (fail closed): one that is still open stays counted until it is answered.
+      if (!this.isOpenRequest(guarded)) this.requests.delete(guarded);
+    });
+  }
+
+  /**
+   * The handle the gate and the locks work with: once its opening no longer serves the session it holds nothing and
+   * approves nothing, and any answer becomes a decline (T036 r3 P1-2, R-05: an earlier opening's approval never
+   * counts). It stays in `requests` while open, for idleness and for `declineEarlier`.
+   */
+  private guard(raw: PermissionHandle, isCurrent: () => boolean): PermissionHandle {
+    const declineInstead = () =>
+      raw.answer({ outcome: 'decline', decidedBy: 'policy', reason: EARLIER_OPENING, at: this.options.now() });
+    const guarded: PermissionHandle = {
+      // The runtime's own, as it changes (held, answered).
+      get request() {
+        return raw.request;
+      },
+      hold: (hold, extra) => {
+        if (!isCurrent()) {
+          declineInstead();
+          this.requests.delete(guarded);
+          return false;
+        }
+        return raw.hold(hold, extra);
+      },
+      answer: (decision, extra) => {
+        this.requests.delete(guarded);
+        if (!isCurrent()) {
+          declineInstead();
+          return false;
+        }
+        return raw.answer(decision, extra);
+      },
+    };
+    this.requests.set(guarded, { raw, isCurrent, sessionId: raw.request.sessionId });
+    this.currentOf.set(guarded, isCurrent);
+    return guarded;
+  }
+
+  /** Whether a guarded request is still waiting for its answer (answered ones leave `requests`). */
+  private isOpenRequest(handle: PermissionHandle): boolean {
+    return this.requests.has(handle);
+  }
+
+  /**
+   * A released opening's requests (T036 r3 P1-2): each one still open is declined to its runtime, its lock wait ends
+   * and its escalation is closed, so nobody can approve it later.
+   */
+  private async declineEarlier(sessionId: SessionId): Promise<void> {
+    for (const [guarded, entry] of [...this.requests]) {
+      if (entry.sessionId !== sessionId || entry.isCurrent()) continue;
+      this.requests.delete(guarded);
+      entry.raw.answer({ outcome: 'decline', decidedBy: 'policy', reason: EARLIER_OPENING, at: this.options.now() });
+      const withdrawn: PermissionRequest = { ...guarded.request, state: 'withdrawn' };
+      delete withdrawn.hold;
+      this.locks?.observe({ type: 'permission.updated', request: withdrawn });
+      await this.gate.withdrawn(withdrawn);
+    }
   }
 
   /** A file changed in a session's workspace while its runtime ran (writtenPaths source 3). */
@@ -772,6 +902,9 @@ export class SessionService {
       const refused = await this.workflow?.sessionAccess?.(sessionId);
       if (refused !== undefined) return fail(requestId, 'invalid_transition', refused);
     }
+    // A closed session is resumed only in its own folder (R-06, T036): when that is gone, nothing is saved or sent.
+    const closed = await this.closedRefusal(session);
+    if (closed !== undefined) return fail(requestId, 'invalid_transition', closed);
     return this.sendUserMessage(requestId, session, messageId, text);
   }
 
@@ -826,8 +959,12 @@ export class SessionService {
         return fail(requestId, 'unknown_outcome', 'It is not known whether the message reached the session; it is not sent again', {
           mayHaveSideEffects: true,
         });
-      default:
+      default: {
+        // Its folder went while the message was on its way (T036): said plainly, never resumed elsewhere.
+        const refused = this.resumeRefused.get(sessionId);
+        if (refused !== undefined) return fail(requestId, 'invalid_transition', refused);
         return fail(requestId, 'runtime_unavailable', 'The message is saved but could not be handed to the session yet', { retryable: true });
+      }
     }
   }
 
@@ -1180,6 +1317,9 @@ export class SessionService {
     let record = await this.store.get(p.operationId);
     if (record === undefined) {
       if (this.closing) return shuttingDown;
+      // A closed target whose folder is gone is not resumed anywhere (R-06, T036): refused before it is accepted.
+      const closed = await this.closedRefusal(target);
+      if (closed !== undefined) return { status: 'rejected', rejection: { reason: 'unknown-target', detail: 'the target session is closed and its folder no longer exists' } };
       const provisioned = await this.ensureProvisioned(target);
       if (this.closing) return shuttingDown;
       const provision = await this.store.get(provisionOp(target.id));
@@ -1473,6 +1613,20 @@ export class SessionService {
     if (ref === undefined) return;
     // Not open: closed already, or a release under way (another closer), which is waited for (r2 P1-3).
     if (!this.runtimes.isOpen(ref)) return this.runtimes.forceRelease(ref);
+    await this.endRuntime(ref, timeoutMs);
+    // The record follows in the session's queue; the runtime is already gone.
+    if (!this.closed) void this.serial(sessionKey(sessionId), () => this.setActivity(sessionId, 'closed')).catch(() => undefined);
+  }
+
+  /**
+   * The graceful close of an open runtime (R-14) with `timeoutMs` counted from this call; past it the session is
+   * released by force (`onSessionClosed` ends its Job). Returns once it is released and `onSessionClosed` ran.
+   */
+  private async endRuntime(ref: string, timeoutMs: number): Promise<void> {
+    // The opening being closed: past the deadline only it is released, never one the session got since (T036 r1 P1-2).
+    const generation = this.runtimes.generationOf(ref);
+    // Not open: a release under way, if any, is waited for.
+    if (generation === undefined) return this.runtimes.forceRelease(ref);
     const graceful = this.runtimes.closeSession(ref, timeoutMs).then(
       () => true,
       () => true,
@@ -1480,9 +1634,64 @@ export class SessionService {
     const ended = this.options.sleep === undefined ? await graceful : await Promise.race([graceful, this.options.sleep(timeoutMs).then(() => false)]);
     // Past the deadline: released by force, or the release the graceful close began is waited for, whichever it is;
     // either way this returns once `onSessionClosed` has finished (its Job ended, r2 P1-3).
-    if (!ended || this.runtimes.isOpen(ref)) await this.runtimes.forceRelease(ref);
-    // The record follows in the session's queue; the runtime is already gone.
-    if (!this.closed) void this.serial(sessionKey(sessionId), () => this.setActivity(sessionId, 'closed')).catch(() => undefined);
+    if (!ended || this.runtimes.isOpen(ref, generation)) await this.runtimes.forceRelease(ref, generation);
+  }
+
+  // ---- idle supervisor (T036) -----------------------------------------------------------------------
+
+  /** Sessions whose runtime is open now. */
+  openSessions(): { sessionId: SessionId; nativeSessionRef: string }[] {
+    return this.runtimes.openSessions();
+  }
+
+  /**
+   * What says whether a session is idle (core/supervisor/idle.ts), as stored and as this process follows it: its
+   * activity and conversation, acked and handoff turns, held requests, deliveries to it nobody gave up on, and its
+   * file locks. Undefined when the session does not exist.
+   */
+  async idleFacts(sessionId: SessionId): Promise<Omit<IdleFacts, 'ownedCommands'> | undefined> {
+    const session = await this.repos.sessions.get(sessionId);
+    if (session === undefined) return undefined;
+    const conversation = await this.repos.conversations.get(sessionId);
+    const deliveries = { pending: 0, unknown: 0 };
+    for (const state of ['pending', 'unknown'] as const)
+      for (const record of await this.store.listByState(state)) {
+        if (record.kind === 'provision' || record.target.sessionId !== sessionId || record.outcome !== undefined) continue;
+        // An unknown delivery the user cancelled waits for nothing any more (CR2 §2).
+        if (state === 'unknown' && record.delivery.attempts.at(-1)?.resolution?.decision === 'cancel') continue;
+        deliveries[state]++;
+      }
+    const locks = (this.locks?.list() ?? []).filter((l) => l.holderSessionId === sessionId || l.waiters.some((w) => w.sessionId === sessionId)).length;
+    return {
+      activity: session.activity,
+      turns: conversation.turns,
+      items: conversation.items,
+      nativeTasks: conversation.nativeTasks,
+      ackedTurns: this.ackedTurns.get(sessionId)?.size ?? 0,
+      handoffTurn: this.handoffTurns.has(sessionId),
+      // Held for the user, and any request still on its way to an answer (T036 r3: a pending one is waited for too).
+      heldRequests: new Set([...this.gate.heldFor(sessionId).map((r) => r.id), ...[...this.requests.values()].filter((r) => r.sessionId === sessionId && r.isCurrent()).map((r) => r.raw.request.id)]).size,
+      deliveries,
+      locks,
+    };
+  }
+
+  /**
+   * The supervisor's close of an idle runtime, in the session's queue (in order with its commands, deliveries and
+   * events): `decide()` last, and when it says yes the graceful close starts in that same step (R-14; past
+   * `timeoutMs` its Job is ended) and the session is marked closed before this returns, so a delivery that waited
+   * for the release resumes it afterwards. The session stays as it was otherwise (C-07: it resumes on demand).
+   */
+  closeIdle(sessionId: SessionId, decide: () => Promise<boolean>, timeoutMs: number): Promise<'closed' | 'kept'> {
+    return this.serial(sessionKey(sessionId), async () => {
+      if (this.closing) return 'kept';
+      const ref = await this.binding(sessionId);
+      if (ref === undefined || this.closing || !this.runtimes.isOpen(ref)) return 'kept';
+      if (!(await decide())) return 'kept';
+      await this.endRuntime(ref, timeoutMs);
+      if (!this.closed) await this.setActivity(sessionId, 'closed');
+      return 'closed';
+    });
   }
 
   /** Whether the session's own turn runs, by the stored turns (an old event cannot undo them): its turn boundary. */
@@ -1699,19 +1908,84 @@ export class SessionService {
     if (record.kind === 'transfer' && this.transfer !== undefined && !(await this.transfer.mayDispatch(record))) throw new Error('the transfer no longer sends this');
   }
 
+  /**
+   * Resumes a closed target in its original folder (R-06), with the model it has now (R-12). Every delivery passes
+   * here, so it is where the supervisor learns the session is in use (T036): a release of its runtime under way
+   * ends first. A folder that is gone, or a task's session kept read only (T032), is refused before the runtime
+   * is called; the delivery stays pending, never claimed.
+   */
   private async resumeTarget(record: PayloadDelivery): Promise<void> {
     const ref = record.target.nativeSessionRef;
     const sessionId = record.target.sessionId;
-    if (ref === undefined || sessionId === undefined || this.runtimes.isOpen(ref)) return;
+    if (ref === undefined || sessionId === undefined) return;
+    const release = this.supervisor?.touch(sessionId);
+    if (release !== undefined) await release;
+    // One resume per session, its reads and checks included (T036 r1 P1-3): whoever finds one under way waits for
+    // it and looks again. Checked and begun in one synchronous step, so two never both begin.
+    for (;;) {
+      if (this.runtimes.isOpen(ref)) return;
+      const underway = this.resumes.get(sessionId);
+      if (underway === undefined) break;
+      await underway.catch(() => undefined);
+    }
+    const run = this.resumeNow(record, sessionId, ref);
+    this.resumes.set(sessionId, run);
+    const done = () => {
+      if (this.resumes.get(sessionId) === run) this.resumes.delete(sessionId);
+    };
+    void run.then(done, done);
+    await run;
+  }
+
+  /** The resume itself, as the one `resumeTarget` under way for the session. */
+  private async resumeNow(record: PayloadDelivery, sessionId: SessionId, ref: string): Promise<void> {
     const session = await this.repos.sessions.get(sessionId);
+    const cwd = record.context.cwd;
+    // Only this attempt's refusal is told to the sender.
+    this.resumeRefused.delete(sessionId);
+    const refused = await this.resumeRefusal(session, cwd);
+    if (refused !== undefined) {
+      this.resumeRefused.set(sessionId, refused);
+      this.log(`resuming ${sessionId} was refused (its folder is gone or kept read only)`);
+      throw new Error(refused);
+    }
     const settings = session === undefined ? record.context.session : await this.settingsOf(session);
-    await this.runtimes.resumeSession(record.context.runtime, {
-      sessionId,
-      nativeSessionRef: ref,
-      cwd: record.context.cwd,
-      ...settings,
-    });
+    // Looked at again after every await (KNOWLEDGE §5): opened meanwhile, it is not resumed a second time.
+    if (this.runtimes.isOpen(ref)) return;
+    try {
+      await this.runtimes.resumeSession(record.context.runtime, {
+        sessionId,
+        nativeSessionRef: ref,
+        cwd,
+        ...settings,
+      });
+    } catch (error) {
+      // Claude reports a folder removed meanwhile as a binary that cannot start (SP-07 G5): said plainly instead.
+      if (this.options.resolveRealPath(cwd) === null) {
+        this.resumeRefused.set(sessionId, folderGone(cwd));
+        // eslint-disable-next-line preserve-caught-error
+        throw new Error(folderGone(cwd));
+      }
+      throw error;
+    }
+    this.resumeRefused.delete(sessionId);
     await this.setActivity(sessionId, 'idle');
+  }
+
+  /** Why a closed session cannot be resumed in `cwd`, or undefined (R-06, T032 read-only sessions, T036). */
+  private async resumeRefusal(session: LogicalSession | undefined, cwd: string): Promise<string | undefined> {
+    if (session?.kind === 'workflow') {
+      const refused = await this.workflow?.sessionAccess?.(session.id);
+      if (refused !== undefined) return refused;
+    }
+    return this.options.resolveRealPath(cwd) === null ? folderGone(cwd) : undefined;
+  }
+
+  /** Why a send to this session would not reach it: it is closed and cannot be resumed (T036); undefined when it can. */
+  private async closedRefusal(session: LogicalSession): Promise<string | undefined> {
+    const ref = await this.binding(session.id);
+    if (ref === undefined || this.runtimes.isOpen(ref)) return undefined;
+    return this.resumeRefusal(session, session.cwd);
   }
 
   /** Dispatches a delivery that is still pending; returns its state afterwards. */
@@ -1747,7 +2021,7 @@ export class SessionService {
     const outcome: DispatchOutcome = await this.delivery.dispatch(operationId, options);
     if (outcome.status === 'sent') {
       const sent = await this.store.get(operationId);
-      this.followAckedTurn(sent?.target.sessionId, outcome.nativeRef.turnRef);
+      // Its ack's turn was followed before `sent` was written, if its opening can still report it (T036 r1/r2).
       this.expectEcho(sent, outcome.attemptId);
       await this.settled(operationId, outcome.attemptId);
     }
@@ -1845,11 +2119,23 @@ export class SessionService {
    * queue, then pushed. Deltas are not stored and are pushed at once. An event whose write fails is not
    * pushed (r1-P1-7): the Snapshot and the event stream must not disagree.
    */
-  private record(event: RuntimeEvent): void {
+  private record(event: RuntimeEvent, isCurrent: (sessionId: SessionId) => boolean = () => true): void {
     if (this.closed) return;
+    // An earlier opening's event (T036 r3 P1-1) is history only: it never reaches the locks, the supervisor, the acks
+    // and handoffs, the activity, the usage or the workflow, which are about what goes on now.
+    const of = sessionOf(event);
+    if (of !== undefined && !isCurrent(of)) {
+      this.recordHistory(event, of);
+      return;
+    }
     // The locks see each event as it arrives, before any await of storing it: a write's end, a turn's end
     // and an exit change who may write at once (R-07, KNOWLEDGE §5).
     this.locks?.observe(event);
+    // The supervisor too, synchronously: an event while it checks a session for idleness cancels that close (T036).
+    if (USE_EVENTS.has(event.type)) {
+      const used = sessionOf(event);
+      if (used !== undefined) void this.supervisor?.touch(used);
+    }
     if (event.type === 'runtime.exited') {
       this.runtimes.markExited(event.sessionIds);
       // No turn of an exited runtime ends any more; the next handoff waits for a restart instead.
@@ -1874,6 +2160,124 @@ export class SessionService {
       // No AppEvent tells the renderer to reload its Snapshot (contracts gap): remembered for when there is one.
       this.unsynced.add(sessionId);
     });
+  }
+
+  /**
+   * What an earlier opening's event may still do (T036 r3 P1-1): record that something of it ended (a turn, an item,
+   * a sub-agent, a request) or a message it sent, in the session's queue like any write, unless it was recorded as
+   * ended already. Anything that would say something runs now (a `running` state, deltas, usage, model) is dropped.
+   */
+  private recordHistory(event: RuntimeEvent, sessionId: SessionId): void {
+    const ends =
+      (event.type === 'turn.updated' && event.turn.state !== 'running') ||
+      (event.type === 'item.updated' && event.item.endedAt !== undefined) ||
+      (event.type === 'nativeTask.updated' && event.task.state !== 'running') ||
+      (event.type === 'permission.updated' && (event.request.state === 'answered' || event.request.state === 'withdrawn')) ||
+      event.type === 'message.completed';
+    if (!ends) return;
+    void this.serial(sessionKey(sessionId), () => this.applyHistory(event)).catch((error: unknown) => {
+      this.log(`recording an earlier opening's ${event.type} of ${sessionId} failed (${errorName(error)}); it is not pushed`);
+      this.unsynced.add(sessionId);
+    });
+  }
+
+  private async applyHistory(event: RuntimeEvent): Promise<void> {
+    if (this.closed) return;
+    const { conversations } = this.repos;
+    switch (event.type) {
+      case 'turn.updated': {
+        const stored = (await conversations.get(event.turn.sessionId)).turns.find((t) => t.id === event.turn.id);
+        if (stored !== undefined && stored.state !== 'running') return;
+        this.contentWrite(event.turn.sessionId);
+        await conversations.upsertTurn(event.turn);
+        this.contentWritten(event.turn.sessionId);
+        break;
+      }
+      case 'item.updated': {
+        const { item } = event;
+        const stored = (await conversations.get(item.sessionId)).items.find((i) => i.id === item.id);
+        if (stored?.endedAt !== undefined) return;
+        this.contentWrite(item.sessionId);
+        await conversations.upsertItem(item);
+        this.contentWritten(item.sessionId);
+        // What it wrote is still written (writtenPaths: what this session changed, whichever opening did).
+        if (item.kind === 'fileChange' && item.state === 'applied') {
+          const session = await this.repos.sessions.get(item.sessionId);
+          this.written.add(
+            item.sessionId,
+            item.changes.flatMap((c) => [c.path, ...(c.movePath ? [c.movePath] : [])]),
+            session?.cwd ?? '',
+          );
+        }
+        break;
+      }
+      case 'nativeTask.updated': {
+        const stored = (await conversations.get(event.task.sessionId)).nativeTasks.find((t) => t.id === event.task.id);
+        if (stored !== undefined && stored.state !== 'running') return;
+        this.contentWrite(event.task.sessionId);
+        await conversations.upsertNativeTask(event.task);
+        this.contentWritten(event.task.sessionId);
+        break;
+      }
+      case 'permission.updated':
+        await conversations.upsertPermissionRequest(event.request);
+        this.forgetRequest(event.request);
+        if (event.request.state === 'withdrawn') await this.gate.withdrawn(event.request);
+        break;
+      case 'message.completed':
+        if (this.isEcho(event.message)) return;
+        this.contentWrite(event.message.sessionId);
+        await conversations.appendMessage(event.message);
+        this.contentWritten(event.message.sessionId);
+        break;
+      default:
+        return;
+    }
+    this.options.publish(event);
+  }
+
+  /** A request the runtime answered or withdrew no longer waits (T036 r3 P1-2). */
+  private forgetRequest(request: PermissionRequest): void {
+    if (request.state !== 'answered' && request.state !== 'withdrawn') return;
+    for (const [guarded] of this.requests) if (guarded.request.id === request.id && guarded.request.sessionId === request.sessionId) this.requests.delete(guarded);
+  }
+
+  /**
+   * After a release (its Job ended): what the released opening left running is over (T036 r3), recorded as a restart
+   * records a crashed run's (`start`), so the session's idleness and turn boundary do not wait for an end that its
+   * runtime can no longer report. A session is opened again only after its release finished, so nothing here is a
+   * later opening's.
+   */
+  private async endLeftOpen(sessionId: SessionId): Promise<void> {
+    if (this.closed) return;
+    const { conversations } = this.repos;
+    const conversation = await conversations.get(sessionId);
+    const at = this.options.now();
+    const changed: RuntimeEvent[] = [];
+    for (const turn of conversation.turns)
+      if (turn.state === 'running') {
+        const ended: Turn = { ...turn, state: 'interrupted', endedAt: at };
+        this.contentWrite(sessionId);
+        await conversations.upsertTurn(ended);
+        changed.push({ type: 'turn.updated', turn: ended });
+      }
+    for (const item of conversation.items) {
+      const ended = endedByExit(item, at);
+      if (ended === undefined) continue;
+      this.contentWrite(sessionId);
+      await conversations.upsertItem(ended);
+      changed.push({ type: 'item.updated', item: ended });
+    }
+    for (const task of conversation.nativeTasks)
+      if (task.state === 'running') {
+        const ended = { ...task, state: 'stopped' as const, endedAt: at };
+        this.contentWrite(sessionId);
+        await conversations.upsertNativeTask(ended);
+        changed.push({ type: 'nativeTask.updated', task: ended });
+      }
+    if (changed.length === 0) return;
+    this.contentWritten(sessionId);
+    for (const event of changed) this.options.publish(event);
   }
 
   private async apply(event: Exclude<RuntimeEvent, { type: 'runtime.exited' | 'message.delta' | 'item.outputDelta' }>): Promise<void> {
@@ -1927,6 +2331,7 @@ export class SessionService {
       }
       case 'permission.updated':
         await conversations.upsertPermissionRequest(event.request);
+        this.forgetRequest(event.request);
         if (event.request.state === 'withdrawn') await this.gate.withdrawn(event.request);
         await this.followHold(event.request);
         break;
@@ -1987,11 +2392,33 @@ export class SessionService {
   }
 
   /** The turn a dispatch's ack named, until it is seen to end (T023 r1-P1-4). */
-  private followAckedTurn(sessionId: SessionId | undefined, turnRef: string | undefined): void {
-    if (sessionId === undefined || turnRef === undefined || this.endedTurns.get(sessionId)?.includes(turnRef)) return;
+  private followAckedTurn(sessionId: SessionId | undefined, turnRef: string | undefined): boolean {
+    if (sessionId === undefined || turnRef === undefined || this.endedTurns.get(sessionId)?.includes(turnRef)) return false;
     const acked = this.ackedTurns.get(sessionId) ?? new Set<string>();
+    if (acked.has(turnRef)) return false;
     acked.add(turnRef);
     this.ackedTurns.set(sessionId, acked);
+    return true;
+  }
+
+  /**
+   * `recordSent` with the ack's turn followed first (T036 r1 P1-1): the decision before its consequence, so no await
+   * lies between the commit of `sent` and the turn counting against idleness. The turn stays followed whatever the
+   * write does: the runtime named it, so it runs until it is seen to end (or the runtime exits).
+   */
+  private async recordSentFollowing(store: DeliveryStore, ...args: Parameters<DeliveryStore['recordSent']>): ReturnType<DeliveryStore['recordSent']> {
+    const [operationId, attemptId, nativeRef] = args;
+    // Only an attempt this process dispatched to the opening that is open now (T036 r2 P1-2): a reconcile after a
+    // restart, or of an opening released since, names a turn whose end will never be reported. Asked right away, in
+    // the same step as the dispatch's own answer.
+    const opening = this.runtimes.dispatchedTo(attemptId);
+    if (opening === undefined || !this.runtimes.isOpen(opening.ref, opening.generation)) return store.recordSent(...args);
+    const sessionId = (await store.get(operationId))?.target.sessionId;
+    // A turn already stored as ended is not waited for.
+    const stored = sessionId === undefined || nativeRef.turnRef === undefined ? undefined : (await this.repos.conversations.get(sessionId)).turns.find((t) => t.id === nativeRef.turnRef);
+    // Looked at again after the reads: an opening released meanwhile reports nothing more.
+    if ((stored === undefined || stored.state === 'running') && this.runtimes.isOpen(opening.ref, opening.generation)) this.followAckedTurn(sessionId, nativeRef.turnRef);
+    return store.recordSent(...args);
   }
 
   private turnSeenEnded(turn: Turn): void {

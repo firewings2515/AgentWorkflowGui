@@ -28,6 +28,7 @@ import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../ada
 import { permissionPolicy } from '../../core/policy';
 import type { AppRepositories, GitPort, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter } from '../../core/ports';
 import { Redactor, SessionService } from '../../core/sessions';
+import { IdleSupervisor, SUPERVISOR_DEFAULTS } from '../../core/supervisor';
 import { TransferService } from '../../core/transfer';
 import { WorkflowEngine } from '../../core/workflow';
 import type { EventBus } from './event-bus';
@@ -65,6 +66,11 @@ export interface BackendOptions {
   /** Diagnostics: fixed text, IDs and error names only. */
   log: (message: string) => void;
   closeTimeoutMs?: number;
+  /**
+   * The idle supervisor (T036): how long a session goes unused before its runtime is closed, how many runtimes may
+   * be open at once (0: no limit), and how often it looks. Defaults: SUPERVISOR_DEFAULTS.
+   */
+  supervisor?: { idleMs?: number; maxOpen?: number; tickMs?: number };
 }
 
 export interface Backend {
@@ -79,6 +85,8 @@ export interface Backend {
   mcp: GuiMcpServer;
   /** The git / worktree adapter (T030) the task pipeline (T032) runs its worktrees, merges and fast-forwards through. */
   git: GitPort;
+  /** Closes idle runtimes while the app runs (T036); its timer is the backend's. */
+  supervisor: IdleSupervisor;
   /** What exiting now would cut off (R-14). */
   unfinishedWork(): Promise<{ runningSessions: number; heldRequests: number; runningNativeTasks: number; commands: number }>;
   shutdown(): Promise<void>;
@@ -235,18 +243,18 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     // The detail argument is left out: it can hold transcript text or protocol lines.
     if (level === 'warn') log(`[${runtime}] ${message}`);
   };
-  let claude: RuntimeAdapter | undefined;
+  // A new adapter for every opening of a session, Claude included (T036 r2 P1-1): the late end of an earlier opening
+  // (its stream ending, its exit) then comes from an adapter that no longer serves the session, and is told apart.
   const createAdapter: AdapterFactory =
     options.createAdapter ??
     ((runtime, sessionId, hooks) => {
       if (runtime === 'claude') {
-        claude ??= new ClaudeAdapter({
+        return new ClaudeAdapter({
           sdk: claudeAgentSdk,
           onPermissionRequest: (handle) => hooks.onPermissionRequest(handle),
           spawnProcess: ({ sessionId: id }) => claudeProcessSpawn(host, id),
           log: adapterLog('claude'),
         });
-        return claude;
       }
       const command = options.codexExecutable;
       if (command === undefined) throw new Error('Codex is not available');
@@ -258,8 +266,9 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       });
     });
   const hooks = { onPermissionRequest: (handle: PermissionHandle) => (ref.service === undefined ? Promise.reject(new Error('not ready')) : ref.service.onPermissionRequest(handle)) };
-  // T035: the Claude adapter the model probe ran on (the shared one). The exit closes it even when no Claude
-  // session ever ran, so a probe's claude.exe is ended and its temp folder removed before the GUI goes.
+  // T035: the Claude adapter the model probe ran on (its own since T036; an injected factory may still share one). The
+  // exit closes it even when no Claude session ever ran, so a probe's claude.exe is ended and its temp folder removed
+  // before the GUI goes.
   let claudeProbeAdapter: RuntimeAdapter | undefined;
   let probesStopped = false;
   const listModels =
@@ -269,8 +278,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       if (probesStopped) throw new Error('the application is closing');
       // Listed outside any session: Codex in a Job of its own, ended right after.
       const probeId = `models-${runtime}` as SessionId;
-      // Claude's adapter is the one all sessions share, so it keeps the service's hooks; the Codex probe
-      // has an app-server of its own, where nothing can be allowed.
+      // Claude's probe keeps the service's hooks (an injected factory may hand it the adapter sessions share); the
+      // Codex probe has an app-server of its own, where nothing can be allowed.
       const probeHooks = runtime === 'claude' ? hooks : { onPermissionRequest: (h: PermissionHandle) => h.answer({ outcome: 'decline', decidedBy: 'policy', at: now() }) };
       const adapter = createAdapter(runtime, probeId, probeHooks);
       if (runtime === 'claude') claudeProbeAdapter = adapter;
@@ -298,7 +307,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     uuid,
     hashPayload: sha256,
     resolveRealPath: (path) => options.resolveRealPath(path),
-    createAdapter: (runtime, sessionId) => createAdapter(runtime, sessionId, hooks),
+    // The router's hooks: each opening's requests know whether that opening still serves the session (T036 r3 P1-2).
+    createAdapter: (runtime, sessionId, sessionHooks) => createAdapter(runtime, sessionId, sessionHooks),
     mountMcp: (sessionId) => {
       const mount = mcp.mount(sessionId);
       tokens.add(mount.token);
@@ -355,6 +365,18 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   // T023: transfer.prepare / confirm / cancel; it reaches storage and runtimes through the service too.
   const transfer = new TransferService({ sessions: service, publish: (event) => void bus.publish(event), now, hashPayload: sha256, log });
   service.attachTransfer(transfer);
+  // T036: idle runtimes closed while the app runs (never after it, D-03); the next delivery resumes them.
+  const supervisor = new IdleSupervisor({
+    sessions: service,
+    now,
+    idleMs: options.supervisor?.idleMs ?? SUPERVISOR_DEFAULTS.idleMs,
+    maxOpen: options.supervisor?.maxOpen ?? SUPERVISOR_DEFAULTS.maxOpen,
+    closeTimeoutMs,
+    // A background command or a Codex Start-Process child would end with the session's Job (R-14).
+    ownedCommands: async (sessionId) => (await host.listOwned(sessionId)).filter((p) => p.kind === 'command' && p.endedAt === undefined).length,
+    log,
+  });
+  service.attachSupervisor(supervisor);
 
   // 6. Restart recovery (CR-2): unknown only reconciled, pending through the one dispatch entry. Stored data
   // it cannot read stops the start like damaged data does (r1-P1-6): no model probe, no runtime.
@@ -386,6 +408,10 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       })
       .catch((error: unknown) => log(`[backend] listing ${runtime} models failed (${describe(error)})`));
   }
+
+  // After recovery: what it dispatched has made those sessions used just now.
+  const idleTimer = setInterval(() => void supervisor.tick(), options.supervisor?.tickMs ?? SUPERVISOR_DEFAULTS.tickMs);
+  idleTimer.unref();
 
   let closing: Promise<void> | undefined;
   const facade: AppFacade = {
@@ -436,6 +462,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     closing ??= (async () => {
       // R-14: the core stops taking anything new at once (a permission check under way is declined), then no new
       // tool calls, then every session closed gracefully, then whatever is left in a Job.
+      clearInterval(idleTimer);
+      supervisor.stop();
       service.beginClose();
       probesStopped = true;
       await mcp.close().catch(() => undefined);
@@ -463,6 +491,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     repositories,
     mcp,
     git,
+    supervisor,
     async unfinishedWork() {
       const work = await service.unfinishedWork();
       const owned = await host.listOwned().catch(() => []);
