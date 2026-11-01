@@ -14,10 +14,15 @@ import { crashCases } from './cases';
 const opened: DatabaseSync[] = [];
 const dirs: string[] = [];
 afterEach(() => {
-  // Every case restarts: its restart read through a connection of its own.
-  expect(opened.length).toBeGreaterThanOrEqual(2);
-  for (const db of opened.splice(0)) db.close();
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  const connections = opened.length;
+  try {
+    // Every case restarts: its restart read through a connection of its own.
+    expect(connections).toBeGreaterThanOrEqual(2);
+  } finally {
+    // Cleaned up even when the check fails (r2): the error is thrown after.
+    for (const db of opened.splice(0)) db.close();
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 /** One database file per case; each start (the first and every restart) opens its own connection to it. */
