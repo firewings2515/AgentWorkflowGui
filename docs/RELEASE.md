@@ -83,10 +83,19 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 
 ## 8. T044 驗證紀錄
 
-2026-11-01，Windows 10 19045 x64，已安裝版（`/S /D=<mkdtemp>\app`，暫存 `--user-data-dir`）：
+2026-11-01，Windows 10 19045 x64，已安裝版（`/S /D=<mkdtemp>\app`，暫存 `--user-data-dir`）。分兩次：
+
+**A. 完整 live（commit `0f67a55` 的安裝檔）**
 
 - 安裝 1 次（18 秒、沒有提權）、解除安裝 1 次（11 秒）；Electron GUI 啟動 2 次（第 2 次不送 turn，只確認模型清單）。
 - Claude（haiku）與 Codex（gpt-6.1-sol）各 1 個 turn 都 completed；claude.exe 由 `app.asar.unpacked` 啟動；koffi／Job Object、`node:sqlite` 正常；GUI MCP server 隨 backend 啟動並掛到兩個 session，但 live 沒有實際呼叫 MCP 工具。
 - 關閉 764 ms，沒有 R-14 對話框（當時沒有未結束的工作），沒有殘留程序。
 - 解除安裝後：安裝資料夾、`HKCU` 解除安裝項目、開始功能表捷徑都已移除；暫存 userData 的 `awg.sqlite` 仍在，並能以唯讀開啟（22 個資料表，`T044-live-uninstall.json`）。
-- 沒有驗證：有未結束工作時的 R-14 對話框（打包版）、預設安裝位置、互動式安裝畫面、Windows 11。
+**B. 最終版的聚焦 live（commit `57f9c33` 的安裝檔：`AgentWorkflowGui-Setup-0.1.0-x64.exe`，218,379,071 位元組，SHA-256 `F5059819767E96C06D3BA45EEBCF52F57BD4A1F024C2AA635FD0BC8A289A37AC`）**
+
+- 驗證 review 後新增的 `app.isPackaged`／`process.resourcesPath` 接線與 `\\?\` 正規化。安裝 1 次（18 秒）、Electron 啟動 1 次、解除安裝 1 次（10 秒）；只送 Claude（haiku）1 個 turn，Codex 沿用 A 的證據。
+- Claude 的 13 個模型在 app 啟動後約 8 秒內出現（第一次查詢就已經有）；1 個 turn completed（`observedModel` `claude-haiku-5-5`）；執行中的 `claude.exe` 路徑正好是這次安裝的 `<安裝>\resources\app.asar.unpacked\node_modules\@anthropic-ai\claude-agent-sdk-win32-x64\claude.exe`。
+- 腳本以 port 0 與 `DevToolsActivePort` 連線，並核對 port 擁有者的 PID 與建立時間，才送指令。關閉 768 ms、沒有殘留程序。
+- 解除安裝後：安裝資料夾、`HKCU` 項目、捷徑都已移除；暫存 userData 的 `awg.sqlite` 仍在，22 個資料表，`logical_session` 1、`message` 2、`turn` 1、`owned_process` 4（`T044-live2-uninstall.json`）。
+
+**沒有驗證**：有未結束工作時的 R-14 對話框（打包版）、預設安裝位置、互動式安裝畫面、Windows 11、`\\?\` 前綴在安裝版 SDK 上是否真的會出現（只有單元測試）。
