@@ -70,7 +70,7 @@ const settle = async () => {
   for (let i = 0; i < 30; i++) await new Promise((resolve) => setImmediate(resolve));
 };
 
-const start = async (loc: RuntimeLocator) => {
+const start = async (loc: RuntimeLocator, redetectMinMs = 0) => {
   const bus = new EventBus();
   const envelopes: EventEnvelope[] = [];
   bus.subscribe((e) => envelopes.push(e));
@@ -79,7 +79,7 @@ const start = async (loc: RuntimeLocator) => {
     bus,
     createHost: () => new FakeHost(),
     runtimes: loc,
-    redetectMinMs: 0,
+    redetectMinMs,
     createAdapter: (runtime, _id, hooks) => new FakeAdapter(runtime, (h) => hooks.onPermissionRequest(h)),
     listModels: (runtime) => Promise.resolve([{ runtime, model: `${runtime}-m`, displayName: `${runtime} m`, efforts: [], isDefault: true, hidden: false }]),
     resolveRealPath: (p) => p,
@@ -136,18 +136,22 @@ describe('T045 runtime detection in the backend', () => {
 
   it('two commands that need the same unavailable runtime at once both wait for the one detection that runs', async () => {
     const loc = locator({ claude: available('claude'), codex: missing('codex') });
-    const s = await start(loc.port);
+    // A pause between detections that is long: only the wait for the running detection can let the second one through.
+    const s = await start(loc.port, 60_000);
     await settle();
     await s.run({ type: 'agent.save', requestId: rid(), agent: agent(), expectedRevision: null });
     const before = loc.calls.filter((c) => c === 'codex').length;
     let open: () => void = () => undefined;
     loc.state.gate = new Promise<void>((resolve) => { open = resolve; });
     loc.answers.codex = available('codex');
-    const first = s.run(create('codex', 'codex-a'));
+    let answered = 0;
+    const first = s.run(create('codex', 'codex-a')).finally(() => answered++);
     await settle();
     // The second asks while the first one's detection is still running: inside the pause, but it must not skip it.
-    const second = s.run(create('codex', 'codex-b'));
+    const second = s.run(create('codex', 'codex-b')).finally(() => answered++);
     await settle();
+    // Neither is answered before the detection is: the second is not refused on the old status.
+    expect(answered).toBe(0);
     open();
     expect(await first).toMatchObject({ ok: true });
     expect(await second).toMatchObject({ ok: true });

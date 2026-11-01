@@ -3,9 +3,9 @@
 // package ships. Nothing found means Codex is not available; it is never started through `cmd.exe`.
 // claude-exe.ts looks for Claude Code by the same rules, in the same order. Every candidate is a full path to an
 // existing .exe, resolved through links (`verifiedExe`); a bare name or a relative PATH folder is never used.
-import { readdirSync } from 'node:fs';
+import { readdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import { envValue, isDirectory, isFile, pathDirs, unique, verifiedExe, type ExeCandidate } from './exe-search';
+import { checkedExe, envValue, isDirectory, isFile, pathDirs, unique, type ExeCandidate, type Realpath } from './exe-search';
 
 /**
  * The oldest Codex this app works with: 0.160.0, the version T013, T017 and the live checks of the app-server
@@ -42,16 +42,16 @@ const findVendored = (dir: string, depth: number): string | undefined => {
  * is set: a path the user gave is never replaced by another), then each `codex.exe` on PATH or the binary behind
  * an npm shim there, then Codex's own install folder (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`).
  */
-export const codexCandidates = (env: NodeJS.ProcessEnv = process.env): ExeCandidate[] => {
+export const codexCandidates = (env: NodeJS.ProcessEnv = process.env, realpath: Realpath = realpathSync.native): ExeCandidate[] => {
   const override = env['AWG_CODEX_COMMAND'];
   if (override !== undefined && override !== '') {
-    const path = verifiedExe(override);
-    return path === undefined ? [] : [{ path, source: 'env' }];
+    const candidate = checkedExe(override, 'env', realpath);
+    return candidate === undefined ? [] : [candidate];
   }
   const found: ExeCandidate[] = [];
   const add = (path: string, source: ExeCandidate['source']) => {
-    const verified = verifiedExe(path);
-    if (verified !== undefined) found.push({ path: verified, source });
+    const candidate = checkedExe(path, source, realpath);
+    if (candidate !== undefined) found.push(candidate);
   };
   for (const dir of pathDirs(env)) {
     const exe = join(dir, 'codex.exe');

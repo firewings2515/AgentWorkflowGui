@@ -15,7 +15,7 @@ AgentWorkflowGui 目前只發行 **Windows x64、未簽章、per-user** 的 NSIS
 | koffi | 3.3.2 | Job Object 用；只打包 `win32-x64` 的 native |
 | OS | Windows 10 22H2（build 19045，實測）、Windows 11 x64 | 沒有 arm64 版安裝檔；沒有 macOS／Linux 版 |
 
-**找到的路徑一律是完整路徑**：`PATH` 裡的 `.`、空項目與相對路徑會被略過，`AWG_CLAUDE_PATH`／`AWG_CODEX_COMMAND` 必須是完整路徑的 `.exe`；偵測後交給啟動器的是解開連結後的真實檔案路徑，不會再依 session 的工作資料夾重新查找。`--version` 只認得 `2.1.309 (Claude Code)`、`codex-cli 0.160.0` 或單獨的版本號（完整 SemVer）這幾種輸出，其他一律當作讀不到版本。
+**找到的路徑一律是完整路徑**：`PATH` 裡的 `.`、空項目與相對路徑會被略過，`AWG_CLAUDE_PATH`／`AWG_CODEX_COMMAND` 必須是完整路徑的 `.exe`；偵測後交給啟動器的是解開連結後的真實檔案路徑，不會再依 session 的工作資料夾重新查找；解開連結後的檔案若不是 `.exe`（例如名為 `claude.exe` 的連結指向 `runtime.js`，SDK 會改用 `node` 啟動它），不會被執行，該 runtime 顯示為「讀不到版本」並附固定說明。`--version` 只認得 `2.1.309 (Claude Code)`、`codex-cli 0.160.0` 或單獨的版本號（完整 SemVer）這幾種輸出，其他一律當作讀不到版本。
 
 ## 2. 產出與建置
 

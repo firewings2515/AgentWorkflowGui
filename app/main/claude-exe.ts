@@ -3,11 +3,11 @@
 // computer. Nothing found means Claude is not available; it is never started through `cmd.exe`.
 // Every candidate is a full path to an existing .exe, resolved through links (`verifiedExe`): a bare name or a
 // relative PATH folder is never used, because the launcher would look it up again in the session's folder.
-import { readdirSync } from 'node:fs';
+import { readdirSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { compareVersions, parseVersion } from './runtime-version';
-import { envValue, isDirectory, isFile, pathDirs, unique, verifiedExe, type ExeCandidate } from './exe-search';
+import { checkedExe, envValue, isDirectory, isFile, pathDirs, unique, type ExeCandidate, type Realpath, verifiedExe } from './exe-search';
 
 interface Install {
   path: string;
@@ -73,16 +73,16 @@ export const desktopClaudeInstalls = (env: NodeJS.ProcessEnv): string[] => {
  * full-path folders of PATH or the binary behind an npm shim there, then the native installer's
  * `~\.local\bin\claude.exe`, then the Claude desktop app's CLI.
  */
-export const claudeCandidates = (env: NodeJS.ProcessEnv = process.env): ExeCandidate[] => {
+export const claudeCandidates = (env: NodeJS.ProcessEnv = process.env, realpath: Realpath = realpathSync.native): ExeCandidate[] => {
   const override = env['AWG_CLAUDE_PATH'];
   if (override !== undefined && override !== '') {
-    const path = verifiedExe(override);
-    return path === undefined ? [] : [{ path, source: 'env' }];
+    const candidate = checkedExe(override, 'env', realpath);
+    return candidate === undefined ? [] : [candidate];
   }
   const found: ExeCandidate[] = [];
   const add = (path: string, source: ExeCandidate['source']) => {
-    const verified = verifiedExe(path);
-    if (verified !== undefined) found.push({ path: verified, source });
+    const candidate = checkedExe(path, source, realpath);
+    if (candidate !== undefined) found.push(candidate);
   };
   for (const dir of pathDirs(env)) {
     const exe = join(dir, 'claude.exe');

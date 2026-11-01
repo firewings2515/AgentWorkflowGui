@@ -114,6 +114,24 @@ describe('T045 finding Claude Code', () => {
     }
   });
 
+  it('a link named .exe that points at something else is not used (review r2): it is shown as failed and never run', () => {
+    // The check after the resolution, with the resolution faked: a link cannot always be made here.
+    const link = touch('links', 'claude.exe');
+    const target = touch('links', 'runtime.js');
+    const codexLink = touch('links', 'codex.exe');
+    const resolve = (path: string) => (path === link ? target : path === codexLink ? target : path);
+    const claude = claudeCandidates(env({ AWG_CLAUDE_PATH: link }), resolve);
+    expect(claude).toEqual([{ path: link, source: 'env', unusable: 'not-exe' }]);
+    expect(claudeCandidates(env({ Path: join(dir, 'links') }), resolve)).toEqual([{ path: link, source: 'path', unusable: 'not-exe' }]);
+    expect(codexCandidates({ AWG_CODEX_COMMAND: codexLink }, resolve)).toEqual([{ path: codexLink, source: 'env', unusable: 'not-exe' }]);
+    expect(codexCandidates({ Path: join(dir, 'links') }, resolve)).toEqual([{ path: codexLink, source: 'path', unusable: 'not-exe' }]);
+    // A resolution to a missing file or to a relative path is no candidate at all; one to an .exe in another folder is that folder's.
+    const other = touch('other', 'real.exe');
+    expect(claudeCandidates(env({ AWG_CLAUDE_PATH: link }), () => join(dir, 'missing.exe'))).toEqual([]);
+    expect(claudeCandidates(env({ AWG_CLAUDE_PATH: link }), () => 'real.exe')).toEqual([]);
+    expect(claudeCandidates(env({ AWG_CLAUDE_PATH: link }), () => other)).toEqual([{ path: other, source: 'env' }]);
+  });
+
   it('hands on the real file: a link is resolved, so what was checked is what is started', () => {
     const real = touch('real', 'claude.exe');
     try {
@@ -302,6 +320,22 @@ describe('T045 the locator', () => {
     expect(picked).toMatchObject({ state: 'available', executable: b, source: 'known-location' });
     const allOld = await locate('claude', { [a]: { version: ok('2.0.0') }, [b]: { version: ok('2.1.0') } }, [{ path: a, source: 'path' }, { path: b, source: 'known-location' }]).detect();
     expect(allOld).toMatchObject({ state: 'too-old', executable: a, version: '2.0.0' });
+  });
+
+  it('an unusable candidate is failed with a fixed explanation, nothing is run, and a usable one after it is preferred', async () => {
+    const bad = 'C:/links/claude.exe';
+    const calls = fakeRun({});
+    const only = createRuntimeLocator({ run: calls.run, candidates: () => [{ path: bad, source: 'env', unusable: 'not-exe' }], env: {} });
+    const status = await only.detect('claude', AT);
+    expect(status).toMatchObject({ state: 'failed', executable: bad, source: 'env', auth: 'unknown' });
+    expect(status.detail).toContain('.exe');
+    expect(() => RuntimeStatus.parse(status)).not.toThrow();
+    expect(calls.calls).toEqual([]);
+    const good = 'C:/good/claude.exe';
+    const both = fakeRun({ [good]: { version: ok('2.1.309 (Claude Code)'), status: ok(claudeJson()) } });
+    const picked = await createRuntimeLocator({ run: both.run, candidates: () => [{ path: bad, source: 'path', unusable: 'not-exe' }, { path: good, source: 'known-location' }], env: {} }).detect('claude', AT);
+    expect(picked).toMatchObject({ state: 'available', executable: good });
+    expect(both.calls.every((c) => c[0] === good)).toBe(true);
   });
 
   it('keeps the last status as current, and never throws', async () => {

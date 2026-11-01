@@ -7,7 +7,16 @@ import type { RuntimeSource } from '../../contracts';
 export interface ExeCandidate {
   path: string;
   source: RuntimeSource;
+  /**
+   * Set when the name says .exe but the file it is a link to is not (a link to `runtime.js`): the SDK starts a .js
+   * file through `node`, which the launcher would look up in the session's folder or PATH. Such a candidate is shown
+   * but never run or handed on.
+   */
+  unusable?: 'not-exe';
 }
+
+/** `fs.realpathSync.native`; replaced in tests, since a link cannot always be made. */
+export type Realpath = (path: string) => string;
 
 export const isFile = (path: string): boolean => {
   try {
@@ -45,18 +54,29 @@ export const pathDirs = (env: NodeJS.ProcessEnv): string[] =>
     .map((d) => d.replace(/^"(.*)"$/, '$1'))
     .filter((d) => d !== '' && isFullPath(d));
 
+const isExeName = (path: string): boolean => /\.exe$/i.test(path);
+
 /**
- * The file a candidate really is: a full path to an existing .exe, resolved through links. This is what is checked
- * (`--version`) and what is handed to the launcher, so it can never be looked up again in a session's folder.
+ * The candidate for a path: a full path named .exe that exists, resolved through links. The resolved path is what is
+ * checked (`--version`) and what is handed to the launcher, so it can never be looked up again in a session's folder.
+ * A link whose target is not an .exe is `unusable`: the extension is checked again after the resolution (review r2).
+ * Undefined when there is no such file.
  */
-export const verifiedExe = (path: string): string | undefined => {
-  if (!isFullPath(path) || !/\.exe$/i.test(path)) return undefined;
+export const checkedExe = (path: string, source: RuntimeSource, realpath: Realpath = realpathSync.native): ExeCandidate | undefined => {
+  if (!isFullPath(path) || !isExeName(path)) return undefined;
   try {
-    const real = realpathSync.native(path);
-    return isFullPath(real) && isFile(real) ? real : undefined;
+    const real = realpath(path);
+    if (!isFullPath(real) || !isFile(real)) return undefined;
+    return isExeName(real) ? { path: real, source } : { path, source, unusable: 'not-exe' };
   } catch {
     return undefined;
   }
+};
+
+/** The real path of a usable .exe, or undefined. */
+export const verifiedExe = (path: string, realpath: Realpath = realpathSync.native): string | undefined => {
+  const candidate = checkedExe(path, 'path', realpath);
+  return candidate === undefined || candidate.unusable !== undefined ? undefined : candidate.path;
 };
 
 /** The same candidates without a repeated path (Windows paths compare ignoring case). */

@@ -57,6 +57,7 @@ export const runtimeDetail = {
       ? `環境變數 AWG_${runtime.toUpperCase()}_${runtime === 'claude' ? 'PATH' : 'COMMAND'} 指定的檔案不存在或不是 .exe。請修正或移除它，再按「重新偵測」。`
       : `找不到 ${NAME[runtime]}。請先安裝 ${NAME[runtime]}，再按「重新偵測」。`,
   tooOld: (runtime: Runtime, version: string): string => `${NAME[runtime]} ${version} 比需要的 ${REQUIRED[runtime]} 舊，請更新 ${NAME[runtime]} 後再按「重新偵測」。`,
+  notExe: (runtime: Runtime): string => `找到的 ${NAME[runtime]} 檔案實際指向的不是 .exe 程式，為了安全不會執行它。請改用 ${NAME[runtime]} 官方安裝的 .exe，再按「重新偵測」。`,
   failed: (runtime: Runtime): string => `找到 ${NAME[runtime]}，但讀不到它的版本，請確認它可以執行，再按「重新偵測」。`,
   signedOut: (runtime: Runtime): string => `${NAME[runtime]} 尚未登入。${SIGN_IN[runtime]}，再按「重新偵測」。`,
 };
@@ -112,7 +113,10 @@ export function createRuntimeLocator(options: RuntimeLocatorOptions = {}): Runti
   };
 
   /** `--version` of each candidate in order; the first that is new enough, else the first that could be read, else the first. */
-  const pick = async (runtime: Runtime, candidates: ExeCandidate[]) => {
+  const pick = async (runtime: Runtime, all: ExeCandidate[]) => {
+    // A link to something that is not an .exe is never run; it only explains why nothing could be used.
+    const candidates = all.filter((c) => c.unusable === undefined);
+    if (candidates.length === 0) return { candidate: all[0] as ExeCandidate, version: undefined };
     let firstRead: { candidate: ExeCandidate; version: string } | undefined;
     for (const candidate of candidates) {
       const result = await run(candidate.path, ['--version'], versionTimeout);
@@ -141,6 +145,7 @@ export function createRuntimeLocator(options: RuntimeLocatorOptions = {}): Runti
     }
     const { candidate, version } = await pick(runtime, candidates);
     const found = { ...base, executable: candidate.path, source: candidate.source satisfies RuntimeSource };
+    if (candidate.unusable !== undefined) return { ...found, state: 'failed', auth: 'unknown', detail: runtimeDetail.notExe(runtime) };
     if (version === undefined) return { ...found, state: 'failed', auth: 'unknown', detail: runtimeDetail.failed(runtime) };
     if (compareVersions(version, requiredVersion) < 0) {
       return { ...found, state: 'too-old', version, auth: 'unknown', detail: runtimeDetail.tooOld(runtime, version) };
