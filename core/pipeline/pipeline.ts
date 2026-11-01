@@ -1181,6 +1181,8 @@ export class TaskPipeline {
     const task = instance?.tasks.find((t) => t.id === taskId);
     const merged = instance?.mergeQueue.find((m) => m.taskId === taskId && m.state === 'merged');
     if (task?.status === 'merged' && merged !== undefined && (task.worktree?.cleanup === 'active' || merged.integration?.cleanup === 'active')) await this.cleanupMerged(instanceId, merged);
+    // A cleanup left pending, or put off at the start because this session was in use (`retryPending`).
+    else if (taskId !== undefined && (task?.worktree?.cleanup === 'pending-cleanup' || instance?.mergeQueue.some((m) => m.taskId === taskId && m.integration?.cleanup === 'pending-cleanup') === true)) await this.retryPending(instanceId, taskId);
   }
 
   private async closeResolver(instanceId: InstanceId, m: MergeAttempt): Promise<void> {
@@ -1200,6 +1202,15 @@ export class TaskPipeline {
     return (await this.repos.sessions.list())
       .filter((s) => s.kind === 'workflow' && s.workflow.instanceId === instance.id && s.workflow.taskId === taskId)
       .map((s) => s.id);
+  }
+
+  /** A session of the list is in a turn, or has a message on its way (pending, or sent with an unknown outcome). */
+  private async inUse(sessionIds: readonly SessionId[]): Promise<boolean> {
+    for (const sessionId of sessionIds) {
+      if (await this.deps.sessions.mainTurnRunning(sessionId)) return true;
+      if ((await this.store.listByTarget(sessionId)).some((d) => d.delivery.state === 'pending' || d.delivery.state === 'unknown')) return true;
+    }
+    return false;
   }
 
   private async cleanupMerged(instanceId: InstanceId, m: MergeAttempt): Promise<void> {
@@ -1639,19 +1650,33 @@ export class TaskPipeline {
    * again at the next start or by `task.retryCleanup`); nothing here fails the start. The GUI's own processes in the
    * folders are ended first, as `task.retryCleanup` does. The git adapter runs one command per repository at a
    * time, and each result is written only if the worktree is still in the state it was read in.
+   *
+   * Not at a time when the sessions of the folder are at work (r1 P1-3): recovery has already sent the deliveries it
+   * found pending, so a session may be in a turn, or a message may be on its way, when this runs. Such a worktree is
+   * left (still pending) and tried again when that session's turn ends (`turnEnded`), at the next start, or by
+   * `task.retryCleanup`. The check is made again right after the runtimes were closed, before git is asked.
+   * `onlyTask`: just that task's worktrees (a turn of its sessions ended).
    */
-  private async retryPending(instanceId: InstanceId): Promise<void> {
+  private async retryPending(instanceId: InstanceId, onlyTask?: TaskId): Promise<void> {
     try {
       const instance = await this.repos.instances.get(instanceId);
       if (instance === undefined || !this.worktreeMode(instance)) return;
       for (const task of instance.tasks) {
-        if (task.worktree?.cleanup !== 'pending-cleanup' || !isFinal(task)) continue;
+        if (task.worktree?.cleanup !== 'pending-cleanup' || !isFinal(task) || (onlyTask !== undefined && task.id !== onlyTask)) continue;
+        const sessions = await this.sessionsOf(instance, task.id);
+        if (await this.inUse(sessions)) {
+          this.deps.log(`[pipeline] the worktree of task ${task.id} stays pending: a session of it is at work`);
+          continue;
+        }
         await this.stopCommands(instanceId, task.id);
-        await this.closeRuntimes(await this.sessionsOf(instance, task.id));
+        await this.closeRuntimes(sessions);
+        if (await this.inUse(sessions)) continue;
         await this.cleanupTask(instanceId, task.id, task.status === 'merged', true);
       }
       for (const m of instance.mergeQueue) {
-        if (m.integration?.cleanup !== 'pending-cleanup' || activeMergeStates.includes(m.state)) continue;
+        if (m.integration?.cleanup !== 'pending-cleanup' || activeMergeStates.includes(m.state) || (onlyTask !== undefined && m.taskId !== onlyTask)) continue;
+        // Only the attempt's resolver works in an integration worktree.
+        if (await this.inUse([await resolverSessionIdOf(this.deps.hash, instanceId, m.taskId, m.attempt)])) continue;
         await this.cleanupIntegration(instanceId, m, true, true);
       }
     } catch (error) {

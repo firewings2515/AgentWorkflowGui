@@ -366,10 +366,11 @@ export class MemoryGit implements GitPort {
     if (options.deleteBranch) {
       const tip = this.tip(worktree.repo, worktree.branch);
       if (tip !== undefined) {
-        // As the git adapter: the commits only this branch holds may be merge commits only (T043 G-6).
+        // As the git adapter: the commits only this branch holds may be merge commits only, and only on an integration branch (T043 G-6).
         const others = [...this.branches].filter(([k]) => k !== `${key(worktree.repo)}|${worktree.branch}` && k.startsWith(`${key(worktree.repo)}|`)).map(([, id]) => id);
         const unique = [...this.reachable(tip)].filter((id) => !others.some((other) => this.isAncestor(id, other)));
-        if (unique.some((id) => (this.commits.get(id)?.parents.length ?? 0) <= 1)) return { status: 'pending-cleanup', detail: `Refused: the commits of ${worktree.branch} are in no other branch, so deleting it would lose them` };
+        const integration = /[\\/]m-[^\\/]*$/.test(worktree.path);
+        if (unique.some((id) => !integration || (this.commits.get(id)?.parents.length ?? 0) <= 1)) return { status: 'pending-cleanup', detail: `Refused: the commits of ${worktree.branch} are in no other branch, so deleting it would lose them` };
         this.branches.delete(`${key(worktree.repo)}|${worktree.branch}`);
       }
     }

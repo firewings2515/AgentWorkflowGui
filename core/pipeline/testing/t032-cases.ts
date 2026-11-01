@@ -1276,6 +1276,47 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       expect(r.git.tip(CWD, (await taskOf(r, t.b!)).worktree!.branch)).toBeDefined(); // B's work stays on its branch
     });
 
+    it('T043 r1 P1-3: a startup retry leaves a worktree alone while a session of it is given a message by recovery; it is cleaned when that turn ends', async () => {
+      const w = await begin(make);
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      const path = (await taskOf(w, t.a!)).worktree!.path;
+      w.git.locked.add(path.toLowerCase());
+      await finish(w, t.a!, { 'a.txt': 'a\n' });
+      await until(async () => (await taskOf(w, t.a!)).worktree?.cleanup === 'pending-cleanup', 'pending');
+      expect(await statusOf(w, t.a!)).toBe('merged');
+      // A message accepted for the task's session and not sent before the app went down.
+      const impl = await implOf(w, t.a!);
+      const session = (await w.repositories.sessions.get(impl))!;
+      const accepted = await w.service.delivery.accept({
+        kind: 'user-message',
+        operationId: 'user-message:t043-pending' as never,
+        payloadHash: hashOf('one more thing'),
+        payload: 'one more thing',
+        proposalRevision: 0,
+        target: { sessionId: impl, nativeSessionRef: (await w.service.nativeSessionOf(impl))! },
+        at: '2026-11-01T00:00:00.000Z',
+        context: { runtime: session.requestedModel.runtime, cwd: session.cwd, entry: { kind: 'new-turn' }, session: { model: session.requestedModel, readOnly: false } },
+      });
+      expect(accepted.status).toBe('accepted');
+      // The restart sends it first (its turn runs); the retry of the pending cleanup must not cut that turn off.
+      w.holding.add(impl);
+      const retriesBefore = w.git.calls.filter((c) => c.op === 'retryCleanup').length;
+      const r = await w.restart();
+      await settle();
+      expect((await r.store.get('user-message:t043-pending' as never))?.delivery.state).toBe('sent');
+      expect(r.closed).not.toContain(impl);
+      expect(r.git.calls.filter((c) => c.op === 'retryCleanup')).toHaveLength(retriesBefore);
+      expect((await taskOf(r, t.a!)).worktree?.cleanup).toBe('pending-cleanup');
+      // The turn ends: the cleanup that was put off is done.
+      r.git.locked.clear();
+      r.holding.delete(impl);
+      await r.finishTurn(impl);
+      await until(async () => (await taskOf(r, t.a!)).worktree?.cleanup === 'removed', 'removed after the turn');
+      expect(r.closed).toContain(impl);
+    });
+
     it('T043: a task still at work keeps its worktree: nothing is removed or retried at startup', async () => {
       const w = await begin(make);
       const t = await made(w, [item('a', 'A')]);

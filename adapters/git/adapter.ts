@@ -43,6 +43,21 @@ const INTENT_KEY = 'awgIntent';
 const TOKEN_KEY = 'awgToken';
 /** Branch config: identity of the folder git was asked to remove, so a leftover can be told from a folder made later. */
 const LEFTOVER_KEY = 'awgLeftover';
+/** Branch config: what the pipeline made the branch for, from the worktree's name at creation (`m-…`: an integration worktree). */
+const KIND_KEY = 'awgKind';
+/**
+ * Branch config: the commit the branch pointed at when this adapter last made or saw a commit on it (creation, `commitAll`,
+ * `merge`). A branch somewhere else now (`branch -f`, a copy under the old name) is not what the pipeline made, whatever
+ * its other records say (T043 r1 P1-1).
+ */
+const TIP_KEY = 'awgTip';
+/**
+ * `<this><branch>` points at the tip of a branch whose deletion was decided and may not be finished: written before the
+ * branch goes, removed once nothing is checked out on it (or it was put back). A retry that finds it finishes or undoes
+ * the deletion instead of taking a missing branch for a done cleanup (T043 r1 P1-2).
+ */
+const PENDING_DELETE = 'refs/awg/pending-delete/';
+const NO_REF = '0000000000000000000000000000000000000000';
 /** The file in a worktree's admin folder (`<common dir>\worktrees\<name>`) that holds the token. */
 const OWNER_FILE = 'awg-owner';
 /** A worktree's name under `.awg\wt`: one safe segment (no separators, no `..`, no trailing dot, no device names). */
@@ -145,6 +160,9 @@ export class GitAdapter implements GitPort {
         if (admin === undefined) throw new GitStepError(`git made ${worktree.path} but its worktree folder could not be found; it was not claimed`);
         writeFileSync(join(admin, OWNER_FILE), token, 'utf8');
         await this.must(['config', `branch.${worktree.branch}.${TOKEN_KEY}`, token], worktree.repo);
+        // The kind and the tip before the ownership record: a branch that is owned has both.
+        await this.must(['config', `branch.${worktree.branch}.${KIND_KEY}`, /^m-/.test(basename(worktree.path)) ? 'integration' : 'task'], worktree.repo);
+        await this.must(['config', `branch.${worktree.branch}.${TIP_KEY}`, baseCommit], worktree.repo);
         await this.must(['config', `branch.${worktree.branch}.${BRANCH_KEY}`, key], worktree.repo);
         await this.git(['config', '--unset-all', `branch.${worktree.branch}.${INTENT_KEY}`], worktree.repo);
         return { status: 'created', baseCommit };
@@ -168,12 +186,18 @@ export class GitAdapter implements GitPort {
           if (unresolved.length > 0) throw new GitStepError(`Conflict markers are still in: ${unresolved.join(', ')}`);
         } else {
           const staged = await this.git(['diff', '--cached', '--quiet'], worktree.path);
-          if (staged.code === 0) return { status: 'nothing', commit: await this.head(worktree.path) };
+          if (staged.code === 0) {
+            const head = await this.head(worktree.path);
+            await this.recordTip(worktree, head);
+            return { status: 'nothing', commit: head };
+          }
           if (staged.code !== 1) throw new GitStepError(detailOf(staged));
         }
         await this.must([...(await this.identityArguments(worktree.path)), 'commit', '--cleanup=whitespace', '-m', message], worktree.path);
         if (merging) await this.forgetConflicts(worktree.path);
-        return { status: 'committed', commit: await this.head(worktree.path) };
+        const head = await this.head(worktree.path);
+        await this.recordTip(worktree, head);
+        return { status: 'committed', commit: head };
       }),
     );
   }
@@ -194,7 +218,11 @@ export class GitAdapter implements GitPort {
           [...(await this.identityArguments(integration.path)), 'merge', '--no-ff', '--no-edit', '--cleanup=whitespace', '-m', message, `refs/heads/${branch}`],
           integration.path,
         );
-        if (result.code === 0) return { status: 'merged', commit: await this.head(integration.path) };
+        if (result.code === 0) {
+          const head = await this.head(integration.path);
+          await this.recordTip(integration, head);
+          return { status: 'merged', commit: head };
+        }
         if (result.code === 1) {
           const files = await this.unmergedFiles(integration.path);
           if (files.length > 0) {
@@ -322,6 +350,8 @@ export class GitAdapter implements GitPort {
       return pending(`Refused: ${error instanceof Error ? error.message : String(error)}`);
     }
     const full = `refs/heads/${worktree.branch}`;
+    const resumed = await this.resumeDelete(worktree, full);
+    if (resumed !== undefined) return resumed;
     const entries = await this.worktrees(worktree.repo);
     const registered = entries.find((entry) => samePath(entry.path, worktree.path));
     if (registered !== undefined && registered.branch !== full) {
@@ -387,44 +417,78 @@ export class GitAdapter implements GitPort {
     if (options.deleteBranch && branchExists) {
       // The caller asks for the branch to go (a merged task's, or an ended merge attempt's integration branch).
       // `branch -d` would compare against the checked-out HEAD, which is not the target branch, so the same check is
-      // made here: another branch holds the commits, or (T043 G-6) the only commits it holds alone are merge commits,
-      // which carry no work of anyone's (their parents are all kept elsewhere) — what an integration branch of a
-      // failed attempt holds. The delete is `update-ref -d <ref> <checked sha>`, which git refuses when the branch
-      // moved since (`branch -D` has no such condition); it does not look at checkouts, so those are checked
-      // before and again after (G-8).
+      // made here. The branch must still be where the pipeline left it (`awgTip`: a branch moved with `branch -f`, or
+      // copied back under the old name, is not what the pipeline made). Then another branch holds the commits, or
+      // (T043 G-6) the branch is an integration branch and the only commits it holds alone are merge commits, which
+      // carry no work of anyone's (their parents are all kept elsewhere) — what a failed attempt leaves. The delete is
+      // `update-ref -d <ref> <checked sha>`, which git refuses when the branch moved since (`branch -D` has no such
+      // condition); it does not look at checkouts, so those are checked before and again after (G-8).
       const tip = await this.tip(worktree.repo, full);
       if (tip !== undefined) {
         const checkedOut = (await this.worktrees(worktree.repo)).find((entry) => entry.branch === full);
         if (checkedOut !== undefined) return pending(`Refused: ${worktree.branch} is checked out in ${checkedOut.path}`);
+        const recordedTip = await this.recorded(worktree.repo, worktree.branch, TIP_KEY);
+        if (recordedTip !== undefined && recordedTip !== tip) {
+          return pending(`Refused: ${worktree.branch} is not at the commit the pipeline left it at (${recordedTip}); it was moved or copied, so it was not deleted`);
+        }
         const others = lines(await this.must(['for-each-ref', '--format=%(refname)', 'refs/heads'], worktree.repo)).filter((ref) => ref !== full);
         const unique = await this.uniqueCommits(worktree.repo, tip, others);
-        if (unique.length > 0) return pending(`Refused: the commits of ${worktree.branch} are in no other branch, so deleting it would lose them`);
-        const deleted = await this.git(['update-ref', '-d', full, tip], worktree.repo);
-        if (deleted.code !== 0) return pending(`The branch changed while it was being checked and was kept: ${detailOf(deleted)}`);
-        // G-8: git has no lock between "checked out nowhere" and the delete. A worktree that checked the branch out in
-        // that gap now has a HEAD that names a branch that is gone: the branch is put back (only if it is still
-        // missing) and the checkout is the user's to deal with. What remains is a checkout after this look, which
-        // finds no branch and fails by itself.
-        const raced = (await this.worktrees(worktree.repo)).find((entry) => entry.branch === full);
-        if (raced !== undefined) {
-          const restored = await this.git(['update-ref', full, tip, '0000000000000000000000000000000000000000'], worktree.repo);
-          return pending(
-            `${worktree.branch} was checked out in ${raced.path} while it was being deleted; ` + (restored.code === 0 ? 'it was put back' : `it could not be put back (${detailOf(restored)})`),
-          );
+        const integration = recordedTip === tip && (await this.recorded(worktree.repo, worktree.branch, KIND_KEY)) === 'integration';
+        if (unique.length > 0 && !(integration && unique.every((commit) => commit.parents > 1))) {
+          return pending(`Refused: the commits of ${worktree.branch} are in no other branch, so deleting it would lose them`);
         }
-        // What `branch -D` also does: the branch's settings (and with them the records) go.
-        await this.git(['config', '--remove-section', `branch.${worktree.branch}`], worktree.repo);
+        // The decision is written first (a ref that keeps the tip alive); it is removed when nothing is left to undo.
+        const marker = `${PENDING_DELETE}${worktree.branch}`;
+        await this.must(['update-ref', marker, tip, NO_REF], worktree.repo);
+        const deleted = await this.git(['update-ref', '-d', full, tip], worktree.repo);
+        if (deleted.code !== 0) {
+          await this.git(['update-ref', '-d', marker], worktree.repo);
+          return pending(`The branch changed while it was being checked and was kept: ${detailOf(deleted)}`);
+        }
+        const finished = await this.finishDelete(worktree, full, marker, tip);
+        if (finished !== undefined) return finished;
       }
     }
     return { status: 'removed' };
   }
 
   /**
-   * The commits reachable from `tip` and from none of `others` (branch refs). Empty: another branch holds all of
-   * them. When the branch holds commits alone and every one is a merge commit, the list is empty too: such a branch
-   * is the GUI's integration branch of an ended merge attempt (T043 G-6) — deleting it loses only merge results,
-   * since each merge's parents are in other branches. A commit with a single parent (someone's work) is listed.
+   * After the branch ref is gone (T043 G-8, r1 P1-2): git has no lock between "checked out nowhere" and the delete, so a
+   * worktree that checked the branch out in that gap now has a HEAD that names a branch that is gone. Then the branch is
+   * put back (only if it is still missing) and the checkout is the user's to deal with; otherwise the branch's records
+   * go with it. The marker stays until either is done, so a look that failed or a crash here is picked up by the next
+   * cleanup (`resumeDelete`), never taken for a finished one. A checkout after this look finds no branch and fails by
+   * itself. Undefined: done.
    */
+  private async finishDelete(worktree: WorktreeRef, full: string, marker: string, tip: string): Promise<CleanupResult | undefined> {
+    const raced = (await this.worktrees(worktree.repo)).find((entry) => entry.branch === full);
+    if (raced !== undefined) {
+      const restored = await this.git(['update-ref', full, tip, NO_REF], worktree.repo);
+      const back = restored.code === 0 || (await this.tip(worktree.repo, full)) !== undefined;
+      if (back) await this.git(['update-ref', '-d', marker], worktree.repo);
+      return pending(`${worktree.branch} was checked out in ${raced.path} while it was being deleted; ` + (back ? 'it was put back' : `it could not be put back (${detailOf(restored)}), and the next cleanup tries again`));
+    }
+    // What `branch -D` also does: the branch's settings (and with them the records) go.
+    await this.git(['config', '--remove-section', `branch.${worktree.branch}`], worktree.repo);
+    const cleared = await this.git(['update-ref', '-d', marker], worktree.repo);
+    if (cleared.code !== 0) return pending(`The record of the deletion could not be withdrawn: ${detailOf(cleared)}`);
+    return undefined;
+  }
+
+  /** A deletion an earlier cleanup decided and did not finish (it failed after the ref went, or the GUI stopped there). */
+  private async resumeDelete(worktree: WorktreeRef, full: string): Promise<CleanupResult | undefined> {
+    const marker = `${PENDING_DELETE}${worktree.branch}`;
+    const marked = await this.tip(worktree.repo, marker);
+    if (marked === undefined) return undefined;
+    if ((await this.tip(worktree.repo, full)) !== undefined) {
+      // The branch is there again (put back, or made anew): the old decision is void.
+      await this.git(['update-ref', '-d', marker], worktree.repo);
+      return undefined;
+    }
+    return this.finishDelete(worktree, full, marker, marked);
+  }
+
+  /** The commits reachable from `tip` and from none of `others` (branch refs), each with its number of parents. Empty: another branch holds all of them. */
   private async uniqueCommits(repo: string, tip: string, others: readonly string[]): Promise<{ commit: string; parents: number }[]> {
     // The revisions go through stdin: a repository can have more branches than a command line holds.
     const result = await this.git(['rev-list', '--parents', '--stdin'], repo, `${tip}\n${others.map((ref) => `^${ref}`).join('\n')}\n`);
@@ -435,7 +499,13 @@ export class GitAdapter implements GitPort {
       const [commit = '', ...parents] = line.split(' ');
       return { commit, parents: parents.length };
     });
-    return commits.some((c) => c.parents <= 1) ? commits : [];
+    return commits;
+  }
+
+  /** The pipeline made a commit on the branch (or looked at it and took it as it is): that is where the branch is meant to be. */
+  private async recordTip(worktree: WorktreeRef, tip: string): Promise<void> {
+    if ((await this.recorded(worktree.repo, worktree.branch, BRANCH_KEY)) === undefined) return;
+    await this.git(['config', `branch.${worktree.branch}.${TIP_KEY}`, tip], worktree.repo);
   }
 
   /** What `createWorktree` recorded in the branch's config under `key`. */

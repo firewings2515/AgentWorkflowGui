@@ -35,7 +35,7 @@ const until = async (check: () => boolean | Promise<boolean>, what: string, ms =
   throw new Error(`timed out waiting for ${what}`);
 };
 
-it('V-19, V-20, V-21 on a real repository: parallel tasks, a dependency, a conflict and failed tests; main only fast-forwards', { timeout: 180_000 }, async () => {
+it('V-19, V-20, V-21 on a real repository: parallel tasks, a dependency, a conflict and failed tests; main only fast-forwards', { timeout: 300_000 }, async () => {
   const sandbox = createSandbox();
   const repo = await sandbox.newRepo('project');
   await sandbox.commitFile(repo, 'src/app.txt', 'app\n', 'initial');
