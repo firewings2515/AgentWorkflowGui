@@ -1,6 +1,5 @@
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { app, BrowserWindow, dialog, Menu, nativeTheme, shell } from 'electron';
+import { app, BrowserWindow, dialog, Menu, nativeTheme, session, shell } from 'electron';
 import { WindowsProcessHost } from '../../adapters/process';
 import type { Theme } from '../../contracts';
 import { APP_INFO_CHANNEL, FOLDER_CHANNEL } from '../preload/channels';
@@ -8,6 +7,7 @@ import { registerAppIpc } from './app-ipc';
 import { type Backend, type DamagedBackend, startBackend } from './backend';
 import { sdkBundledClaude } from './claude-exe';
 import { EventBus } from './event-bus';
+import { realFolder } from './exe-search';
 import { handleFolderRequest } from './folders';
 import { handleTrusted } from './ipc';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
@@ -15,6 +15,7 @@ import { resolveRealPath } from './real-path';
 import { createRuntimeLocator } from './runtime-locator';
 import { supervisorSettings } from './supervisor-settings';
 import { hiddenMenuTemplate, themeOf, WINDOW_BACKGROUND } from './window-chrome';
+import { guardSession, guardWebContents } from './web-security';
 import { createWebPreferences } from './window-options';
 
 const APP_NAME = 'AgentWorkflowGui';
@@ -55,12 +56,7 @@ function createWindow(): void {
   win.on('closed', () => {
     if (mainWindow === win) mainWindow = null;
   });
-
-  // The renderer is a single local page: block navigation and new windows.
-  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  win.webContents.on('will-navigate', (event, url) => {
-    if (url !== win.webContents.getURL()) event.preventDefault();
-  });
+  // Navigation, new windows, frames and webviews are blocked for every web contents (`web-contents-created`).
 
   if (devUrl) {
     void win.loadURL(devUrl);
@@ -108,8 +104,11 @@ async function confirmExit(ready: Backend): Promise<boolean> {
 }
 
 app.setName(APP_NAME);
+// The renderer is a single local page showing untrusted text (T042): before any window exists.
+app.on('web-contents-created', (_event, contents) => guardWebContents(contents, isTrustedUrl));
 
 void app.whenReady().then(async () => {
+  guardSession(session.defaultSession);
   handleTrusted(APP_INFO_CHANNEL, getTrustedSender, () => ({ name: APP_NAME, version: app.getVersion() }));
   Menu.setApplicationMenu(Menu.buildFromTemplate(hiddenMenuTemplate(devUrl !== undefined)));
   applyTheme(theme);
@@ -148,7 +147,7 @@ void app.whenReady().then(async () => {
         return picked.canceled ? null : (picked.filePaths[0] ?? null);
       },
       openPath: (path) => shell.openPath(path),
-      exists: existsSync,
+      realFolder: (path) => realFolder(path),
     }),
   );
   if (backend.status === 'ready') {

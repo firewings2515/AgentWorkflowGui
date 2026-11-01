@@ -103,6 +103,12 @@ export const resolvePath = (raw: string, cwd: AbsPath | undefined, style: PathSt
 /** Normalises an absolute path (scope roots, recorded paths); relative or unclear paths give `undefined`. */
 export const normaliseAbsolute = (raw: string): AbsPath | undefined => resolvePath(raw, undefined, 'win');
 
+/** The folder holding `path`; `undefined` for a root (`c:/`, `//server/share`). */
+export const parentOf = (path: AbsPath): AbsPath | undefined => {
+  const { root, segments } = splitAbs(path);
+  return segments.length === 0 ? undefined : joinAbs(root, segments.slice(0, -1));
+};
+
 export const isWithin = (path: AbsPath, root: AbsPath): boolean =>
   path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
 
