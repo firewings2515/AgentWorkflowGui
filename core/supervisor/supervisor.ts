@@ -9,6 +9,13 @@
 // then on a delivery from outside the queue waits for the release to end and resumes the session afterwards, so
 // nothing reaches a runtime that is going away (it would be claimed and end unknown, CR-2).
 //
+// Known limit (T036 G-4, judged in T043): a runtime that starts a turn of its own at the very moment of the close — a
+// sub-agent's wake-up, a scheduled task — shows nothing before its first event, and `RuntimeAdapter` has no query for
+// "about to run something". Waiting cannot close that window (no signal to wait for, only a longer one), so nothing is
+// waited for: the turn is interrupted by the graceful close (R-14), recorded as interrupted, the session ends `closed`
+// and the next message resumes it; no transcript is lost. What the supervisor does is say so: a use of the session while
+// it is being released is logged.
+//
 // Nothing about a close is stored: it happens only to a session with nothing unfinished, and after a crash every
 // session is closed anyway (its Job ended with the GUI, `SessionService.start` marks it closed).
 import type { SessionId, Timestamp } from '../../contracts';
@@ -51,6 +58,8 @@ interface Watch {
   aborted: boolean;
   /** While `releasing`: resolves once the release (and the session's `closed` record) is done. */
   release?: Promise<void>;
+  /** Something used the session while its runtime was being released (G-4): logged when the release ends. */
+  usedDuringRelease?: boolean;
 }
 
 export class IdleSupervisor {
@@ -70,6 +79,7 @@ export class IdleSupervisor {
     const w = this.watch(sessionId);
     w.lastUse = this.nowMs();
     if (w.phase === 'checking') w.aborted = true;
+    if (w.phase === 'releasing') w.usedDuringRelease = true;
     return w.phase === 'releasing' ? w.release : undefined;
   }
 
@@ -152,6 +162,7 @@ export class IdleSupervisor {
           }
           // Decided, with nothing awaited since the last check: from here a delivery waits for the release.
           w.phase = 'releasing';
+          delete w.usedDuringRelease;
           w.release = new Promise<void>((resolve) => {
             released = resolve;
           });
@@ -165,6 +176,8 @@ export class IdleSupervisor {
       this.log(`closing the idle runtime of ${sessionId} failed (${error instanceof Error ? error.name : 'non-error thrown'})`);
       return false;
     } finally {
+      if (w.usedDuringRelease === true) this.log(`${sessionId} was used while its runtime was being closed; a turn it started meanwhile was interrupted by the close (known limit), and its next message resumes it`);
+      delete w.usedDuringRelease;
       w.phase = 'none';
       delete w.release;
       released?.();

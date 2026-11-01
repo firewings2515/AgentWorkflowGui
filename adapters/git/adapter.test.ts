@@ -715,6 +715,100 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
     expect(await sandbox.adapter.removeWorktree(ref, { deleteBranch: true })).toEqual({ status: 'removed' });
   });
 
+  describe('T043 G-6: the integration branch of an ended attempt', () => {
+    /** A task branch with a commit and an integration branch that holds only the merge of it (a failed attempt). */
+    const mergedAttempt = async (repo: string, name: string) => {
+      const task = await taskWith(repo, `${name}t`, `${name}.txt`, `${name}\n`);
+      const integ = await integration(repo, `${name}m`);
+      expect((await sandbox.adapter.merge(integ, task.branch, `merge ${name}`)).status).toBe('merged');
+      return { task, integ };
+    };
+
+    it('deletes a GUI-made branch whose only own commits are merge commits; the task branch and its commit stay', async () => {
+      const repo = await sandbox.newRepo();
+      const { task, integ } = await mergedAttempt(repo, 'g6a');
+      const taskTip = (await sandbox.git(repo, 'rev-parse', task.branch)).trim();
+      expect(await sandbox.adapter.removeWorktree(integ, { deleteBranch: true })).toEqual({ status: 'removed' });
+      expect(existsSync(integ.path)).toBe(false);
+      expect(await sandbox.adapter.resolveBranch(repo, integ.branch)).toBeUndefined();
+      expect(await sandbox.adapter.resolveBranch(repo, task.branch)).toBe(taskTip);
+      await expect(sandbox.git(repo, 'config', '--get-regexp', `branch\\.${integ.branch}\\.`)).rejects.toThrow(); // its records went with it
+    });
+
+    it('also when a conflict was resolved and committed in it', async () => {
+      const repo = await sandbox.newRepo();
+      const a = await taskWith(repo, 'g6ca', 'c.txt', 'a side\n');
+      const b = await taskWith(repo, 'g6cb', 'c.txt', 'b side\n');
+      const integ = await integration(repo, 'g6cm');
+      expect((await sandbox.adapter.merge(integ, a.branch, 'merge a')).status).toBe('merged');
+      expect((await sandbox.adapter.merge(integ, b.branch, 'merge b')).status).toBe('conflict');
+      sandbox.write(integ.path, 'c.txt', 'both\n');
+      expect((await sandbox.adapter.commitAll(integ, 'resolved', [])).status).toBe('committed');
+      expect(await sandbox.adapter.removeWorktree(integ, { deleteBranch: true })).toEqual({ status: 'removed' });
+      expect(await sandbox.adapter.resolveBranch(repo, integ.branch)).toBeUndefined();
+      expect(await sandbox.adapter.resolveBranch(repo, a.branch)).toBeDefined();
+      expect(await sandbox.adapter.resolveBranch(repo, b.branch)).toBeDefined();
+    });
+
+    it('keeps it when a commit of someone’s own work is on it alone, and when the worktree is held (pending, retry deletes it)', async () => {
+      const repo = await sandbox.newRepo();
+      const { integ } = await mergedAttempt(repo, 'g6b');
+      sandbox.write(integ.path, 'hand.txt', 'by hand\n');
+      expect((await sandbox.adapter.commitAll(integ, 'by hand', [])).status).toBe('committed'); // a plain commit on top
+      const result = await sandbox.adapter.removeWorktree(integ, { deleteBranch: true });
+      expect(result).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('lose') as unknown });
+      expect(await sandbox.adapter.resolveBranch(repo, integ.branch)).toBeDefined();
+
+      const held = await mergedAttempt(repo, 'g6h');
+      const holder = await holdFolder(held.integ.path);
+      expect((await sandbox.adapter.removeWorktree(held.integ, { deleteBranch: true })).status).toBe('pending-cleanup');
+      expect(await sandbox.adapter.resolveBranch(repo, held.integ.branch)).toBeDefined();
+      await holder.release();
+      expect(await sandbox.adapter.retryCleanup(held.integ, { deleteBranch: true })).toEqual({ status: 'removed' });
+      expect(await sandbox.adapter.resolveBranch(repo, held.integ.branch)).toBeUndefined();
+    });
+
+    it('never touches a branch the pipeline did not make, however much it looks like one', async () => {
+      const repo = await sandbox.newRepo();
+      const task = await taskWith(repo, 'g6ut', 'u.txt', 'u\n');
+      // A user's branch, made by hand with a merge commit of its own, in a worktree of the pipeline's naming.
+      await sandbox.git(repo, 'worktree', 'add', '-q', '-b', 'awg/m-user', worktreePath(repo, 'g6u'), 'main');
+      await sandbox.git(worktreePath(repo, 'g6u'), 'merge', '--no-ff', '-q', '-m', 'users merge', task.branch);
+      const mine = { repo, path: worktreePath(repo, 'g6u'), branch: 'awg/m-user' };
+      expect((await sandbox.adapter.removeWorktree(mine, { deleteBranch: true })).status).toBe('pending-cleanup');
+      expect(existsSync(mine.path)).toBe(true);
+      expect(await sandbox.adapter.resolveBranch(repo, 'awg/m-user')).toBeDefined();
+      // Nor a branch that exists with no worktree made by the adapter at all.
+      await sandbox.git(repo, 'branch', 'awg/m-bare', task.branch);
+      const bare = { repo, path: worktreePath(repo, 'g6bare'), branch: 'awg/m-bare' };
+      expect((await sandbox.adapter.retryCleanup(bare, { deleteBranch: true })).status).toBe('pending-cleanup');
+      expect(await sandbox.adapter.resolveBranch(repo, 'awg/m-bare')).toBeDefined();
+    });
+  });
+
+  it('T043 G-8: a checkout that appears while the branch is being deleted gets the branch back', async () => {
+    const repo = await sandbox.newRepo();
+    const ref = await taskWith(repo, 'g8', 'g.txt', 'g\n');
+    await mergeIntoMain(repo, ref);
+    expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).status).toBe('removed');
+    const tip = (await sandbox.git(repo, 'rev-parse', ref.branch)).trim();
+    const elsewhere = join(sandbox.root, 'elsewhere-g8');
+    let seen = 0;
+    // The checkout happens right after the first look and before the delete: the delete's own look afterwards sees it.
+    const racing = sandbox.hooked(async (args) => {
+      if (args[0] === 'update-ref' && args[1] === '-d') {
+        seen += 1;
+        await sandbox.git(repo, 'worktree', 'add', '-q', elsewhere, ref.branch);
+      }
+    });
+    const result = await racing.retryCleanup(ref, { deleteBranch: true });
+    expect(seen).toBe(1);
+    expect(result).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('checked out') as unknown });
+    expect((await sandbox.git(repo, 'rev-parse', ref.branch)).trim()).toBe(tip); // put back
+    expect((await sandbox.git(elsewhere, 'rev-parse', 'HEAD')).trim()).toBe(tip);
+    expect((await sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgBranch`)).trim()).not.toBe(''); // still the pipeline's own
+  });
+
   it('deletes nothing but one worktree folder: .awg\\wt itself, its other worktrees, or a path with extra parts are refused', async () => {
     const repo = await sandbox.newRepo();
     const a = await taskWith(repo, 'a', 'a.txt', 'a\n');

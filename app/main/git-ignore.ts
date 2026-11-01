@@ -77,7 +77,10 @@ const decide = (rules: readonly Rule[], relative: string, isDir: boolean): boole
 
 const key = (path: string) => path.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
 
-/** Watches one folder (not below it); `undefined` when it cannot be watched. */
+/** One folder is the other or inside it (keys). */
+const overlaps = (a: string, b: string): boolean => a === b || a.startsWith(`${b}\\`) || b.startsWith(`${a}\\`);
+
+/** Watches one folder (not below it);`undefined` when it cannot be watched. */
 export type WatchFolder = (folder: string, onChange: (filename: string | null) => void) => { close(): void } | undefined;
 
 const watchFolder: WatchFolder = (folder, onChange) => {
@@ -99,9 +102,18 @@ export class GitIgnoreRules {
   /**
    * The `info` folder of every git dir whose `exclude` was read, watched on its own: it is often outside
    * the session's workspace (a linked worktree's common git dir, or a workspace below the repository
-   * root), where the workspace watcher never sees it change (T033 r2 P2).
+   * root), where the workspace watcher never sees it change (T033 r2 P2). `roots`: the repository roots whose
+   * exclude it serves; with the last of them released it is closed (T043).
    */
-  private readonly infoWatchers = new Map<string, { close(): void } | undefined>();
+  private readonly infoWatchers = new Map<string, { watcher: { close(): void } | undefined; roots: Set<string> }>();
+  /** The workspace (key) each session with a running workspace watch uses (`acquire`), and how many sessions use each. */
+  private readonly sessions = new Map<string, string>();
+  private readonly workspaces = new Map<string, number>();
+  /**
+   * The workspaces (keys) each repository root, whose exclude was read, was read for. A root read for none (no
+   * `acquire` knew of it) is never released and lives until `close()`, as before.
+   */
+  private readonly attached = new Map<string, Set<string>>();
 
   constructor(
     private readonly read: (path: string) => string | undefined = (path) => {
@@ -125,14 +137,63 @@ export class GitIgnoreRules {
 
   /** Stops the `info` folder watches (on exit). */
   close(): void {
-    for (const watcher of this.infoWatchers.values()) {
-      try {
-        watcher?.close();
-      } catch {
-        // Gone already.
-      }
-    }
+    for (const entry of this.infoWatchers.values()) this.closeWatcher(entry.watcher);
     this.infoWatchers.clear();
+    this.attached.clear();
+    this.sessions.clear();
+    this.workspaces.clear();
+  }
+
+  private closeWatcher(watcher: { close(): void } | undefined): void {
+    try {
+      watcher?.close();
+    } catch {
+      // Gone already.
+    }
+  }
+
+  /**
+   * A session's workspace is being watched (T043): the exclude watches of the repositories in it are kept while any
+   * session uses them. Repeating it for the same session changes nothing.
+   */
+  acquire(sessionId: string, workspaceRoot: string): void {
+    if (this.sessions.has(sessionId)) return;
+    const workspace = key(workspaceRoot);
+    this.sessions.set(sessionId, workspace);
+    this.workspaces.set(workspace, (this.workspaces.get(workspace) ?? 0) + 1);
+    for (const [root, users] of this.attached) if (overlaps(workspace, root)) users.add(workspace);
+  }
+
+  /**
+   * That session's watch ended. When it was the last one using a workspace, the repositories read only for that
+   * workspace are forgotten: their exclude rules are dropped (nothing would tell when they change) and an `info`
+   * folder watch no repository needs any more is closed. A session never acquired, or released twice, changes nothing.
+   */
+  release(sessionId: string): void {
+    const workspace = this.sessions.get(sessionId);
+    if (workspace === undefined) return;
+    this.sessions.delete(sessionId);
+    const left = (this.workspaces.get(workspace) ?? 1) - 1;
+    if (left > 0) {
+      this.workspaces.set(workspace, left);
+      return;
+    }
+    this.workspaces.delete(workspace);
+    for (const [root, users] of [...this.attached]) {
+      if (users.delete(workspace) && users.size === 0) this.forget(root);
+    }
+  }
+
+  /** A repository root nobody needs: its cached exclude goes, and so does any `info` watch only it used. */
+  private forget(root: string): void {
+    this.attached.delete(root);
+    this.folders.delete(`${root}#exclude`);
+    for (const [folder, entry] of [...this.infoWatchers]) {
+      entry.roots.delete(root);
+      if (entry.roots.size > 0) continue;
+      this.closeWatcher(entry.watcher);
+      this.infoWatchers.delete(folder);
+    }
   }
 
   /** Never throws (it runs on every watcher event): anything unexpected ignores nothing. */
@@ -197,8 +258,9 @@ export class GitIgnoreRules {
     if (rules === undefined) {
       const file = `${this.commonGitDir(root)}\\info\\exclude`;
       rules = parseGitignore(this.read(file) ?? '', () => this.bad(file));
-      this.watchInfo(win32.dirname(file));
+      this.watchInfo(win32.dirname(file), root);
       this.folders.set(cacheKey, rules);
+      this.attach(root);
     }
     return rules;
   }
@@ -221,9 +283,13 @@ export class GitIgnoreRules {
    * be watched (missing, no access) is a known limit: a change of its exclude then counts after the next
    * start, or once the workspace watcher reports it.
    */
-  private watchInfo(folder: string): void {
+  private watchInfo(folder: string, root: string): void {
     const k = key(folder);
-    if (this.infoWatchers.has(k)) return;
+    const known = this.infoWatchers.get(k);
+    if (known !== undefined) {
+      known.roots.add(root);
+      return;
+    }
     const dropExcludes = () => {
       for (const c of [...this.folders.keys()]) if (c.endsWith('#exclude')) this.folders.delete(c);
     };
@@ -231,7 +297,14 @@ export class GitIgnoreRules {
       if (filename === null || key(filename) === 'exclude') dropExcludes();
     });
     if (watcher === undefined) this.log('[locks] a git info folder cannot be watched; a change of its exclude counts after the next start');
-    this.infoWatchers.set(k, watcher);
+    this.infoWatchers.set(k, { watcher, roots: new Set([root]) });
+  }
+
+  /** The repository root `root` is read for every workspace now watched that it is in or holds. */
+  private attach(root: string): void {
+    const users = this.attached.get(root) ?? new Set<string>();
+    for (const workspace of this.workspaces.keys()) if (overlaps(workspace, root)) users.add(workspace);
+    this.attached.set(root, users);
   }
 
   /** A pattern left out: said once per file until it is read again. */

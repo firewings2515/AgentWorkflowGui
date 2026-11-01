@@ -302,6 +302,8 @@ interface Probe {
   cli: WatchedProcess;
   /** Settles after the process exited and its folder was removed (or the removal failed and was logged). */
   removed: Promise<void>;
+  /** A close() has already waited for its removal (T043): later ones do not wait again, the removal goes on by itself. */
+  closeWaited?: boolean;
 }
 
 /** Same folder, compared the way Windows does (case-insensitive, either separator, no trailing one). */
@@ -390,7 +392,10 @@ export class ClaudeAdapter implements RuntimeAdapter {
    * dropped, its folder is left, and that is logged. Returns whether any was let go.
    */
   private async closeProbes(timeoutMs: number): Promise<boolean> {
-    const probes = [...this.probes];
+    // A probe an earlier close() already waited for (its folder removal was slow) is not waited for again: that
+    // removal goes on by itself, and a second close() (shutdown after closeAll) would only add another timeout.
+    const probes = [...this.probes].filter((p) => p.closeWaited !== true);
+    for (const p of probes) p.closeWaited = true;
     for (const p of probes) if (p.cli.running() && !p.cli.kill()) this.log('warn', 'close: could not end a probe CLI', p.folder);
     await within(Promise.all(probes.map((p) => p.removed)), timeoutMs);
     const left = probes.filter((p) => p.cli.running());

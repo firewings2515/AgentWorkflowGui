@@ -1202,6 +1202,89 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       await until(async () => (await delivered(w, t.b!)) === 1, 'B delivered');
       expect(w.git.calls.filter((c) => c.op !== 'status' && c.op !== 'resolveBranch')).toEqual([]);
     });
+
+    it('T043 G-6: the integration branch of a failed attempt is deleted with its worktree; the task’s branch and the target stay', async () => {
+      const w = await begin(make);
+      let red = true;
+      w.commands.script = (spec) => (spec.purpose === 'test' && red ? { exitCode: 1, outputTail: 'red' } : { exitCode: 0, outputTail: 'ok' });
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'A delivered');
+      const before = main(w);
+      await finish(w, t.a!, { 'a.txt': 'a\n' });
+      await until(async () => (await attemptsOf(w, t.a!))[0]?.state === 'tests-failed', 'tests failed');
+      const [first] = await attemptsOf(w, t.a!);
+      expect(first?.integration).toMatchObject({ cleanup: 'removed' });
+      expect(w.git.tip(CWD, first!.integration!.branch)).toBeUndefined();
+      expect(w.git.tip(CWD, (await taskOf(w, t.a!)).worktree!.branch)).toBeDefined();
+      expect(main(w)).toBe(before);
+      // The next attempt gets its own branch and merges as before.
+      red = false;
+      await finish(w, t.a!, { 'a.txt': 'fixed\n' });
+      await until(async () => (await statusOf(w, t.a!)) === 'merged', 'A merged');
+      const [, second] = await attemptsOf(w, t.a!);
+      expect(w.git.tip(CWD, second!.integration!.branch)).toBeUndefined();
+      expect(second!.integration!.branch).not.toBe(first!.integration!.branch);
+    });
+
+    it('T043: at startup a worktree left pending-cleanup is tried again; one still held stays pending', async () => {
+      const w = await begin(make);
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      const path = (await taskOf(w, t.a!)).worktree!.path;
+      w.git.locked.add(path.toLowerCase());
+      await finish(w, t.a!, { 'a.txt': 'a\n' });
+      await until(async () => (await taskOf(w, t.a!)).worktree?.cleanup === 'pending-cleanup', 'pending');
+      // Still held at the start: stays pending, was tried (retryCleanup), nothing thrown.
+      const held = await w.restart();
+      expect((await taskOf(held, t.a!)).worktree?.cleanup).toBe('pending-cleanup');
+      expect(held.git.calls.filter((c) => c.op === 'retryCleanup')).toHaveLength(1);
+      // task.retryCleanup says so while it is held, and the next start finishes it once it is free (branch deleted: merged).
+      expect(await held.run({ type: 'task.retryCleanup', requestId: rid(), instanceId: INSTANCE, taskId: t.a! })).toMatchObject({ ok: false, code: 'invalid_transition', retryable: true });
+      held.git.locked.clear();
+      const r = await held.restart();
+      expect((await taskOf(r, t.a!)).worktree?.cleanup).toBe('removed');
+      expect(r.git.tip(CWD, (await taskOf(r, t.a!)).worktree!.branch)).toBeUndefined();
+      // Nothing left to retry on the next start.
+      const tried = r.git.calls.filter((c) => c.op === 'retryCleanup').length;
+      const again = await r.restart();
+      expect(again.git.calls.filter((c) => c.op === 'retryCleanup')).toHaveLength(tried);
+    });
+
+    it('T043: a pending integration worktree of a failed attempt and a pending task worktree of an ended run are retried at startup', async () => {
+      const w = await begin(make);
+      w.commands.script = (spec) => (spec.purpose === 'test' ? { exitCode: 1, outputTail: 'red' } : { exitCode: 0, outputTail: 'ok' });
+      const t = await made(w, [item('a', 'A'), item('b', 'B')]);
+      await give(w, t.a!);
+      await give(w, t.b!);
+      await until(async () => (await delivered(w, t.a!)) === 1 && (await delivered(w, t.b!)) === 1, 'delivered');
+      const integ = await integrationRef(hashOf, CWD, INSTANCE, t.a!, 0);
+      w.git.locked.add(integ.path.toLowerCase());
+      await finish(w, t.a!, { 'a.txt': 'a\n' });
+      await until(async () => (await attemptsOf(w, t.a!))[0]?.integration?.cleanup === 'pending-cleanup', 'integration pending');
+      expect(w.git.tip(CWD, integ.branch)).toBeDefined(); // held: the branch is still there
+      // B's worktree is held when the run is cancelled: its work is committed to its branch, the worktree stays pending.
+      w.git.locked.add((await taskOf(w, t.b!)).worktree!.path.toLowerCase());
+      expect(await w.run({ type: 'workflow.cancel', requestId: rid(), instanceId: INSTANCE, expectedRevision: (await instanceOf(w)).revision })).toMatchObject({ ok: true });
+      await until(async () => (await taskOf(w, t.b!)).worktree?.cleanup === 'pending-cleanup', 'B pending');
+      w.git.locked.clear();
+      const r = await w.restart();
+      expect((await attemptsOf(r, t.a!))[0]?.integration?.cleanup).toBe('removed');
+      expect(r.git.tip(CWD, integ.branch)).toBeUndefined();
+      expect((await taskOf(r, t.b!)).worktree?.cleanup).toBe('removed');
+      expect(r.git.tip(CWD, (await taskOf(r, t.b!)).worktree!.branch)).toBeDefined(); // B's work stays on its branch
+    });
+
+    it('T043: a task still at work keeps its worktree: nothing is removed or retried at startup', async () => {
+      const w = await begin(make);
+      const t = await made(w, [item('a', 'A')]);
+      await give(w, t.a!);
+      await until(async () => (await delivered(w, t.a!)) === 1, 'delivered');
+      const r = await w.restart();
+      expect(r.git.calls.filter((c) => c.op === 'retryCleanup' || c.op === 'removeWorktree')).toEqual([]);
+      expect((await taskOf(r, t.a!)).worktree?.cleanup).toBe('active');
+    });
   });
 
 /**

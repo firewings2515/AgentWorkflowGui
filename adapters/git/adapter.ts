@@ -385,24 +385,57 @@ export class GitAdapter implements GitPort {
     }
 
     if (options.deleteBranch && branchExists) {
-      // The caller says the task is merged. `branch -d` would compare against the checked-out HEAD, which is not the
-      // target branch, so the same check is made here (another branch holds the commits). The delete is
-      // `update-ref -d <ref> <checked sha>`, which git refuses when the branch moved since (`branch -D` has no such
-      // condition); it does not look at checkouts, so those are checked first (the window left is the one before
-      // the delete: a checkout in that gap is not seen, see the hand-over notes).
+      // The caller asks for the branch to go (a merged task's, or an ended merge attempt's integration branch).
+      // `branch -d` would compare against the checked-out HEAD, which is not the target branch, so the same check is
+      // made here: another branch holds the commits, or (T043 G-6) the only commits it holds alone are merge commits,
+      // which carry no work of anyone's (their parents are all kept elsewhere) — what an integration branch of a
+      // failed attempt holds. The delete is `update-ref -d <ref> <checked sha>`, which git refuses when the branch
+      // moved since (`branch -D` has no such condition); it does not look at checkouts, so those are checked
+      // before and again after (G-8).
       const tip = await this.tip(worktree.repo, full);
       if (tip !== undefined) {
         const checkedOut = (await this.worktrees(worktree.repo)).find((entry) => entry.branch === full);
         if (checkedOut !== undefined) return pending(`Refused: ${worktree.branch} is checked out in ${checkedOut.path}`);
-        const holders = lines(await this.must(['for-each-ref', '--format=%(refname)', '--contains', tip, 'refs/heads'], worktree.repo)).filter((ref) => ref !== full);
-        if (holders.length === 0) return pending(`Refused: the commits of ${worktree.branch} are in no other branch, so deleting it would lose them`);
+        const others = lines(await this.must(['for-each-ref', '--format=%(refname)', 'refs/heads'], worktree.repo)).filter((ref) => ref !== full);
+        const unique = await this.uniqueCommits(worktree.repo, tip, others);
+        if (unique.length > 0) return pending(`Refused: the commits of ${worktree.branch} are in no other branch, so deleting it would lose them`);
         const deleted = await this.git(['update-ref', '-d', full, tip], worktree.repo);
         if (deleted.code !== 0) return pending(`The branch changed while it was being checked and was kept: ${detailOf(deleted)}`);
+        // G-8: git has no lock between "checked out nowhere" and the delete. A worktree that checked the branch out in
+        // that gap now has a HEAD that names a branch that is gone: the branch is put back (only if it is still
+        // missing) and the checkout is the user's to deal with. What remains is a checkout after this look, which
+        // finds no branch and fails by itself.
+        const raced = (await this.worktrees(worktree.repo)).find((entry) => entry.branch === full);
+        if (raced !== undefined) {
+          const restored = await this.git(['update-ref', full, tip, '0000000000000000000000000000000000000000'], worktree.repo);
+          return pending(
+            `${worktree.branch} was checked out in ${raced.path} while it was being deleted; ` + (restored.code === 0 ? 'it was put back' : `it could not be put back (${detailOf(restored)})`),
+          );
+        }
         // What `branch -D` also does: the branch's settings (and with them the records) go.
         await this.git(['config', '--remove-section', `branch.${worktree.branch}`], worktree.repo);
       }
     }
     return { status: 'removed' };
+  }
+
+  /**
+   * The commits reachable from `tip` and from none of `others` (branch refs). Empty: another branch holds all of
+   * them. When the branch holds commits alone and every one is a merge commit, the list is empty too: such a branch
+   * is the GUI's integration branch of an ended merge attempt (T043 G-6) — deleting it loses only merge results,
+   * since each merge's parents are in other branches. A commit with a single parent (someone's work) is listed.
+   */
+  private async uniqueCommits(repo: string, tip: string, others: readonly string[]): Promise<{ commit: string; parents: number }[]> {
+    // The revisions go through stdin: a repository can have more branches than a command line holds.
+    const result = await this.git(['rev-list', '--parents', '--stdin'], repo, `${tip}\n${others.map((ref) => `^${ref}`).join('\n')}\n`);
+    if (result.code !== 0) throw new GitStepError(detailOf(result));
+    if (result.truncated) throw new GitStepError('The list of commits was too large to read in full');
+    const listed = lines(result.stdout);
+    const commits = listed.map((line) => {
+      const [commit = '', ...parents] = line.split(' ');
+      return { commit, parents: parents.length };
+    });
+    return commits.some((c) => c.parents <= 1) ? commits : [];
   }
 
   /** What `createWorktree` recorded in the branch's config under `key`. */

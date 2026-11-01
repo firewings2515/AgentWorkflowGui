@@ -942,16 +942,14 @@ export class TaskPipeline {
   private async resolutionFailed(instanceId: InstanceId, m: MergeAttempt, detail: string): Promise<void> {
     const instance = await this.repos.instances.get(instanceId);
     const integ = instance === undefined ? undefined : await this.integRef(instance, m);
-    let head: string | undefined;
     if (integ !== undefined) {
       const status = await this.git.status(integ).catch(() => undefined);
       if (status?.merging === true) await this.git.abortMerge(integ);
-      head = (await this.git.status(integ).catch(() => undefined))?.head;
     }
     const saved = await this.endAttempt(instanceId, m, ['resolving', 'merging'], 'conflict', detail);
     if (saved === undefined) return;
     await this.closeResolver(instanceId, m);
-    await this.cleanupIntegration(instanceId, m, head !== undefined && head === m.baseCommit);
+    await this.cleanupIntegration(instanceId, m, true);
     await this.giveBack(instanceId, m, 'conflict');
   }
 
@@ -974,7 +972,7 @@ export class TaskPipeline {
     }
     const saved = await this.endAttempt(instance.id, m, ['testing'], 'tests-failed', undefined, test);
     if (saved === undefined) return;
-    await this.cleanupIntegration(instance.id, m, false);
+    await this.cleanupIntegration(instance.id, m, true);
     await this.giveBack(instance.id, m, 'tests');
   }
 
@@ -1115,7 +1113,7 @@ export class TaskPipeline {
       const done = TaskPipeline.withAttempt(current, x, (a) => ({ ...a, state: 'cancelled', endedAt: at, detail: 'the target branch moved before the fast-forward; merging again from its new commit' }));
       return TaskPipeline.withTask({ ...done, mergeQueue: [...done.mergeQueue, next] }, x.taskId, (t) => ({ ...t, status: 'awaiting-merge' }));
     });
-    if (saved !== undefined) await this.cleanupIntegration(instanceId, m, false);
+    if (saved !== undefined) await this.cleanupIntegration(instanceId, m, true);
   }
 
   /** Git refused or failed (or nothing can test): the attempt fails, the task waits for the user (R-05). */
@@ -1135,7 +1133,7 @@ export class TaskPipeline {
       const integ = await this.integRef(saved, attempt);
       const status = integ === undefined ? undefined : await this.git.status(integ).catch(() => undefined);
       if (integ !== undefined && status?.merging === true) await this.git.abortMerge(integ);
-      await this.cleanupIntegration(instanceId, m, status !== undefined && status.head === attempt.baseCommit);
+      await this.cleanupIntegration(instanceId, m, true);
     }
   }
 
@@ -1238,6 +1236,12 @@ export class TaskPipeline {
     return result;
   }
 
+  /**
+   * An integration worktree is scaffolding of one merge attempt: whatever the attempt's end, its branch is asked to go
+   * with it (T043 G-6). The git adapter agrees only for a branch the pipeline made whose own commits are merge commits
+   * (nothing of anyone's work is lost, the task's branch keeps its commits); otherwise the cleanup stays pending with the
+   * reason. A user's branch is never touched: the adapter acts only on branches it made.
+   */
   private async cleanupIntegration(instanceId: InstanceId, m: Pick<MergeAttempt, 'taskId' | 'attempt'>, deleteBranch: boolean, retry = false): Promise<CleanupResult | undefined> {
     const instance = await this.repos.instances.get(instanceId);
     const attempt = instance === undefined ? undefined : TaskPipeline.findAttempt(instance, m);
@@ -1282,7 +1286,7 @@ export class TaskPipeline {
       await this.closeRuntimes(await this.sessionsOf(instance, taskId));
       await this.cleanupTask(instanceId, taskId, task.status === 'merged', true);
     }
-    for (const m of attempts) await this.cleanupIntegration(instanceId, m, m.state === 'merged', true);
+    for (const m of attempts) await this.cleanupIntegration(instanceId, m, true, true);
     const after = await this.repos.instances.get(instanceId);
     const left = after?.tasks.find((t) => t.id === taskId)?.worktree?.cleanup === 'pending-cleanup' || after?.mergeQueue.some((m) => m.taskId === taskId && m.integration?.cleanup === 'pending-cleanup');
     if (left === true) return fail(requestId, 'invalid_transition', 'The worktree could not be removed yet; close what uses it and retry', { retryable: true, mayHaveSideEffects: true });
@@ -1365,7 +1369,7 @@ export class TaskPipeline {
       // The work stays on the task's branch: committed first, and the worktree goes only once that worked.
       await this.releaseWorktree(instance.id, task.id, `the run was ${instance.state}`);
     }
-    for (const m of instance.mergeQueue) if (m.integration?.cleanup === 'active') await this.cleanupIntegration(instance.id, m, m.state === 'merged');
+    for (const m of instance.mergeQueue) if (m.integration?.cleanup === 'active') await this.cleanupIntegration(instance.id, m, true);
   }
 
   // ---- escalations --------------------------------------------------------------------------------
@@ -1589,6 +1593,7 @@ export class TaskPipeline {
       this.remember(instance);
       if (ended(instance)) {
         if (instance.endedAt !== undefined) await this.afterEnd(instance).catch((error: unknown) => this.deps.log(`[pipeline] finishing the end of ${instance.id} failed (${errorText(error)})`));
+        await this.retryPending(instance.id);
         continue;
       }
       await this.deps.host.serial(instance.id, async () => {
@@ -1618,10 +1623,39 @@ export class TaskPipeline {
       for (const m of current.mergeQueue) {
         if (m.state === 'conflict' || m.state === 'tests-failed') await this.giveBack(current.id, m, m.state === 'conflict' ? 'conflict' : 'tests');
         if (m.state === 'merged') await this.afterMerged(current.id, m);
-        if (m.integration?.cleanup === 'active' && ['conflict', 'tests-failed', 'failed', 'cancelled'].includes(m.state)) await this.cleanupIntegration(current.id, m, false);
+        if (m.integration?.cleanup === 'active' && ['conflict', 'tests-failed', 'failed', 'cancelled'].includes(m.state)) await this.cleanupIntegration(current.id, m, true);
       }
+      await this.retryPending(current.id);
       await this.admit(current.id);
       this.kick(current.id);
+    }
+  }
+
+  /**
+   * At startup (T043): a worktree left as `pending-cleanup` (a process held it, or the removal was cut short) is
+   * tried again, so folders and branches do not pile up until the user presses `task.retryCleanup`. Only what is
+   * not in use any more: a task still at work keeps its worktree; an integration worktree always belongs to an ended
+   * attempt (its cleanup starts when the attempt ends). One that is still held stays `pending-cleanup` (and is tried
+   * again at the next start or by `task.retryCleanup`); nothing here fails the start. The GUI's own processes in the
+   * folders are ended first, as `task.retryCleanup` does. The git adapter runs one command per repository at a
+   * time, and each result is written only if the worktree is still in the state it was read in.
+   */
+  private async retryPending(instanceId: InstanceId): Promise<void> {
+    try {
+      const instance = await this.repos.instances.get(instanceId);
+      if (instance === undefined || !this.worktreeMode(instance)) return;
+      for (const task of instance.tasks) {
+        if (task.worktree?.cleanup !== 'pending-cleanup' || !isFinal(task)) continue;
+        await this.stopCommands(instanceId, task.id);
+        await this.closeRuntimes(await this.sessionsOf(instance, task.id));
+        await this.cleanupTask(instanceId, task.id, task.status === 'merged', true);
+      }
+      for (const m of instance.mergeQueue) {
+        if (m.integration?.cleanup !== 'pending-cleanup' || activeMergeStates.includes(m.state)) continue;
+        await this.cleanupIntegration(instanceId, m, true, true);
+      }
+    } catch (error) {
+      this.deps.log(`[pipeline] retrying the pending cleanups of ${instanceId} failed (${errorText(error)})`);
     }
   }
 }
