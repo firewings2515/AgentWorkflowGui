@@ -49,6 +49,16 @@ describe('T042 A11: Glob patterns that leave the folder', () => {
     [{ pattern: '**/[.][.]/*' }, 'unrecognised'],
     [{ pattern: '.*/*' }, 'unrecognised'],
     [{ pattern: '{a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}/*' }, 'unrecognised'],
+    // r2-P1: what cannot be expanded is refused even with no wildcard of the policy's own in it.
+    [{ pattern: '{..,src}/{a,b}{a,b}{a,b}{a,b}{a,b}.txt' }, 'secret-read'],
+    [{ pattern: '{..,src}/{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}.txt' }, 'unrecognised'],
+    [{ path: 'src', pattern: '{..,src}/{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}.txt' }, 'unrecognised'],
+    [{ pattern: '{../x.txt' }, 'unrecognised'],
+    [{ pattern: '{..,src/x.txt' }, 'unrecognised'],
+    [{ pattern: 'x}/../a.txt' }, 'unrecognised'],
+    [{ pattern: '../x(.txt' }, 'unrecognised'],
+    [{ pattern: '/' }, 'unrecognised'],
+    [{ pattern: 'C:' }, 'unrecognised'],
   ])('%j is not approved', (input, rule) => {
     expect(verdict(input)).toBe(rule);
   });
@@ -78,6 +88,8 @@ describe('T042 A11: Glob patterns that leave the folder', () => {
     expect(globReach({ pattern: '**/*.{ts,tsx}' })).toEqual([]);
     expect(globReach({ path: 'src', pattern: String.raw`\\server\share\*` })).toEqual(['//server/share/*']);
     expect(globReach({ pattern: '/*' })).toEqual(['/*']);
+    expect(globReach({ pattern: '{../x.txt' })).toEqual(['{../x.txt/*']);
+    expect(globReach({ path: 'src', pattern: '{..,a}/{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}.txt' })).toEqual(['src/{..,a}/{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}.txt/*']);
     expect(glob({ pattern: '**/*.ts' }).paths).toEqual([]);
     expect(
       buildPermissionRequest(

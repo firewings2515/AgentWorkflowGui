@@ -76,9 +76,10 @@ const expandBraces = (text: string): string[] | undefined => {
  * Where a Glob call reaches beyond its `path` (T042 A11): the pattern's fixed folder part, joined to `path`
  * as the tool joins them, so `C:/Users/x/.ssh/*` or `../../*` is checked like a path. Brace alternatives are
  * placed one by one (`{../far,src}/**`). What cannot be placed — a `..`, a drive or a dots-only wildcard among
- * the wildcards, a search from a root, a bracket or brace that is not closed — gives the whole pattern, which the
- * policy cannot approve. A plain relative pattern (`**\/*.ts`) adds nothing: the search stays in `path` or the
- * working folder.
+ * the wildcards, a search from a root, a bracket or brace that is not closed, too many alternatives — gives the
+ * whole pattern, always with a `*` in it: the policy refuses a wildcard path (rule B), and a pattern without one
+ * (`{..,src}/{a,b}….txt`) would otherwise be read as a plain path (r2-P1). A plain relative pattern (`**\/*.ts`)
+ * adds nothing: the search stays in `path` or the working folder.
  */
 export const globReach = (input: Record<string, unknown>): string[] => {
   const raw = str(input.pattern);
@@ -86,7 +87,8 @@ export const globReach = (input: Record<string, unknown>): string[] => {
   const pattern = raw.replaceAll('\\', '/');
   const path = str(input.path);
   const joined = (absolute: boolean, part: string) => (absolute || path === undefined || path === '' ? part : `${path}/${part}`);
-  const whole = [joined(/^([a-z]:|\/|~)/i.test(pattern), pattern)];
+  const unplaced = joined(/^([a-z]:|\/|~)/i.test(pattern), pattern);
+  const whole = [unplaced.includes('*') ? unplaced : `${unplaced}/*`];
   const reach = (alternative: string): string[] | undefined => {
     const segments = alternative.split('/');
     if (segments.some((s) => s.split('[').length !== s.split(']').length || s.split('(').length !== s.split(')').length)) return undefined;

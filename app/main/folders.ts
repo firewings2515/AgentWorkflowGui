@@ -13,7 +13,10 @@ export interface FolderDeps {
   openPath(path: string): Promise<string>;
   /**
    * The real path of an existing folder, or undefined: a file is never handed to `openPath`, which would run it.
-   * The real path is what is opened, so a link swapped after the check does not move it (T042 F2, r1-P1-3).
+   * The real path is what is opened, so retargeting a link that was in the stored path does not move it (T042 F2).
+   * Not closed: between the check and `openPath`, another process can replace the folder itself, or any folder
+   * above it (rename a parent and put a junction in its place), with something that holds a program of the same
+   * name; `openPath` has no "folders only" mode (T042-report.md, residual risk 7).
    */
   realFolder(path: string): string | undefined;
 }
