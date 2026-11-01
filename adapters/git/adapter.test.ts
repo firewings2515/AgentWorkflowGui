@@ -851,8 +851,8 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
 
   describe('T043 r2 P1-1: a tip is claimed only by a commit the adapter made', () => {
     const awgTip = async (repo: string, ref: WorktreeRef) => (await sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgTip`)).trim();
-    const commitTreeOf = async (repo: string, treeOf: string, parents: string[]): Promise<string> =>
-      (await sandbox.git(repo, 'commit-tree', `${treeOf}^{tree}`, ...parents.flatMap((p) => ['-p', p]), '-m', 'made outside')).trim();
+    const commitTreeOf = async (repo: string, treeOf: string, parents: string[], message = 'made outside'): Promise<string> =>
+      (await sandbox.git(repo, 'commit-tree', `${treeOf}^{tree}`, ...parents.flatMap((p) => ['-p', p]), '-m', message)).trim();
 
     it('a merge that turns out "Already up to date" because someone else merged first does not claim their commit', async () => {
       const repo = await sandbox.newRepo();
@@ -936,6 +936,91 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
     });
   });
 
+  describe('T043 r3 P1-1: a commit with the same parents and message but another tree is not ours', () => {
+    const awgTip = async (repo: string, ref: WorktreeRef) => (await sandbox.git(repo, 'config', '--get', `branch.${ref.branch}.awgTip`)).trim();
+
+    it('"Already up to date" after an outsider made a merge with the very parents and message of ours: not claimed, not deleted', async () => {
+      const repo = await sandbox.newRepo();
+      const task = await taskWith(repo, 'r3at', 'a.txt', 'a\n');
+      const other = await taskWith(repo, 'r3ao', 'other.txt', 'other\n');
+      const integ = await integration(repo, 'm-r3a');
+      const before = await awgTip(repo, integ);
+      let evil = '';
+      const racing = sandbox.hooked(async (args) => {
+        if (args.includes('merge') && args.includes('--no-ff') && evil === '') {
+          // Parents: the tip we hold and the task; message: ours; tree: someone else's.
+          evil = (await sandbox.git(repo, 'commit-tree', `${other.branch}^{tree}`, '-p', before, '-p', task.branch, '-m', 'merge a')).trim();
+          await sandbox.git(repo, 'update-ref', `refs/heads/${integ.branch}`, evil);
+        }
+      });
+      expect(await racing.merge(integ, task.branch, 'merge a')).toMatchObject({ status: 'merged', commit: evil });
+      expect(await awgTip(repo, integ)).toBe(before);
+      expect((await sandbox.adapter.removeWorktree(integ, { deleteBranch: true })).status).toBe('pending-cleanup');
+      expect(await sandbox.adapter.resolveBranch(repo, integ.branch)).toBe(evil);
+    });
+  });
+
+  describe('T043 r3 P1-2: a branch name that is a symbolic ref is never followed', () => {
+    it('a GUI branch name turned into a symbolic ref to a user branch: refused, the user branch stays', async () => {
+      const repo = await sandbox.newRepo();
+      const ref = await taskWith(repo, 'r3st', 'a.txt', 'a\n');
+      await mergeIntoMain(repo, ref);
+      expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).status).toBe('removed');
+      const tip = (await sandbox.git(repo, 'rev-parse', ref.branch)).trim();
+      await sandbox.git(repo, 'branch', 'user/keep', tip);
+      await sandbox.git(repo, 'update-ref', '--no-deref', '-d', `refs/heads/${ref.branch}`);
+      await sandbox.git(repo, 'symbolic-ref', `refs/heads/${ref.branch}`, 'refs/heads/user/keep');
+      const result = await sandbox.adapter.retryCleanup(ref, { deleteBranch: true });
+      expect(result).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('symbolic ref') as unknown });
+      expect((await sandbox.git(repo, 'rev-parse', 'user/keep')).trim()).toBe(tip);
+      expect((await sandbox.git(repo, 'symbolic-ref', `refs/heads/${ref.branch}`)).trim()).toBe('refs/heads/user/keep');
+    });
+
+    it('put back after a checkout appeared, the name having become a symbolic ref meanwhile: nothing it points at is created', async () => {
+      const repo = await sandbox.newRepo();
+      const ref = await taskWith(repo, 'r3sr', 'a.txt', 'a\n');
+      await mergeIntoMain(repo, ref);
+      expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).status).toBe('removed');
+      const elsewhere = join(sandbox.root, 'elsewhere-r3sr');
+      let done = false;
+      const racing = sandbox.hooked(async (args) => {
+        if (args[0] === 'update-ref' && args.includes('-d') && args.includes(`refs/heads/${ref.branch}`) && !done) {
+          done = true;
+          await sandbox.git(repo, 'worktree', 'add', '-q', elsewhere, ref.branch); // checked out in the gap…
+        } else if (done && args[0] === 'update-ref' && args.includes('0000000000000000000000000000000000000000')) {
+          done = false;
+          // …and just before the branch is put back the name is made a symbolic ref to a branch that does not exist.
+          await sandbox.git(repo, 'symbolic-ref', `refs/heads/${ref.branch}`, 'refs/heads/user/ghost');
+        }
+      });
+      const result = await racing.retryCleanup(ref, { deleteBranch: true });
+      expect(result.status).toBe('pending-cleanup');
+      await expect(sandbox.git(repo, 'rev-parse', '--verify', '-q', 'refs/heads/user/ghost')).rejects.toThrow(); // never created through the link
+    });
+
+    it('a name that is a symbolic ref when the branch is to be put back is left as it is', async () => {
+      const repo = await sandbox.newRepo();
+      const ref = await taskWith(repo, 'r3sq', 'a.txt', 'a\n');
+      await mergeIntoMain(repo, ref);
+      expect((await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).status).toBe('removed');
+      const elsewhere = join(sandbox.root, 'elsewhere-r3sq');
+      let done = false;
+      const racing = sandbox.hooked(async (args) => {
+        if (args[0] === 'update-ref' && args.includes('-d') && args.includes(`refs/heads/${ref.branch}`) && !done) {
+          done = true;
+          await sandbox.git(repo, 'worktree', 'add', '-q', elsewhere, ref.branch);
+        } else if (done && args[0] === 'symbolic-ref') {
+          done = false;
+          await sandbox.git(repo, 'symbolic-ref', `refs/heads/${ref.branch}`, 'refs/heads/user/ghost');
+        }
+      });
+      const result = await racing.retryCleanup(ref, { deleteBranch: true });
+      expect(result).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('could not be put back') as unknown });
+      await expect(sandbox.git(repo, 'rev-parse', '--verify', '-q', 'refs/heads/user/ghost')).rejects.toThrow();
+      expect((await sandbox.git(repo, 'symbolic-ref', `refs/heads/${ref.branch}`)).trim()).toBe('refs/heads/user/ghost');
+    });
+  });
+
   describe('T043 r2 P2: a cleanup that could not finish its last steps is not a finished cleanup', () => {
     const failing = (match: (args: readonly string[]) => boolean) =>
       sandbox.hooked(
@@ -968,7 +1053,7 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
       const repo = await sandbox.newRepo();
       const ref = await taskWith(repo, 'p2eb', 'b.txt', 'b\n');
       await sandbox.git(repo, 'update-ref', `refs/awg/pending-delete/${ref.branch}`, (await sandbox.git(repo, 'rev-parse', ref.branch)).trim());
-      const refused = await failing((args) => args[0] === 'update-ref' && args[1] === '-d' && args[2]?.startsWith('refs/awg/') === true).removeWorktree(ref, { deleteBranch: false });
+      const refused = await failing((args) => args[0] === 'update-ref' && args.includes('-d') && args.some((a) => a.startsWith('refs/awg/'))).removeWorktree(ref, { deleteBranch: false });
       expect(refused).toMatchObject({ status: 'pending-cleanup', detail: expect.stringContaining('could not be withdrawn') as unknown });
       expect(await sandbox.adapter.removeWorktree(ref, { deleteBranch: false })).toEqual({ status: 'removed' });
       await expect(sandbox.git(repo, 'rev-parse', '--verify', '-q', `refs/awg/pending-delete/${ref.branch}`)).rejects.toThrow();
@@ -980,7 +1065,7 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
     const failingLook = (repo: string, ref: WorktreeRef, elsewhere: string | undefined, onLook: { failed: number }) => {
       let deleted = false;
       return sandbox.hooked(async (args) => {
-        if (args[0] === 'update-ref' && args[1] === '-d' && args[2] === `refs/heads/${ref.branch}`) {
+        if (args[0] === 'update-ref' && args.includes('-d') && args.includes(`refs/heads/${ref.branch}`)) {
           deleted = true;
           if (elsewhere !== undefined) await sandbox.git(repo, 'worktree', 'add', '-q', elsewhere, ref.branch);
         } else if (deleted && args[0] === 'worktree') {
@@ -1060,7 +1145,7 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
     let seen = 0;
     // The checkout happens right after the first look and before the delete: the delete's own look afterwards sees it.
     const racing = sandbox.hooked(async (args) => {
-      if (args[0] === 'update-ref' && args[1] === '-d' && args[2]?.startsWith('refs/heads/') === true) {
+      if (args[0] === 'update-ref' && args.includes('-d') && args.some((a) => a.startsWith('refs/heads/'))) {
         seen += 1;
         await sandbox.git(repo, 'worktree', 'add', '-q', elsewhere, ref.branch);
       }
@@ -1172,7 +1257,7 @@ describe.concurrent('removeWorktree and retryCleanup', () => {
     const extra = (await sandbox.git(repo, 'commit-tree', `${tip}^{tree}`, '-p', tip, '-m', 'unmerged work')).trim();
     let moved = false;
     const racing = sandbox.hooked(async (args) => {
-      if (args[0] === 'update-ref' && args[1] === '-d' && !moved) {
+      if (args[0] === 'update-ref' && args.includes('-d') && !moved) {
         moved = true;
         await sandbox.git(repo, 'update-ref', `refs/heads/${ref.branch}`, extra);
       }
