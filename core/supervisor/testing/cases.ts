@@ -13,6 +13,7 @@ import {
   adapterOf,
   adaptersOf,
   AT,
+  CLOSE_MS,
   closesOf,
   resumedOf,
   textsOf,
@@ -647,6 +648,8 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       }
       await settle();
       expect(w.service.runtimes.retiredCount).toBe(0);
+      // Each collection is logged, with the session ID only (T039).
+      expect(w.logs.filter((l) => l.includes(`a retired adapter of ${a} was collected (closed and no longer listened to)`))).toHaveLength(4);
       const adapters = adaptersOf(w, 'codex', a);
       expect(adapters).toHaveLength(4);
       // Each was closed when it was let go (R-14), and none is listened to any more.
@@ -656,6 +659,49 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       await settle();
       expect(w.logs.some((l) => l.includes('late exit'))).toBe(false);
       expect((await w.repositories.conversations.get(a)).turns.some((t) => t.id === 'turn-after-collect')).toBe(false);
+    });
+
+    it('T039: a released opening’s "turn completed" queued before its release is not written over as interrupted', async () => {
+      const w = await make();
+      const a = await created(w, 'codex');
+      expect((await send(w, a, 'long work')).ok).toBe(true);
+      const old = adapterOf(w, 'codex', a);
+      const turnId = TurnId.parse(old.lastTurn!);
+      old.emit({ type: 'turn.updated', turn: { id: turnId, sessionId: a, state: 'running', startedAt: AT } });
+      await settle();
+      // The "completed" write and the release's "interrupted" write both wait, so whichever reads first can be made to
+      // write last (the read-after-write window of the T036 review follow-up).
+      const completedGate = gate();
+      const interruptedGate = gate();
+      w.beforeConversationWrite = (method, args) => {
+        const turn = method === 'upsertTurn' ? (args[0] as { id: string; state: string }) : undefined;
+        if (turn?.id !== turnId) return undefined;
+        return turn.state === 'completed' ? completedGate.promise : turn.state === 'interrupted' ? interruptedGate.promise : undefined;
+      };
+      // The runtime exits; its turn's end arrives right behind (the opening is released by then: history only).
+      old.emit({ type: 'runtime.exited', runtime: 'codex', sessionIds: [a], expected: false, code: 1, signal: null, at: AT });
+      old.emit({ type: 'turn.updated', turn: { id: turnId, sessionId: a, state: 'completed', startedAt: AT, endedAt: AT } });
+      await settle();
+      completedGate.open();
+      await settle();
+      interruptedGate.open();
+      await settle();
+      expect((await w.repositories.conversations.get(a)).turns.find((t) => t.id === turnId)?.state).toBe('completed');
+      expect(isOpen(w, a)).toBe(false);
+    });
+
+    it('T039: after a release the turn it left running is recorded interrupted, and shutdown waits for that record', async () => {
+      const w = await make();
+      const a = await created(w, 'codex');
+      expect((await send(w, a, 'long work')).ok).toBe(true);
+      const turnId = TurnId.parse(adapterOf(w, 'codex', a).lastTurn!);
+      adapterOf(w, 'codex', a).emit({ type: 'turn.updated', turn: { id: turnId, sessionId: a, state: 'running', startedAt: AT } });
+      await settle();
+      // The close returns at once (no deadline passes); the left-open record is slow to write.
+      // (core has no timers: a few hundred microtask turns, longer than the rest of the exit takes).
+      w.beforeConversationWrite = (method) => (method === 'upsertTurn' ? settle() : undefined);
+      await w.service.shutdown(CLOSE_MS);
+      expect((await w.repositories.conversations.get(a)).turns.find((t) => t.id === turnId)).toMatchObject({ state: 'interrupted' });
     });
 
     it('an earlier opening’s late running turn and request change nothing now (history only)', async () => {

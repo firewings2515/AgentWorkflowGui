@@ -366,7 +366,7 @@ export class SessionRuntimes {
     const adapter = entry.instance;
     if (adapter === undefined || this.retired.has(adapter)) return;
     this.retired.add(adapter);
-    void this.collect(adapter);
+    void this.collect(adapter, sessionId);
   }
 
   /** Retired adapters not yet collected (tests, diagnostics). */
@@ -379,7 +379,7 @@ export class SessionRuntimes {
    * is given), it is closed (R-14: whatever it still runs ends) and no longer listened to. One that serves another
    * session (a shared adapter) is only forgotten as retired.
    */
-  private async collect(adapter: RuntimeAdapter): Promise<void> {
+  private async collect(adapter: RuntimeAdapter, sessionId: SessionId): Promise<void> {
     const inUse = () => [...this.entries.values()].some((e) => e.instance === adapter);
     const closes = [...this.closingRefs.values()]
       .filter((c) => c.adapter === adapter)
@@ -393,13 +393,16 @@ export class SessionRuntimes {
     if (closes.length > 0) await bounded(Promise.all(closes));
     if (!inUse()) await bounded(adapter.close(CLOSE_SETTLE_MS).catch(() => undefined));
     // Looked at again after the waits: a shared adapter taken up again meanwhile keeps listening.
-    if (!inUse()) {
+    const released = !inUse();
+    if (released) {
       this.subscriptions.get(adapter)?.();
       this.subscriptions.delete(adapter);
       this.subscribed.delete(adapter);
       this.started.delete(adapter);
     }
     this.retired.delete(adapter);
+    // Seen in a live run without an inspector too (T039, T036 follow-up): fixed text and the session ID only.
+    this.options.log?.(`[runtimes] a retired adapter of ${sessionId} was collected (${released ? 'closed and no longer listened to' : 'still serves another session'})`);
   }
 
   /** Whether `adapter` serves the session now: the adapter of its opening, open or coming up (T036 r2/r3). */

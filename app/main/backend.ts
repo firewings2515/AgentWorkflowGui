@@ -34,6 +34,7 @@ import { TransferService } from '../../core/transfer';
 import { WorkflowEngine } from '../../core/workflow';
 import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
+import { type FaultPoint, faultApplies, withFaultPoint } from './fault-points';
 import { hashFile, setTimer } from './file-hash';
 import { GitIgnoreRules } from './git-ignore';
 import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
@@ -77,6 +78,8 @@ export interface BackendOptions {
    * be open at once (0: no limit), and how often it looks. Defaults: SUPERVISOR_DEFAULTS.
    */
   supervisor?: { idleMs?: number; maxOpen?: number; tickMs?: number };
+  /** A development run's fault point for the crash tests (fault-points.ts, T039); never set in a packaged app. */
+  faultPoint?: FaultPoint;
 }
 
 export interface Backend {
@@ -229,6 +232,21 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     log(`[backend] cleaning up earlier processes failed (${describe(error)})`);
   }
 
+  /**
+   * At the end (R-14): every Job of this run is closed, also one whose processes all exited by themselves (a
+   * runtime opened only to reconcile, T039 r1-P1-1), so their records are ended; what is still recorded live then
+   * is looked at once more by PID and creation time, and gone is recorded ended like at the start.
+   */
+  const endJobs = async (): Promise<void> => {
+    const left: OwnedProcess[] = await host.listOwned().catch(() => []);
+    const recorded = await repositories.processes.listLive().catch(() => [] as OwnedProcess[]);
+    for (const sessionId of new Set([...left, ...recorded].map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
+    const still = await repositories.processes.listLive().catch(() => [] as OwnedProcess[]);
+    if (still.length === 0) return;
+    const cleaned = await host.cleanupOrphans(still).catch(() => ({ ended: [] as OwnedProcess[], gone: [] as OwnedProcess[] }));
+    for (const p of [...cleaned.ended, ...cleaned.gone]) await repositories.processes.markEnded(p.pid, p.startedAt, now()).catch(() => undefined);
+  };
+
   // 4-5. MCP server, adapters, the session service. Handlers and hooks reach the service once it exists.
   const ref: { service?: SessionService; workflow?: WorkflowEngine } = {};
   const starting = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is starting' } } as const;
@@ -295,9 +313,12 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   // probe): a runtime whose last detection is not `available` gets no adapter, so a path that was only shown (a link
   // to something that is not an .exe, an old version, a signed-out runtime) is never started (T045 review r3). The
   // callers see a failure before any runtime is called: a delivery stays pending, never claimed and never unknown.
+  const { faultPoint } = options;
+  if (faultPoint !== undefined) log(`[fault] armed: ${faultPoint.point} of ${faultPoint.sessionId ?? `every ${String(faultPoint.runtime)} session`}`);
   const createAdapter: AdapterFactory = (runtime, sessionId, hooks) => {
     if (options.runtimes !== undefined && !isRuntimeAvailable(runtime)) throw new RuntimeUnavailableError(runtime);
-    return makeAdapter(runtime, sessionId, hooks);
+    const adapter = makeAdapter(runtime, sessionId, hooks);
+    return faultPoint !== undefined && faultApplies(faultPoint, runtime, sessionId) ? withFaultPoint(adapter, sessionId, faultPoint, log) : adapter;
   };
   const hooks ={ onPermissionRequest: (handle: PermissionHandle) => (ref.service === undefined ? Promise.reject(new Error('not ready')) : ref.service.onPermissionRequest(handle)) };
   // T035: the Claude adapter the model probe ran on (its own since T036; an injected factory may still share one). The
@@ -321,10 +342,11 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         if (runtime === 'codex') await adapter.start();
         return await adapter.listModels();
       } finally {
-        if (runtime === 'codex') {
-          await adapter.close(2000).catch(() => undefined);
-          await host.closeJob(probeId).catch(() => undefined);
-        }
+        if (runtime === 'codex') await adapter.close(2000).catch(() => undefined);
+        // The probe's Job is done with either way (T039): Claude's listModels returns once its claude.exe has exited (or
+        // was waited for), and only ending the Job records its runtime-host as ended; the exit ends only Jobs with a
+        // live process left, so a probe whose process exited by itself would keep an open record until the next start.
+        await host.closeJob(probeId).catch(() => undefined);
       }
     });
 
@@ -508,8 +530,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   } catch (error) {
     await service.shutdown(closeTimeoutMs).catch(() => undefined);
     await mcp.close().catch(() => undefined);
-    const left: OwnedProcess[] = await host.listOwned().catch(() => []);
-    for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
+    await endJobs();
     watchers.stopAll();
     ignored.close();
     return damaged(error);
@@ -604,8 +625,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       // again after closeAll finds nothing left. Bounded by the same deadline; before the Jobs are ended, so
       // the probe's claude.exe exits through it and its folder goes.
       await claudeProbeAdapter?.close(closeTimeoutMs).catch(() => undefined);
-      const left: OwnedProcess[] = await host.listOwned().catch(() => []);
-      for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
+      await endJobs();
       watchers.stopAll();
       ignored.close();
       db.close();

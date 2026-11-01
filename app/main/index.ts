@@ -8,6 +8,7 @@ import { type Backend, type DamagedBackend, startBackend } from './backend';
 import { sdkBundledClaude } from './claude-exe';
 import { EventBus } from './event-bus';
 import { realFolder } from './exe-search';
+import { faultPointFrom } from './fault-points';
 import { handleFolderRequest } from './folders';
 import { handleTrusted } from './ipc';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
@@ -118,7 +119,10 @@ void app.whenReady().then(async () => {
     if (next !== undefined) applyTheme(next);
   });
   const dbPath = join(app.getPath('userData'), 'awg.sqlite');
+  // The crash tests' fault point (T039): development runs only.
+  const faultPoint = app.isPackaged ? undefined : faultPointFrom(process.env);
   backend = await startBackend({
+    ...(faultPoint !== undefined && { faultPoint }),
     dbPath,
     bus,
     createHost: (repository) => new WindowsProcessHost({ repository, log: (_level, message) => log(`[process] ${message}`) }),

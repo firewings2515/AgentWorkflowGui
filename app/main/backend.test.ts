@@ -232,6 +232,8 @@ describe('the assembled backend', () => {
     expect(handle.decision).toMatchObject({ outcome: 'approve', decidedBy: 'policy' });
     // The Codex probe ran in a Job of its own, ended right after.
     expect(s.order).toContain('closeJob:models-codex');
+    // So did Claude's (T039): ending its Job is what records its runtime-host as ended, even when it exited by itself.
+    expect(s.order).toContain('closeJob:models-claude');
     await s.backend.shutdown();
   });
 

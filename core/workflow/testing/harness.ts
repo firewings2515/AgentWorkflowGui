@@ -25,7 +25,7 @@ import {
 import { hashOf } from '../../delivery/testing/fixtures';
 import { MemoryDeliveryStore } from '../../delivery/testing/memory-store';
 import type { WorktreeFiles } from '../../pipeline';
-import type { AppRepositories, DeliveryStore, GitPort, McpMount, PermissionPolicy, PolicyDecision, StoredDelivery } from '../../ports';
+import type { AppRepositories, DeliveryStore, DispatchRequest, GitPort, McpMount, PermissionPolicy, PolicyDecision, StoredDelivery } from '../../ports';
 import { SessionService } from '../../sessions';
 import { FakeAdapter } from '../../sessions/testing/fake-adapter';
 import { MemoryRepositories } from '../../sessions/testing/memory-repositories';
@@ -235,6 +235,13 @@ export interface World {
   files: FakeFiles;
   /** Sessions whose runtime the pipeline closed before removing a folder. */
   closed: SessionId[];
+  /**
+   * When set, every dispatch waits for what it returns before the runtime gets it (T039: a crash after the unknown
+   * commit, before the runtime received the payload). Not carried over by a restart.
+   */
+  dispatchGate: ((request: DispatchRequest) => Promise<void> | undefined) | undefined;
+  /** Called with every new Codex adapter before it is used (e.g. to hold its session's start). Not carried over. */
+  onNewCodex: ((adapter: FakeAdapter, sessionId: SessionId) => void) | undefined;
 }
 
 let turns = 0;
@@ -244,6 +251,7 @@ const adapterOf = (w: World, sessionId: SessionId) => w.codex.get(sessionId) ?? 
 const withTurns = (adapter: FakeAdapter, w: World, codexSession?: SessionId): FakeAdapter => {
   const dispatch = adapter.dispatchOnce.bind(adapter);
   adapter.dispatchOnce = async (request) => {
+    await w.dispatchGate?.(request);
     let result = await dispatch(request);
     const sessionId =
       codexSession ??
@@ -276,7 +284,10 @@ export interface RealFolders {
   files: WorktreeFiles;
 }
 
-const build = (repositories: AppRepositories, store: DeliveryStore, previous?: World, real?: RealFolders): World => {
+/** The storage of the next start: a new connection to the same database, read back from its file (T039 r1-P1-2). */
+export type Reopen = () => { repositories: AppRepositories; store: DeliveryStore };
+
+const build = (repositories: AppRepositories, store: DeliveryStore, previous?: World, real?: RealFolders, reopen?: Reopen): World => {
   const world = {
     repositories,
     store,
@@ -328,6 +339,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
       if (runtime === 'claude') return world.claude;
       const adapter = withTurns(new FakeAdapter('codex', (handle) => world.service.onPermissionRequest(handle)), world, sessionId);
       world.codex.set(sessionId, adapter);
+      world.onNewCodex?.(adapter, sessionId);
       return adapter;
     },
     mountMcp: (sessionId) => {
@@ -376,7 +388,8 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
   };
   world.run = (command) => world.service.execute(command);
   world.restart = async () => {
-    const next = build(repositories, store, world, real);
+    const fresh = reopen?.();
+    const next = build(fresh?.repositories ?? repositories, fresh?.store ?? store, world, real, reopen);
     await next.service.start();
     await next.engine.recover();
     return next;
@@ -390,8 +403,8 @@ export const world = async (workflow: WorkflowTemplate = template()): Promise<Wo
 };
 
 /** The same world on other storage (the SQLite repositories and store in app/main's tests, r2). */
-export const worldOn = async (repositories: AppRepositories, store: DeliveryStore, workflow: WorkflowTemplate = template(), real?: RealFolders): Promise<World> => {
-  const w = build(repositories, store, undefined, real);
+export const worldOn = async (repositories: AppRepositories, store: DeliveryStore, workflow: WorkflowTemplate = template(), real?: RealFolders, reopen?: Reopen): Promise<World> => {
+  const w = build(repositories, store, undefined, real, reopen);
   for (const a of agents()) await w.repositories.agents.save(a, null);
   await w.repositories.workflows.save(workflow, null);
   return w;

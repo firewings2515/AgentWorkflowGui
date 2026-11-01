@@ -126,6 +126,8 @@ export interface SupWorld {
   holdNextRecordSent: Promise<void> | undefined;
   /** When set, the next `sessions.get` waits for it before it reads (once). */
   holdNextSessionGet: Promise<void> | undefined;
+  /** When set, every conversation write waits for what it returns before it writes (T039: two writers of one turn). */
+  beforeConversationWrite: ((method: string, args: unknown[]) => Promise<void> | undefined) | undefined;
   /** Every MCP mount handed out, by session. */
   mounts: SessionId[];
   /** Called with every new adapter before it is used (e.g. to hold the resume of a session's next opening). */
@@ -143,6 +145,11 @@ export interface SupWorldOptions {
   claudePerSession?: boolean;
   /** Replaces the fake for a runtime when it returns an adapter (core cannot import the real ones). */
   createAdapter?: (runtime: Runtime, sessionId: SessionId, hooks: RuntimeAdapterHooks, world: SupWorld) => RuntimeAdapter | undefined;
+  /**
+   * The storage of the next start: a new connection to the same database, read back from its file (T039 r1-P1-2).
+   * Without it a restart keeps the same objects.
+   */
+  reopen?: () => { repositories: AppRepositories; store: DeliveryStore };
 }
 
 const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: SupWorldOptions, previous?: SupWorld): SupWorld => {
@@ -199,7 +206,21 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
       };
     },
   });
-  const repositories = new Proxy(rawRepositories, { get: (target, key): unknown => (key === 'sessions' ? sessions : Reflect.get(target, key)) });
+  // ... and every conversation write held while `beforeConversationWrite` says so.
+  const conversations = new Proxy(rawRepositories.conversations, {
+    get: (target, key): unknown => {
+      const value: unknown = Reflect.get(target, key);
+      if (typeof value !== 'function') return value;
+      if (typeof key !== 'string' || !key.startsWith('upsert')) return (value as (...a: unknown[]) => unknown).bind(target);
+      return async (...args: unknown[]) => {
+        await world.beforeConversationWrite?.(key, args);
+        return (value as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+  const repositories = new Proxy(rawRepositories, {
+    get: (target, key): unknown => (key === 'sessions' ? sessions : key === 'conversations' ? conversations : Reflect.get(target, key)),
+  });
   world.repositories = repositories;
   const policy: PermissionPolicy = { evaluate: (request) => world.decide(request.sessionId) };
   const onPermission = (handle: PermissionHandle) => world.service.onPermissionRequest(handle);
@@ -259,7 +280,10 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
   });
   world.service.attachSupervisor(world.supervisor);
   world.run = (command) => world.service.execute(command);
-  world.restart = () => build(rawRepositories, rawStore, o, world);
+  world.restart = () => {
+    const next = o.reopen?.();
+    return build(next?.repositories ?? rawRepositories, next?.store ?? rawStore, o, world);
+  };
   return world;
 };
 
