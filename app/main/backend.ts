@@ -34,6 +34,7 @@ import { TransferService } from '../../core/transfer';
 import { WorkflowEngine } from '../../core/workflow';
 import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
+import { type FaultPoint, faultApplies, withFaultPoint } from './fault-points';
 import { hashFile, setTimer } from './file-hash';
 import { GitIgnoreRules } from './git-ignore';
 import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
@@ -77,6 +78,8 @@ export interface BackendOptions {
    * be open at once (0: no limit), and how often it looks. Defaults: SUPERVISOR_DEFAULTS.
    */
   supervisor?: { idleMs?: number; maxOpen?: number; tickMs?: number };
+  /** A development run's fault point for the crash tests (fault-points.ts, T039); never set in a packaged app. */
+  faultPoint?: FaultPoint;
 }
 
 export interface Backend {
@@ -295,9 +298,12 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   // probe): a runtime whose last detection is not `available` gets no adapter, so a path that was only shown (a link
   // to something that is not an .exe, an old version, a signed-out runtime) is never started (T045 review r3). The
   // callers see a failure before any runtime is called: a delivery stays pending, never claimed and never unknown.
+  const { faultPoint } = options;
+  if (faultPoint !== undefined) log(`[fault] armed: ${faultPoint.point} of ${faultPoint.sessionId ?? `every ${String(faultPoint.runtime)} session`}`);
   const createAdapter: AdapterFactory = (runtime, sessionId, hooks) => {
     if (options.runtimes !== undefined && !isRuntimeAvailable(runtime)) throw new RuntimeUnavailableError(runtime);
-    return makeAdapter(runtime, sessionId, hooks);
+    const adapter = makeAdapter(runtime, sessionId, hooks);
+    return faultPoint !== undefined && faultApplies(faultPoint, runtime, sessionId) ? withFaultPoint(adapter, sessionId, faultPoint, log) : adapter;
   };
   const hooks ={ onPermissionRequest: (handle: PermissionHandle) => (ref.service === undefined ? Promise.reject(new Error('not ready')) : ref.service.onPermissionRequest(handle)) };
   // T035: the Claude adapter the model probe ran on (its own since T036; an injected factory may still share one). The
@@ -321,10 +327,11 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         if (runtime === 'codex') await adapter.start();
         return await adapter.listModels();
       } finally {
-        if (runtime === 'codex') {
-          await adapter.close(2000).catch(() => undefined);
-          await host.closeJob(probeId).catch(() => undefined);
-        }
+        if (runtime === 'codex') await adapter.close(2000).catch(() => undefined);
+        // The probe's Job is done with either way (T039): Claude's listModels returns once its claude.exe has exited (or
+        // was waited for), and only ending the Job records its runtime-host as ended; the exit ends only Jobs with a
+        // live process left, so a probe whose process exited by itself would keep an open record until the next start.
+        await host.closeJob(probeId).catch(() => undefined);
       }
     });
 

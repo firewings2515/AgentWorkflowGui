@@ -77,3 +77,32 @@ describe('T045 index.ts gives the backend the runtime locator', () => {
     expect(typeof (hoisted.createRuntimeLocator.mock.calls[0]?.[0] as { sdkBundledClaude?: unknown }).sdkBundledClaude).toBe('function');
   });
 });
+
+describe('T039 the crash tests’ fault point reaches the backend of a development run only', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    hoisted.startBackend.mockReset();
+    hoisted.createRuntimeLocator.mockReset();
+    hoisted.createRuntimeLocator.mockReturnValue({ detect: vi.fn(), current: vi.fn() });
+    hoisted.startBackend.mockResolvedValue({ status: 'ready', facade: { snapshot: () => ({ preferences: { theme: 'dark' } }) }, unfinishedWork: () => Promise.resolve({}), shutdown: () => Promise.resolve() });
+    vi.stubEnv('AWG_FAULT_POINT', 'dispatch');
+    vi.stubEnv('AWG_FAULT_SESSION', 'session-a');
+  });
+
+  const started = async () => {
+    await import('./index');
+    await vi.waitFor(() => expect(hoisted.startBackend).toHaveBeenCalledTimes(1));
+    vi.unstubAllEnvs();
+    return hoisted.startBackend.mock.calls[0]?.[0] as { faultPoint?: unknown };
+  };
+
+  it('a development run passes it on', async () => {
+    hoisted.isPackaged.value = false;
+    expect((await started()).faultPoint).toEqual({ point: 'dispatch', sessionId: 'session-a' });
+  });
+
+  it('a packaged app never reads it', async () => {
+    hoisted.isPackaged.value = true;
+    expect('faultPoint' in (await started())).toBe(false);
+  });
+});

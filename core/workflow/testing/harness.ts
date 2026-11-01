@@ -25,7 +25,7 @@ import {
 import { hashOf } from '../../delivery/testing/fixtures';
 import { MemoryDeliveryStore } from '../../delivery/testing/memory-store';
 import type { WorktreeFiles } from '../../pipeline';
-import type { AppRepositories, DeliveryStore, GitPort, McpMount, PermissionPolicy, PolicyDecision, StoredDelivery } from '../../ports';
+import type { AppRepositories, DeliveryStore, DispatchRequest, GitPort, McpMount, PermissionPolicy, PolicyDecision, StoredDelivery } from '../../ports';
 import { SessionService } from '../../sessions';
 import { FakeAdapter } from '../../sessions/testing/fake-adapter';
 import { MemoryRepositories } from '../../sessions/testing/memory-repositories';
@@ -235,6 +235,13 @@ export interface World {
   files: FakeFiles;
   /** Sessions whose runtime the pipeline closed before removing a folder. */
   closed: SessionId[];
+  /**
+   * When set, every dispatch waits for what it returns before the runtime gets it (T039: a crash after the unknown
+   * commit, before the runtime received the payload). Not carried over by a restart.
+   */
+  dispatchGate: ((request: DispatchRequest) => Promise<void> | undefined) | undefined;
+  /** Called with every new Codex adapter before it is used (e.g. to hold its session's start). Not carried over. */
+  onNewCodex: ((adapter: FakeAdapter, sessionId: SessionId) => void) | undefined;
 }
 
 let turns = 0;
@@ -244,6 +251,7 @@ const adapterOf = (w: World, sessionId: SessionId) => w.codex.get(sessionId) ?? 
 const withTurns = (adapter: FakeAdapter, w: World, codexSession?: SessionId): FakeAdapter => {
   const dispatch = adapter.dispatchOnce.bind(adapter);
   adapter.dispatchOnce = async (request) => {
+    await w.dispatchGate?.(request);
     let result = await dispatch(request);
     const sessionId =
       codexSession ??
@@ -328,6 +336,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
       if (runtime === 'claude') return world.claude;
       const adapter = withTurns(new FakeAdapter('codex', (handle) => world.service.onPermissionRequest(handle)), world, sessionId);
       world.codex.set(sessionId, adapter);
+      world.onNewCodex?.(adapter, sessionId);
       return adapter;
     },
     mountMcp: (sessionId) => {

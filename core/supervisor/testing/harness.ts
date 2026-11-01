@@ -126,6 +126,8 @@ export interface SupWorld {
   holdNextRecordSent: Promise<void> | undefined;
   /** When set, the next `sessions.get` waits for it before it reads (once). */
   holdNextSessionGet: Promise<void> | undefined;
+  /** When set, every conversation write waits for what it returns before it writes (T039: two writers of one turn). */
+  beforeConversationWrite: ((method: string, args: unknown[]) => Promise<void> | undefined) | undefined;
   /** Every MCP mount handed out, by session. */
   mounts: SessionId[];
   /** Called with every new adapter before it is used (e.g. to hold the resume of a session's next opening). */
@@ -199,7 +201,21 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
       };
     },
   });
-  const repositories = new Proxy(rawRepositories, { get: (target, key): unknown => (key === 'sessions' ? sessions : Reflect.get(target, key)) });
+  // ... and every conversation write held while `beforeConversationWrite` says so.
+  const conversations = new Proxy(rawRepositories.conversations, {
+    get: (target, key): unknown => {
+      const value: unknown = Reflect.get(target, key);
+      if (typeof value !== 'function') return value;
+      if (typeof key !== 'string' || !key.startsWith('upsert')) return (value as (...a: unknown[]) => unknown).bind(target);
+      return async (...args: unknown[]) => {
+        await world.beforeConversationWrite?.(key, args);
+        return (value as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+  const repositories = new Proxy(rawRepositories, {
+    get: (target, key): unknown => (key === 'sessions' ? sessions : key === 'conversations' ? conversations : Reflect.get(target, key)),
+  });
   world.repositories = repositories;
   const policy: PermissionPolicy = { evaluate: (request) => world.decide(request.sessionId) };
   const onPermission = (handle: PermissionHandle) => world.service.onPermissionRequest(handle);

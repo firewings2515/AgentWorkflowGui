@@ -428,8 +428,13 @@ export class SessionService {
         try {
           await options.onSessionClosed?.(sessionId);
         } finally {
-          // Its Job has ended: what it left running is over (T036 r3, as a restart records it).
-          await this.endLeftOpen(sessionId).catch((error: unknown) => this.log(`recording what ${sessionId} left running failed (${errorName(error)})`));
+          // Its Job has ended: what it left running is over (T036 r3, as a restart records it). In the session's queue
+          // (T039), after the writes of its events already queued, so a late "turn completed" of the released opening is
+          // never written over as interrupted. Not waited for here: a close may run with that queue held (closeIdle,
+          // exclusive); shutdown waits for the queues before it stops writing.
+          void this.serial(sessionKey(sessionId), () => this.endLeftOpen(sessionId)).catch((error: unknown) =>
+            this.log(`recording what ${sessionId} left running failed (${errorName(error)})`),
+          );
         }
       },
       onEvent: (event, isCurrent) => this.record(event, isCurrent),
@@ -631,6 +636,13 @@ export class SessionService {
     await Promise.allSettled(open.map(({ nativeSessionRef }) => this.runtimes.closeSession(nativeSessionRef, timeoutMs)));
     await this.runtimes.closeAll(timeoutMs);
     for (const { sessionId } of open) await this.setActivity(sessionId, 'closed').catch(() => undefined);
+    // What the closes queued (each released session's left-open turns and items, T039) is written before the end.
+    await this.within(
+      (async () => {
+        while (this.queues.size > 0) await Promise.allSettled([...this.queues.values()]);
+      })(),
+      timeoutMs,
+    );
     // From here nothing is written: the main process closes the database next.
     this.closed = true;
   }
