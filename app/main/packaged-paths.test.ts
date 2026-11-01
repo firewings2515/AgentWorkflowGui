@@ -39,6 +39,22 @@ describe('T044 unpackedPath', () => {
     expect(unpackedPath(`C:\\app.asar\\Apps\\AWG\\resources\\app.asar\\${SDK_EXE}`, odd)).toBe(`C:\\app.asar\\Apps\\AWG\\resources\\app.asar.unpacked\\${SDK_EXE}`);
   });
 
+  it('treats a \\\\?\\ prefix on either side as the same path (review r2 P2)', () => {
+    const exe = `app.asar\\${SDK_EXE}`;
+    const want = `${RESOURCES}\\app.asar.unpacked\\${SDK_EXE}`;
+    expect(unpackedPath(`\\\\?\\${RESOURCES}\\${exe}`, packaged)).toBe(want);
+    expect(unpackedPath(`//?/${RESOURCES.replace(/\\/g, '/')}/${exe.replace(/\\/g, '/')}`, packaged)).toBe(want);
+    expect(unpackedPath(`${RESOURCES}\\${exe}`, { isPackaged: true, resourcesPath: `\\\\?\\${RESOURCES}` })).toBe(want);
+    expect(unpackedPath(`\\\\?\\${RESOURCES}\\${exe}`, { isPackaged: true, resourcesPath: `\\\\?\\${RESOURCES}` })).toBe(want);
+    expect(unpackedPath(`\\\\?\\UNC\\srv\\share\\res\\${exe}`, { isPackaged: true, resourcesPath: '\\\\srv\\share\\res' })).toBe(`\\\\srv\\share\\res\\app.asar.unpacked\\${SDK_EXE}`);
+  });
+
+  it('still leaves a prefixed path outside this app.asar alone', () => {
+    for (const path of [`\\\\?\\C:\\dev\\app.asar\\project\\${SDK_EXE}`, `\\\\?\\${RESOURCES}\\app.asar.unpacked\\${SDK_EXE}`, '\\\\?\\', '\\\\.\\C:\\x\\claude.exe']) {
+      expect(unpackedPath(path, packaged)).toBe(path);
+    }
+  });
+
   it('does not let .. climb out of the archive', () => {
     expect(unpackedPath(`${RESOURCES}\\app.asar\\..\\..\\Windows\\x.exe`, packaged)).toBe(`${RESOURCES}\\app.asar\\..\\..\\Windows\\x.exe`);
   });
