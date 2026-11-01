@@ -85,6 +85,11 @@ export interface ClaudeAdapterOptions extends RuntimeAdapterHooks {
   /** The SDK functions; `claudeAgentSdk` from ./sdk in production, a fake in tests. */
   sdk: ClaudeSdk;
   /**
+   * The Claude Code executable to start (T045): the one found on this computer, handed to the SDK as
+   * `pathToClaudeCodeExecutable`. The SDK's own copy when absent (tests, development).
+   */
+  executable?: string;
+  /**
    * Origin stamped on a dispatched message (`SDKUserMessage.origin`). By default it follows
    * `DispatchRequest.origin`: the user's own input is `human`, peer and handoff payloads are `peer`
    * (R-03, SP-05), and anything else goes unattributed, which Claude treats as not human (fail closed).
@@ -828,6 +833,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
       includePartialMessages: true,
       persistSession: true,
       stderr: (data) => this.log('debug', 'claude stderr', data),
+      ...opt('pathToClaudeCodeExecutable', this.options.executable),
       ...opt('spawnClaudeCodeProcess', spawn),
     };
   }

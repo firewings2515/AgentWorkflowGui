@@ -16,6 +16,7 @@ import {
   type OwnedProcess,
   type PayloadHash,
   type Runtime,
+  type RuntimeStatus,
   type SessionId,
   type Snapshot,
 } from '../../contracts';
@@ -26,7 +27,7 @@ import { GuiMcpServer, type McpToolHandlers } from '../../adapters/mcp-server';
 import { claudeProcessSpawn, codexAppServerSpawn, type JobSpawner } from '../../adapters/process';
 import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../adapters/storage';
 import { permissionPolicy } from '../../core/policy';
-import type { AppRepositories, GitPort, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter } from '../../core/ports';
+import type { AppRepositories, GitPort, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter, RuntimeLocator } from '../../core/ports';
 import { Redactor, SessionService } from '../../core/sessions';
 import { IdleSupervisor, SUPERVISOR_DEFAULTS } from '../../core/supervisor';
 import { TransferService } from '../../core/transfer';
@@ -35,11 +36,8 @@ import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { hashFile, setTimer } from './file-hash';
 import { GitIgnoreRules } from './git-ignore';
-import { type PackagedContext, withUnpackedCommand } from './packaged-paths';
 import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
-
-const NOT_PACKAGED: PackagedContext = { isPackaged: false, resourcesPath: '' };
 
 /** What the main process needs from its process host: the port plus the spawn the adapters use (T013). */
 export type BackendProcessHost = ProcessHost & JobSpawner;
@@ -52,14 +50,17 @@ export interface BackendOptions {
   bus: Pick<EventBus, 'seq' | 'publish'>;
   /** The process host, recording into the backend's own OwnedProcess repository (T013). */
   createHost(processes: OwnedProcessRepository): BackendProcessHost;
-  /** Where the app runs from (packaged-paths.ts); claude.exe is started from `app.asar.unpacked` when packaged. */
-  packaged?: PackagedContext;
-  /** The Codex executable (codex-exe.ts); Codex is unavailable without one. */
-  codexExecutable?: string | undefined;
+  /**
+   * Finds the user's own Claude Code and Codex (runtime-locator.ts, T045). A runtime is available only while its last
+   * detection says so; without one (tests) Claude is always available and Codex only with an injected `createAdapter`.
+   */
+  runtimes?: RuntimeLocator;
   /** Replaces the real adapters (tests). */
   createAdapter?: AdapterFactory;
   /** Replaces the git adapter (tests). */
   createGit?: () => GitPort;
+  /** How soon after a failed detection an unavailable runtime is looked for again before a command that needs it (default 2 s). */
+  redetectMinMs?: number;
   /** Replaces the runtimes' model lists (tests). */
   listModels?: (runtime: Runtime) => Promise<ModelOption[]>;
   policy?: PermissionPolicy;
@@ -177,6 +178,12 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   const uuid = () => options.uuid?.() ?? randomUUID();
   const closeTimeoutMs = options.closeTimeoutMs ?? 5000;
 
+  // Runtime detection (C-33, T045): what was found of each runtime at the last detection. Without a locator (tests) Claude
+  // is always available and Codex only with an injected adapter factory.
+  const statuses = new Map<Runtime, RuntimeStatus>();
+  const isRuntimeAvailable = (runtime: Runtime): boolean =>
+    options.runtimes === undefined ? runtime === 'claude' || options.createAdapter !== undefined : statuses.get(runtime)?.state === 'available';
+
   // 1-2. Storage, read once in full: a damaged record stops everything here (T015 fails closed).
   // The deliveries recovery will read are read here too (r1-P1-6): pending and unknown ones.
   let db: DatabaseSync | undefined;
@@ -257,14 +264,17 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     options.createAdapter ??
     ((runtime, sessionId, hooks) => {
       if (runtime === 'claude') {
+        const claudeExecutable = statuses.get('claude')?.executable;
         return new ClaudeAdapter({
           sdk: claudeAgentSdk,
+          // The user's own Claude Code (T045); the SDK's built-in copy only when none was detected (tests).
+          ...(claudeExecutable !== undefined && { executable: claudeExecutable }),
           onPermissionRequest: (handle) => hooks.onPermissionRequest(handle),
-          spawnProcess: ({ sessionId: id }) => withUnpackedCommand(claudeProcessSpawn(host, id), options.packaged ?? NOT_PACKAGED),
+          spawnProcess: ({ sessionId: id }) => claudeProcessSpawn(host, id),
           log: adapterLog('claude'),
         });
       }
-      const command = options.codexExecutable;
+      const command = statuses.get('codex')?.executable;
       if (command === undefined) throw new Error('Codex is not available');
       return new CodexAdapter({
         spawn: codexAppServerSpawn(host, sessionId, { command }),
@@ -302,6 +312,73 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       }
     });
 
+  let modelOptions: ModelOption[] = [];
+  /** Looks for the runtime again: executable, version and sign-in. The model list is the next step. */
+  const probe = async (runtime: Runtime): Promise<void> => {
+    if (options.runtimes === undefined) return;
+    statuses.set(runtime, await options.runtimes.detect(runtime, now()));
+  };
+  /** The models of an available runtime, listed again; none for an unavailable one, so no dropdown offers it. */
+  const refreshModels = async (runtime: Runtime): Promise<void> => {
+    const status = statuses.get(runtime);
+    if (options.runtimes === undefined || status === undefined) return;
+    let list: ModelOption[] = [];
+    if (status.state === 'available') {
+      try {
+        list = await listModels(runtime);
+      } catch (error) {
+        // A failed listing keeps what was listed before.
+        log(`[backend] listing ${runtime} models failed (${describe(error)})`);
+        list = modelOptions.filter((m) => m.runtime === runtime);
+      }
+    }
+    modelOptions = [...modelOptions.filter((m) => m.runtime !== runtime), ...list];
+    const current = statuses.get(runtime) ?? status;
+    const next = { ...current, modelCount: current.state === 'available' ? list.length : 0 };
+    statuses.set(runtime, next);
+    void bus.publish({ type: 'modelOptions.updated', runtime, options: list, at: now() });
+    void bus.publish({ type: 'runtime.status', status: next });
+  };
+  // One detection per runtime at a time; a second ask while one runs gets that one's result.
+  const detecting = new Map<Runtime, Promise<void>>();
+  const track = (runtime: Runtime, work: Promise<void>): Promise<void> => {
+    const tracked = work.catch((error: unknown) => log(`[backend] detecting ${runtime} failed (${describe(error)})`)).finally(() => detecting.delete(runtime));
+    detecting.set(runtime, tracked);
+    return tracked;
+  };
+  const detect = (runtime: Runtime): Promise<void> => detecting.get(runtime) ?? track(runtime, probe(runtime).then(() => refreshModels(runtime)));
+  const RUNTIMES: readonly Runtime[] = ['claude', 'codex'];
+  /** Before a runtime is used: when it is not available now, it is looked for once more (not more often than redetectMinMs). */
+  const lastTried = new Map<Runtime, number>();
+  const redetectIfUnavailable = async (wanted: readonly Runtime[]): Promise<void> => {
+    if (options.runtimes === undefined) return;
+    for (const runtime of wanted) {
+      if (isRuntimeAvailable(runtime)) continue;
+      const since = Date.now() - (lastTried.get(runtime) ?? 0);
+      if (since < (options.redetectMinMs ?? 2000)) continue;
+      lastTried.set(runtime, Date.now());
+      await detect(runtime);
+    }
+  };
+  /** The runtimes a command is about to start or resume. */
+  const runtimesOf = async (command: Command): Promise<readonly Runtime[]> => {
+    switch (command.type) {
+      case 'session.create':
+      case 'session.setModel':
+        return [command.model.runtime];
+      case 'session.send': {
+        // A send resumes a runtime the idle supervisor closed.
+        const session = await repositories.sessions.get(command.sessionId);
+        return session === undefined ? [] : [session.requestedModel.runtime];
+      }
+      case 'workflow.start':
+      case 'transfer.confirm':
+        return RUNTIMES;
+      default:
+        return [];
+    }
+  };
+
   const service = new SessionService({
     repositories,
     store,
@@ -332,7 +409,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       isIgnored: (path) => (isPipelineFolder(path) && ref.workflow?.pipeline?.ownsPath(path) === true) || ignored.isIgnored(path),
     },
     listModels,
-    isRuntimeAvailable: (runtime) => runtime === 'claude' || options.codexExecutable !== undefined || options.createAdapter !== undefined,
+    isRuntimeAvailable,
     onSessionOpened: (sessionId) => {
       void repositories.sessions.get(sessionId).then((s) => s && (watchers.start(sessionId, s.folderScope.workspaceRoot), ignored.acquire(sessionId, s.folderScope.workspaceRoot)));
     },
@@ -387,6 +464,10 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   });
   service.attachSupervisor(supervisor);
 
+  // 5b. The runtimes found on this computer, before recovery asks whether a runtime can be used (C-33). Their model
+  // lists come later, in the background.
+  await Promise.all(RUNTIMES.map((runtime) => probe(runtime).catch((error: unknown) => log(`[backend] detecting ${runtime} failed (${describe(error)})`))));
+
   // 6. Restart recovery (CR-2): unknown only reconciled, pending through the one dispatch entry. Stored data
   // it cannot read stops the start like damaged data does (r1-P1-6): no model probe, no runtime.
   try {
@@ -407,9 +488,12 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   }
 
   // 7. Model lists, in the background: the window does not wait for them (R-12).
-  let modelOptions: ModelOption[] = [];
-  for (const runtime of ['claude', 'codex'] as const) {
-    if (runtime === 'codex' && options.codexExecutable === undefined && options.createAdapter === undefined) continue;
+  for (const runtime of RUNTIMES) {
+    if (options.runtimes !== undefined) {
+      void track(runtime, refreshModels(runtime));
+      continue;
+    }
+    if (runtime === 'codex' && options.createAdapter === undefined) continue;
     void listModels(runtime)
       .then((list) => {
         modelOptions = [...modelOptions.filter((m) => m.runtime !== runtime), ...list];
@@ -454,13 +538,18 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         // Paging and backups (C-26, C-28) are wired in T040: every session's whole history for now.
         historyPages: [],
         storage: {},
-        // Runtime detection (C-33) is wired in T045.
-        runtimes: [],
+        runtimes: RUNTIMES.flatMap((runtime) => statuses.get(runtime) ?? []),
       };
     },
     async execute(command: Command): Promise<CommandResult> {
       if (closing !== undefined) return failure(command.requestId, 'runtime_unavailable', 'The application is closing');
       try {
+        if (command.type === 'runtime.detect') {
+          if (options.runtimes === undefined) return failure(command.requestId, 'unsupported', 'runtime.detect is not available');
+          await Promise.all((command.runtime === undefined ? RUNTIMES : [command.runtime]).map(detect));
+          return { ok: true, requestId: command.requestId, created: [] };
+        }
+        await redetectIfUnavailable(await runtimesOf(command));
         return await service.execute(command);
       } catch (error) {
         log(`[backend] ${command.type} failed (${describe(error)})`);

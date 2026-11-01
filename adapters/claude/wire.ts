@@ -69,6 +69,8 @@ export interface WireQueryOptions {
   /** Reliable recovery needs the transcript (CR2_DELIVERY_FIX §4). */
   persistSession: true;
   stderr?: (data: string) => void;
+  /** The Claude Code to start: the user's own install (T045). The SDK's built-in executable when absent. */
+  pathToClaudeCodeExecutable?: string;
   /** Starts claude.exe; the GUI puts it in the session's Job (T013, R-14). */
   spawnClaudeCodeProcess?: (options: WireSpawnOptions) => WireSpawnedProcess;
 }

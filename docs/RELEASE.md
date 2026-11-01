@@ -9,8 +9,9 @@ AgentWorkflowGui 目前只發行 **Windows x64、未簽章、per-user** 的 NSIS
 | Electron | 45.0.0 | 內建 Node **24.22.0**、Chromium 156.0.8078.48、V8 15.6、SQLite 3.53.4；`node:sqlite` 用的是這個 runtime，不需要另外安裝 Node |
 | Node（開發／建置） | ≥ 22.13.0 | `package.json` 的 `engines`；打包後的 app 不需要系統安裝 Node |
 | electron-builder | 26.18.0 | dev 依賴，固定版本；NSIS 3.0.4.1（由它下載到使用者 cache） |
-| Claude Agent SDK | 0.3.309 | 內含原生 CLI（`@anthropic-ai/claude-agent-sdk-win32-x64/claude.exe`，Claude Code **2.1.309**）；隨安裝檔附上 |
-| Codex CLI | 0.160.0（實測） | **不隨安裝檔附上**；使用者自己安裝，app 在 `PATH` 找 `codex.exe`（或環境變數 `AWG_CODEX_COMMAND`）；找不到時 Codex 不可用，Claude 不受影響 |
+| Claude Agent SDK | 0.3.309 | 只附 SDK 的 JavaScript；它的原生 CLI（`@anthropic-ai/claude-agent-sdk-win32-x64/claude.exe`）**不隨安裝檔附上** |
+| Claude Code | **≥ 2.1.309**（SDK 的 `claudeCodeVersion`） | **需要使用者自行安裝並登入**；不隨安裝檔附上。app 依序找：環境變數 `AWG_CLAUDE_PATH` → `PATH` 上的 `claude.exe` → `%USERPROFILE%\.local\bin\claude.exe` → Claude 桌面版附帶的 CLI（`claude-code\<版本>\`，取最新）；用 `claude --version` 檢查版本、`claude auth status` 檢查登入。找不到、太舊或未登入時 Claude 不可用，Codex 不受影響 |
+| Codex CLI | **≥ 0.160.0**（實測的版本） | **不隨安裝檔附上**；使用者自己安裝並登入。app 依序找：環境變數 `AWG_CODEX_COMMAND` → `PATH` 上的 `codex.exe`（或 npm shim 背後的 vendored binary）→ `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`；用 `codex --version` 與 `codex login status` 檢查。找不到、太舊或未登入時 Codex 不可用，Claude 不受影響 |
 | koffi | 3.3.2 | Job Object 用；只打包 `win32-x64` 的 native |
 | OS | Windows 10 22H2（build 19045，實測）、Windows 11 x64 | 沒有 arm64 版安裝檔；沒有 macOS／Linux 版 |
 
@@ -22,7 +23,7 @@ npm run dist     # electron-vite build → 產生授權清單 → electron-build
 npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來看內容
 ```
 
-- 產物：`release\AgentWorkflowGui-Setup-<version>-x64.exe`（約 218 MB，其中 claude.exe 約 285 MB 壓縮前）；`release\win-unpacked\` 約 610 MB。`release\` 與 `build-resources\` 都在 `.gitignore`，不進 git。
+- 產物：`release\AgentWorkflowGui-Setup-<version>-x64.exe`（約 110 MB；T044 內建 claude.exe 時是 218 MB）；`release\win-unpacked\` 約 326 MB。`release\` 與 `build-resources\` 都在 `.gitignore`，不進 git。
 - 設定在 `electron-builder.yml`；`npm run dist` 不需要系統管理員權限、不需要憑證，也不發布到任何地方（`publish: null`）。
 - 第一次建置會下載 Electron zip 與 NSIS 工具到使用者的 cache（`%LOCALAPPDATA%\electron\Cache`、`%LOCALAPPDATA%\electron-builder\Cache`）。
 
@@ -31,10 +32,10 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 | 項目 | 處理 |
 |---|---|
 | koffi（`.node`） | `asarUnpack`；`require('koffi')` 由 Electron 對 `.node` 的處理導到 `app.asar.unpacked` |
-| claude.exe | `asarUnpack`；Agent SDK 用 `require.resolve` 找到的是 `app.asar` 內的路徑，不能啟動，`app/main/packaged-paths.ts` 在啟動時把它換成 `app.asar.unpacked` 的同一個檔案（session 與 model 探測共用）。只有 `app.isPackaged` 為真、而且路徑開頭正好是 `<process.resourcesPath>\app.asar\` 時才換；開發版與其他路徑一律原樣 |
+| claude.exe | **不打包**（T045）。app 把偵測到的使用者自己的 Claude Code 用 `pathToClaudeCodeExecutable` 交給 SDK，仍由 app 啟動在每個 session 的 Job 裡。T044 的 `app.asar` → `app.asar.unpacked` 路徑轉換因此移除。只有開發版（未打包）找不到本機 Claude Code 時才退回 SDK 附的那一份，並記 log；打包版不退回 |
 | GUI MCP server | 在 main bundle 內、同一個行程的本機 HTTP server，不需要路徑 |
 | `node:sqlite` | Electron 內建，不需要 unpack |
-| Codex | 不打包；由 `PATH` 偵測 |
+| Claude Code、Codex | 不打包；由 app 偵測使用者自己的安裝（見第 1 節），結果顯示在「設定 → Runtime」 |
 | 使用者資料 | `%APPDATA%\AgentWorkflowGui\`（`awg.sqlite` 等），由 Electron 的 `userData` 決定 |
 
 ## 3. 安裝、解除安裝與使用者資料
@@ -57,28 +58,32 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 ## 5. 授權
 
 - 本專案：**Apache-2.0**（`LICENSE`、`NOTICE`，兩者都放進安裝檔的 `resources\app.asar` 內）。
-- 第三方授權清單：`npm run dist` 由 `package-lock.json` 的 production 依賴產生 `THIRD_PARTY_LICENSES.txt`（135 個套件，含 renderer 打進 bundle 的 react 與 @xyflow/react），安裝後在 `resources\THIRD_PARTY_LICENSES.txt`。授權分布：MIT 111、ISC 15、BSD-3-Clause 3、Apache-2.0 2、BSD-2-Clause 1、Unlicense 1，另外 2 個是 Anthropic 的專有授權（見下）。清單是 production 依賴的**超集合**：也列出 lock 內有、但沒有放進安裝檔的套件（例如 Agent SDK 的選用 peer 依賴 `@anthropic-ai/sdk`）。
+- 第三方授權清單：`npm run dist` 由 `package-lock.json` 的 production 依賴產生 `THIRD_PARTY_LICENSES.txt`（135 個套件，含 renderer 打進 bundle 的 react 與 @xyflow/react），安裝後在 `resources\THIRD_PARTY_LICENSES.txt`。授權分布：MIT 111、ISC 15、BSD-3-Clause 3、Apache-2.0 2、BSD-2-Clause 1、Unlicense 1，另外 2 個是 Anthropic 的專有授權（見下）。清單是 production 依賴的**超集合**：也列出 lock 內有、但沒有放進安裝檔的套件（例如 Agent SDK 的選用 peer 依賴 `@anthropic-ai/sdk`，以及 SDK 的原生 CLI 套件 `claude-agent-sdk-win32-x64` 等，T045 起這些不在安裝檔內）。
   - 清單產生程式 `scripts/third-party-licenses.mjs` 讀每個套件根目錄與其內 vendored 資料夾（不含巢狀 `node_modules`）的授權與 NOTICE 檔，目前 137 個檔案（含 koffi 的 `vendor/node-addon-api/LICENSE.md`、`vendor/node-api-headers/LICENSE`），每個檔以 `File: node_modules/...` 標出；`npm run dist` 最後跑 `scripts/check-licenses.mjs`，產物（`app.asar` 與 `app.asar.unpacked`）裡任何一個授權或 NOTICE 檔不在清單內就失敗；有 2 個套件沒有授權檔（`@koromix/koffi-win32-x64`、`standardwebhooks`，兩者的 package.json 都標示 MIT；koffi 主套件附有 LICENSE.txt），清單中標明「no licence file in the package」。
-- **Anthropic 的 Claude Agent SDK 與 claude.exe 是專有授權**（`SEE LICENSE`：© Anthropic PBC，依 Anthropic 的法律條款使用）。安裝檔內含 `claude.exe`，**對外發行（不只自用）前，需要確認 Anthropic 的條款允許以這種方式再散布**；這個判斷不是工程問題，這份文件沒有結論。若不允許，替代方案是改成要求使用者自己安裝 Claude Code，並以 `pathToClaudeCodeExecutable` 指向它（需要改程式，不在這次範圍）。
+- **Anthropic 的 Claude Agent SDK 是專有授權**（`SEE LICENSE`：© Anthropic PBC，依 Anthropic 的法律條款使用）。T045 起**安裝檔不再散布 `claude.exe`**（SDK 附的原生 CLI，約 285 MB）：app 使用使用者自己安裝、自己登入的 Claude Code，原本的「是否允許再散布 claude.exe」疑慮不再存在。安裝檔裡仍有 SDK 本身的 JavaScript（`@anthropic-ai/claude-agent-sdk`，約 5 MB）與它的授權檔；它是否可以隨應用程式散布，仍依 Anthropic 的條款，這份文件沒有結論，對外發行前請一併確認。
+- app 不讀取、不保存、不顯示 Claude Code 或 Codex 的登入憑證或帳號：登入狀態只用它們自己的 `claude auth status`、`codex login status` 查，只顯示類別（訂閱、API key、未登入、不明）。
 - Codex CLI（Apache-2.0）不隨附。
 
 ## 6. 已知限制
 
 - 只有 Windows x64；沒有簽章、沒有自動更新、沒有 arm64。
-- 安裝檔很大（約 218 MB，主要是 claude.exe）。
-- Codex 要使用者自己安裝，而且 `codex.exe` 要在 `PATH`（或設定 `AWG_CODEX_COMMAND`）；從開始功能表啟動時看到的是使用者的 `PATH`，app 啟動時才偵測，剛安裝完 Codex 要重開 app（必要時重新登入 Windows，讓新的 `PATH` 生效）才找得到。
+- 安裝檔約 110 MB（T045 之前內建 claude.exe 時 218 MB）。
+- **Claude Code 與 Codex 都要使用者自己安裝並登入**，app 不安裝、不下載、不代為登入。Claude Code 要 ≥ 2.1.309、Codex 要 ≥ 0.160.0；太舊時該 runtime 不可用，並提示要更新到的版本。
+- 從開始功能表啟動時看到的是使用者的 `PATH`，所以剛安裝完要到「設定 → Runtime」按「重新偵測」；建立或 resume session 前，若該 runtime 目前不可用也會自動重新偵測一次（不定時輪詢）。剛改過的 `PATH` 只有重開 app（必要時重新登入 Windows）才看得到。
+- 不可用的 runtime 的模型不會出現在 Model 下拉選單，選單旁邊會說明原因。登入狀態讀不懂時記為「不明」，不擋使用。
+- Claude 桌面版附帶的 CLI 放在帶版本號的資料夾（`%APPDATA%\Claude\claude-code\<版本>\` 或 Microsoft Store 版的 `%LOCALAPPDATA%\Claude-Data\<套件資料夾>\claude-code\<版本>\<hash>\`），app 用列目錄找、取最新版本；這個資料夾結構是 Claude 桌面版的內部實作，將來改動時只會找不到，不會壞掉（仍可用 `AWG_CLAUDE_PATH` 指定）。
 - 啟動後 Claude 的模型清單約 8 秒才出現（Codex 約 3 秒），這段時間模型選單只有 Codex 的選項。
-- 圖示是 Electron 預設圖示（沒有設計過的 app 圖示）。exe 的版本資訊是 electron-builder 填的：`FileVersion` 0.1.0、`ProductVersion` 0.1.0.0、`ProductName` 與 `FileDescription` 為 `AgentWorkflowGui`、`LegalCopyright` 為 Copyright 2026 firewings2515；但 `CompanyName` 仍是 Electron 的預設值「GitHub, Inc.」（`package.json` 沒有 `author`），發行前要設定。
+- 圖示是 Electron 預設圖示（沒有設計過的 app 圖示）。exe 的版本資訊是 electron-builder 填的：`FileVersion` 0.1.0、`ProductVersion` 0.1.0.0、`ProductName` 與 `FileDescription` 為 `AgentWorkflowGui`、`LegalCopyright` 為 Copyright 2026 firewings2515；`CompanyName` 取自 `package.json` 的 `author`（預設 `firewings2515`，發行前可以改成要顯示的名稱）。
 - 安裝／解除安裝只測過靜默模式（`/S`）與 per-user；沒有測過互動式安裝畫面，也沒有測過套用 AppLocker／WDAC 的企業環境。
 - Claude 與 Codex 的 native home（`~/.claude`、`~/.codex`）由各自的 CLI 管理，解除安裝不會清理它們。
 
 ## 7. 發行前檢查清單
 
 1. `npm ci`，`npm run lint`、`npm run typecheck`、`npx vitest run --maxWorkers=4`、`npm run build` 都通過。
-2. `npm run dist`，確認 `release\` 內有安裝檔，`app.asar.unpacked` 內有 koffi 與 claude.exe。
-3. 在乾淨的 Windows 使用者帳號安裝（可用靜默安裝到暫存資料夾），以暫存的 `--user-data-dir` 啟動，跑 Claude 與 Codex 各一個 turn，正常退出（R-14）後沒有殘留程序。
+2. `npm run dist`，確認 `release\` 內有安裝檔，`app.asar.unpacked` 內有 koffi、**沒有** claude.exe。
+3. 在已安裝並登入 Claude Code 與 Codex 的 Windows 使用者帳號安裝（可用靜默安裝到暫存資料夾），以暫存的 `--user-data-dir` 啟動，「設定 → Runtime」兩張卡都是「可用」，跑 Claude 與 Codex 各一個 turn，正常退出（R-14）後沒有殘留程序。
 4. 解除安裝後 `%APPDATA%\AgentWorkflowGui` 仍在、開始功能表捷徑與 `HKCU` 解除安裝項目已移除。
-5. 確認 Anthropic 條款允許再散布 claude.exe（第 5 節）。
+5. 對外發行前，確認 Anthropic 的條款允許隨附 SDK 的 JavaScript（第 5 節；claude.exe 已不隨附）。
 6. 算安裝檔的 SHA-256，隨發行說明公布；說明 SmartScreen 的警告。
 
 ## 8. T044 驗證紀錄

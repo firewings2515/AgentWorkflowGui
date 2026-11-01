@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { AgentId, NodeId } from '../../../contracts';
-import type { AgentDefinition, InputRule, ModelOption, OutputRule, WorkflowNode, WorkflowTemplate } from '../../../contracts';
+import type { AgentDefinition, InputRule, ModelOption, OutputRule, RuntimeStatus, WorkflowNode, WorkflowTemplate } from '../../../contracts';
+import { RuntimeNotice } from './RuntimeNotice';
 import { destinationKey, destinationValue, isolationLabels, writePolicyLabels } from './workflow-editor-state';
 import type { WorkflowIssue } from './workflow-editor-state';
 
@@ -52,8 +53,8 @@ export function WorkflowSettings({ workflow, issues, onChange, onRoot }: {
   </>;
 }
 
-export function WorkflowInspector({ workflow, node, agents, models, issues, destinationChoices, onDestinationChoice, onChange }: {
-  workflow: WorkflowTemplate; node: WorkflowNode; agents: readonly AgentDefinition[]; models: readonly ModelOption[];
+export function WorkflowInspector({ workflow, node, agents, models, runtimes = [], issues, destinationChoices, onDestinationChoice, onChange }: {
+  workflow: WorkflowTemplate; node: WorkflowNode; agents: readonly AgentDefinition[]; models: readonly ModelOption[]; runtimes?: readonly RuntimeStatus[];
   issues: WorkflowIssue[]; onChange: (node: WorkflowNode, applyDestination?: boolean) => void;
   destinationChoices: Record<string, string>; onDestinationChoice: (ruleId: string, value: string) => void;
 }) {
@@ -80,6 +81,7 @@ export function WorkflowInspector({ workflow, node, agents, models, issues, dest
         {!selectedModel && <option value={modelKey(node.model)}>未提供的 Model：{node.model.model}</option>}
         {availableModels.map(model => <option key={modelKey(model)} value={modelKey(model)}>{model.runtime} · {model.displayName}</option>)}
       </select>)}
+      <RuntimeNotice runtimes={runtimes} />
       {field('model.effort', '推理強度', props => <select {...props} value={node.model.effort ?? ''} onChange={event => {
         const model = { runtime: node.model.runtime, model: node.model.model };
         onChange({ ...node, model: { ...model, ...(event.target.value ? { effort: event.target.value } : {}) } });

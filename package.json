@@ -5,6 +5,7 @@
   "description": "Local desktop GUI for managing reusable agent workflows across Claude and Codex sessions.",
   "private": true,
   "license": "Apache-2.0",
+  "author": "firewings2515",
   "main": "./out/main/index.js",
   "engines": {
     "node": ">=22.13.0"

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { NodeId } from '../../../contracts';
-import type { AgentDefinition, ModelOption, WorkflowNode, WorkflowTemplate } from '../../../contracts';
+import type { AgentDefinition, ModelOption, RuntimeStatus, WorkflowNode, WorkflowTemplate } from '../../../contracts';
 import type { WorkflowRepository } from './workflow-repository';
 import { workflowSaveCommand } from './workflow-repository';
 import type { WorkflowDemoControls } from './workflow-demo';
@@ -59,8 +59,8 @@ function DeleteGraphDialog({ workflow, selection, onCancel, onConfirm }: {
   </dialog>;
 }
 
-export function WorkflowEditor({ repository, demo, agents, models, selectedId, visible, onSelect }: {
-  repository: WorkflowRepository; demo?: WorkflowDemoControls | undefined; agents: readonly AgentDefinition[]; models: readonly ModelOption[];
+export function WorkflowEditor({ repository, demo, agents, models, runtimes = [], selectedId, visible, onSelect }: {
+  repository: WorkflowRepository; demo?: WorkflowDemoControls | undefined; agents: readonly AgentDefinition[]; models: readonly ModelOption[]; runtimes?: readonly RuntimeStatus[];
   selectedId: string; visible: boolean; onSelect: (id: string) => void;
 }) {
   const workflows = useSyncExternalStore(repository.subscribe, repository.getSnapshot);
@@ -257,7 +257,7 @@ export function WorkflowEditor({ repository, demo, agents, models, selectedId, v
         </div>
         <aside className="workflow-inspector" aria-label="Workflow 屬性檢視器"><h3 ref={inspectorHeading} tabIndex={-1}>{selectedNode ? `節點：${selectedNode.label}` : selection?.kind === 'edge' ? '連線設定' : '範本設定'}</h3>
           <fieldset className="workflow-inspector-fields" disabled={pending}>
-            {selectedNode ? <WorkflowInspector key={selectedNode.id} workflow={workflow} node={selectedNode} agents={agents} models={models} issues={issues} destinationChoices={draft.destinationChoices} onDestinationChoice={(ruleId, value) => {
+            {selectedNode ? <WorkflowInspector key={selectedNode.id} workflow={workflow} node={selectedNode} agents={agents} models={models} runtimes={runtimes} issues={issues} destinationChoices={draft.destinationChoices} onDestinationChoice={(ruleId, value) => {
               const destinationChoices = { ...draft.destinationChoices, [destinationKey(selectedNode.id, ruleId)]: value };
               if (value === destinationValue(selectedNode.outputRules.find(rule => rule.id === ruleId)!.target)) delete destinationChoices[destinationKey(selectedNode.id, ruleId)];
               patch(selectedId, { destinationChoices, message: '' });
