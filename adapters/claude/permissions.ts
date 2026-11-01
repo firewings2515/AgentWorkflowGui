@@ -39,26 +39,75 @@ export const permissionKindOfTool = (toolName: string): PermissionRequest['kind'
 
 // A glob segment that matches more than its own text (`*`, `?`, `[a]`, `{a,b}`, extglobs).
 const GLOB_SEGMENT = /[*?[\]{}()!+@]/;
+// A wildcard segment made only of dots and wildcards (`.*`, `[.][.]`) may match `.` or `..` in some globbers.
+const DOTS_ONLY = /^[.*?[\]]*\.[.*?[\]]*$/;
+// What a search may not start from: nothing, a root, a drive, the home folder, a bare UNC server or share.
+const ROOT = /^(\/*|[a-z]:\/*|~\/*|\/\/[^/]*(\/[^/]*)?\/*)$/i;
+// `{a,b}` alternatives past this many are not placed one by one.
+const MAX_EXPANSIONS = 64;
+
+/** `{a,b}` groups expanded, as the tool does before it matches; undefined when unbalanced or too many. */
+const expandBraces = (text: string): string[] | undefined => {
+  const open = text.indexOf('{');
+  if (open < 0) return text.includes('}') ? undefined : [text];
+  const parts: string[] = [];
+  let depth = 0;
+  let from = open + 1;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i];
+    if (c === '{') depth++;
+    else if (c === ',' && depth === 1) {
+      parts.push(text.slice(from, i));
+      from = i + 1;
+    } else if (c === '}' && --depth === 0) {
+      parts.push(text.slice(from, i));
+      const out: string[] = [];
+      for (const part of parts) {
+        const more = expandBraces(`${text.slice(0, open)}${part}${text.slice(i + 1)}`);
+        if (more === undefined || out.push(...more) > MAX_EXPANSIONS) return undefined;
+      }
+      return out;
+    }
+  }
+  return undefined;
+};
 
 /**
  * Where a Glob call reaches beyond its `path` (T042 A11): the pattern's fixed folder part, joined to `path`
- * as the tool joins them, so `C:/Users/x/.ssh/*` or `../../*` is checked like a path. A `..` or a drive among
- * the wildcards cannot be placed; then the whole pattern is given, which the policy cannot approve. A plain
- * relative pattern (`**\/*.ts`) adds nothing: the search stays in `path` or the working folder.
+ * as the tool joins them, so `C:/Users/x/.ssh/*` or `../../*` is checked like a path. Brace alternatives are
+ * placed one by one (`{../far,src}/**`). What cannot be placed — a `..`, a drive or a dots-only wildcard among
+ * the wildcards, a search from a root, a bracket or brace that is not closed — gives the whole pattern, which the
+ * policy cannot approve. A plain relative pattern (`**\/*.ts`) adds nothing: the search stays in `path` or the
+ * working folder.
  */
 export const globReach = (input: Record<string, unknown>): string[] => {
-  const pattern = str(input.pattern);
-  if (pattern === undefined || pattern === '') return [];
-  const segments = pattern.replaceAll('\\', '/').split('/');
-  const wild = segments.findIndex((s) => GLOB_SEGMENT.test(s));
-  const fixed = wild < 0 ? segments : segments.slice(0, wild);
-  const rest = wild < 0 ? [] : segments.slice(wild);
-  const absolute = /^([a-z]:|\/|~)/i.test(pattern);
+  const raw = str(input.pattern);
+  if (raw === undefined || raw === '') return [];
+  const pattern = raw.replaceAll('\\', '/');
   const path = str(input.path);
-  const joined = (part: string) => (absolute || path === undefined || path === '' ? part : `${path}/${part}`);
-  if (rest.includes('..') || rest.some((s) => s.includes(':'))) return [joined(pattern)];
-  const prefix = fixed.join('/');
-  return prefix === '' ? [] : [joined(prefix)];
+  const joined = (absolute: boolean, part: string) => (absolute || path === undefined || path === '' ? part : `${path}/${part}`);
+  const whole = [joined(/^([a-z]:|\/|~)/i.test(pattern), pattern)];
+  const reach = (alternative: string): string[] | undefined => {
+    const segments = alternative.split('/');
+    if (segments.some((s) => s.split('[').length !== s.split(']').length || s.split('(').length !== s.split(')').length)) return undefined;
+    const wild = segments.findIndex((s) => GLOB_SEGMENT.test(s));
+    const fixed = wild < 0 ? segments : segments.slice(0, wild);
+    const rest = wild < 0 ? [] : segments.slice(wild);
+    const absolute = /^([a-z]:|\/|~)/i.test(alternative);
+    if (rest.some((s) => s === '..' || s.includes(':') || DOTS_ONLY.test(s))) return undefined;
+    const prefix = fixed.join('/');
+    if (absolute && ROOT.test(prefix)) return undefined;
+    return prefix === '' ? [] : [joined(absolute, prefix)];
+  };
+  const alternatives = expandBraces(pattern);
+  if (alternatives === undefined) return whole;
+  const out = new Set<string>();
+  for (const alternative of alternatives) {
+    const r = reach(alternative);
+    if (r === undefined) return whole;
+    for (const p of r) out.add(p);
+  }
+  return [...out];
 };
 
 export const buildPermissionRequest = (call: PreToolUse, ctx: { id: PermissionRequestId; placement: Placement; createdAt: Timestamp }): PermissionRequest => {

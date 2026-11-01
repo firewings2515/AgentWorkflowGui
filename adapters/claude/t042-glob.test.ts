@@ -30,7 +30,25 @@ describe('T042 A11: Glob patterns that leave the folder', () => {
     [{ pattern: 'src/*/../../../*' }, 'unrecognised'],
     [{ pattern: 'C:*.txt' }, 'unrecognised'],
     [{ pattern: '~/.ssh/*' }, 'unrecognised'],
-    [{ pattern: '//server/share/*' }, 'secret-read'],
+    [{ pattern: '//server/share/x/*' }, 'secret-read'],
+    // r1-P1-1: a search from a root, brace alternatives, a backslash UNC pattern beside a relative `path`.
+    [{ pattern: '/*' }, 'unrecognised'],
+    [{ pattern: '/**/id_rsa' }, 'unrecognised'],
+    [{ pattern: 'C:/*' }, 'unrecognised'],
+    [{ pattern: String.raw`C:\**\*.pem` }, 'unrecognised'],
+    [{ pattern: '~/*' }, 'unrecognised'],
+    [{ pattern: '//server/share/*' }, 'unrecognised'],
+    [{ path: 'src', pattern: String.raw`\\server\share\*` }, 'unrecognised'],
+    [{ pattern: '{../far,src}/**' }, 'secret-read'],
+    [{ pattern: 'src/{a,{b,../../far}}/*' }, 'secret-read'],
+    [{ pattern: '{C:/Users/x,src}/*' }, 'secret-read'],
+    [{ pattern: '{.,x}./*' }, 'secret-read'],
+    [{ pattern: '{../far/*' }, 'unrecognised'],
+    [{ pattern: 'x}/../*' }, 'unrecognised'],
+    [{ pattern: '[/]Users/*' }, 'unrecognised'],
+    [{ pattern: '**/[.][.]/*' }, 'unrecognised'],
+    [{ pattern: '.*/*' }, 'unrecognised'],
+    [{ pattern: '{a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}/*' }, 'unrecognised'],
   ])('%j is not approved', (input, rule) => {
     expect(verdict(input)).toBe(rule);
   });
@@ -38,7 +56,12 @@ describe('T042 A11: Glob patterns that leave the folder', () => {
   it.each([
     [{ pattern: '**/*.ts' }],
     [{ pattern: 'src/**/*.ts' }],
+    [{ pattern: 'src/**' }],
     [{ pattern: '*.{ts,tsx}' }],
+    [{ pattern: '**/*.{ts,tsx,js}' }],
+    [{ pattern: '{src,lib}/**/*.ts' }],
+    [{ pattern: 'app/[id]/page.tsx' }],
+    [{ pattern: '**/.env*' }],
     [{ path: String.raw`E:\work\proj\src`, pattern: '*.ts' }],
     [{ pattern: 'E:/work/proj/src/**/*.ts' }],
     [{ path: 'src', pattern: '../lib/*.ts' }],
@@ -51,6 +74,10 @@ describe('T042 A11: Glob patterns that leave the folder', () => {
     expect(globReach({ pattern: 'src/**/*.ts' })).toEqual(['src']);
     expect(globReach({ path: 'lib', pattern: '../x/*' })).toEqual(['lib/../x']);
     expect(globReach({ path: 'lib', pattern: 'C:/x/*' })).toEqual(['C:/x']);
+    expect(globReach({ pattern: '{../far,src}/**' })).toEqual(['../far', 'src']);
+    expect(globReach({ pattern: '**/*.{ts,tsx}' })).toEqual([]);
+    expect(globReach({ path: 'src', pattern: String.raw`\\server\share\*` })).toEqual(['//server/share/*']);
+    expect(globReach({ pattern: '/*' })).toEqual(['/*']);
     expect(glob({ pattern: '**/*.ts' }).paths).toEqual([]);
     expect(
       buildPermissionRequest(

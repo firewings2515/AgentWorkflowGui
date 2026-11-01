@@ -11,6 +11,7 @@ import type { PermissionRequest } from '../../contracts';
 import { permissionPolicy } from '../../core/policy';
 import type { PolicyContext } from '../../core/ports';
 import { codexSingle, command, edit, request, tool } from '../../core/policy/testing/requests';
+import { realFolder } from './exe-search';
 import { resolveRealPath } from './real-path';
 
 let base = '';
@@ -233,24 +234,27 @@ describe('T042 A9: the same request after the folder was swapped for a junction 
 });
 
 describe('T042 A10: making a link (the step a later swap needs) is never approved', () => {
-  const target = () => join(far, 'deep');
+  // Forward slashes and no quotes, so the Codex wrapper reads the command as written (r1-P2-1: the placeholder
+  // is a word of its own, never a letter inside `-ItemType`).
+  const target = () => join(far, 'deep').replaceAll('\\', '/');
   it.each([
-    ['New-Item -ItemType Junction -Path j -Target T'],
-    ['New-Item -ItemType SymbolicLink -Path j -Target T'],
-    ['New-Item -ItemType HardLink -Path j -Target T'],
-    ['New-Item j -ItemType Junction -Value T'],
-    ['cmd /c mklink /J j T'],
-    ['cmd /c mklink /H j T'],
-    ['ln -s T j'],
-    ['ln T j'],
-    ['cp -s T j'],
-    ['cp -l T j'],
-    ['fsutil hardlink create j T'],
+    ['New-Item -ItemType Junction -Path j -Target TARGET'],
+    ['New-Item -ItemType SymbolicLink -Path j -Target TARGET'],
+    ['New-Item -ItemType HardLink -Path j -Target TARGET'],
+    ['New-Item j -ItemType Junction -Value TARGET'],
+    ['cmd /c mklink /J j TARGET'],
+    ['cmd /c mklink /H j TARGET'],
+    ['ln -s TARGET j'],
+    ['ln TARGET j'],
+    ['cp -s TARGET j'],
+    ['cp -l TARGET j'],
+    ['fsutil hardlink create j TARGET'],
     ['fsutil file setCaseSensitiveInfo sub enable'],
   ])('%s', (template) => {
-    const cmd = template.replace('T', `'${target()}'`);
+    const cmd = template.replaceAll('TARGET', target());
+    expect(cmd.replaceAll(target(), 'TARGET')).toBe(template);
     expect(verdict(bash(cmd)), cmd).not.toBe('approve');
-    expect(verdict(codexCmd(cmd.replaceAll("'", '"'))), cmd).not.toBe('approve');
+    expect(verdict(codexCmd(cmd)), cmd).not.toBe('approve');
   });
 });
 
@@ -259,5 +263,14 @@ describe('T042 A8: residual risk, pinned', () => {
     // Windows cannot tell which name of a hard-linked file is the original. Making one is refused (A10); one that
     // was there before the session is not detected. See T042-report.md, residual risks.
     expect(verdict(claudeWrite(join(ws, 'hard.txt')))).toBe('approve');
+  });
+});
+
+describe('T042 F2 (r1-P1-3): the folder that is opened is the real one that was checked', () => {
+  it('resolves a junction to its target, and refuses a file or a missing path', () => {
+    expect(realFolder(ws)).toBe(ws);
+    expect(realFolder(join(ws, 'link'))).toBe(join(far, 'deep'));
+    expect(realFolder(join(ws, 'x.txt'))).toBeUndefined();
+    expect(realFolder(join(ws, 'missing'))).toBeUndefined();
   });
 });

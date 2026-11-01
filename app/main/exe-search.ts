@@ -34,6 +34,16 @@ export const isDirectory = (path: string): boolean => {
   }
 };
 
+/** The real path of an existing folder, links resolved, or undefined for a file or a missing path (T042 F2). */
+export const realFolder = (path: string, realpath: Realpath = realpathSync.native): string | undefined => {
+  try {
+    const real = realpath(path);
+    return statSync(real).isDirectory() ? real : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 /** Windows environment names are case-insensitive: `Path`, `PATH`. */
 export const envValue = (env: NodeJS.ProcessEnv, name: string): string | undefined => {
   const key = Object.keys(env).find((k) => k.toUpperCase() === name.toUpperCase());

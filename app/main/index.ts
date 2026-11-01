@@ -7,7 +7,7 @@ import { registerAppIpc } from './app-ipc';
 import { type Backend, type DamagedBackend, startBackend } from './backend';
 import { sdkBundledClaude } from './claude-exe';
 import { EventBus } from './event-bus';
-import { isDirectory } from './exe-search';
+import { realFolder } from './exe-search';
 import { handleFolderRequest } from './folders';
 import { handleTrusted } from './ipc';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
@@ -147,7 +147,7 @@ void app.whenReady().then(async () => {
         return picked.canceled ? null : (picked.filePaths[0] ?? null);
       },
       openPath: (path) => shell.openPath(path),
-      isFolder: isDirectory,
+      realFolder: (path) => realFolder(path),
     }),
   );
   if (backend.status === 'ready') {

@@ -13,7 +13,7 @@ const deps = (extra: Partial<FolderDeps> = {}): FolderDeps & { opened: string[] 
       opened.push(path);
       return Promise.resolve('');
     },
-    isFolder: () => true,
+    realFolder: (path) => path,
     ...extra,
   };
 };
@@ -48,10 +48,16 @@ describe('folder requests (C-24)', () => {
     expect(await handleFolderRequest({ type: 'folder.open', requestId: 'r', target: { kind: 'session-cwd', sessionId: 'nobody' } }, d)).toMatchObject({ ok: false, code: 'not_found' });
     // task-c has no worktree yet.
     expect(await handleFolderRequest({ type: 'folder.open', requestId: 'r', target: { kind: 'task-worktree', instanceId: 'inst-login', taskId: 'task-c' } }, d)).toMatchObject({ ok: false, code: 'not_found' });
-    const gone = deps({ isFolder: () => false });
+    const gone = deps({ realFolder: () => undefined });
     expect(await handleFolderRequest({ type: 'folder.open', requestId: 'r', target: { kind: 'app-data' } }, gone)).toMatchObject({ ok: false, code: 'not_found' });
     expect(d.opened).toEqual([]);
     expect(await handleFolderRequest('nonsense', d)).toMatchObject({ ok: false, requestId: null, code: 'invalid_request' });
+  });
+
+  it('opens the real folder that was checked, not the path as stored (T042 r1-P1-3)', async () => {
+    const d = deps({ realFolder: () => 'D:/real/target' });
+    expect(await handleFolderRequest({ type: 'folder.open', requestId: 'r', target: { kind: 'app-data' } }, d)).toEqual({ ok: true, requestId: 'r' });
+    expect(d.opened).toEqual(['D:/real/target']);
   });
 
   it('turns a failing dialog or explorer into internal_error without throwing', async () => {

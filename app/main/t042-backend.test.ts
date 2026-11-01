@@ -26,7 +26,7 @@ import { runCommand } from './app-ipc';
 import { type BackendProcessHost, startBackend } from './backend';
 import { EventBus } from './event-bus';
 import { handleFolderRequest } from './folders';
-import { isDirectory } from './exe-search';
+import { realFolder } from './exe-search';
 import { resolveRealPath } from './real-path';
 
 const hashed = vi.hoisted(() => ({ paths: [] as string[] }));
@@ -259,7 +259,7 @@ describe('T042 F2: opening a "folder" never runs a file', () => {
         opened.push(p);
         return Promise.resolve('');
       },
-      isFolder: isDirectory,
+      realFolder: (p: string) => realFolder(p),
     };
     const onFile = await handleFolderRequest({ type: 'folder.open', requestId: 'r1', target: { kind: 'session-cwd', sessionId: 'codex-file' } }, deps);
     expect(onFile).toMatchObject({ ok: false, code: 'not_found' });
