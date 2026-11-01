@@ -104,3 +104,15 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 - 解除安裝後：安裝資料夾、`HKCU` 項目、捷徑都已移除；暫存 userData 的 `awg.sqlite` 仍在，22 個資料表，`logical_session` 1、`message` 2、`turn` 1、`owned_process` 4（`T044-live2-uninstall.json`）。
 
 **沒有驗證**：有未結束工作時的 R-14 對話框（打包版）、預設安裝位置、互動式安裝畫面、Windows 11、`\\?\` 前綴在安裝版 SDK 上是否真的會出現（只有單元測試）。
+
+## 9. T045 驗證紀錄
+
+2026-11-01，Windows 10 19045 x64，已安裝版（commit `31ccab8` 的內容；`AgentWorkflowGui-Setup-0.1.0-x64.exe`，115,495,579 位元組，SHA-256 `F77B06B3AF445DED94C8A3860735382F88FE9F477C01C0F7D9CEFBF319569FD6`，T044 是 218 MB）。`/S /D=<mkdtemp>\app` 安裝、暫存 `--user-data-dir`；安裝 1 次（13 秒、沒有提權）、解除安裝 1 次（9 秒）、Electron 啟動 3 次（第 1 次因 live 腳本的 agent schemaVersion 過舊而在建立 session 前停下）、Claude turn 1、Codex turn 0。
+
+- 安裝後 `resources\app.asar.unpacked` 內沒有 `claude.exe`，exe 的 `CompanyName` 是 `firewings2515`。
+- **用本機 Claude Code**：Snapshot 的 `runtimes` 為 Claude `available` 2.1.309（`C:\Users\capri\.local\bin\claude.exe`，來源 PATH，訂閱，13 個模型）、Codex `available` 0.160.0（來源 PATH，訂閱，10 個模型）。Claude（haiku）1 個 turn completed（`observedModel` `claude-haiku-5-5`）；實際啟動的 `claude.exe` 是 `C:\Users\capri\.local\bin\claude.exe`（PID 43020，父行程是這次的 Electron），不是安裝資料夾內的檔案。`runtime.detect` 回 ok，狀態不變。關閉 735 ms，沒有殘留程序。
+- **找不到 Claude 時**（`AWG_CLAUDE_PATH` 指向不存在的檔案）：Snapshot 顯示 Claude `not-installed`（`detail` 說明環境變數的檔案不存在）、`modelCount` 0、模型選單沒有 Claude；Codex `available`、10 個模型。「`session.create` 回 `runtime_unavailable`」沒有在安裝版上實測（腳本沿用 run1 的 userData，`agent.save` 回 `stale_revision`，在建立 session 前就停了），改由單元測試 `app/main/backend-runtimes.test.ts` 涵蓋。
+- 解除安裝後：安裝資料夾、`HKCU` 項目、開始功能表捷徑都已移除；暫存 userData 的 `awg.sqlite` 仍在；沒有殘留程序。
+- 兩次 run1 結束時 `owned_process` 各有一筆沒有 `endedAt` 的 `runtime-host`，對應的程序都已不存在；來源（探測用的行程記錄）沒有追查。
+
+**沒有驗證**：Claude 桌面版附帶 CLI 的搜尋（本機的 Store 版沒有該資料夾，只有單元測試）、「版本太舊」與「未登入」在安裝版上的畫面（單元測試涵蓋）、設定頁的截圖（只用 DOM 與 CSS 量測；1024x768、深色與淺色）、Windows 11。
