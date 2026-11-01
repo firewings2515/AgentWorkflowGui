@@ -1,8 +1,8 @@
 // T045: version reading and comparison, the search for Claude Code, and the locator's states. The status commands
 // are faked: nothing here starts a real runtime.
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { RuntimeStatus, type Runtime } from '../../contracts';
 import { CLAUDE_CODE_MIN_VERSION } from '../../adapters/claude/cli-version';
@@ -13,7 +13,8 @@ import { compareVersions, parseVersion } from './runtime-version';
 
 let dir: string;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'awg-t045-'));
+  // As the search reports it: resolved through links and short names.
+  dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'awg-t045-')));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
@@ -27,28 +28,45 @@ const touch = (...parts: string[]) => {
 };
 
 describe('T045 version text', () => {
-  it('reads the number from Claude, Codex and bare outputs', () => {
-    expect(parseVersion('2.1.309 (Claude Code)\n')).toBe('2.1.309');
-    expect(parseVersion('codex-cli 0.160.0\r\n')).toBe('0.160.0');
-    expect(parseVersion('0.160.0')).toBe('0.160.0');
-    expect(parseVersion('codex-cli 0.161.0-alpha.2')).toBe('0.161.0-alpha.2');
-    expect(parseVersion('v3.0.1')).toBe('3.0.1');
+  it('reads the number from the known output forms only', () => {
+    expect(parseVersion('claude', '2.1.309 (Claude Code)\n')).toBe('2.1.309');
+    expect(parseVersion('claude', '2.1.309')).toBe('2.1.309');
+    expect(parseVersion('codex', 'codex-cli 0.160.0\r\n')).toBe('0.160.0');
+    expect(parseVersion('codex', '0.160.0')).toBe('0.160.0');
+    expect(parseVersion('codex', 'codex-cli 0.161.0-alpha.2')).toBe('0.161.0-alpha.2');
+    expect(parseVersion('bare', '2.1.309')).toBe('2.1.309');
+    expect(parseVersion('codex', 'codex-cli 1.0.0+build.5')).toBe('1.0.0');
   });
 
-  it('reads nothing from text without a version, and never from a longer number', () => {
-    expect(parseVersion('')).toBeUndefined();
-    expect(parseVersion('command not found')).toBeUndefined();
-    expect(parseVersion('1.2')).toBeUndefined();
-    expect(parseVersion('1.2.3.4')).toBeUndefined();
+  it('reads nothing from anything else: a number in an error message, an incomplete or odd version, the other program', () => {
+    for (const text of ['', 'command not found', '1.2', '1.2.3.4', 'v3.0.1', 'error: Node 24.0.0 required', 'Error: Node 24.0.0 required\n', '2.1.309-', '2.1.309-.', '2.1.309+', '01.2.3', '1.2.3-01', '2.1.309 (Claude Code) extra', 'warning\n2.1.309 (Claude Code)', '2.1.309 (Claude Code)\n2.1.310']) {
+      expect(parseVersion('claude', text), text).toBeUndefined();
+      expect(parseVersion('codex', text), text).toBeUndefined();
+    }
+    expect(parseVersion('claude', 'codex-cli 0.160.0')).toBeUndefined();
+    expect(parseVersion('codex', '0.160.0 (Claude Code)')).toBeUndefined();
+    expect(parseVersion('bare', '2.1.309 (Claude Code)')).toBeUndefined();
   });
 
-  it('compares numbers by part, not as text, and a pre-release is older than its release', () => {
+  it('compares numbers by part, not as text', () => {
     expect(compareVersions('2.1.309', '2.1.309')).toBe(0);
     expect(compareVersions('2.1.310', '2.1.309')).toBeGreaterThan(0);
     expect(compareVersions('2.1.9', '2.1.309')).toBeLessThan(0);
     expect(compareVersions('10.0.0', '9.9.9')).toBeGreaterThan(0);
-    expect(compareVersions('0.160.0-alpha.1', '0.160.0')).toBeLessThan(0);
-    expect(compareVersions('0.160.0-alpha.2', '0.160.0-alpha.10')).toBeLessThan(0);
+  });
+
+  it('orders pre-releases as SemVer 2.0.0 does', () => {
+    // The chain from the SemVer specification, each older than the next.
+    const chain = ['1.0.0-alpha', '1.0.0-alpha.1', '1.0.0-alpha.beta', '1.0.0-beta', '1.0.0-beta.2', '1.0.0-beta.11', '1.0.0-rc.1', '1.0.0'];
+    for (let i = 0; i + 1 < chain.length; i++) {
+      expect(compareVersions(chain[i] as string, chain[i + 1] as string), `${chain[i]} < ${chain[i + 1]}`).toBeLessThan(0);
+      expect(compareVersions(chain[i + 1] as string, chain[i] as string)).toBeGreaterThan(0);
+    }
+    // Review r1: names compare as ASCII (an upper-case letter is older), a number is older than a name.
+    expect(compareVersions('2.1.309-B', '2.1.309-a')).toBeLessThan(0);
+    expect(compareVersions('2.1.309-1', '2.1.309-0a')).toBeLessThan(0);
+    expect(compareVersions('2.1.309-alpha.2', '2.1.309-alpha.10')).toBeLessThan(0);
+    expect(compareVersions('2.1.309-alpha', '2.1.309')).toBeLessThan(0);
   });
 
   it('requires the version of the pinned SDK for Claude and 0.160.0 for Codex', () => {
@@ -66,6 +84,44 @@ describe('T045 finding Claude Code', () => {
     expect(claudeCandidates(env({ AWG_CLAUDE_PATH: mine, Path: join(dir, 'bin') }))).toEqual([{ path: mine, source: 'env' }]);
     expect(claudeCandidates(env({ AWG_CLAUDE_PATH: join(dir, 'nope', 'claude.exe'), Path: join(dir, 'bin') }))).toEqual([]);
     expect(claudeCandidates(env({ AWG_CLAUDE_PATH: mine.replace(/\.exe$/, '.cmd'), Path: join(dir, 'bin') }))).toEqual([]);
+  });
+
+  it('never takes a relative PATH folder, the current folder or a bare name (review r1): the launcher would look it up again in the session folder', () => {
+    // A folder below the current folder with a claude.exe and a codex.exe in it, reachable by a relative path.
+    const here = realpathSync.native(mkdtempSync(join(process.cwd(), 'awg-t045-rel-')));
+    try {
+      writeFileSync(join(here, 'claude.exe'), '');
+      writeFileSync(join(here, 'codex.exe'), '');
+      const rel = relative(process.cwd(), here);
+      expect(rel.startsWith('awg-t045-rel-')).toBe(true);
+      const trusted = touch('trusted', 'claude.exe');
+      const trustedCodex = touch('trusted', 'codex.exe');
+      const path = ['.', '', rel, `.\\${rel}`, 'C:drive-relative', join(dir, 'trusted')].join(';');
+      expect(claudeCandidates(env({ Path: path }))).toEqual([{ path: trusted, source: 'path' }]);
+      expect(codexCandidates({ Path: path })).toEqual([{ path: trustedCodex, source: 'path' }]);
+      // Nothing but relative folders: nothing found, although the files exist where they point.
+      expect(claudeCandidates(env({ Path: `.;${rel}` }))).toEqual([]);
+      expect(codexCandidates({ Path: `.;${rel}` })).toEqual([]);
+      // The override must be a full path too.
+      expect(claudeCandidates(env({ AWG_CLAUDE_PATH: join(rel, 'claude.exe') }))).toEqual([]);
+      expect(claudeCandidates(env({ AWG_CLAUDE_PATH: 'claude.exe' }))).toEqual([]);
+      expect(codexCandidates({ AWG_CODEX_COMMAND: join(rel, 'codex.exe'), Path: join(dir, 'trusted') })).toEqual([]);
+      expect(codexCandidates({ AWG_CODEX_COMMAND: 'codex.exe', Path: join(dir, 'trusted') })).toEqual([]);
+      // A full path in the override is kept as it is.
+      expect(claudeCandidates(env({ AWG_CLAUDE_PATH: join(here, 'claude.exe') }))).toEqual([{ path: join(here, 'claude.exe'), source: 'env' }]);
+    } finally {
+      rmSync(here, { recursive: true, force: true });
+    }
+  });
+
+  it('hands on the real file: a link is resolved, so what was checked is what is started', () => {
+    const real = touch('real', 'claude.exe');
+    try {
+      symlinkSync(real, join(dir, 'link.exe'), 'file');
+    } catch {
+      return; // creating a link needs a privilege some machines do not give; the case is not testable there
+    }
+    expect(claudeCandidates(env({ AWG_CLAUDE_PATH: join(dir, 'link.exe') }))).toEqual([{ path: real, source: 'env' }]);
   });
 
   it('takes claude.exe on PATH, then ~/.local/bin, then the desktop app, in that order', () => {
@@ -179,7 +235,7 @@ describe('T045 the locator', () => {
   });
 
   it('a version that cannot be read is failed, never guessed', async () => {
-    for (const version of [ok('hello'), ok(''), { stdout: '', stderr: '', code: null }, { stdout: '2.1.309', stderr: '', code: 1 }]) {
+    for (const version of [ok('hello'), ok(''), ok('error: Node 24.0.0 required'), ok('2.1.309-'), ok('2.1.309 (Claude Code)\nwarning'), ok('','2.1.309 (Claude Code)'), { stdout: '', stderr: '', code: null }, { stdout: '2.1.309', stderr: '', code: 1 }]) {
       const { detect } = locate('claude', { [claude]: { version } }, [{ path: claude, source: 'path' }]);
       const status = await detect();
       expect(status).toMatchObject({ state: 'failed', executable: claude, auth: 'unknown' });

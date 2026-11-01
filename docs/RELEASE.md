@@ -15,6 +15,8 @@ AgentWorkflowGui 目前只發行 **Windows x64、未簽章、per-user** 的 NSIS
 | koffi | 3.3.2 | Job Object 用；只打包 `win32-x64` 的 native |
 | OS | Windows 10 22H2（build 19045，實測）、Windows 11 x64 | 沒有 arm64 版安裝檔；沒有 macOS／Linux 版 |
 
+**找到的路徑一律是完整路徑**：`PATH` 裡的 `.`、空項目與相對路徑會被略過，`AWG_CLAUDE_PATH`／`AWG_CODEX_COMMAND` 必須是完整路徑的 `.exe`；偵測後交給啟動器的是解開連結後的真實檔案路徑，不會再依 session 的工作資料夾重新查找。`--version` 只認得 `2.1.309 (Claude Code)`、`codex-cli 0.160.0` 或單獨的版本號（完整 SemVer）這幾種輸出，其他一律當作讀不到版本。
+
 ## 2. 產出與建置
 
 ```bash
@@ -111,7 +113,7 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 
 - 安裝後 `resources\app.asar.unpacked` 內沒有 `claude.exe`，exe 的 `CompanyName` 是 `firewings2515`。
 - **用本機 Claude Code**：Snapshot 的 `runtimes` 為 Claude `available` 2.1.309（`C:\Users\capri\.local\bin\claude.exe`，來源 PATH，訂閱，13 個模型）、Codex `available` 0.160.0（來源 PATH，訂閱，10 個模型）。Claude（haiku）1 個 turn completed（`observedModel` `claude-haiku-5-5`）；實際啟動的 `claude.exe` 是 `C:\Users\capri\.local\bin\claude.exe`（PID 43020，父行程是這次的 Electron），不是安裝資料夾內的檔案。`runtime.detect` 回 ok，狀態不變。關閉 735 ms，沒有殘留程序。
-- **找不到 Claude 時**（`AWG_CLAUDE_PATH` 指向不存在的檔案）：Snapshot 顯示 Claude `not-installed`（`detail` 說明環境變數的檔案不存在）、`modelCount` 0、模型選單沒有 Claude；Codex `available`、10 個模型。「`session.create` 回 `runtime_unavailable`」沒有在安裝版上實測（腳本沿用 run1 的 userData，`agent.save` 回 `stale_revision`，在建立 session 前就停了），改由單元測試 `app/main/backend-runtimes.test.ts` 涵蓋。
+- **找不到 Claude 時**（`AWG_CLAUDE_PATH` 指向不存在的檔案）：Snapshot 顯示 Claude `not-installed`（`detail` 說明環境變數的檔案不存在）、`modelCount` 0、模型選單沒有 Claude；Codex `available`、10 個模型。「`session.create` 回 `runtime_unavailable`」沒有在安裝版上實測（腳本沿用 run1 的 userData，`agent.save` 回 `stale_revision`，在建立 session 前就停了），改由單元測試 `app/main/backend-runtimes.test.ts` 的「Claude unavailable: session.create(claude) is refused with runtime_unavailable, and Codex can still be created」涵蓋（Claude 不可用、Codex 可用：建立 Claude session 回 `runtime_unavailable`，建立 Codex session 成功）。審查第 1 輪指出本紀錄原本引用的測試方向相反（Codex 不可用、Claude 可用），已補上這個測試。
 - 解除安裝後：安裝資料夾、`HKCU` 項目、開始功能表捷徑都已移除；暫存 userData 的 `awg.sqlite` 仍在；沒有殘留程序。
 - 兩次 run1 結束時 `owned_process` 各有一筆沒有 `endedAt` 的 `runtime-host`，對應的程序都已不存在；來源（探測用的行程記錄）沒有追查。
 

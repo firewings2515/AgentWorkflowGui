@@ -352,13 +352,19 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   const lastTried = new Map<Runtime, number>();
   const redetectIfUnavailable = async (wanted: readonly Runtime[]): Promise<void> => {
     if (options.runtimes === undefined) return;
-    for (const runtime of wanted) {
-      if (isRuntimeAvailable(runtime)) continue;
-      const since = Date.now() - (lastTried.get(runtime) ?? 0);
-      if (since < (options.redetectMinMs ?? 2000)) continue;
-      lastTried.set(runtime, Date.now());
-      await detect(runtime);
-    }
+    await Promise.all(
+      wanted.map(async (runtime) => {
+        if (isRuntimeAvailable(runtime)) return;
+        // A detection already under way answers every command that needs the runtime, whenever it began; the pause
+        // between two detections only applies when none is running (T045 review r1).
+        const running = detecting.get(runtime);
+        if (running !== undefined) return running;
+        const since = Date.now() - (lastTried.get(runtime) ?? 0);
+        if (since < (options.redetectMinMs ?? 2000)) return;
+        lastTried.set(runtime, Date.now());
+        await detect(runtime);
+      }),
+    );
   };
   /** The runtimes a command is about to start or resume. */
   const runtimesOf = async (command: Command): Promise<readonly Runtime[]> => {
@@ -371,9 +377,15 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         const session = await repositories.sessions.get(command.sessionId);
         return session === undefined ? [] : [session.requestedModel.runtime];
       }
-      case 'workflow.start':
-      case 'transfer.confirm':
-        return RUNTIMES;
+      case 'workflow.start': {
+        // Only what the template uses: a Codex-only workflow does not wait for Claude to be looked for.
+        const template = await repositories.workflows.get(command.workflowId);
+        return template === undefined ? [] : RUNTIMES.filter((runtime) => template.nodes.some((node) => node.kind === 'agent' && node.model.runtime === runtime));
+      }
+      case 'transfer.confirm': {
+        const proposal = await repositories.transfers.get(command.transferId);
+        return proposal === undefined ? [] : [proposal.target.runtime];
+      }
       default:
         return [];
     }

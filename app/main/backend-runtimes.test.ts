@@ -4,10 +4,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { type Command, type CommandResult, type EventEnvelope, type OwnedProcess, RequestId, type Runtime, type RuntimeStatus, SessionId } from '../../contracts';
+import { type Command, type CommandResult, type EventEnvelope, InstanceId, type OwnedProcess, RequestId, type Runtime, type RuntimeStatus, SessionId } from '../../contracts';
 import type { RuntimeLocator } from '../../core/ports';
 import { FakeAdapter } from '../../core/sessions/testing/fake-adapter';
 import { agent } from '../../core/sessions/testing/harness';
+import { agents, template, WORKFLOW } from '../../core/workflow/testing/harness';
 import { type BackendProcessHost, startBackend } from './backend';
 import { EventBus } from './event-bus';
 
@@ -48,14 +49,19 @@ const missing = (runtime: Runtime): RuntimeStatus => ({
 /** A locator whose answers the test changes; `calls` lists what was asked. */
 const locator = (answers: Record<Runtime, RuntimeStatus>) => {
   const calls: Runtime[] = [];
+  /** A detection of these runtimes never answers; `gate` holds every detection until it is opened. */
+  const hang = new Set<Runtime>();
+  const state: { gate?: Promise<void> } = {};
   const port: RuntimeLocator = {
-    detect: (runtime, at) => {
+    detect: async (runtime, at) => {
       calls.push(runtime);
-      return Promise.resolve({ ...answers[runtime], checkedAt: at });
+      if (hang.has(runtime)) await new Promise<never>(() => undefined);
+      await state.gate;
+      return { ...answers[runtime], checkedAt: at };
     },
     current: (runtime) => answers[runtime],
   };
-  return { port, answers, calls };
+  return { port, answers, calls, hang, state };
 };
 
 let n = 0;
@@ -110,6 +116,72 @@ describe('T045 runtime detection in the backend', () => {
     const codex = await s.run(create('codex', 'codex-1'));
     expect(codex).toMatchObject({ ok: false, code: 'runtime_unavailable' });
     expect(await s.run(create('claude', 'claude-1'))).toMatchObject({ ok: true });
+    await s.backend.shutdown();
+  });
+
+  it('Claude unavailable: session.create(claude) is refused with runtime_unavailable, and Codex can still be created', async () => {
+    const loc = locator({ claude: missing('claude'), codex: available('codex') });
+    const s = await start(loc.port);
+    await settle();
+    await s.run({ type: 'agent.save', requestId: rid(), agent: agent(), expectedRevision: null });
+    const refused = await s.run(create('claude', 'claude-refused'));
+    expect(refused).toMatchObject({ ok: false, code: 'runtime_unavailable' });
+    expect(refused.ok ? '' : refused.message).toContain('claude');
+    expect(await s.run(create('codex', 'codex-ok'))).toMatchObject({ ok: true });
+    const snapshot = await s.backend.facade.snapshot();
+    expect(snapshot.sessions.map((x) => x.id)).toEqual(['codex-ok']);
+    expect(snapshot.modelOptions.map((m) => m.runtime)).toEqual(['codex']);
+    await s.backend.shutdown();
+  });
+
+  it('two commands that need the same unavailable runtime at once both wait for the one detection that runs', async () => {
+    const loc = locator({ claude: available('claude'), codex: missing('codex') });
+    const s = await start(loc.port);
+    await settle();
+    await s.run({ type: 'agent.save', requestId: rid(), agent: agent(), expectedRevision: null });
+    const before = loc.calls.filter((c) => c === 'codex').length;
+    let open: () => void = () => undefined;
+    loc.state.gate = new Promise<void>((resolve) => { open = resolve; });
+    loc.answers.codex = available('codex');
+    const first = s.run(create('codex', 'codex-a'));
+    await settle();
+    // The second asks while the first one's detection is still running: inside the pause, but it must not skip it.
+    const second = s.run(create('codex', 'codex-b'));
+    await settle();
+    open();
+    expect(await first).toMatchObject({ ok: true });
+    expect(await second).toMatchObject({ ok: true });
+    expect(loc.calls.filter((c) => c === 'codex').length).toBe(before + 1);
+    await s.backend.shutdown();
+  });
+
+  it('a workflow that only uses Codex does not wait for Claude to be looked for', async () => {
+    const loc = locator({ claude: missing('claude'), codex: available('codex') });
+    const s = await start(loc.port);
+    await settle();
+    loc.hang.add('claude');
+    for (const a of agents()) await s.run({ type: 'agent.save', requestId: rid(), agent: a, expectedRevision: null });
+    const codex = { model: { runtime: 'codex' as const, model: 'codex-m' } };
+    await s.run({ type: 'workflow.save', requestId: rid(), workflow: template({}, { plan: codex, impl: codex, review: codex }), expectedRevision: null });
+    const started = await Promise.race([
+      s.run({ type: 'workflow.start', requestId: rid(), instanceId: InstanceId.parse('run-codex'), rootSessionId: SessionId.parse('root-codex'), workflowId: WORKFLOW, workflowRevision: 0, title: 'Codex only', cwd: dir, firstMessage: 'Go.', crossToolConsent: true }),
+      new Promise<'waited'>((resolve) => setTimeout(() => resolve('waited'), 3000)),
+    ]);
+    expect(started).toMatchObject({ ok: true });
+    expect(loc.calls.filter((c) => c === 'claude').length).toBe(1); // the one at startup
+    await s.backend.shutdown();
+  });
+
+  it('a workflow that uses Claude does look for it again first', async () => {
+    const loc = locator({ claude: missing('claude'), codex: available('codex') });
+    const s = await start(loc.port);
+    await settle();
+    for (const a of agents()) await s.run({ type: 'agent.save', requestId: rid(), agent: a, expectedRevision: null });
+    await s.run({ type: 'workflow.save', requestId: rid(), workflow: template({}), expectedRevision: null });
+    loc.answers.claude = available('claude');
+    const before = loc.calls.filter((c) => c === 'claude').length;
+    await s.run({ type: 'workflow.start', requestId: rid(), instanceId: InstanceId.parse('run-mixed'), rootSessionId: SessionId.parse('root-mixed'), workflowId: WORKFLOW, workflowRevision: 0, title: 'Mixed', cwd: dir, firstMessage: 'Go.', crossToolConsent: true });
+    expect(loc.calls.filter((c) => c === 'claude').length).toBe(before + 1);
     await s.backend.shutdown();
   });
 

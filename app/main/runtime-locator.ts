@@ -9,7 +9,7 @@ import { CLAUDE_CODE_MIN_VERSION } from '../../adapters/claude/cli-version';
 import type { RuntimeLocator } from '../../core/ports';
 import { claudeCandidates } from './claude-exe';
 import { CODEX_MIN_VERSION, codexCandidates } from './codex-exe';
-import type { ExeCandidate } from './exe-search';
+import { isFullPath, type ExeCandidate } from './exe-search';
 import { compareVersions, parseVersion } from './runtime-version';
 
 export interface RunResult {
@@ -99,7 +99,8 @@ export function createRuntimeLocator(options: RuntimeLocatorOptions = {}): Runti
   const last = new Map<Runtime, RuntimeStatus>();
 
   const candidatesOf = (runtime: Runtime): ExeCandidate[] => {
-    if (options.candidates !== undefined) return options.candidates(runtime, env);
+    // Whatever the search gave: only a full path is ever checked or handed on, never a name the launcher would look up again.
+    if (options.candidates !== undefined) return options.candidates(runtime, env).filter((c) => isFullPath(c.path));
     const found = runtime === 'claude' ? claudeCandidates(env) : codexCandidates(env);
     // The SDK's own copy is the last resort and only in development; an explicit AWG_CLAUDE_PATH is never replaced.
     const explicit = runtime === 'claude' && (env['AWG_CLAUDE_PATH'] ?? '') !== '';
@@ -115,7 +116,8 @@ export function createRuntimeLocator(options: RuntimeLocatorOptions = {}): Runti
     let firstRead: { candidate: ExeCandidate; version: string } | undefined;
     for (const candidate of candidates) {
       const result = await run(candidate.path, ['--version'], versionTimeout);
-      const version = result.code === 0 ? parseVersion(`${result.stdout}\n${result.stderr}`) : undefined;
+      // Only stdout, and only the program's own version line: an error message with a number in it is no version.
+      const version = result.code === 0 ? parseVersion(runtime, result.stdout) : undefined;
       if (version === undefined) continue;
       if (compareVersions(version, REQUIRED[runtime]) >= 0) return { candidate, version };
       firstRead ??= { candidate, version };

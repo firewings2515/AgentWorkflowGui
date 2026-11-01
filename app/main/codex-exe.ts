@@ -1,10 +1,11 @@
 // Where `codex.exe` is (T017, T013 known limit, T045). A Job can only start a real executable: npm's `codex`,
 // `codex.cmd` and `codex.ps1` are shims that need a shell, so they are followed to the binary the npm
 // package ships. Nothing found means Codex is not available; it is never started through `cmd.exe`.
-// claude-exe.ts looks for Claude Code by the same rules, in the same order.
+// claude-exe.ts looks for Claude Code by the same rules, in the same order. Every candidate is a full path to an
+// existing .exe, resolved through links (`verifiedExe`); a bare name or a relative PATH folder is never used.
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { envValue, isDirectory, isFile, pathDirs, unique, type ExeCandidate } from './exe-search';
+import { envValue, isDirectory, isFile, pathDirs, unique, verifiedExe, type ExeCandidate } from './exe-search';
 
 /**
  * The oldest Codex this app works with: 0.160.0, the version T013, T017 and the live checks of the app-server
@@ -43,20 +44,27 @@ const findVendored = (dir: string, depth: number): string | undefined => {
  */
 export const codexCandidates = (env: NodeJS.ProcessEnv = process.env): ExeCandidate[] => {
   const override = env['AWG_CODEX_COMMAND'];
-  if (override !== undefined && override !== '') return isFile(override) && /\.exe$/i.test(override) ? [{ path: override, source: 'env' }] : [];
+  if (override !== undefined && override !== '') {
+    const path = verifiedExe(override);
+    return path === undefined ? [] : [{ path, source: 'env' }];
+  }
   const found: ExeCandidate[] = [];
+  const add = (path: string, source: ExeCandidate['source']) => {
+    const verified = verifiedExe(path);
+    if (verified !== undefined) found.push({ path: verified, source });
+  };
   for (const dir of pathDirs(env)) {
     const exe = join(dir, 'codex.exe');
-    if (isFile(exe)) found.push({ path: exe, source: 'path' });
+    if (isFile(exe)) add(exe, 'path');
     else if (['codex.cmd', 'codex.ps1', 'codex'].some((shim) => isFile(join(dir, shim)))) {
       const vendored = findVendored(join(dir, 'node_modules', '@openai'), 6);
-      if (vendored !== undefined) found.push({ path: vendored, source: 'path' });
+      if (vendored !== undefined) add(vendored, 'path');
     }
   }
   const local = envValue(env, 'LOCALAPPDATA');
   if (local !== undefined) {
     const known = join(local, 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe');
-    if (isFile(known)) found.push({ path: known, source: 'known-location' });
+    if (isFile(known)) add(known, 'known-location');
   }
   return unique(found);
 };
