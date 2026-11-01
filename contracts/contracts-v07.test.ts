@@ -21,7 +21,7 @@ import {
   StorageInfo,
   UiPreferences,
 } from './index';
-import { fixtureSnapshot, fixtureSnapshotInput } from './fixtures/snapshot';
+import { fixtureBackupList, fixtureReadOnlySnapshot, fixtureSnapshot, fixtureSnapshotInput } from './fixtures/snapshot';
 import { longConversation } from './fixtures/long-conversation';
 
 const at = '2026-11-01T10:00:00+08:00';
@@ -38,14 +38,19 @@ const envelope = (seq: number, event: unknown) => ({ schemaVersion: CONTRACTS_VE
 const delta = (text: string) => ({ type: 'message.delta', sessionId: 's-1', messageId: 'm-1', delta: text });
 
 describe('contracts 0.7', () => {
-  it('C-32: is version 0.7.0; the fixture shows a paged history and the last backup', () => {
+  it('C-32: is version 0.7.0; the fixtures show a paged history, backups, a pending restore and read-only data', () => {
     expect(CONTRACTS_VERSION).toBe('0.7.0');
     expect(fixtureSnapshot.historyPages).toEqual([{ sessionId: 's-plan-notes', olderCursor: 'cursor-plan-notes-1' }]);
     expect(fixtureSnapshot.storage.lastBackupAt).toBeDefined();
+    expect(fixtureReadOnlySnapshot.app).toMatchObject({ status: 'read-only', reason: 'disk-full' });
+    expect(fixtureReadOnlySnapshot.storage.pendingRestore?.backupId).toBe('bk-1023-daily');
+    expect(fixtureBackupList.ok && fixtureBackupList.type === 'backup.list' && fixtureBackupList.backups.map((b) => b.reason)).toEqual(['daily', 'pre-migration', 'daily']);
   });
 
   describe('C-26 paging', () => {
-    it('a Snapshot written before 0.7 reads with whole histories and no storage information', () => {
+    // A Snapshot is never stored (main and renderer ship together); this is a Snapshot built by code that does
+    // not know the 0.7 fields yet, such as a main process wired before T040 (T037 r1 P1-1).
+    it('a Snapshot without the 0.7 fields reads with whole histories and no storage information', () => {
       const before: Record<string, unknown> = { ...fixtureSnapshotInput, preferences: { theme: 'light' } };
       delete before['historyPages'];
       delete before['storage'];
@@ -94,6 +99,8 @@ describe('contracts 0.7', () => {
       expect(rules(EventBatch, batch([envelope(4, delta('a'))], 4, 6))).toEqual(['batch.seq-range']);
       expect(rules(EventBatch, batch([envelope(2, delta('a'))], 3, 2))).toEqual(['batch.seq-range']);
       expect(ok(EventBatch, batch([], 1, 1))).toBe(false);
+      expect(ok(EventBatch, batch([{ ...envelope(1, delta('a')), schemaVersion: '0.6.0' }], 1, 1))).toBe(false);
+      expect(ok(EventBatch, { ...batch([envelope(1, delta('a'))], 1, 1), schemaVersion: '0.6.0' })).toBe(false);
     });
 
     it('only deltas may be merged; permission, turn end, escalation, handoff and transfer events never are', () => {

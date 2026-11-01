@@ -8,7 +8,7 @@
 import type { z } from 'zod';
 import { CONTRACTS_VERSION } from '../common';
 import type { DeliveryRecord } from '../delivery';
-import { Snapshot } from '../ipc';
+import { QueryResult, Snapshot } from '../ipc';
 import type { WorkflowTemplate } from '../workflow';
 
 const v = CONTRACTS_VERSION;
@@ -314,3 +314,25 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
 
 /** Parsed fixture (branded IDs applied). Throws at import time if the fixture drifts from the contracts. */
 export const fixtureSnapshot = Snapshot.parse(fixtureSnapshotInput);
+
+/**
+ * The same data opened read-only after the disk filled up (C-29), with a restore the user asked for waiting for
+ * the next start (C-28), so the read-only banner and the restore notice can be built before the backend.
+ */
+export const fixtureReadOnlySnapshot = Snapshot.parse({
+  ...fixtureSnapshotInput,
+  app: { status: 'read-only', reason: 'disk-full', location: 'C:/Users/demo/AppData/Roaming/AgentWorkflowGui/awg.db' },
+  storage: { lastBackupAt: t('09:00'), pendingRestore: { backupId: 'bk-1023-daily', requestedAt: t('11:40') } },
+});
+
+/** What `backup.list` answers (C-28), newest first: the day's backup, one before a migration, an older daily one. */
+export const fixtureBackupList = QueryResult.parse({
+  ok: true,
+  type: 'backup.list',
+  requestId: 'q-backups',
+  backups: [
+    { id: 'bk-1024-daily', createdAt: t('09:00'), reason: 'daily', storageVersion: 8, sizeBytes: 2_621_440 },
+    { id: 'bk-1023-migration', createdAt: '2026-10-23T21:14:00+08:00', reason: 'pre-migration', storageVersion: 7, sizeBytes: 2_490_368 },
+    { id: 'bk-1023-daily', createdAt: '2026-10-23T08:58:00+08:00', reason: 'daily', storageVersion: 7, sizeBytes: 2_488_320 },
+  ],
+});

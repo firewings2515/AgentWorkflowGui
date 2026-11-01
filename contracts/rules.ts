@@ -102,7 +102,6 @@ const ruleMessages = {
   'activity.cause-only-closed': 'a close cause is given only with activity closed',
   'batch.seq-increasing': 'envelopes of a batch are in increasing seq order',
   'batch.seq-range': 'a batch covers fromSeq to toSeq and ends with toSeq',
-  'batch.one-version': 'envelopes of a batch carry its schema version',
   'snapshot.history-page-unique': 'one history page entry per session',
   'history.one-session': 'every record of a history page belongs to its session',
   // storage.ts

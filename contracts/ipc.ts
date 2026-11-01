@@ -256,7 +256,6 @@ export const EventBatch = z
     const seqs = b.envelopes.map((e) => e.seq);
     if (seqs.some((s, i) => i > 0 && s <= (seqs[i - 1] ?? 0))) addRuleIssue(ctx, 'batch.seq-increasing');
     if (b.fromSeq > b.toSeq || (seqs[0] ?? 0) < b.fromSeq || seqs.at(-1) !== b.toSeq) addRuleIssue(ctx, 'batch.seq-range');
-    if (b.envelopes.some((e) => e.schemaVersion !== b.schemaVersion)) addRuleIssue(ctx, 'batch.one-version');
   });
 export type EventBatch = z.infer<typeof EventBatch>;
 
