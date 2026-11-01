@@ -1,0 +1,56 @@
+# Windows installer (T044). Unsigned, per-user NSIS; no auto-update, nothing is published.
+appId: com.firewings2515.agentworkflowgui
+productName: AgentWorkflowGui
+copyright: Copyright 2026 firewings2515
+directories:
+  output: release
+  buildResources: build-resources
+publish: null
+electronLanguages: [en-US, zh-TW]
+
+# Only the built app and what the main process requires at run time. The renderer is bundled by vite, so its
+# libraries (react, @xyflow/react and their dependencies) stay out of the installer.
+files:
+  - out/**
+  - package.json
+  - LICENSE
+  - NOTICE
+  - '!node_modules/react{,/**}'
+  - '!node_modules/react-dom{,/**}'
+  - '!node_modules/scheduler{,/**}'
+  - '!node_modules/@xyflow{,/**}'
+  - '!node_modules/d3-*{,/**}'
+  - '!node_modules/zustand{,/**}'
+  - '!node_modules/classcat{,/**}'
+  - '!node_modules/**/*.{md,map,ts,tsx}'
+  - '!node_modules/**/{test,tests,__tests__,docs,example,examples}{,/**}'
+
+# Native code and executables cannot run from inside app.asar. koffi's .node and the Claude CLI that the Agent
+# SDK ships are unpacked next to it (app/main/packaged-paths.ts maps the SDK's path to the unpacked file).
+asar: true
+asarUnpack:
+  - node_modules/koffi/**
+  - node_modules/@koromix/**
+  - node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/**
+
+extraResources:
+  - from: build-resources/THIRD_PARTY_LICENSES.txt
+    to: THIRD_PARTY_LICENSES.txt
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  # No certificate is configured: the installer and the exe are unsigned (docs/RELEASE.md).
+  verifyUpdateCodeSignature: false
+  artifactName: '${productName}-Setup-${version}-${arch}.${ext}'
+
+nsis:
+  oneClick: true
+  perMachine: false
+  allowElevation: false
+  runAfterFinish: false
+  createDesktopShortcut: false
+  createStartMenuShortcut: true
+  # Uninstalling keeps %APPDATA%\AgentWorkflowGui (the database and backups).
+  deleteAppDataOnUninstall: false

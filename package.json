@@ -13,6 +13,9 @@
     "postinstall": "install-electron",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "licenses": "node scripts/third-party-licenses.mjs",
+    "pack": "electron-vite build && npm run licenses && electron-builder --dir",
+    "dist": "electron-vite build && npm run licenses && electron-builder --win nsis --x64",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.core.json && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run"
@@ -35,6 +38,7 @@
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.1.2",
     "electron": "45.0.0",
+    "electron-builder": "26.18.0",
     "electron-vite": "6.0.0",
     "eslint": "10.13.0",
     "eslint-plugin-react-hooks": "7.1.1",

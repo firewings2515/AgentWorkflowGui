@@ -35,6 +35,7 @@ import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { hashFile, setTimer } from './file-hash';
 import { GitIgnoreRules } from './git-ignore';
+import { withUnpackedCommand } from './packaged-paths';
 import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
 
@@ -252,7 +253,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         return new ClaudeAdapter({
           sdk: claudeAgentSdk,
           onPermissionRequest: (handle) => hooks.onPermissionRequest(handle),
-          spawnProcess: ({ sessionId: id }) => claudeProcessSpawn(host, id),
+          spawnProcess: ({ sessionId: id }) => withUnpackedCommand(claudeProcessSpawn(host, id)),
           log: adapterLog('claude'),
         });
       }

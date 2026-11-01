@@ -15,3 +15,7 @@ coverage/
 
 # Logs
 *.log
+
+# Packaging (T044): installer output and generated licence list
+release/
+build-resources/
