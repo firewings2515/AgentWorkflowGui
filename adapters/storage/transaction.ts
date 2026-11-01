@@ -2,6 +2,7 @@
 // conditional updates inside it cannot race another connection (CR2_DELIVERY_FIX §1).
 import type { DatabaseSync } from 'node:sqlite';
 import { CommitUncertainError } from '../../core/ports';
+import { isDiskFull, storageHealth, writeFailure } from './health';
 
 /** What a transaction body returns: commit its writes, or roll back because it wrote nothing. */
 export type Outcome<T> = { value: T; commit: boolean };
@@ -17,18 +18,22 @@ const rollback = (db: DatabaseSync) => {
 };
 
 /**
- * Runs `body` in one `BEGIN IMMEDIATE` transaction. An error before COMMIT rolls back and is rethrown as
- * it is: nothing was committed. An error from COMMIT itself means the outcome cannot be confirmed, so it
- * becomes `CommitUncertainError` and the caller must not act on the transaction (CR2_DELIVERY_FIX §1).
+ * Runs `body` in one `BEGIN IMMEDIATE` transaction. Pre-commit SQLite/I/O errors are classified after
+ * rollback; domain validation errors retain their safe rule codes. SQLITE_FULL also latches read-only.
+ * Other COMMIT errors retain CR-2's uncertain-outcome semantics: callers must not dispatch or resend.
  */
 export const writeTransaction = <T>(db: DatabaseSync, body: () => Outcome<T>): T => {
-  db.exec('BEGIN IMMEDIATE');
+  const health = storageHealth(db);
+  health.assertWritable();
+  health.hooks?.beforeWrite();
   let outcome: Outcome<T>;
   try {
+    db.exec('BEGIN IMMEDIATE');
     outcome = body();
+    if (outcome.commit) health.hooks?.beforeCommit();
   } catch (error) {
     rollback(db);
-    throw error;
+    throw writeFailure(db, error);
   }
   if (!outcome.commit) {
     rollback(db);
@@ -38,7 +43,8 @@ export const writeTransaction = <T>(db: DatabaseSync, body: () => Outcome<T>): T
     db.exec('COMMIT');
   } catch (error) {
     rollback(db);
-    throw new CommitUncertainError(`commit could not be confirmed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    if (isDiskFull(error)) throw writeFailure(db, error);
+    throw new CommitUncertainError('storage:commit-uncertain', { cause: error });
   }
   return outcome.value;
 };

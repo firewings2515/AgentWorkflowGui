@@ -119,7 +119,7 @@ describe('v5 → v6 → v7 compatibility', () => {
     }
     const before = { deliveries: db.prepare('SELECT * FROM delivery').all(), attempts: db.prepare('SELECT * FROM dispatch_attempt').all(), proposals: db.prepare('SELECT * FROM transfer_proposal').all() };
     expect(migrate(db)).toBe(latestVersion());
-    expect(db.prepare('SELECT * FROM delivery').all()).toEqual(before.deliveries);
+    expect(db.prepare('SELECT * FROM delivery').all()).toEqual(before.deliveries.map((r) => ({ ...r, target_ambiguous: 0 })));
     expect(db.prepare('SELECT * FROM dispatch_attempt').all()).toEqual(before.attempts);
     expect(db.prepare('SELECT * FROM transfer_proposal').all()).toEqual(before.proposals);
     for (const record of deliveryBefore) {

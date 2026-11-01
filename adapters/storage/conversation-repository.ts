@@ -3,6 +3,7 @@
 // text over the blob threshold (a message's `text`, a command's `output`, a file change's `diff`) is kept
 // apart in `blob` and joined back when read (IMPLEMENTATION_DRAFT §5).
 import type { z } from 'zod';
+import type { SQLInputValue, StatementSync } from 'node:sqlite';
 import {
   Artifact,
   Message,
@@ -11,11 +12,13 @@ import {
   SessionItem,
   Turn,
   type HistoryPage,
+  type HistoryCursor,
   type SessionId,
 } from '../../contracts';
 import type { Conversation, ConversationRepository } from '../../core/ports';
-import { InvalidRecordError, checkRecord, epochMs, joinBlobs, readRecord, run, splitBlobs, writeBlobs, type StorageContext } from './codec';
+import { InvalidRecordError, StoredDataError, checkRecord, epochMs, joinBlobs, readRecord, run, splitBlobs, writeBlobs, type StorageContext } from './codec';
 import { committed, readTransaction, unchanged, writeTransaction } from './transaction';
+import { checkHistoryLimit, HistoryCursors, type HistoryBoundary } from './history';
 
 interface Kind<T extends { id: string; sessionId: string }> {
   table: 'turn' | 'message' | 'session_item' | 'native_task' | 'permission_request' | 'artifact';
@@ -50,27 +53,99 @@ const KINDS = {
 
 interface Row {
   id: string;
+  session_id: string;
   has_blob: number;
   body: string;
 }
 
 export class SqliteConversationRepository implements ConversationRepository {
+  private readonly cursors = new HistoryCursors();
+  private readonly statements = new Map<string, StatementSync>();
   constructor(private readonly ctx: StorageContext) {}
+
+  private historyStatement(sql: string): StatementSync {
+    let statement = this.statements.get(sql);
+    if (!statement) { statement = this.ctx.db.prepare(sql); this.statements.set(sql, statement); }
+    return statement;
+  }
 
   upsertTurn(turn: Turn): Promise<void> {
     return run(() => this.upsert(KINDS.turn, turn));
   }
 
-  /** Paging (C-26) comes with T038; until then the Snapshot holds whole histories and no cursor is handed out. */
-  page(): Promise<HistoryPage | 'invalid-cursor'> {
-    return Promise.resolve('invalid-cursor');
+  page(sessionId: SessionId, before: HistoryCursor, limitTurns: number): Promise<HistoryPage | 'invalid-cursor'> {
+    return run(() => readTransaction(this.ctx.db, () => {
+      const boundary = this.cursors.get(sessionId, before);
+      if (!boundary) return 'invalid-cursor';
+      return this.loadPage(sessionId, limitTurns, boundary);
+    }));
+  }
+
+  /** Called inside the snapshot's read transaction. Keyset by (time, arrival), never OFFSET. */
+  loadPage(sessionId: SessionId, limit: number, before?: HistoryBoundary, includeOpen = false): HistoryPage {
+    checkHistoryLimit(limit);
+    const db = this.ctx.db;
+    // A failed migration leaves the previous schema intact and readable. Do not depend on v10 indexes
+    // when opening that database read-only; a full history is explicitly allowed by the Snapshot port.
+    if (!db.prepare("SELECT 1 FROM pragma_table_xinfo('turn') WHERE name = 'history_turn'").get()) {
+      return { ...this.load(sessionId), sessionId, olderCursor: null };
+    }
+    const params: SQLInputValue[] = [sessionId];
+    if (before) params.push(before.at, before.row);
+    params.push(limit + 1);
+    const rows = this.historyStatement(`SELECT rowid AS position, at_ms, id, session_id, body, has_blob FROM turn
+      WHERE session_id = ? ${before ? 'AND (at_ms, rowid) < (?, ?)' : ''}
+      ORDER BY at_ms DESC, rowid DESC LIMIT ?`).all(...params) as unknown as (Row & { position: number; at_ms: number })[];
+    const hasOlder = rows.length > limit;
+    const selected = rows.slice(0, limit).reverse();
+    const first = selected[0];
+    const lower = hasOlder && first ? first.at_ms : undefined;
+    const turns = new Map(selected.map((row) => [row.id, row]));
+    if (!includeOpen) for (const [id, row] of turns) if (this.decode(KINDS.turn, row).state === 'running') turns.delete(id);
+    if (includeOpen) {
+      for (const row of this.historyStatement('SELECT rowid AS position, at_ms, id, session_id, body, has_blob FROM turn WHERE session_id = ? AND history_open = 1').all(sessionId) as unknown as typeof rows) turns.set(row.id, row);
+    }
+    const turnRows = [...turns.values()].sort((a, b) => a.at_ms - b.at_ms || a.position - b.position);
+    const related = <T extends { id: string; sessionId: string }>(k: Kind<T>): T[] => {
+      const found = new Map<string, Row & { position: number; at_ms: number }>();
+      const collect = (where: string, values: SQLInputValue[], index = '') => {
+        for (const row of this.historyStatement(`SELECT rowid AS position, at_ms, id, session_id, has_blob, body FROM ${k.table} ${index} WHERE session_id = ? AND ${where}${includeOpen ? '' : ' AND history_open = 0'}`).all(sessionId, ...values) as unknown as (Row & { position: number; at_ms: number })[]) found.set(row.id, row);
+      };
+      // Separate indexed seeks avoid an OR that would read the entire session's history.
+      for (const id of turns.keys()) collect('history_turn = ?', [id]);
+      const timeArgs: SQLInputValue[] = [];
+      let timeWhere = 'history_turn IS NULL';
+      if (lower !== undefined) { timeWhere += ' AND at_ms >= ?'; timeArgs.push(lower); }
+      if (before) { timeWhere += ' AND at_ms < ?'; timeArgs.push(before.at); }
+      collect(timeWhere, timeArgs);
+      // Runtime events may arrive before their turn record. Such a reference has no turn to page with
+      // yet; use the same time window, seeking the session/time index, instead of silently losing it.
+      collect(timeWhere.replace('history_turn IS NULL', `history_turn IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM turn WHERE turn.id = ${k.table}.history_turn AND turn.session_id = ${k.table}.session_id
+      )`), timeArgs, `INDEXED BY ${k.table === 'artifact' ? 'artifact_history_time' : `${k.table}_by_session`}`);
+      if (includeOpen) collect('history_open = 1', []);
+      return [...found.values()].sort((a, b) => k.byArrival ? a.position - b.position : a.at_ms - b.at_ms || a.position - b.position).map((r) => this.decode(k, r));
+    };
+    return {
+      sessionId,
+      turns: turnRows.map((r) => this.decode(KINDS.turn, r)),
+      messages: related(KINDS.message), items: related(KINDS.item), nativeTasks: related(KINDS.nativeTask),
+      permissionRequests: related(KINDS.permissionRequest), artifacts: related(KINDS.artifact),
+      olderCursor: hasOlder && first ? this.cursors.issue(sessionId, { at: first.at_ms, row: first.position }) : null,
+    };
+  }
+
+  private decode<T extends { id: string; sessionId: string }>(kind: Kind<T>, row: Row): T {
+    const value = readRecord(kind.schema, kind.table, row.has_blob === 1 ? joinBlobs(this.ctx, kind.table, kind.table, row.id, row.body) : row.body);
+    if (value.id !== row.id || value.sessionId !== row.session_id) throw new StoredDataError(kind.table, ['identity:mismatch']);
+    return value;
   }
 
   appendMessage(message: Message): Promise<void> {
     return run(() => {
       const k = KINDS.message;
-      const parsed = checkRecord(k.schema, k.table, message);
       writeTransaction(this.ctx.db, () => {
+        const parsed = checkRecord(k.schema, k.table, message);
         const { body, blobs } = splitBlobs(this.ctx, parsed, k.blobFields(parsed));
         const result = this.ctx.db
           .prepare(`INSERT INTO ${k.table} (id, session_id, at_ms, has_blob, body) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING`)
@@ -116,8 +191,8 @@ export class SqliteConversationRepository implements ConversationRepository {
   }
 
   private upsert<T extends { id: string; sessionId: string }>(kind: Kind<T>, record: T): void {
-    const parsed = checkRecord(kind.schema, kind.table, record);
     writeTransaction(this.ctx.db, () => {
+      const parsed = checkRecord(kind.schema, kind.table, record);
       const { body, blobs } = splitBlobs(this.ctx, parsed, kind.blobFields(parsed));
       // A record keeps its session: the same ID under another session is a bug, not an update.
       const result = this.ctx.db
@@ -135,9 +210,9 @@ export class SqliteConversationRepository implements ConversationRepository {
 
   private loadKind<T extends { id: string; sessionId: string }>(kind: Kind<T>, sessionId: SessionId | undefined): T[] {
     const order = kind.byArrival ? 'rowid' : 'at_ms, rowid';
-    const sql = `SELECT id, has_blob, body FROM ${kind.table} ${sessionId === undefined ? '' : 'WHERE session_id = ?'} ORDER BY ${order}`;
+    const sql = `SELECT id, session_id, has_blob, body FROM ${kind.table} ${sessionId === undefined ? '' : 'WHERE session_id = ?'} ORDER BY ${order}`;
     const statement = this.ctx.db.prepare(sql);
     const rows = (sessionId === undefined ? statement.all() : statement.all(sessionId)) as unknown as Row[];
-    return rows.map((row) => readRecord(kind.schema, kind.table, row.has_blob === 1 ? joinBlobs(this.ctx, kind.table, kind.table, row.id, row.body) : row.body));
+    return rows.map((row) => this.decode(kind, row));
   }
 }

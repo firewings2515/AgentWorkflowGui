@@ -20,6 +20,9 @@ import type {
   WorkflowTemplate,
   ProjectId,
   ProjectSettings,
+  HistoryCursor,
+  HistoryPage,
+  HistoryPageInfo,
 } from '../../../contracts';
 import type { AppRepositories, Conversation, DefinitionRepository, NodeSessionKey, SaveResult, SnapshotData } from '../../ports';
 
@@ -56,8 +59,47 @@ class Definitions<T extends { id: string; revision: number }, Id extends string>
 }
 
 const emptyConversation = (): Conversation => ({ turns: [], messages: [], items: [], nativeTasks: [], permissionRequests: [], artifacts: [] });
+let cursorStore = 0;
 
 export class MemoryRepositories implements AppRepositories {
+  private readonly cursorPrefix = `memory-${++cursorStore}-`;
+  private cursorSequence = 0;
+  private readonly cursors = new Map<SessionId, Map<HistoryCursor, { at: number; row: number }>>();
+
+  private history(sessionId: SessionId, limit: number, before?: { at: number; row: number }, includeOpen = false): HistoryPage {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError('history:limit');
+    const c = this.conversationRecords.get(sessionId) ?? emptyConversation();
+    const ordered = c.turns.map((turn, row) => ({ turn, row, at: Date.parse(turn.startedAt) })).sort((a, b) => a.at - b.at || a.row - b.row);
+    const older = ordered.filter((t) => !before || t.at < before.at || (t.at === before.at && t.row < before.row));
+    const selected = older.slice(-limit);
+    const first = selected[0];
+    const hasOlder = older.length > limit;
+    const ids = new Set(selected.filter((t) => includeOpen || t.turn.state !== 'running').map((t) => t.turn.id));
+    const knownTurns = new Set(c.turns.map((t) => t.id));
+    if (includeOpen) for (const t of c.turns) if (t.state === 'running') ids.add(t.id);
+    const result = emptyConversation();
+    result.turns = ordered.filter((t) => ids.has(t.turn.id)).map((t) => t.turn);
+    for (const key of ['messages', 'items', 'nativeTasks', 'permissionRequests', 'artifacts'] as const) {
+      const sorted = c[key].map((record, row) => ({ record, row, at: Date.parse('createdAt' in record ? record.createdAt : 'startedAt' in record ? record.startedAt : record.updatedAt) }));
+      if (key !== 'artifacts') sorted.sort((a, b) => a.at - b.at || a.row - b.row);
+      const records = sorted.filter(({ record, at }) => {
+        if ((key === 'nativeTasks' && (!('endedAt' in record) || record.endedAt === undefined)) ||
+          (key === 'permissionRequests' && 'state' in record && (record.state === 'pending' || record.state === 'held'))) return includeOpen;
+        if ('turnId' in record && record.turnId !== undefined && knownTurns.has(record.turnId)) return ids.has(record.turnId);
+        return (!hasOlder || !first || at >= first.at) && (!before || at < before.at);
+      }).map(({ record }) => record);
+      (result[key] as unknown[]) = records;
+    }
+    let olderCursor: HistoryCursor | null = null;
+    if (hasOlder && first) {
+      olderCursor = `${this.cursorPrefix}${++this.cursorSequence}` as HistoryCursor;
+      let cursors = this.cursors.get(sessionId);
+      if (!cursors) { cursors = new Map(); this.cursors.set(sessionId, cursors); }
+      cursors.set(olderCursor, { at: first.at, row: first.row });
+      if (cursors.size > 8) cursors.delete(cursors.keys().next().value!);
+    }
+    return copy({ ...result, sessionId, olderCursor });
+  }
   readonly agents = new Definitions<AgentDefinition, AgentId>();
   readonly workflows = new Definitions<WorkflowTemplate, WorkflowId>();
   readonly projects = new Definitions<ProjectSettings, ProjectId>();
@@ -122,8 +164,11 @@ export class MemoryRepositories implements AppRepositories {
     upsertPermissionRequest: (request: Conversation['permissionRequests'][number]) => this.upsert('permissionRequests', request),
     upsertArtifact: (artifact: Conversation['artifacts'][number]) => this.upsert('artifacts', artifact),
     get: (sessionId: SessionId) => Promise.resolve(copy(this.conversationRecords.get(sessionId) ?? emptyConversation())),
-    // Paging (C-26): these repositories always return whole histories, so they never hand out a cursor.
-    page: () => Promise.resolve('invalid-cursor' as const),
+    page: (sessionId: SessionId, before: HistoryCursor, limitTurns: number): Promise<HistoryPage | 'invalid-cursor'> =>
+      new Promise((resolve) => {
+        const boundary = this.cursors.get(sessionId)?.get(before);
+        resolve(boundary ? this.history(sessionId, limitTurns, boundary) : 'invalid-cursor');
+      }),
   };
 
   readonly escalations = {
@@ -212,22 +257,30 @@ export class MemoryRepositories implements AppRepositories {
     },
   };
 
-  async readSnapshotData(): Promise<SnapshotData> {
-    const merged = emptyConversation();
-    for (const c of this.conversationRecords.values()) for (const key of Object.keys(merged) as (keyof Conversation)[]) (merged[key] as unknown[]).push(...copy(c[key]));
-    return {
-      agents: await this.agents.list(),
-      workflows: await this.workflows.list(),
-      sessions: await this.sessions.list(),
-      conversations: merged,
-      escalations: await this.escalations.list(),
-      preferences: await this.preferences.get(),
-      instances: await this.instances.list(),
-      handoffs: this.handoffRecords.map(copy),
-      peerMessages: this.peerMessageRecords.map(copy),
-      transfers: await this.transfers.list(),
-      projects: await this.projects.list(),
-      historyPages: [],
-    };
+  readSnapshotData(options: { recentTurns?: number } = {}): Promise<SnapshotData> {
+    return new Promise((resolve) => {
+      const merged = emptyConversation();
+      const historyPages: HistoryPageInfo[] = [];
+      for (const sessionId of this.sessionRecords.keys()) {
+        const c = options.recentTurns === undefined ? this.conversationRecords.get(sessionId) ?? emptyConversation() : this.history(sessionId, options.recentTurns, undefined, true);
+        if ('olderCursor' in c) historyPages.push({ sessionId, olderCursor: c.olderCursor as HistoryCursor | null });
+        for (const key of Object.keys(merged) as (keyof Conversation)[]) (merged[key] as unknown[]).push(...copy(c[key]));
+      }
+      // Capture every list before yielding, like a SQLite read transaction.
+      resolve(copy({
+        agents: [...this.agents.records.values()],
+        workflows: [...this.workflows.records.values()],
+        sessions: [...this.sessionRecords.values()],
+        conversations: merged,
+        escalations: [...this.escalationRecords.values()],
+        preferences: this.preferencesRecord,
+        instances: [...this.instanceRecords.values()],
+        handoffs: this.handoffRecords.map(copy),
+        peerMessages: this.peerMessageRecords.map(copy),
+        transfers: [...this.transferRecords.values()],
+        projects: [...this.projects.records.values()],
+        historyPages,
+      }));
+    });
   }
 }

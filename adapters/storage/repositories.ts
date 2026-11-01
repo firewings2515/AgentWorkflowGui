@@ -47,23 +47,29 @@ export const createRepositories = (db: DatabaseSync, options: RepositoryOptions 
     peerMessages,
     transfers,
     projects,
-    readSnapshotData: () =>
+    readSnapshotData: (options = {}) =>
       run(() =>
         readTransaction(db, (): SnapshotData => {
           const records = delivery.loadAll();
+          const sessionRecords = sessions.loadAll();
+          const pages = options.recentTurns === undefined ? [] : sessionRecords.map((s) => conversations.loadPage(s.id, options.recentTurns!, undefined, true));
+          const conversation = options.recentTurns === undefined ? conversations.load() : {
+            turns: pages.flatMap((p) => p.turns), messages: pages.flatMap((p) => p.messages), items: pages.flatMap((p) => p.items),
+            nativeTasks: pages.flatMap((p) => p.nativeTasks), permissionRequests: pages.flatMap((p) => p.permissionRequests), artifacts: pages.flatMap((p) => p.artifacts),
+          };
           return {
             agents: agents.loadAll(),
             workflows: workflows.loadAll(),
             projects: projects.loadAll(),
-            sessions: sessions.loadAll(),
-            conversations: conversations.load(),
+            sessions: sessionRecords,
+            conversations: conversation,
             escalations: escalations.loadAll(),
             preferences: preferences.load(),
             instances: instances.loadAll(),
             handoffs: handoffs.loadAll(records),
             peerMessages: peerMessages.loadAll(records),
             transfers: transfers.loadAll(),
-            historyPages: [],
+            historyPages: pages.map(({ sessionId, olderCursor }) => ({ sessionId, olderCursor })),
           };
         }),
       ),
