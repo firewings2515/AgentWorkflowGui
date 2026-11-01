@@ -31,7 +31,7 @@ export const StoredDeliverySchema = z.discriminatedUnion('kind', [
   z.strictObject({ ...base, kind: z.literal('provision'), spec: z.strictObject({
     ...settings, runtime: Runtime, sessionId: SessionId, cwd: z.string().min(1), preallocatedRef: z.string().min(1).optional(),
   }) }),
-  z.strictObject({ ...base, kind: z.enum(['handoff', 'peer-message', 'transfer', 'user-message']),
+  z.strictObject({ ...base, kind: z.enum(['handoff', 'peer-message', 'transfer', 'user-message', 'system-notice']),
     payload: z.string(), handoff: handoff.optional(), peer: peer.optional(),
     context: z.strictObject({ runtime: Runtime, cwd: z.string().min(1), session: z.strictObject(settings),
       origin: MessageOrigin.optional(), entry: z.discriminatedUnion('kind', [
@@ -80,6 +80,7 @@ export const validateDelivery = (value: unknown, writing = false): StoredDeliver
       damaged(['provision:binding-mismatch'], writing);
     }
   } else {
+    if (record.kind === 'system-notice' && record.context.origin?.kind !== 'system') damaged(['origin:system-notice'], writing);
     const issues = deliveryTargetIssues(record.delivery, record.target);
     if (issues.length > 0) damaged(issues, writing);
     if ((record.handoff !== undefined && record.kind !== 'handoff') || (record.peer !== undefined && record.kind !== 'peer-message')) {

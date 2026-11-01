@@ -311,15 +311,20 @@ export class SqliteDeliveryStore implements DeliveryStore {
 
   listByTarget(sessionId: SessionId): Promise<StoredDelivery[]> {
     return this.run(() =>
-      readTransaction(this.db, () =>
-        (this.db
+      readTransaction(this.db, () => {
+        const hasAmbiguous = this.db.prepare("SELECT 1 FROM pragma_table_xinfo('delivery') WHERE name = 'target_ambiguous'").get();
+        if (hasAmbiguous && this.db.prepare('SELECT 1 FROM delivery WHERE target_ambiguous = 1 LIMIT 1').get()) {
+          throw new StoredDataError('delivery', ['target:duplicate-key']);
+        }
+        return (this.db
           // Only a row whose target names another session by a nonempty text sessionId is left out unread.
           // Every other row (this session's, an unbound target, anything that cannot say whose it is) is
           // loaded, so a damaged one fails closed and is never taken for "no work" (T028 r1 P1-3, r2, r3).
           .prepare(DELIVERY_BY_TARGET_SQL)
           .all(sessionId) as unknown as DeliveryRow[])
           .map((row) => this.load(row))
-          .filter((record) => record.target.sessionId === sessionId),
+          .filter((record) => record.target.sessionId === sessionId);
+      },
       ),
     );
   }
@@ -395,6 +400,7 @@ export class SqliteDeliveryStore implements DeliveryStore {
   }
 
   private load(row: DeliveryRow): StoredDelivery {
+    if ('target_ambiguous' in row && row.target_ambiguous === 1) throw new StoredDataError('delivery', ['target:duplicate-key']);
     if (row.metadata_required !== 0 && row.metadata_required !== 1) throw new StoredDataError('delivery', ['metadata:flag']);
     readRecord(TargetSchema, 'delivery', row.accepted_target);
     const admissions = this.db.prepare('SELECT count_key, ordinal FROM receive_admission WHERE operation_id = ? ORDER BY ordinal').all(row.operation_id);

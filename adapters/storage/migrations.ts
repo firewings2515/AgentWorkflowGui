@@ -3,6 +3,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { TARGET_SESSION_V7 } from './delivery-target-query';
 import { committed, unchanged, writeTransaction } from './transaction';
+import { storageHealth } from './health';
 
 export interface Migration {
   version: number;
@@ -310,6 +311,65 @@ UPDATE project SET body = json_set(body, '$.schemaVersion', '0.7.0') WHERE json_
 UPDATE workflow_instance SET body = json_set(body, '$.template.schemaVersion', '0.7.0') WHERE json_extract(body, '$.template.schemaVersion') = '0.6.0';
 `;
 
+// Rebuild with foreign_keys disabled outside the transaction. Preserve rowid (arrival ordering),
+// every column and every index, including the exact frozen v7 index text.
+const storage07V9 = `
+CREATE TABLE delivery_v9 (
+  operation_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('handoff', 'peer-message', 'transfer', 'user-message', 'provision', 'system-notice')),
+  source_call_ref TEXT,
+  payload_hash TEXT NOT NULL,
+  proposal_revision INTEGER NOT NULL CHECK (proposal_revision >= 0),
+  accepted_target TEXT NOT NULL,
+  target TEXT NOT NULL,
+  body TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'unknown', 'sent')),
+  accepted_at TEXT NOT NULL,
+  sender TEXT,
+  outcome TEXT,
+  metadata_required INTEGER NOT NULL DEFAULT 0 CHECK (metadata_required IN (0, 1)),
+  accepted_ms INTEGER NOT NULL DEFAULT 0
+) STRICT;
+INSERT INTO delivery_v9 (rowid, operation_id, kind, source_call_ref, payload_hash, proposal_revision,
+  accepted_target, target, body, state, accepted_at, sender, outcome, metadata_required, accepted_ms)
+  SELECT rowid, * FROM delivery;
+DROP TABLE delivery;
+ALTER TABLE delivery_v9 RENAME TO delivery;
+CREATE INDEX delivery_by_state ON delivery (state, accepted_ms);
+CREATE UNIQUE INDEX delivery_by_source_call ON delivery (source_call_ref) WHERE source_call_ref IS NOT NULL;
+CREATE UNIQUE INDEX delivery_handoff_id ON delivery
+  (CASE WHEN json_valid(body) THEN json_extract(body, '$.handoff.handoffId') END) WHERE kind = 'handoff';
+CREATE UNIQUE INDEX delivery_peer_id ON delivery
+  (CASE WHEN json_valid(body) THEN json_extract(body, '$.peer.peerMessageId') END) WHERE kind = 'peer-message';
+CREATE INDEX delivery_handoff_instance ON delivery
+  (CASE WHEN json_valid(body) THEN json_extract(body, '$.handoff.instanceId') END, accepted_ms) WHERE kind = 'handoff';
+CREATE INDEX delivery_by_target ON delivery (${TARGET_SESSION_V7}, accepted_ms);
+ALTER TABLE delivery ADD COLUMN target_ambiguous INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX delivery_ambiguous ON delivery (target_ambiguous) WHERE target_ambiguous = 1;
+UPDATE delivery SET target_ambiguous = CASE WHEN json_valid(target) THEN EXISTS (
+  SELECT 1 FROM json_tree(target) WHERE key IS NOT NULL GROUP BY parent, key HAVING count(*) > 1
+) ELSE 0 END;
+CREATE TRIGGER delivery_target_insert AFTER INSERT ON delivery BEGIN
+  UPDATE delivery SET target_ambiguous = CASE WHEN json_valid(NEW.target) THEN EXISTS (
+    SELECT 1 FROM json_tree(NEW.target) WHERE key IS NOT NULL GROUP BY parent, key HAVING count(*) > 1
+  ) ELSE 0 END WHERE operation_id = NEW.operation_id;
+END;
+CREATE TRIGGER delivery_target_update AFTER UPDATE OF target ON delivery BEGIN
+  UPDATE delivery SET target_ambiguous = CASE WHEN json_valid(NEW.target) THEN EXISTS (
+    SELECT 1 FROM json_tree(NEW.target) WHERE key IS NOT NULL GROUP BY parent, key HAVING count(*) > 1
+  ) ELSE 0 END WHERE operation_id = NEW.operation_id;
+END;
+`;
+
+const pagingV10 = ['turn', 'message', 'session_item', 'native_task', 'permission_request', 'artifact'].map((table) => `
+ALTER TABLE ${table} ADD COLUMN history_turn TEXT GENERATED ALWAYS AS
+  (CASE WHEN json_valid(body) THEN json_extract(body, '$.turnId') END) VIRTUAL;
+CREATE INDEX ${table}_history_turn ON ${table} (session_id, history_turn, at_ms);
+ALTER TABLE ${table} ADD COLUMN history_open INTEGER GENERATED ALWAYS AS
+  (CASE WHEN json_valid(body) THEN ${table === 'turn' ? "json_extract(body, '$.state') = 'running'" : table === 'permission_request' ? "json_extract(body, '$.state') IN ('pending', 'held')" : table === 'native_task' ? "json_extract(body, '$.endedAt') IS NULL" : '0'} ELSE 1 END) VIRTUAL;
+CREATE INDEX ${table}_history_open ON ${table} (session_id, history_open, at_ms);
+`).join('\n') + '\nCREATE INDEX artifact_history_time ON artifact (session_id, at_ms);\n';
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
@@ -319,13 +379,20 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 6, name: 'contracts-0.6', sql: contracts06V6 },
   { version: 7, name: 'storage-0.6', sql: storage06V7 },
   { version: 8, name: 'contracts-0.7', sql: contracts07V8 },
+  { version: 9, name: 'storage-0.7-delivery', sql: storage07V9 },
+  { version: 10, name: 'storage-0.7-history', sql: pagingV10 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;
 
 /** Brings the database up to the latest version; returns the version it is at afterwards. */
-export const migrate = (db: DatabaseSync, migrations: readonly Migration[] = MIGRATIONS): number =>
-  writeTransaction(db, () => {
+export const migrate = (db: DatabaseSync, migrations: readonly Migration[] = MIGRATIONS): number => {
+  const health = storageHealth(db);
+  delete health.failedMigrationVersion;
+  let applying: number | undefined;
+  const foreignKeys = db.prepare('PRAGMA foreign_keys').get()?.foreign_keys;
+  db.exec('PRAGMA foreign_keys = OFF');
+  try { return writeTransaction(db, () => {
     db.exec('CREATE TABLE IF NOT EXISTS schema_migration (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL) STRICT');
     const row = db.prepare('SELECT max(version) AS version FROM schema_migration').get() as { version: number | null } | undefined;
     const current = row?.version ?? 0;
@@ -335,8 +402,14 @@ export const migrate = (db: DatabaseSync, migrations: readonly Migration[] = MIG
     if (pending.length === 0) return unchanged(current);
     const record = db.prepare('INSERT INTO schema_migration (version, name, applied_at) VALUES (?, ?, ?)');
     for (const m of pending) {
-      db.exec(m.sql);
+      applying = m.version;
+      if (!storageHealth(db).hooks?.migration(db, m.sql)) db.exec(m.sql);
       record.run(m.version, m.name, new Date().toISOString());
     }
+    if (db.prepare('PRAGMA foreign_key_check').get()) throw new Error('schema:foreign-key');
     return committed(latest);
-  });
+  }); } catch (error) {
+    health.failedMigrationVersion = applying;
+    throw error;
+  } finally { db.exec(`PRAGMA foreign_keys = ${foreignKeys === 1 ? 'ON' : 'OFF'}`); }
+};

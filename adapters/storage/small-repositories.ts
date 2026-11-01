@@ -19,8 +19,8 @@ export class SqliteEscalationRepository implements EscalationRepository {
 
   upsert(escalation: Escalation): Promise<void> {
     return run(() => {
-      const parsed = checkRecord(Escalation, 'escalation', escalation);
       writeTransaction(this.ctx.db, () => {
+        const parsed = checkRecord(Escalation, 'escalation', escalation);
         this.ctx.db
           .prepare(
             `INSERT INTO escalation (id, state, created_ms, body) VALUES (?, ?, ?, ?)
@@ -60,8 +60,8 @@ export class SqlitePreferencesRepository implements PreferencesRepository {
 
   set(preferences: UiPreferences): Promise<UiPreferences> {
     return run(() => {
-      const parsed = checkRecord(UiPreferences, 'preference', preferences);
       return writeTransaction(this.ctx.db, () => {
+        const parsed = checkRecord(UiPreferences, 'preference', preferences);
         this.ctx.db.prepare('INSERT INTO preference (id, body) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET body = excluded.body').run(JSON.stringify(parsed));
         return committed(parsed);
       });
@@ -80,8 +80,8 @@ export class SqliteOwnedProcessRepository implements OwnedProcessRepository {
 
   record(process: OwnedProcess): Promise<void> {
     return run(() => {
-      const { endedAt, ...rest } = checkRecord(OwnedProcess, 'owned_process', process);
       writeTransaction(this.ctx.db, () => {
+        const { endedAt, ...rest } = checkRecord(OwnedProcess, 'owned_process', process);
         // Recording the same process again refreshes its details but never revives one already ended.
         this.ctx.db
           .prepare(
@@ -96,9 +96,9 @@ export class SqliteOwnedProcessRepository implements OwnedProcessRepository {
 
   markEnded(pid: number, startedAt: Timestamp, at: Timestamp): Promise<void> {
     return run(() => {
-      const started = checkRecord(Timestamp, 'owned_process', startedAt);
-      const ended = checkRecord(Timestamp, 'owned_process', at);
       writeTransaction(this.ctx.db, () => {
+        const started = checkRecord(Timestamp, 'owned_process', startedAt);
+        const ended = checkRecord(Timestamp, 'owned_process', at);
         // The first end is kept; an unknown process is nothing to end.
         const result = this.ctx.db
           .prepare('UPDATE owned_process SET ended_at = ? WHERE pid = ? AND started_key = ? AND ended_at IS NULL')
