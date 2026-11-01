@@ -18,7 +18,7 @@ AgentWorkflowGui 目前只發行 **Windows x64、未簽章、per-user** 的 NSIS
 
 ```bash
 npm ci
-npm run dist     # electron-vite build → 產生授權清單 → electron-builder（NSIS，x64）
+npm run dist     # electron-vite build → 產生授權清單 → electron-builder（NSIS，x64）→ 檢查授權檔都在清單內
 npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來看內容
 ```
 
@@ -31,7 +31,7 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 | 項目 | 處理 |
 |---|---|
 | koffi（`.node`） | `asarUnpack`；`require('koffi')` 由 Electron 對 `.node` 的處理導到 `app.asar.unpacked` |
-| claude.exe | `asarUnpack`；Agent SDK 用 `require.resolve` 找到的是 `app.asar` 內的路徑，不能啟動，`app/main/packaged-paths.ts` 在啟動時把它換成 `app.asar.unpacked` 的同一個檔案（session 與 model 探測共用） |
+| claude.exe | `asarUnpack`；Agent SDK 用 `require.resolve` 找到的是 `app.asar` 內的路徑，不能啟動，`app/main/packaged-paths.ts` 在啟動時把它換成 `app.asar.unpacked` 的同一個檔案（session 與 model 探測共用）。只有 `app.isPackaged` 為真、而且路徑開頭正好是 `<process.resourcesPath>\app.asar\` 時才換；開發版與其他路徑一律原樣 |
 | GUI MCP server | 在 main bundle 內、同一個行程的本機 HTTP server，不需要路徑 |
 | `node:sqlite` | Electron 內建，不需要 unpack |
 | Codex | 不打包；由 `PATH` 偵測 |
@@ -50,7 +50,7 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 - 安裝檔與 `AgentWorkflowGui.exe` **沒有程式碼簽章**，所以：
   - 從網路下載後執行，Windows SmartScreen 會顯示「Windows 已保護您的電腦」，發行者是「不明的發行者」。使用者要按「**其他資訊 → 仍要執行**」。
   - 有些公司的 AppLocker／WDAC／防毒政策會直接擋未簽章的程式。
-  - 新發行的檔案沒有 SmartScreen 信譽，即使之後簽章，也要累積下載量才會消除警告（EV 憑證可立即建立信譽）。
+  - 新發行的檔案沒有 SmartScreen 信譽。依 [Microsoft 現行文件](https://learn.microsoft.com/windows/apps/package-and-deploy/smartscreen-reputation)，信譽是隨下載與使用累積的；簽章（包括 EV 憑證）不再讓檔案立即取得信譽，也不保證不出現警告。
 - 給使用者的做法：從可信來源取得，並對照發行頁公布的 SHA-256；發行者可以用 `Get-FileHash` 算出雜湊一起公布。
 - 未來要簽章：在 `electron-builder.yml` 的 `win` 加入憑證設定（`certificateSubjectName` 或 `azureSignOptions`）即可，不需要改程式。這次**沒有做**。
 
@@ -58,7 +58,7 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 
 - 本專案：**Apache-2.0**（`LICENSE`、`NOTICE`，兩者都放進安裝檔的 `resources\app.asar` 內）。
 - 第三方授權清單：`npm run dist` 由 `package-lock.json` 的 production 依賴產生 `THIRD_PARTY_LICENSES.txt`（135 個套件，含 renderer 打進 bundle 的 react 與 @xyflow/react），安裝後在 `resources\THIRD_PARTY_LICENSES.txt`。授權分布：MIT 111、ISC 15、BSD-3-Clause 3、Apache-2.0 2、BSD-2-Clause 1、Unlicense 1，另外 2 個是 Anthropic 的專有授權（見下）。清單是 production 依賴的**超集合**：也列出 lock 內有、但沒有放進安裝檔的套件（例如 Agent SDK 的選用 peer 依賴 `@anthropic-ai/sdk`）。
-  - 清單產生程式 `scripts/third-party-licenses.mjs` 只讀 package 自己附的授權檔；有 2 個套件沒有授權檔（`@koromix/koffi-win32-x64`、`standardwebhooks`，兩者的 package.json 都標示 MIT；koffi 主套件附有 LICENSE.txt），清單中標明「no licence file in the package」。
+  - 清單產生程式 `scripts/third-party-licenses.mjs` 讀每個套件根目錄與其內 vendored 資料夾（不含巢狀 `node_modules`）的授權與 NOTICE 檔，目前 137 個檔案（含 koffi 的 `vendor/node-addon-api/LICENSE.md`、`vendor/node-api-headers/LICENSE`），每個檔以 `File: node_modules/...` 標出；`npm run dist` 最後跑 `scripts/check-licenses.mjs`，產物（`app.asar` 與 `app.asar.unpacked`）裡任何一個授權或 NOTICE 檔不在清單內就失敗；有 2 個套件沒有授權檔（`@koromix/koffi-win32-x64`、`standardwebhooks`，兩者的 package.json 都標示 MIT；koffi 主套件附有 LICENSE.txt），清單中標明「no licence file in the package」。
 - **Anthropic 的 Claude Agent SDK 與 claude.exe 是專有授權**（`SEE LICENSE`：© Anthropic PBC，依 Anthropic 的法律條款使用）。安裝檔內含 `claude.exe`，**對外發行（不只自用）前，需要確認 Anthropic 的條款允許以這種方式再散布**；這個判斷不是工程問題，這份文件沒有結論。若不允許，替代方案是改成要求使用者自己安裝 Claude Code，並以 `pathToClaudeCodeExecutable` 指向它（需要改程式，不在這次範圍）。
 - Codex CLI（Apache-2.0）不隨附。
 
@@ -68,7 +68,7 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 - 安裝檔很大（約 218 MB，主要是 claude.exe）。
 - Codex 要使用者自己安裝，而且 `codex.exe` 要在 `PATH`（或設定 `AWG_CODEX_COMMAND`）；從開始功能表啟動時看到的是使用者的 `PATH`，app 啟動時才偵測，剛安裝完 Codex 要重開 app（必要時重新登入 Windows，讓新的 `PATH` 生效）才找得到。
 - 啟動後 Claude 的模型清單約 8 秒才出現（Codex 約 3 秒），這段時間模型選單只有 Codex 的選項。
-- 圖示是 Electron 預設圖示（沒有設計過的 app 圖示），exe 也沒有自訂的版本資訊。
+- 圖示是 Electron 預設圖示（沒有設計過的 app 圖示）。exe 的版本資訊是 electron-builder 填的：`FileVersion` 0.1.0、`ProductVersion` 0.1.0.0、`ProductName` 與 `FileDescription` 為 `AgentWorkflowGui`、`LegalCopyright` 為 Copyright 2026 firewings2515；但 `CompanyName` 仍是 Electron 的預設值「GitHub, Inc.」（`package.json` 沒有 `author`），發行前要設定。
 - 安裝／解除安裝只測過靜默模式（`/S`）與 per-user；沒有測過互動式安裝畫面，也沒有測過套用 AppLocker／WDAC 的企業環境。
 - Claude 與 Codex 的 native home（`~/.claude`、`~/.codex`）由各自的 CLI 管理，解除安裝不會清理它們。
 
@@ -88,5 +88,5 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 - 安裝 1 次（18 秒、沒有提權）、解除安裝 1 次（11 秒）；Electron GUI 啟動 2 次（第 2 次不送 turn，只確認模型清單）。
 - Claude（haiku）與 Codex（gpt-6.1-sol）各 1 個 turn 都 completed；claude.exe 由 `app.asar.unpacked` 啟動；koffi／Job Object、`node:sqlite` 正常；GUI MCP server 隨 backend 啟動並掛到兩個 session，但 live 沒有實際呼叫 MCP 工具。
 - 關閉 764 ms，沒有 R-14 對話框（當時沒有未結束的工作），沒有殘留程序。
-- 解除安裝後：安裝資料夾、`HKCU` 解除安裝項目、開始功能表捷徑都已移除；暫存 userData 的 `awg.sqlite` 仍在，2 個 session、4 則訊息、2 個 turn 讀得到。
+- 解除安裝後：安裝資料夾、`HKCU` 解除安裝項目、開始功能表捷徑都已移除；暫存 userData 的 `awg.sqlite` 仍在，並能以唯讀開啟（22 個資料表，`T044-live-uninstall.json`）。
 - 沒有驗證：有未結束工作時的 R-14 對話框（打包版）、預設安裝位置、互動式安裝畫面、Windows 11。

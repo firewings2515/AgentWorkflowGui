@@ -22,7 +22,9 @@ files:
   - '!node_modules/d3-*{,/**}'
   - '!node_modules/zustand{,/**}'
   - '!node_modules/classcat{,/**}'
-  - '!node_modules/**/*.{md,map,ts,tsx}'
+  # Documentation and sources go; licence and notice files stay (scripts/check-licenses.mjs checks them).
+  - '!node_modules/**/*.{map,ts,tsx}'
+  - '!node_modules/**/{README,CHANGELOG,HISTORY,CONTRIBUTING,SECURITY,CODE_OF_CONDUCT}{,.*}.md'
   - '!node_modules/**/{test,tests,__tests__,docs,example,examples}{,/**}'
 
 # Native code and executables cannot run from inside app.asar. koffi's .node and the Claude CLI that the Agent

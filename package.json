@@ -14,8 +14,9 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "licenses": "node scripts/third-party-licenses.mjs",
+    "check-licenses": "node scripts/check-licenses.mjs",
     "pack": "electron-vite build && npm run licenses && electron-builder --dir",
-    "dist": "electron-vite build && npm run licenses && electron-builder --win nsis --x64",
+    "dist": "electron-vite build && npm run licenses && electron-builder --win nsis --x64 && npm run check-licenses",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.core.json && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run"
