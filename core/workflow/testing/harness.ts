@@ -284,7 +284,10 @@ export interface RealFolders {
   files: WorktreeFiles;
 }
 
-const build = (repositories: AppRepositories, store: DeliveryStore, previous?: World, real?: RealFolders): World => {
+/** The storage of the next start: a new connection to the same database, read back from its file (T039 r1-P1-2). */
+export type Reopen = () => { repositories: AppRepositories; store: DeliveryStore };
+
+const build = (repositories: AppRepositories, store: DeliveryStore, previous?: World, real?: RealFolders, reopen?: Reopen): World => {
   const world = {
     repositories,
     store,
@@ -385,7 +388,8 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
   };
   world.run = (command) => world.service.execute(command);
   world.restart = async () => {
-    const next = build(repositories, store, world, real);
+    const fresh = reopen?.();
+    const next = build(fresh?.repositories ?? repositories, fresh?.store ?? store, world, real, reopen);
     await next.service.start();
     await next.engine.recover();
     return next;
@@ -399,8 +403,8 @@ export const world = async (workflow: WorkflowTemplate = template()): Promise<Wo
 };
 
 /** The same world on other storage (the SQLite repositories and store in app/main's tests, r2). */
-export const worldOn = async (repositories: AppRepositories, store: DeliveryStore, workflow: WorkflowTemplate = template(), real?: RealFolders): Promise<World> => {
-  const w = build(repositories, store, undefined, real);
+export const worldOn = async (repositories: AppRepositories, store: DeliveryStore, workflow: WorkflowTemplate = template(), real?: RealFolders, reopen?: Reopen): Promise<World> => {
+  const w = build(repositories, store, undefined, real, reopen);
   for (const a of agents()) await w.repositories.agents.save(a, null);
   await w.repositories.workflows.save(workflow, null);
   return w;

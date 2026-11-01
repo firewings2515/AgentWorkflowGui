@@ -6,6 +6,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { type ItemId, MessageId, type OwnedProcess, RequestId, type Runtime, SessionId, TurnId } from '../../contracts';
 import type { OwnedProcessRepository, PermissionHandle } from '../../core/ports';
@@ -13,6 +14,7 @@ import { FakeAdapter } from '../../core/sessions/testing/fake-adapter';
 import { agent } from '../../core/sessions/testing/harness';
 import { type Backend, type BackendProcessHost, startBackend } from '../../app/main/backend';
 import { EventBus } from '../../app/main/event-bus';
+import type { FaultPoint } from '../../app/main/fault-points';
 
 class Host implements BackendProcessHost {
   readonly cleanups: OwnedProcess[][] = [];
@@ -49,7 +51,7 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const start = async (stillRunning: (p: OwnedProcess) => boolean = () => true) => {
+const start = async (stillRunning: (p: OwnedProcess) => boolean = () => true, faultPoint?: FaultPoint) => {
   const adapters: FakeAdapter[] = [];
   const logs: string[] = [];
   let host: Host | undefined;
@@ -70,6 +72,7 @@ const start = async (stillRunning: (p: OwnedProcess) => boolean = () => true) =>
     },
     log: (m) => logs.push(m),
     closeTimeoutMs: 50,
+    ...(faultPoint !== undefined && { faultPoint }),
   });
   if (backend.status !== 'ready') throw new Error('not ready');
   backends.push(backend);
@@ -127,6 +130,44 @@ describe('T039 P6 through the backend: a crash with a command running', () => {
       // A third start finds nothing left to clean.
       const third = await start();
       expect(third.host.cleanups).toEqual([[]]);
+    });
+  }
+});
+
+describe('T039 r1-P1-1: a normal exit after a restart that only reconciled', () => {
+  for (const runtime of ['codex', 'claude'] as const) {
+    it(`${runtime}: the processes of this run that exited by themselves are recorded ended too`, async () => {
+      // The GUI dies with the message's dispatch committed unknown (the fault point stops it there).
+      const sessionId = SessionId.parse(`reconcile-${runtime}`);
+      const first = await start(() => true, { point: 'dispatch', sessionId });
+      const run = (command: object) => first.backend.facade.execute({ requestId: rid(), ...command } as never);
+      await run({ type: 'agent.save', agent: agent(), expectedRevision: null });
+      await run({ type: 'session.create', sessionId, kind: 'ordinary', agentId: agent().id, model: { runtime, model: `${runtime}-m` }, cwd: dir });
+      await settle();
+      const session = (await first.backend.facade.snapshot()).sessions.find((s) => s.id === sessionId)!;
+      void run({ type: 'session.send', sessionId, messageId: MessageId.parse(`r-${runtime}`), expectedRevision: session.revision, text: 'hello', attachments: [] });
+      await settle();
+
+      // The next start only reconciles it; the runtime it opened for that, recorded in the session's Job, has exited
+      // by itself by the time the user exits (nothing of it is in a Job any more).
+      const second = await start(() => false);
+      expect((await second.backend.facade.snapshot()).sessions.find((s) => s.id === sessionId)?.activity).toBe('reconciling');
+      const reconciler: OwnedProcess = { pid: 5101, startedAt: '2026-11-01T00:00:05.000Z', sessionId, runtime, kind: 'runtime-host', jobRef: 'job-r', recordedAt: '2026-11-01T00:00:05.100Z' };
+      const helper: OwnedProcess = { ...reconciler, pid: 5102, startedAt: '2026-11-01T00:00:05.200Z', kind: 'helper', recordedAt: '2026-11-01T00:00:05.300Z' };
+      await second.host.repository.record(reconciler);
+      await second.host.repository.record(helper);
+      backends.splice(backends.indexOf(second.backend), 1);
+      await second.backend.shutdown();
+
+      // Every record of that run has its end: the next start finds nothing to clean.
+      const third = await start();
+      expect(await third.host.repository.listLive()).toEqual([]);
+      expect(third.host.cleanups).toEqual([[]]);
+      const db = new DatabaseSync(join(dir, 'awg.sqlite'), { readOnly: true });
+      const rows = db.prepare('SELECT pid, ended_at FROM owned_process WHERE pid IN (5101, 5102) ORDER BY pid').all();
+      db.close();
+      expect(rows.map((r) => r['pid'])).toEqual([5101, 5102]);
+      expect(rows.every((r) => typeof r['ended_at'] === 'string')).toBe(true);
     });
   }
 });

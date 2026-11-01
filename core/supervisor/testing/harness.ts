@@ -145,6 +145,11 @@ export interface SupWorldOptions {
   claudePerSession?: boolean;
   /** Replaces the fake for a runtime when it returns an adapter (core cannot import the real ones). */
   createAdapter?: (runtime: Runtime, sessionId: SessionId, hooks: RuntimeAdapterHooks, world: SupWorld) => RuntimeAdapter | undefined;
+  /**
+   * The storage of the next start: a new connection to the same database, read back from its file (T039 r1-P1-2).
+   * Without it a restart keeps the same objects.
+   */
+  reopen?: () => { repositories: AppRepositories; store: DeliveryStore };
 }
 
 const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: SupWorldOptions, previous?: SupWorld): SupWorld => {
@@ -275,7 +280,10 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
   });
   world.service.attachSupervisor(world.supervisor);
   world.run = (command) => world.service.execute(command);
-  world.restart = () => build(rawRepositories, rawStore, o, world);
+  world.restart = () => {
+    const next = o.reopen?.();
+    return build(next?.repositories ?? rawRepositories, next?.store ?? rawStore, o, world);
+  };
   return world;
 };
 

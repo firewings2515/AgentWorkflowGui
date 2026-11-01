@@ -232,6 +232,21 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     log(`[backend] cleaning up earlier processes failed (${describe(error)})`);
   }
 
+  /**
+   * At the end (R-14): every Job of this run is closed, also one whose processes all exited by themselves (a
+   * runtime opened only to reconcile, T039 r1-P1-1), so their records are ended; what is still recorded live then
+   * is looked at once more by PID and creation time, and gone is recorded ended like at the start.
+   */
+  const endJobs = async (): Promise<void> => {
+    const left: OwnedProcess[] = await host.listOwned().catch(() => []);
+    const recorded = await repositories.processes.listLive().catch(() => [] as OwnedProcess[]);
+    for (const sessionId of new Set([...left, ...recorded].map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
+    const still = await repositories.processes.listLive().catch(() => [] as OwnedProcess[]);
+    if (still.length === 0) return;
+    const cleaned = await host.cleanupOrphans(still).catch(() => ({ ended: [] as OwnedProcess[], gone: [] as OwnedProcess[] }));
+    for (const p of [...cleaned.ended, ...cleaned.gone]) await repositories.processes.markEnded(p.pid, p.startedAt, now()).catch(() => undefined);
+  };
+
   // 4-5. MCP server, adapters, the session service. Handlers and hooks reach the service once it exists.
   const ref: { service?: SessionService; workflow?: WorkflowEngine } = {};
   const starting = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is starting' } } as const;
@@ -515,8 +530,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   } catch (error) {
     await service.shutdown(closeTimeoutMs).catch(() => undefined);
     await mcp.close().catch(() => undefined);
-    const left: OwnedProcess[] = await host.listOwned().catch(() => []);
-    for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
+    await endJobs();
     watchers.stopAll();
     ignored.close();
     return damaged(error);
@@ -611,8 +625,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       // again after closeAll finds nothing left. Bounded by the same deadline; before the Jobs are ended, so
       // the probe's claude.exe exits through it and its folder goes.
       await claudeProbeAdapter?.close(closeTimeoutMs).catch(() => undefined);
-      const left: OwnedProcess[] = await host.listOwned().catch(() => []);
-      for (const sessionId of new Set(left.map((p) => p.sessionId))) await host.closeJob(sessionId).catch(() => undefined);
+      await endJobs();
       watchers.stopAll();
       ignored.close();
       db.close();

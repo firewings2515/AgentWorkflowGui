@@ -1,38 +1,48 @@
 // T039 crash matrix on the real SQLite repositories and delivery store; the same cases run on memory storage in
-// crash-memory.test.ts.
+// crash-memory.test.ts. Each restart reads its state back through a new connection to the same file (r1-P1-2).
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import { afterEach } from 'vitest';
+import { afterEach, expect } from 'vitest';
 import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../adapters/storage';
 import { supWorldOn } from '../../core/supervisor/testing/harness';
 import { worldOn } from '../../core/workflow/testing/harness';
 import { crashCases } from './cases';
 
-const opened: { db: DatabaseSync; dir: string }[] = [];
+// Every connection of a case, the abandoned ones included (a crashed run's connection is never closed by it).
+const opened: DatabaseSync[] = [];
+const dirs: string[] = [];
 afterEach(() => {
-  for (const { db, dir } of opened.splice(0)) {
-    db.close();
-    rmSync(dir, { recursive: true, force: true });
-  }
+  // Every case restarts: its restart read through a connection of its own.
+  expect(opened.length).toBeGreaterThanOrEqual(2);
+  for (const db of opened.splice(0)) db.close();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+/** One database file per case; each start (the first and every restart) opens its own connection to it. */
 const database = () => {
   const dir = mkdtempSync(join(tmpdir(), 'awg-t039-crash-'));
-  const db = openDatabase(join(dir, 'awg.sqlite'));
-  opened.push({ db, dir });
-  return db;
+  dirs.push(dir);
+  const path = join(dir, 'awg.sqlite');
+  return () => {
+    const db = openDatabase(path);
+    opened.push(db);
+    // New repositories and store on the new connection: what the restart sees is only what the file holds (r1-P1-2).
+    return { repositories: createRepositories(db), store: new SqliteDeliveryStore(db) };
+  };
 };
 
 crashCases(
   'SQLite',
   (o) => {
-    const db = database();
-    return supWorldOn(createRepositories(db), new SqliteDeliveryStore(db), o);
+    const open = database();
+    const first = open();
+    return supWorldOn(first.repositories, first.store, { ...o, reopen: open });
   },
   (workflow) => {
-    const db = database();
-    return worldOn(createRepositories(db), new SqliteDeliveryStore(db), workflow);
+    const open = database();
+    const first = open();
+    return worldOn(first.repositories, first.store, workflow, undefined, open);
   },
 );
