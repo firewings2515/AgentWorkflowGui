@@ -333,10 +333,11 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     listModels,
     isRuntimeAvailable: (runtime) => runtime === 'claude' || options.codexExecutable !== undefined || options.createAdapter !== undefined,
     onSessionOpened: (sessionId) => {
-      void repositories.sessions.get(sessionId).then((s) => s && watchers.start(sessionId, s.folderScope.workspaceRoot));
+      void repositories.sessions.get(sessionId).then((s) => s && (watchers.start(sessionId, s.folderScope.workspaceRoot), ignored.acquire(sessionId, s.folderScope.workspaceRoot)));
     },
     onSessionClosed: async (sessionId) => {
       watchers.stop(sessionId);
+      ignored.release(sessionId);
       try {
         mcp.revoke(sessionId);
       } catch {

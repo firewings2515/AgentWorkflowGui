@@ -387,6 +387,29 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       expect(isOpen(w, a)).toBe(true);
     });
 
+    it('T043 G-4: a turn the runtime starts while it is being released does not stop the close; it is logged, and the session resumes afterwards', async () => {
+      const { w, a, adapter } = await idleOne();
+      const held = gate();
+      adapter.closeGate = held.promise;
+      const ticking = w.supervisor.tick();
+      await settle();
+      expect(closesOf(w, 'codex', a)).toHaveLength(1);
+      expect(w.logs.some((l) => l.includes('was used while its runtime was being closed'))).toBe(false);
+      // The runtime woke up on its own at the moment of the close.
+      adapter.emit({ type: 'turn.updated', turn: { id: TurnId.parse('turn-self'), sessionId: a, state: 'running', startedAt: AT } });
+      await settle();
+      held.open();
+      await ticking;
+      await settle();
+      expect(isOpen(w, a)).toBe(false);
+      expect(w.logs.filter((l) => l.includes(`${a} was used while its runtime was being closed`))).toHaveLength(1);
+      // Nothing is lost: the next message resumes the session in its folder.
+      expect((await send(w, a, 'again')).ok).toBe(true);
+      await settle();
+      expect(resumedOf(w, 'codex', a)).toHaveLength(1);
+      expect(isOpen(w, a)).toBe(true);
+    });
+
     it('a delivery from outside the queue while the runtime is being released waits, resumes it, and is sent once', async () => {
       const { w, a, adapter } = await idleOne();
       const held = gate();

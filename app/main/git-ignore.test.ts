@@ -148,3 +148,86 @@ describe('review r2', () => {
     expect(watched[0]!.closed).toBe(true);
   });
 });
+
+describe('T043 the info watch lives while a session uses it', () => {
+  const linked = (): Record<string, string> => ({
+    'e:\\wt\\one\\.git': 'gitdir: E:/main/.git/worktrees/one\n',
+    'e:\\main\\.git\\worktrees\\one\\commondir': '../..\n',
+    'e:\\wt\\two\\.git': 'gitdir: E:/main/.git/worktrees/two\n',
+    'e:\\main\\.git\\worktrees\\two\\commondir': '../..\n',
+    'e:\\main\\.git\\info\\exclude': 'scratch/\n',
+  });
+  const make = (files: Record<string, string>) => {
+    const watched: { folder: string; closed: boolean }[] = [];
+    const ignore = new GitIgnoreRules(
+      (path) => files[path.toLowerCase()],
+      (folder) => ['e:\\wt\\one', 'e:\\wt\\two', 'e:\\other'].includes(folder.toLowerCase()),
+      () => undefined,
+      (folder) => {
+        const entry = { folder, closed: false };
+        watched.push(entry);
+        return { close: () => (entry.closed = true) };
+      },
+    );
+    return { ignore, watched };
+  };
+
+  it('is closed when the last session of the repository leaves, and made again (with the rules read again) when one comes back', () => {
+    const files = linked();
+    const { ignore, watched } = make(files);
+    ignore.acquire('s1', 'E:\\wt\\one');
+    ignore.acquire('s2', 'E:\\wt\\two');
+    expect(ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt')).toBe(true);
+    expect(ignore.isIgnored('E:\\wt\\two\\scratch\\x.txt')).toBe(true);
+    expect(watched).toHaveLength(1); // one watch for the shared info folder
+
+    ignore.release('s1');
+    expect(watched[0]!.closed).toBe(false); // wt\two still uses it
+    ignore.release('s2');
+    expect(watched[0]!.closed).toBe(true);
+
+    // Nobody watches the exclude now, so what was cached is not trusted: it is read again, and watched again.
+    files['e:\\main\\.git\\info\\exclude'] = '';
+    ignore.acquire('s3', 'E:\\wt\\one');
+    expect(ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt')).toBe(false);
+    expect(watched).toHaveLength(2);
+    expect(watched[1]!.closed).toBe(false);
+    ignore.release('s3');
+    expect(watched[1]!.closed).toBe(true);
+  });
+
+  it('several sessions in one workspace keep it until the last leaves; starting or stopping twice accumulates nothing', () => {
+    const { ignore, watched } = make(linked());
+    ignore.acquire('a', 'E:\\wt\\one');
+    ignore.acquire('a', 'E:\\wt\\one'); // the same session again
+    ignore.acquire('b', 'e:/wt/one/'); // another session, the same folder written differently
+    expect(ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt')).toBe(true);
+    ignore.release('a');
+    ignore.release('a'); // twice
+    ignore.release('never-started');
+    expect(watched[0]!.closed).toBe(false);
+    ignore.release('b');
+    expect(watched[0]!.closed).toBe(true);
+    // Round after round leaves nothing open.
+    for (let i = 0; i < 5; i++) {
+      ignore.acquire('c', 'E:\\wt\\one');
+      expect(ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt')).toBe(true);
+      ignore.release('c');
+    }
+    expect(watched.filter((w) => !w.closed)).toHaveLength(0);
+    expect(watched).toHaveLength(6);
+  });
+
+  it('a repository read for no session is left alone by other sessions leaving, and is closed with the app', () => {
+    const files = { ...linked(), 'e:\\other\\.git\\info\\exclude': 'tmp/\n' };
+    const { ignore, watched } = make(files);
+    ignore.isIgnored('E:\\other\\tmp\\y.txt'); // no session acquired it
+    ignore.acquire('s1', 'E:\\wt\\one');
+    ignore.isIgnored('E:\\wt\\one\\scratch\\x.txt');
+    expect(watched).toHaveLength(2);
+    ignore.release('s1');
+    expect(watched.map((w) => w.closed)).toEqual([false, true]);
+    ignore.close();
+    expect(watched.map((w) => w.closed)).toEqual([true, true]);
+  });
+});

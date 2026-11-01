@@ -347,6 +347,30 @@ describe('T035 r2 P1 a probe claude.exe is managed like a session one, and the G
     expect(p.kills).toBe(2);
   });
 
+  it('T043 a second close() does not wait again for a folder removal the first one already waited for', async () => {
+    const probeCwd = join(root, 'probe');
+    let removals = 0;
+    const { h } = probeSetup({
+      probeCwd,
+      probeExitTimeoutMs: 20,
+      removeFolder: () => {
+        removals += 1;
+        return new Promise<void>(() => undefined); // never finishes: the folder is held
+      },
+    });
+    h.sdk.behaviour.models = MODELS;
+    await h.adapter.start();
+    await h.adapter.listModels();
+    expect(removals).toBe(1);
+    const first = Date.now();
+    expect(await h.adapter.close(150)).toEqual({ forced: false }); // the process had exited: waited, not forced
+    expect(Date.now() - first).toBeGreaterThanOrEqual(120);
+    const second = Date.now();
+    expect(await h.adapter.close(2000)).toEqual({ forced: false });
+    expect(Date.now() - second).toBeLessThan(500);
+    expect(removals).toBe(1); // not asked again either
+  });
+
   it('t035-r2-P1 a probe whose folder could not be made is ended by close() too', async () => {
     const file = join(root, 'a-file');
     writeFileSync(file, '');

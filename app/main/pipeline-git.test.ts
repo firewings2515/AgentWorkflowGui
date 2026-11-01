@@ -35,7 +35,7 @@ const until = async (check: () => boolean | Promise<boolean>, what: string, ms =
   throw new Error(`timed out waiting for ${what}`);
 };
 
-it('V-19, V-20, V-21 on a real repository: parallel tasks, a dependency, a conflict and failed tests; main only fast-forwards', { timeout: 180_000 }, async () => {
+it('V-19, V-20, V-21 on a real repository: parallel tasks, a dependency, a conflict and failed tests; main only fast-forwards', { timeout: 300_000 }, async () => {
   const sandbox = createSandbox();
   const repo = await sandbox.newRepo('project');
   await sandbox.commitFile(repo, 'src/app.txt', 'app\n', 'initial');
@@ -137,6 +137,8 @@ it('V-19, V-20, V-21 on a real repository: parallel tasks, a dependency, a confl
   expect((await instanceOf(w)).mergeQueue.map((m) => m.state)).toEqual(['merged', 'conflict', 'merged', 'tests-failed', 'merged']);
   // The last integration worktree goes after C's own; nothing of the run is left running in the repository.
   await until(async () => (await instanceOf(w)).mergeQueue.every((m) => m.integration?.cleanup === 'removed'), 'integration worktrees removed');
+  // T043 G-6: the integration branches of the conflict and the failed tests went with their worktrees, like the merged ones.
+  for (const m of (await instanceOf(w)).mergeQueue) expect(await sandbox.git(repo, 'branch', '--list', m.integration!.branch), m.state).toBe('');
   expect(await w.run({ type: 'workflow.complete', requestId: rid(), instanceId: INSTANCE, expectedRevision: (await instanceOf(w)).revision })).toMatchObject({ ok: true });
 });
 

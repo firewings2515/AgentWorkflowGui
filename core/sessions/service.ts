@@ -1681,6 +1681,18 @@ export class SessionService {
   }
 
   /**
+   * Runs `fn` with the queues of these sessions held (T043 r2 P1-2): every dispatch, resume and stored event of them waits
+   * until it is done, so a check that they are idle stays true while `fn` closes their runtimes and releases their
+   * folder. For the pipeline's cleanup of a worktree; `fn` must not wait for anything queued under these sessions. The
+   * queues are taken in a fixed order (two callers cannot wait on each other).
+   */
+  exclusive<T>(sessionIds: readonly SessionId[], fn: () => Promise<T>): Promise<T> {
+    const keys = [...new Set(sessionIds)].map(sessionKey).sort();
+    const hold = (i: number): Promise<T> => (i >= keys.length ? fn() : this.serial(keys[i]!, () => hold(i + 1)));
+    return hold(0);
+  }
+
+  /**
    * The supervisor's close of an idle runtime, in the session's queue (in order with its commands, deliveries and
    * events): `decide()` last, and when it says yes the graceful close starts in that same step (R-14; past
    * `timeoutMs` its Job is ended) and the session is marked closed before this returns, so a delivery that waited
