@@ -14,6 +14,7 @@
 //                            l4d the same, with the policy's hold of that ping approved as the user (only it)
 //                            (l5 for Claude: check P6, resume once, normal exit; R-14 with a command is Codex's)
 //                            l5  check P6; exit while a command runs, answering R-14's exit confirmation
+//                            l6  check P6 only (after an l4b run after l5), sending nothing; normal exit
 //     chain flow             f1  workflow: root (Claude) creates a task and hands it to Implement (Codex), whose dispatch
 //                                stops after its unknown commit (P3) → kill
 //                            f2  check P3; the user's retry; Implement works and hands off; the merge queue's test runs
@@ -35,6 +36,10 @@ const [CHAIN, STEP] = process.argv.slice(2);
 // `--no-kill`: an exit that does not finish is left as it is (its PID recorded) instead of ended: the approved count
 // of kills has no room left (T039 run 2).
 const NO_KILL = process.argv.includes('--no-kill');
+// `--rerun=N`: a step run again on the same userData. Its message and request IDs differ from the earlier run's, which
+// the app already took (an ID it has seen is not sent again: T039 run 3, l4b).
+const RERUN = process.argv.find((a) => /^--rerun=\d+$/.test(a))?.slice('--rerun='.length);
+const ID = `t039-${CHAIN}-${STEP}${RERUN === undefined ? '' : `-r${RERUN}`}`;
 const REPO = 'E:\\sideproj\\AgentWorkflowGui\\wt\\T039';
 const RESULTS = 'C:\\Users\\capri\\AppData\\Local\\Claude-Data\\claude_pzs8sxrjxfjjc\\side-session-notes\\local_33889000-34ec-4796-966a-d586b11e4f9c';
 const STATE = join(RESULTS, `T039-live-state-${CHAIN}.json`);
@@ -170,7 +175,7 @@ const launch = async (base, extraEnv, logName) => {
       ws.send(JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression, awaitPromise, returnByValue: true } }));
     });
   let requests = 0;
-  const command = (c) => ({ requestId: `t039-${CHAIN}-${STEP}-${String(++requests)}`, ...c });
+  const command = (c) => ({ requestId: `${ID}-${String(++requests)}`, ...c });
   const app = {
     child,
     created,
@@ -238,7 +243,7 @@ const createSession = async (app, result, id, cwd) => {
 let messages = 0;
 const sendText = async (app, id, text) => {
   const v = await sessionView(app, id);
-  return app.send({ type: 'session.send', sessionId: id, messageId: `t039-${CHAIN}-${STEP}-m${String(++messages)}`, expectedRevision: v.revision, text, attachments: [] });
+  return app.send({ type: 'session.send', sessionId: id, messageId: `${ID}-m${String(++messages)}`, expectedRevision: v.revision, text, attachments: [] });
 };
 /** Waits until the session's own turns all ended and one more assistant message than before is there. */
 const turnDone = (app, id, assistantBefore, ms = 180_000) =>
@@ -504,6 +509,7 @@ const ordinary = async () => {
     l4c: {},
     l4d: {},
     l5: {},
+    l6: {},
   }[STEP];
   if (env === undefined) throw new Error(`unknown step ${STEP}`);
   const result = begin(STEP);
@@ -619,6 +625,12 @@ const ordinary = async () => {
 
     // l5: P6 after the restart, then an exit with a command running (R-14's confirmation).
     step(result, 'P6 after the restart', { db: readDb(app.userData, [S('p6')]), view: viewOf(await app.snapshot(), [S('p6')]), cleanupLog: app.log().split(/\r?\n/).filter((l) => l.includes('left by an earlier run')) });
+    if (STEP === 'l6') {
+      // Codex's P6 kill came after its l5 (T039 run 3): only its restart is checked here, with no turn.
+      await exitApp(app, result);
+      step(result, 'after the exit', { db: readDb(app.userData) });
+      return;
+    }
     if (CHAIN === 'claude') {
       // The session is resumed once; R-14's confirmation with a command running is the Codex chain's (T039 run 2).
       const b6 = (await sessionView(app, S('p6'))).assistant;
