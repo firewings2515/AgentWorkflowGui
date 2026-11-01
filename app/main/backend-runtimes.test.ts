@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { type Command, type CommandResult, type EventEnvelope, InstanceId, type OwnedProcess, RequestId, type Runtime, type RuntimeStatus, SessionId } from '../../contracts';
+import { type Command, type CommandResult, type EventEnvelope, InstanceId, MessageId, type OwnedProcess, RequestId, type Runtime, type RuntimeStatus, SessionId } from '../../contracts';
 import type { RuntimeLocator } from '../../core/ports';
 import { FakeAdapter } from '../../core/sessions/testing/fake-adapter';
 import { agent } from '../../core/sessions/testing/harness';
@@ -70,17 +70,24 @@ const settle = async () => {
   for (let i = 0; i < 30; i++) await new Promise((resolve) => setImmediate(resolve));
 };
 
-const start = async (loc: RuntimeLocator, redetectMinMs = 0) => {
+const start = async (loc: RuntimeLocator, redetectMinMs = 0, extra: { dbPath?: string; supervisor?: { idleMs: number; maxOpen: number; tickMs: number } } = {}) => {
+  /** Every adapter the factory made, in order. */
+  const adapters: FakeAdapter[] = [];
   const bus = new EventBus();
   const envelopes: EventEnvelope[] = [];
   bus.subscribe((e) => envelopes.push(e));
   const result = await startBackend({
-    dbPath: join(dir, 'awg.sqlite'),
+    dbPath: extra.dbPath ?? join(dir, 'awg.sqlite'),
     bus,
     createHost: () => new FakeHost(),
     runtimes: loc,
     redetectMinMs,
-    createAdapter: (runtime, _id, hooks) => new FakeAdapter(runtime, (h) => hooks.onPermissionRequest(h)),
+    ...(extra.supervisor !== undefined && { supervisor: extra.supervisor }),
+    createAdapter: (runtime, _id, hooks) => {
+      const adapter = new FakeAdapter(runtime, (h) => hooks.onPermissionRequest(h));
+      adapters.push(adapter);
+      return adapter;
+    },
     listModels: (runtime) => Promise.resolve([{ runtime, model: `${runtime}-m`, displayName: `${runtime} m`, efforts: [], isDefault: true, hidden: false }]),
     resolveRealPath: (p) => p,
     watch: () => {
@@ -91,11 +98,76 @@ const start = async (loc: RuntimeLocator, redetectMinMs = 0) => {
   });
   if (result.status !== 'ready') throw new Error('not ready');
   const run = (command: Command) => result.facade.execute(command) as Promise<CommandResult>;
-  return { backend: result, envelopes, run };
+  return { backend: result, envelopes, run, adapters };
 };
 
 const create = (runtime: Runtime, id: string): Command => ({
   type: 'session.create', requestId: rid(), sessionId: SessionId.parse(id), kind: 'ordinary', agentId: agent().id, model: { runtime, model: `${runtime}-m` }, cwd: dir,
+});
+
+/** A candidate the locator shows but must never run: the name says .exe, the link points at something else. */
+const notExe = (runtime: Runtime): RuntimeStatus => ({
+  runtime, state: 'failed', executable: `C:/links/${runtime}.exe`, source: 'path', requiredVersion: '1.0.0', auth: 'unknown', modelCount: 0, checkedAt: AT,
+  detail: 'points at something that is not an .exe',
+});
+
+describe.each([':memory:', 'SQLite file'])('T045 review r3: a session resumed after its runtime became unusable (%s)', (store) => {
+  it('is refused with runtime_unavailable before any adapter is made; the message stays pending; it is sent once the runtime is usable again', async () => {
+    const loc = locator({ claude: available('claude'), codex: available('codex') });
+    const s = await start(loc.port, 0, { ...(store === ':memory:' && { dbPath: ':memory:' }), supervisor: { idleMs: 1, maxOpen: 0, tickMs: 3_600_000 } });
+    await settle();
+    await s.run({ type: 'agent.save', requestId: rid(), agent: agent(), expectedRevision: null });
+    expect(await s.run(create('claude', 'resume-me'))).toMatchObject({ ok: true });
+    await settle();
+    // The idle supervisor closes the runtime of the idle session.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await s.backend.supervisor.tick();
+    await settle();
+    expect(s.backend.service.openSessions().length).toBe(0);
+    const made = s.adapters.length;
+    const resumed = () => s.adapters.filter((a) => a.calls.includes('resumeSession')).length;
+    const dispatched = () => s.adapters.filter((a) => a.calls.includes('dispatchOnce')).length;
+    const resumedBefore = resumed();
+    const dispatchedBefore = dispatched();
+
+    // The candidate becomes a link to something that is not an .exe; the detection says failed.
+    loc.answers.claude = notExe('claude');
+    expect(await s.run({ type: 'runtime.detect', requestId: rid(), runtime: 'claude' })).toMatchObject({ ok: true });
+    expect((await s.backend.facade.snapshot()).runtimes.find((r) => r.runtime === 'claude')?.state).toBe('failed');
+
+    const session = (await s.backend.facade.snapshot()).sessions.find((x) => x.id === 'resume-me');
+    const send = (messageId: string) =>
+      s.run({ type: 'session.send', requestId: rid(), sessionId: SessionId.parse('resume-me'), messageId: MessageId.parse(messageId), expectedRevision: session?.revision ?? 0, text: 'hello again', attachments: [] });
+    expect(await send('m-1')).toMatchObject({ ok: false, code: 'runtime_unavailable' });
+    // Nothing was made or called: not the factory, not the resume, not the dispatch.
+    expect(s.adapters.length).toBe(made);
+    expect(resumed()).toBe(resumedBefore);
+    expect(dispatched()).toBe(dispatchedBefore);
+    // The message is saved and waits: pending, never claimed and never unknown (CR-2).
+    const { store: deliveries } = s.backend.service.storage;
+    expect((await deliveries.listByState('pending')).filter((d) => d.kind === 'user-message').length).toBe(1);
+    expect((await deliveries.listByState('unknown')).length).toBe(0);
+
+    // Usable again: the same message goes out now.
+    loc.answers.claude = available('claude');
+    expect(await s.run({ type: 'runtime.detect', requestId: rid(), runtime: 'claude' })).toMatchObject({ ok: true });
+    expect(await send('m-1')).toMatchObject({ ok: true });
+    expect(resumed()).toBe(resumedBefore + 1);
+    expect(dispatched()).toBe(dispatchedBefore + 1);
+    expect((await deliveries.listByState('pending')).length).toBe(0);
+    await s.backend.shutdown();
+  });
+
+  it('a runtime that is not available gets no adapter from any door, a model probe included', async () => {
+    const loc = locator({ claude: notExe('claude'), codex: available('codex') });
+    const s = await start(loc.port, 0, store === ':memory:' ? { dbPath: ':memory:' } : {});
+    await settle();
+    expect(s.adapters.map((a) => a.runtime)).not.toContain('claude');
+    await s.run({ type: 'agent.save', requestId: rid(), agent: agent(), expectedRevision: null });
+    expect(await s.run(create('claude', 'never'))).toMatchObject({ ok: false, code: 'runtime_unavailable' });
+    expect(s.adapters.map((a) => a.runtime)).not.toContain('claude');
+    await s.backend.shutdown();
+  });
 });
 
 describe('T045 runtime detection in the backend', () => {

@@ -98,6 +98,14 @@ export interface Backend {
   shutdown(): Promise<void>;
 }
 
+/** A runtime was asked to start while its last detection says it cannot be used (fixed text: nothing of the runtime's output). */
+export class RuntimeUnavailableError extends Error {
+  constructor(readonly runtime: Runtime) {
+    super(`${runtime} is not available on this computer`);
+    this.name = 'RuntimeUnavailableError';
+  }
+}
+
 /** The database cannot be opened or holds damaged records: nothing runs, the user is told (fail closed). */
 export interface DamagedBackend {
   status: 'damaged';
@@ -260,7 +268,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   };
   // A new adapter for every opening of a session, Claude included (T036 r2 P1-1): the late end of an earlier opening
   // (its stream ending, its exit) then comes from an adapter that no longer serves the session, and is told apart.
-  const createAdapter: AdapterFactory =
+  const makeAdapter: AdapterFactory =
     options.createAdapter ??
     ((runtime, sessionId, hooks) => {
       if (runtime === 'claude') {
@@ -283,7 +291,15 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         log: adapterLog('codex'),
       });
     });
-  const hooks = { onPermissionRequest: (handle: PermissionHandle) => (ref.service === undefined ? Promise.reject(new Error('not ready')) : ref.service.onPermissionRequest(handle)) };
+  // The one door every start of a runtime goes through (create, resume, delivery recovery, transfer, workflow, model
+  // probe): a runtime whose last detection is not `available` gets no adapter, so a path that was only shown (a link
+  // to something that is not an .exe, an old version, a signed-out runtime) is never started (T045 review r3). The
+  // callers see a failure before any runtime is called: a delivery stays pending, never claimed and never unknown.
+  const createAdapter: AdapterFactory = (runtime, sessionId, hooks) => {
+    if (options.runtimes !== undefined && !isRuntimeAvailable(runtime)) throw new RuntimeUnavailableError(runtime);
+    return makeAdapter(runtime, sessionId, hooks);
+  };
+  const hooks ={ onPermissionRequest: (handle: PermissionHandle) => (ref.service === undefined ? Promise.reject(new Error('not ready')) : ref.service.onPermissionRequest(handle)) };
   // T035: the Claude adapter the model probe ran on (its own since T036; an injected factory may still share one). The
   // exit closes it even when no Claude session ever ran, so a probe's claude.exe is ended and its temp folder removed
   // before the GUI goes.

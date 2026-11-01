@@ -72,6 +72,7 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 - 安裝檔約 110 MB（T045 之前內建 claude.exe 時 218 MB）。
 - **Claude Code 與 Codex 都要使用者自己安裝並登入**，app 不安裝、不下載、不代為登入。Claude Code 要 ≥ 2.1.309、Codex 要 ≥ 0.160.0；太舊時該 runtime 不可用，並提示要更新到的版本。
 - 從開始功能表啟動時看到的是使用者的 `PATH`，所以剛安裝完要到「設定 → Runtime」按「重新偵測」；建立或 resume session 前，若該 runtime 目前不可用也會自動重新偵測一次（不定時輪詢）。剛改過的 `PATH` 只有重開 app（必要時重新登入 Windows）才看得到。
+- runtime 變得不可用（解除安裝、版本太舊、未登入、檔案不是 `.exe`）之後，已存在的 session 要重新啟動它時，app 在建立 adapter 之前就拒絕：`session.send` 回 `runtime_unavailable`，訊息已儲存並維持待送（不會進入送出中或結果未知），runtime 恢復可用、按「重新偵測」後再送同一則訊息即可。
 - 不可用的 runtime 的模型不會出現在 Model 下拉選單，選單旁邊會說明原因。登入狀態讀不懂時記為「不明」，不擋使用。
 - Claude 桌面版附帶的 CLI 放在帶版本號的資料夾（`%APPDATA%\Claude\claude-code\<版本>\` 或 Microsoft Store 版的 `%LOCALAPPDATA%\Claude-Data\<套件資料夾>\claude-code\<版本>\<hash>\`），app 用列目錄找、取最新版本；這個資料夾結構是 Claude 桌面版的內部實作，將來改動時只會找不到，不會壞掉（仍可用 `AWG_CLAUDE_PATH` 指定）。
 - 啟動後 Claude 的模型清單約 8 秒才出現（Codex 約 3 秒），這段時間模型選單只有 Codex 的選項。
