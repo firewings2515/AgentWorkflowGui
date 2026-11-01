@@ -1,3 +1,4 @@
+import { readOnlyProps } from './read-only';
 import type { LogicalSession, NativeTask, SessionId, Snapshot, WorkflowInstance } from '../../../contracts';
 import { detailPanels } from './workbench-state';
 import type { DetailTab } from './workbench-state';
@@ -53,7 +54,7 @@ function NativeTasks({ snapshot, session, onNotice, store }: Pick<DetailProps, '
           {snapshot.messages.filter(message => message.sessionId === session.id && message.nativeTaskId === task.id).map(message => <p key={message.id}>{message.text}</p>)}
           {snapshot.items.filter(item => item.sessionId === session.id && item.nativeTaskId === task.id).map(item => <p key={item.id}>{item.kind === 'command' ? item.command : item.kind === 'toolCall' ? `${item.tool} · ${item.summary}` : item.changes.map(change => change.path).join('、')} · {item.state}</p>)}
         </details>
-        {task.state === 'running' && <button className="danger-button" disabled={store?.isBlocked('nativeTask.stop', `nativeTask:${JSON.stringify([session.id, task.id])}`)} onClick={() => {
+        {task.state === 'running' && <button className="danger-button" {...readOnlyProps(snapshot.app.status === 'read-only')} disabled={snapshot.app.status !== 'ready' || store?.isBlocked('nativeTask.stop', `nativeTask:${JSON.stringify([session.id, task.id])}`)} onClick={() => {
           if (store) void store.send({ type: 'nativeTask.stop', requestId: RequestId.parse(crypto.randomUUID()), sessionId: session.id, nativeTaskId: task.id });
           else onNotice(`示意操作：停止「${task.label}」（${session.title}）。尚未連接 runtime，未送出停止指令。`);
         }}>停止這個子 agent</button>}

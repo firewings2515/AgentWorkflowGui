@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from 'react';
+import { readOnlyProps } from './read-only';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from 'react';
 import type { AgentId, SessionId, Snapshot } from '../../../contracts';
-import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
+import { fixtureReadOnlySnapshot, fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
 import { SessionTree } from './SessionTree';
 import { SessionWorkspace } from './SessionWorkspace';
 import type { Selection } from './SessionWorkspace';
@@ -17,7 +18,10 @@ import { createWorkflowDemo } from './workflow-demo';
 import { RequestId } from '../../../contracts';
 import { createIpcAgentRepository } from './agent-repository';
 import { createIpcWorkflowRepository } from './workflow-repository';
-import { rendererStore } from './renderer-store';
+import { createRendererStore, rendererStore } from './renderer-store';
+import { createStorageDemo } from './query-bridge';
+import { BackupDialog, SettingsDialog, StorageBanner } from './StorageSettings';
+import { performanceSnapshot } from './performance-demo';
 import type { RendererStore, RendererState } from './renderer-store';
 import { ConnectionStatus } from './ConnectionStatus';
 import { WorkflowStart } from './WorkflowStart';
@@ -51,7 +55,15 @@ const currentRoute = () => window.location.hash.slice(1) || '/workbench';
 const focusView = (viewId: string) => requestAnimationFrame(() => document.getElementById(`${viewId}-heading`)?.focus());
 
 export function App({ snapshot }: { snapshot?: Snapshot }) {
-  return window.awg ? <ConnectedApp store={rendererStore(window.awg)} /> : <AppContent snapshot={snapshot ?? fixtureSnapshot} />;
+  const demo = new URLSearchParams(window.location.search).get('demo');
+  return window.awg ? <ConnectedApp store={rendererStore(window.awg)} /> : <DemoApp snapshot={snapshot ?? (demo === 'long' ? performanceSnapshot() : demo === 'read-only' ? fixtureReadOnlySnapshot : fixtureSnapshot)} />;
+}
+
+function DemoApp({ snapshot }: { snapshot: Snapshot }) {
+  const serviceStore = useMemo(() => createRendererStore(createStorageDemo(snapshot)), [snapshot]);
+  const state = useSyncExternalStore(serviceStore.subscribe, serviceStore.getSnapshot);
+  useEffect(() => { void serviceStore.start(); return () => serviceStore.dispose(); }, [serviceStore]);
+  return <AppContent snapshot={state.snapshot ?? snapshot} serviceStore={serviceStore} />;
 }
 
 function ConnectedApp({ store }: { store: RendererStore }) {
@@ -63,10 +75,10 @@ function ConnectedApp({ store }: { store: RendererStore }) {
     return () => { window.removeEventListener('online', reconnect); store.dispose(); };
   }, [store]);
   if (!state.snapshot) return <div className="connection-screen"><h1>{APP_NAME}</h1><ConnectionStatus state={state} store={store} /></div>;
-  return <AppContent snapshot={state.snapshot} store={store} ipcState={state} />;
+  return <AppContent snapshot={state.snapshot} store={store} serviceStore={store} ipcState={state} />;
 }
 
-function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?: RendererStore; ipcState?: RendererState }) {
+function AppContent({ snapshot, store, serviceStore, ipcState }: { snapshot: Snapshot; store?: RendererStore; serviceStore: RendererStore; ipcState?: RendererState }) {
   const [{ repository: workflowRepository, controls: workflowDemo }] = useState(() => store
     ? { repository: createIpcWorkflowRepository(store), controls: undefined } : createWorkflowDemo(snapshot.workflows));
   const [{ repository: agentRepository, controls: agentDemo }] = useState(() => store
@@ -75,10 +87,13 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
   const agentOptions = useSyncExternalStore(agentRepository.subscribe, agentRepository.getSnapshot);
   const [workspace, dispatch] = useReducer(workspaceReducer, snapshot.sessions, initialWorkspace);
   const [route, setRoute] = useState(currentRoute);
-  const [demoTheme, setTheme] = useState<Theme>(() => readTheme(snapshot.preferences.theme));
-  const theme = store ? snapshot.preferences.theme : demoTheme;
+  const [demoTheme, setTheme] = useState<Theme>();
+  const readOnly = snapshot.app.status === 'read-only';
+  const theme = store && !readOnly ? snapshot.preferences.theme : demoTheme ?? readTheme(snapshot.preferences.theme);
   const narrow = useSyncExternalStore(subscribeWidth, isNarrow);
   const [notice, setNotice] = useState('');
+  const [settings, setSettings] = useState(false);
+  const [backups, setBackups] = useState(false);
   const [selections, setSelections] = useState<Record<string, Selection>>({});
   const [transfer, setTransfer] = useState<TransferPreview | null>(null);
   const [createDraft, setCreateDraft] = useState<SessionCreateDraft>({ agentId: '', modelKey: '', cwd: '', parentId: '' });
@@ -142,8 +157,8 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
       view?.querySelector<HTMLElement>(transfer?.model ? 'select[aria-label="Model"]' : '[data-transfer-trigger]')?.focus();
     });
   };
-  const commandDisabled = snapshot.app.status === 'damaged' || (!!store && ipcState?.connection !== 'ready');
-  const themeDisabled = commandDisabled || !!store?.isBlocked('preferences.set', 'preferences');
+  const commandDisabled = snapshot.app.status !== 'ready' || (!!store && ipcState?.connection !== 'ready');
+  const themeDisabled = !readOnly && (commandDisabled || !!store?.isBlocked('preferences.set', 'preferences'));
   const tabDisabled = workspace.views.length >= 2 || snapshot.sessions.length === 0;
   const addTab = () => {
     if (tabDisabled) return;
@@ -159,11 +174,12 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
   };
   const changeTheme = (next: Theme) => {
     if (themeDisabled || next === theme) return;
-    if (store) void store.send({ type: 'preferences.set', requestId: RequestId.parse(crypto.randomUUID()), preferences: { ...snapshot.preferences, theme: next } });
+    if (store && !readOnly) void store.send({ type: 'preferences.set', requestId: RequestId.parse(crypto.randomUUID()), preferences: { ...snapshot.preferences, theme: next } });
     else setTheme(next);
   };
   const header = <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true">≋</span>
-    <AppMenu theme={theme} commandDisabled={commandDisabled} themeDisabled={themeDisabled} tabDisabled={tabDisabled} reloadDisabled={!store || ipcState?.connection === 'loading'}
+    <AppMenu readOnly={readOnly} theme={theme} commandDisabled={commandDisabled} themeDisabled={themeDisabled} tabDisabled={tabDisabled} reloadDisabled={!store || ipcState?.connection === 'loading'}
+      onBackups={() => setBackups(true)} onSettings={() => setSettings(true)}
       onCreate={createSession} onWorkflow={() => { if (!commandDisabled) navigate('/workflows/start'); }} onTab={addTab}
       onNavigate={page => navigate(routes[page] ?? '/workbench')} onTheme={changeTheme} onReload={() => void store?.reconnect()} />
     <strong>{APP_NAME}</strong>{!store && <span className="demo-badge">示意資料 · 示意模式</span>}</div>
@@ -185,10 +201,11 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
 
   return <div className="app-shell">
     {header}
+    <StorageBanner snapshot={snapshot} store={serviceStore} onBackups={() => setBackups(true)} />
     <nav className="app-nav" aria-label="主要導覽">{pageRegistry.filter(entry => entry.navigation).map(entry => <a key={entry.id} href={`#${routes[entry.id]}`} aria-current={page?.id === entry.id ? 'page' : undefined} onClick={event => { event.preventDefault(); navigate(routes[entry.id] ?? '/workbench'); }}>{entry.title}</a>)}<span className="nav-note">{store ? '資料來自應用程式服務' : '以契約假資料預覽工作台'}</span></nav>
     <div className="page-toolbar"><h1 ref={pageHeading} tabIndex={-1}>{page?.title ?? '找不到頁面'}</h1>
-      {workbenchVisible && <button disabled={commandDisabled} onClick={createSession}>新增 session</button>}
-      {(workbenchVisible || page?.id === 'workflow') && <button disabled={commandDisabled} onClick={() => navigate('/workflows/start')}>啟動 Workflow</button>}
+      {workbenchVisible && <button {...readOnlyProps(readOnly)} disabled={commandDisabled} onClick={createSession}>新增 session</button>}
+      {(workbenchVisible || page?.id === 'workflow') && <button {...readOnlyProps(readOnly)} disabled={commandDisabled} onClick={() => navigate('/workflows/start')}>啟動 Workflow</button>}
       {workbenchVisible && <button className="primary" disabled={tabDisabled} title={workspace.views.length >= 2 ? '此階段提供兩組工作區' : '開啟第二組並排工作區'} onClick={addTab}>＋ 新增 tab</button>}
     </div>
     <main className="page-content">
@@ -197,7 +214,7 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
         <div className="workspace-area">
           {workspace.views.length > 1 && <div className="workspace-switcher" aria-label="可見工作區">{workspace.views.map(view => <button key={view.id} aria-pressed={view.id === workspace.activeViewId} onClick={() => { dispatch({ type: 'focus', viewId: view.id }); focusView(view.id); }}>{snapshot.sessions.find(session => session.id === view.sessionId)?.title ?? view.sessionId}</button>)}</div>}
           {workspace.views.length === 0 && <div className="empty-workbench"><h2>開啟一段對話</h2><p>從左側選取 session，恢復工作區。</p><p className="muted">Sessions 仍保留在清單中。</p></div>}
-          <div className={`workspace-grid ${workspace.views.length > 1 ? 'split' : ''}`}>{workspace.views.map(view => <SessionWorkspace key={view.id} snapshot={snapshot} store={store} ipcState={ipcState} agentOptions={agentOptions} view={view} active={view.id === workspace.activeViewId} visible={workbenchVisible && (!narrow || view.id === workspace.activeViewId)} selection={selections[view.sessionId]}
+          <div className={`workspace-grid ${workspace.views.length > 1 ? 'split' : ''}`}>{workspace.views.map(view => <SessionWorkspace key={view.id} snapshot={snapshot} historyStore={serviceStore} store={store} ipcState={ipcState} agentOptions={agentOptions} view={view} active={view.id === workspace.activeViewId} visible={workbenchVisible && (!narrow || view.id === workspace.activeViewId)} selection={selections[view.sessionId]}
             onFocus={() => { if (view.id !== workspace.activeViewId) dispatch({ type: 'focus', viewId: view.id }); }}
             onClose={() => {
               dispatch({ type: 'close', viewId: view.id });
@@ -223,8 +240,8 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
             onProgress={instanceId => { returnAnchor.current = { viewId: view.id, sessionId: view.sessionId }; navigate(`/workflow-instances/${encodeURIComponent(instanceId)}`); }} onNotice={setNotice} />)}</div>
         </div>
       </div>
-      <AgentCatalog repository={agentRepository} demo={agentDemo} selectedId={page?.id === 'agents' ? entityId : ''} visible={page?.id === 'agents'} onSelect={id => navigate(id ? `/agents/${encodeURIComponent(id)}` : '/agents')} />
-      <WorkflowEditor repository={workflowRepository} demo={workflowDemo} agents={agentOptions} models={snapshot.modelOptions} selectedId={page?.id === 'workflow' ? entityId : ''} visible={page?.id === 'workflow'} onSelect={id => navigate(`/workflows/${encodeURIComponent(id)}/edit`)} />
+      <AgentCatalog readOnly={snapshot.app.status === 'read-only'} repository={agentRepository} demo={agentDemo} selectedId={page?.id === 'agents' ? entityId : ''} visible={page?.id === 'agents'} onSelect={id => navigate(id ? `/agents/${encodeURIComponent(id)}` : '/agents')} />
+      <WorkflowEditor readOnly={snapshot.app.status === 'read-only'} repository={workflowRepository} demo={workflowDemo} agents={agentOptions} models={snapshot.modelOptions} selectedId={page?.id === 'workflow' ? entityId : ''} visible={page?.id === 'workflow'} onSelect={id => navigate(`/workflows/${encodeURIComponent(id)}/edit`)} />
       {page?.id === 'start' && <WorkflowStart snapshot={snapshot} store={store} ipcState={ipcState} onOpen={id => { navigate('/workbench'); openSession(id); }} />}
       {page?.id === 'create' && <SessionCreate snapshot={snapshot} store={store} ipcState={ipcState} draft={createDraft} onDraft={setCreateDraft} onOpen={id => { setCreateDraft({ agentId: '', modelKey: '', cwd: '', parentId: '' }); navigate('/workbench'); openSession(id); }} />}
       {page?.id === 'progress' && <WorkflowProgress snapshot={snapshot} instanceId={entityId} store={store} ipcState={ipcState} onOpen={openProgressSession} onBack={() => {
@@ -238,5 +255,7 @@ function AppContent({ snapshot, store, ipcState }: { snapshot: Snapshot; store?:
     <footer className="app-footer">{store && ipcState ? <ConnectionStatus store={store} state={ipcState} /> : <span>示意資料 · 示意模式 · 未連接 runtime</span>}<span>{workspace.views.length} 組工作區</span></footer>
     {notice && <div className="notice" role="status"><span>{notice}</span><button aria-label="關閉提示" onClick={() => setNotice('')}>×</button></div>}
     {transfer && <TransferDialog key={`${transfer.sessionId}:${transfer.viewId}`} snapshot={snapshot} preview={transfer} store={store} ipcState={ipcState} onClose={closeTransfer} onOpen={id => { openSession(id, transfer.viewId); closeTransfer(); }} />}
+    {settings && <SettingsDialog store={serviceStore} demo={!store} onClose={() => setSettings(false)} />}
+    {backups && <BackupDialog store={serviceStore} demo={!store} onClose={() => setBackups(false)} />}
   </div>;
 }

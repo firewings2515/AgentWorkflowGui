@@ -40,7 +40,7 @@ export function observedModelText(session: LogicalSession): string {
 }
 export function Empty({ children }: { children: ReactNode }) { return <p className="empty-note">{children}</p>; }
 
-export interface MenuAction { label: string; hint?: string; group?: string; checked?: boolean; disabled?: boolean; onSelect: () => void }
+export interface MenuAction { title?: string; 'aria-describedby'?: string; label: string; hint?: string; group?: string; checked?: boolean; disabled?: boolean; onSelect: () => void }
 export function Menu({ label, children, actions, shortcut = false, className = '' }: {
   label: string; children: ReactNode; actions: MenuAction[]; shortcut?: boolean; className?: string;
 }) {
@@ -64,7 +64,7 @@ export function Menu({ label, children, actions, shortcut = false, className = '
   useEffect(() => {
     if (!shortcut) return;
     const handler = (event: KeyboardEvent) => {
-      if (event.ctrlKey && event.key.toLowerCase() === 'u' && root.current?.closest('[data-workspace]')?.contains(document.activeElement)) {
+      if (!event.isComposing && !event.repeat && !event.altKey && !event.metaKey && event.ctrlKey && (event.code === 'KeyU' || (!event.code && event.key.toLowerCase() === 'u')) && root.current?.closest('[data-workspace]')?.contains(document.activeElement)) {
         event.preventDefault();
         if (!actions[0]?.disabled) actions[0]?.onSelect();
         setOpen(false);
@@ -88,7 +88,7 @@ export function Menu({ label, children, actions, shortcut = false, className = '
       if (next >= 0) { event.preventDefault(); buttons[next]?.focus(); }
     }}>{actions.map((action, index) => <div key={action.label} role="none">
       {action.group && action.group !== actions[index - 1]?.group && <div className="menu-group" role="presentation">{action.group}</div>}
-      <button type="button" role={action.checked === undefined ? 'menuitem' : 'menuitemradio'} aria-checked={action.checked} aria-label={action.hint ? `${action.label} ${action.hint}` : action.label} aria-keyshortcuts={action.hint?.replace('Ctrl+', 'Control+')} disabled={action.disabled} onClick={() => {
+      <button type="button" role={action.checked === undefined ? 'menuitem' : 'menuitemradio'} aria-checked={action.checked} aria-label={action.hint ? `${action.label} ${action.hint}` : action.label} aria-keyshortcuts={action.hint?.replace('Ctrl+', 'Control+')} title={action.title} aria-describedby={action['aria-describedby']} disabled={action.disabled} onClick={() => {
       setOpen(false); trigger.current?.focus(); action.onSelect();
     }}><span>{action.label}</span>{action.checked && <span aria-hidden="true">✓</span>}{action.hint && <kbd>{action.hint}</kbd>}</button></div>)}</div>}
   </div>;

@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, within } from '@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App, APP_NAME, THEME_KEY } from './App';
 import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
+import { transcriptGeometry } from './transcript-test-geometry';
 
 const pane = (id = 'view-1') => within(screen.getByRole('region', { name: `工作區 ${id}` }));
 const selectSession = (title: string) => fireEvent.click(within(screen.getByRole('complementary', { name: 'Session 清單' })).getByRole('button', { name: title }));
@@ -107,6 +108,7 @@ describe('T004 工作台外殼', () => {
   });
 
   it('preserves session draft and scroll across selection and page navigation', () => {
+    transcriptGeometry().geometry.height = 100;
     render(<App />);
     fireEvent.change(draft(), { target: { value: '保留草稿' } });
     fireEvent.scroll(pane().getByLabelText('規劃想法 對話'), { target: { scrollTop: 125 } });
@@ -126,6 +128,7 @@ describe('T004 工作台外殼', () => {
   });
 
   it('restores scroll after a hidden page resets DOM position without overwriting saved state', () => {
+    transcriptGeometry().geometry.height = 100;
     render(<App />);
     const transcript = pane().getByLabelText('規劃想法 對話');
     fireEvent.scroll(transcript, { target: { scrollTop: 145 } });
@@ -137,6 +140,7 @@ describe('T004 工作台外殼', () => {
   });
 
   it('switches narrow workspaces independently and restores scroll on switching and widening', () => {
+    transcriptGeometry().geometry.height = 100;
     let narrow = true;
     const query = new EventTarget();
     Object.defineProperty(query, 'matches', { get: () => narrow });

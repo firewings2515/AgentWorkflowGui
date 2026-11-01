@@ -1,3 +1,4 @@
+import { readOnlyProps } from './read-only';
 import { useEffect, useRef, useState } from 'react';
 import { RequestId, SessionId } from '../../../contracts';
 import type { Command, CommandResult, Snapshot } from '../../../contracts';
@@ -23,7 +24,7 @@ export function SessionCreate({ snapshot, store, ipcState, draft, onDraft, onOpe
   const agent = snapshot.agents.find(item => item.id === agentId);
   const model = snapshot.modelOptions.find(item => !item.hidden && `${item.runtime}:${item.model}` === modelKey);
   const parent = snapshot.sessions.find(item => item.id === parentId);
-  const disabled = !store || ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || !!unresolved || !!result?.ok || !!confirmed || !!(result && blocksResubmit(result));
+  const disabled = !store || ipcState?.connection !== 'ready' || snapshot.app.status !== 'ready' || !!unresolved || !!result?.ok || !!confirmed || !!(result && blocksResubmit(result));
   // A create receipt alone is not a usable session. Wait for the authoritative read/revision.
   useEffect(() => {
     if ((!result?.ok && unresolved?.createCheck !== 'found') || !confirmed || ipcState?.connection !== 'ready' || opened.current === confirmed.id) return;
@@ -47,7 +48,7 @@ export function SessionCreate({ snapshot, store, ipcState, draft, onDraft, onOpe
       pending.current = true;
       void store.send(command).then(result => { setReceipt({ command, result }); pending.current = false; });
     }}>
-      <fieldset disabled={disabled}>
+      <fieldset {...readOnlyProps(snapshot.app.status === 'read-only')} disabled={disabled}>
         <legend>Session 設定</legend>
         <label>Agent<select required value={agentId} onChange={event => onDraft({ ...draft, agentId: event.target.value })}>
           <option value="">選擇 Agent</option>
@@ -66,7 +67,7 @@ export function SessionCreate({ snapshot, store, ipcState, draft, onDraft, onOpe
           {parentId && !parent && <option value={parentId}>上層 session 已不存在</option>}
           {snapshot.sessions.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}
         </select></label>
-        <button className="primary" type="submit" disabled={!agent || !model || !cwd.trim() || (!!parentId && !parent)}>建立 session</button>
+        <button {...readOnlyProps(snapshot.app.status === 'read-only')} className="primary" type="submit" disabled={!agent || !model || !cwd.trim() || (!!parentId && !parent)}>建立 session</button>
       </fieldset>
     </form>
     {attempt && <p className="mono">本次 session：{attempt.sessionId}</p>}

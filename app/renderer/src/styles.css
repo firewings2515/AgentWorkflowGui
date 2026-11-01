@@ -202,7 +202,7 @@ p { line-height: 1.7; }
 .workspace-body.details-hidden { grid-template-columns: minmax(0, 1fr); }
 .chat-panel { min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: auto; }
 /* Preserve a readable transcript viewport; the panel scrolls to the composer when short. */
-.transcript-frame { min-height: 160px; flex: 1 0 160px; display: flex; flex-direction: column; }
+.transcript-frame { position: relative; min-height: 160px; flex: 1 0 160px; display: flex; flex-direction: column; }
 .transcript { flex: 1; overflow: auto; padding: 24px clamp(16px, 3vw, 46px); min-height: 0; }
 .transcript-heading { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; margin-bottom: 26px; }
 .message { background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 18px; max-width: 92%; overflow-wrap: anywhere; }
@@ -281,7 +281,7 @@ dd { margin: 0; }
 .empty-workbench { display: grid; align-content: center; justify-items: center; height: 100%; padding: 30px; text-align: center; }
 .empty-workbench + .workspace-grid { flex: 0; }
 .workspace-switcher { display: none; }
-dialog { max-width: min(520px, calc(100vw - 32px)); padding: 28px; border: 1px solid var(--line); border-radius: 12px; color: var(--text); background: var(--surface); box-shadow: 0 20px 80px var(--shadow); }
+dialog { max-width: min(520px, calc(100vw - 32px)); max-height: calc(100dvh - 24px); overflow: auto; overflow-wrap: anywhere; padding: 28px; border: 1px solid var(--line); border-radius: 12px; color: var(--text); background: var(--surface); box-shadow: 0 20px 80px var(--shadow); }
 dialog::backdrop { background: var(--backdrop); }
 dialog h2 { margin: 12px 0 20px; }
 .transfer-route { padding: 16px; background: var(--raised); border-radius: 7px; margin-bottom: 16px; }
@@ -381,4 +381,58 @@ dialog h2 { margin: 12px 0 20px; }
   .app-header { min-height: 52px; }
   .app-nav { margin-bottom: 8px; }
   .transcript { padding-top: 12px; }
+}
+
+.transcript { overflow-anchor: none; }
+.virtual-message-row { display: flow-root; }
+.history-control { font-size: 12px; color: var(--muted); margin-bottom: 14px; }
+.storage-banner { flex-shrink: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 12px; border: 1px solid var(--warning); background: var(--panel); font-size: 12px; overflow-wrap: anywhere; }
+.storage-status { position: sticky; top: 0; z-index: 15; flex-shrink: 0; max-height: min(120px, 25dvh); overflow: auto; }
+.storage-banner code { word-break: break-all; }
+.jump-latest { position: absolute; bottom: 8px; right: 18px; z-index: 2; box-shadow: 0 2px 8px var(--shadow); }
+.storage-summary { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap; padding: 4px 10px; }
+.storage-summary > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.storage-summary button { flex-shrink: 0; padding: 3px 8px; }
+.storage-details { padding: 8px 12px; font-size: 12px; overflow-wrap: anywhere; }
+.storage-details code { word-break: break-all; }
+.settings-dialog { width: min(680px, calc(100vw - 24px)); max-width: calc(100vw - 24px); }
+.settings-dialog > header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.settings-dialog form label { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 16px 0; }
+.settings-dialog input { padding: 8px; max-width: 100%; width: 120px; }
+.backup-list { list-style: none; padding: 0; }
+.backup-list li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); padding: 14px 0; }
+.backup-list p { margin: 6px 0; }
+.session-toolbar, .page-toolbar, .app-footer, .workspace-switcher { flex-wrap: wrap; }
+.page-toolbar { gap: 8px; }
+.page-toolbar h1 { margin-right: auto; }
+.app-shell > header, .app-nav, .page-toolbar, .app-footer { flex-shrink: 0; }
+@media (max-width: 1100px) and (max-height: 800px) {
+  .composer, .split .composer { padding: 6px 10px; }
+  .composer textarea { min-height: 40px; max-height: 90px; }
+  .selectors { gap: 6px; }
+  .selectors label { gap: 2px; }
+  .workspace-header { padding: 8px 12px 5px; }
+  .session-toolbar { padding: 0 12px 6px; }
+  .transcript { padding: 12px 16px; }
+}
+/* At 200% zoom the effective viewport can be 512×384. Let the document
+   scroll and stack panels, so no controls are trapped beneath a fixed height. */
+@media (max-width: 700px) {
+  .workspace-body, .split .workspace-body { display: flex; flex-direction: column; overflow: auto; }
+  .detail-panel { position: static; width: 100%; min-height: 240px; flex-shrink: 0; box-shadow: none; }
+  .chat-panel { flex: 1 0 auto; overflow: visible; }
+  .transcript-frame { flex: 0 0 clamp(160px, 42dvh, 420px); height: clamp(160px, 42dvh, 420px); }
+  .transcript { height: 100%; flex: 1 1 0; }
+  .detail-content { overflow: visible; }
+  .brand { flex-wrap: wrap; min-width: 0; }
+  .app-header { gap: 6px; }
+  .page-content { min-height: 480px; flex-shrink: 0; }
+  .workbench { min-height: 480px; }
+  .app-shell { height: auto; min-height: 100dvh; }
+  .app-nav { flex-wrap: wrap; }
+  .settings-dialog { padding: 14px; }
+}
+@media (max-height: 500px) {
+  .app-shell { height: auto; min-height: 100dvh; }
+  .page-content { flex: none; height: 560px; }
 }

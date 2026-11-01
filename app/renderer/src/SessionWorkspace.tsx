@@ -1,21 +1,24 @@
-import { useLayoutEffect, useRef } from 'react';
+import { readOnlyProps } from './read-only';
+import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import type { AgentDefinition, AgentId, LogicalSession, ModelOption, ModelSelection, SessionId, Snapshot } from '../../../contracts';
 import type { SessionViewContext, WorkspaceView } from './workbench-state';
 import { contextFor } from './workbench-state';
 import { DetailPanel } from './DetailPanel';
-import { Empty, formatTime, Menu, observedModelText, Status } from './ui';
+import { Empty, Menu, observedModelText, Status } from './ui';
 import { MessageId, RequestId } from '../../../contracts';
 import { commandFeedback } from './command-feedback';
 import type { RendererStore, RendererState } from './renderer-store';
 import { sessionBlocksSend, sessionCanInterrupt } from './renderer-store';
 import { EscalationPanel, openEscalations } from './EscalationPanel';
 import { LockWaits } from './LockWaits';
+import { VirtualMessages } from './VirtualMessages';
 
 export interface Selection { agentId: AgentId; model: ModelSelection }
 export interface WorkspaceProps {
   snapshot: Snapshot;
   store?: RendererStore | undefined;
+  historyStore?: RendererStore | undefined;
   ipcState?: RendererState | undefined;
   agentOptions: readonly AgentDefinition[];
   view: WorkspaceView;
@@ -33,17 +36,23 @@ export interface WorkspaceProps {
   onNotice: (message: string) => void;
 }
 
-function Transcript({ snapshot, session, view, visible, onContext, store, ipcState, pendingPanel }: Pick<WorkspaceProps, 'snapshot' | 'view' | 'visible' | 'onContext' | 'store' | 'ipcState'> & { session: LogicalSession; pendingPanel: RefObject<HTMLDetailsElement | null> }) {
+function Transcript({ snapshot, session, view, visible, onContext, store, ipcState, historyStore, pendingPanel }: Pick<WorkspaceProps, 'snapshot' | 'view' | 'visible' | 'onContext' | 'store' | 'ipcState' | 'historyStore'> & { session: LogicalSession; pendingPanel: RefObject<HTMLDetailsElement | null> }) {
   const scroll = useRef<HTMLDivElement>(null);
   const context = contextFor(view);
-  // display:none can reset DOM scrollTop; restore when the page/pane reappears.
-  useLayoutEffect(() => {
-    if (visible && scroll.current) scroll.current.scrollTop = context.scrollTop;
-  }, [session.id, context.scrollTop, visible]);
-  const messages = snapshot.messages.filter(message => message.sessionId === session.id && !message.nativeTaskId);
-  return <div className="transcript" ref={scroll} aria-label={`${session.title} 對話`} onScroll={event => {
-    if (visible) onContext({ scrollTop: event.currentTarget.scrollTop });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const pending = useRef(false);
+  const cursor = snapshot.historyPages.find(info => info.sessionId === session.id)?.olderCursor;
+  const load = () => {
+    if (!cursor || pending.current || !historyStore) return;
+    pending.current = true; setLoading(true); setError('');
+    void historyStore.loadHistory(session.id).catch((error: unknown) => setError(error instanceof Error ? error.message : '載入歷史失敗。')).finally(() => { pending.current = false; setLoading(false); });
+  };
+  const messages = useMemo(() => snapshot.messages.filter(message => message.sessionId === session.id && !message.nativeTaskId), [snapshot.messages, session.id]);
+  return <div className="transcript" ref={scroll} role="region" tabIndex={0} aria-label={`${session.title} 對話`} onScroll={event => {
+    if (visible && event.currentTarget.scrollTop <= 48 && !error) load();
   }}>
+    <div className="transcript-top">
     <div className="transcript-heading"><span>對話紀錄</span><span>{store ? '目前快照' : '示意快照'}</span></div>
     <LockWaits snapshot={snapshot} sessionId={session.id} />
     {openEscalations(snapshot, session.id).length > 0 && <details className="pending-panel" id={`${view.id}-pending`} ref={pendingPanel} key={session.id}>
@@ -51,16 +60,12 @@ function Transcript({ snapshot, session, view, visible, onContext, store, ipcSta
       <div className="pending-panel-scroll"><EscalationPanel snapshot={snapshot} sessionId={session.id} store={store} ipcState={ipcState} /></div>
     </details>}
     {messages.length === 0 && <Empty>這個 session 尚無主對話訊息。</Empty>}
-    {messages.map(message => <article className={`message message-${message.role} origin-${message.origin.kind}`} key={message.id}>
-      <div className="message-meta"><strong>{message.origin.kind === 'peer' || message.origin.kind === 'handoff' || message.origin.kind === 'transfer'
-        ? `${message.origin.kind === 'transfer' ? '轉交自' : '來自'} ${snapshot.sessions.find(source => 'fromSessionId' in message.origin && source.id === message.origin.fromSessionId)?.title ?? message.origin.fromSessionId}`
-        : message.role === 'user' ? '你' : message.role === 'system' ? '系統' : 'Agent'}
-      </strong><time dateTime={message.createdAt}>{formatTime(message.createdAt)}</time></div>
-      <p>{message.text}</p>
-      {message.observedModel && session.requestedModel.runtime === 'claude' && <small className="muted">訊息回報 · {message.observedModel}</small>}
-      {message.attachments.length > 0 && <div className="attachment-chips">{message.attachments.map(attachment => <span key={`${attachment.kind}:${attachment.path}`}>{attachment.name}</span>)}</div>}
-    </article>)}
+    <div className="history-control">{cursor ? <button disabled={loading || !historyStore} onClick={load}>{loading ? '正在載入更早的對話…' : '載入更早的對話'}</button> : <span>已到最早</span>}{error && <p role="alert">{error} <button onClick={load}>重試</button></p>}</div>
+    </div>
+    <VirtualMessages messages={messages} sessions={snapshot.sessions} runtime={session.requestedModel.runtime} scroll={scroll} visible={visible} initialPosition={context.reading} onPosition={(reading, scrollTop) => onContext({ reading, scrollTop })} />
+    <div className="transcript-tail">
     {Object.values(ipcState?.messageStreams ?? {}).filter(stream => stream.sessionId === session.id && !stream.nativeTaskId).map(stream => <article className="message" key={stream.messageId}><small>接收中 · 訊息尚未完整</small><p>{stream.delta}</p></article>)}
+    </div>
   </div>;
 }
 
@@ -78,7 +83,8 @@ export function SessionWorkspace(props: WorkspaceProps) {
   const activeTurn = sessionBlocksSend(snapshot, session.id);
   const canInterrupt = sessionCanInterrupt(snapshot, session.id);
   const creating = Object.values(props.ipcState?.blockedCommands ?? {}).some(item => item.command.type === 'session.create' && item.command.sessionId === session.id && !item.result);
-  const blocked = !!props.store && (props.ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || props.store.isBlocked('session.send', `session:${session.id}`) || creating);
+  const readOnly = snapshot.app.status === 'read-only';
+  const blocked = readOnly || !!props.store && (props.ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || props.store.isBlocked('session.send', `session:${session.id}`) || creating);
   const interruptBlocked = props.store?.isBlocked('session.interrupt', `session:${session.id}`) ?? false;
   const interrupt = Object.values(props.ipcState?.blockedCommands ?? {}).find(item => item.command.type === 'session.interrupt' && item.command.sessionId === session.id);
   const lastInterrupt = Object.values(props.ipcState?.commands ?? {}).filter(item => item.command.type === 'session.interrupt' && item.command.sessionId === session.id).at(-1);
@@ -98,11 +104,11 @@ export function SessionWorkspace(props: WorkspaceProps) {
       }}><span aria-live="polite">待處理 {pendingCount} 件</span></button>}
       <button className="icon-button" aria-label={`關閉工作區 ${view.id}`} title="只關閉工作區視圖" onClick={onClose}>×</button>
     </header>
-    <div className="session-toolbar"><Status value={session.activity} />{session.kind === 'ordinary' && <button data-transfer-trigger onClick={props.onTransfer}>換到另一個工具</button>}<button aria-expanded={context.detailsVisible} onClick={() => onContext({ detailsVisible: !context.detailsVisible })}>{context.detailsVisible ? '收合細節' : '展開細節'}</button></div>
+    <div className="session-toolbar"><Status value={session.activity} />{props.ipcState?.closeCauses?.[session.id] && <span className="muted">{props.ipcState.closeCauses[session.id] === 'idle' ? '閒置自動釋放' : '超過程序上限而釋放'}</span>}{session.kind === 'ordinary' && <button {...readOnlyProps(readOnly)} disabled={readOnly} data-transfer-trigger onClick={props.onTransfer}>換到另一個工具</button>}<button aria-expanded={context.detailsVisible} onClick={() => onContext({ detailsVisible: !context.detailsVisible })}>{context.detailsVisible ? '收合細節' : '展開細節'}</button></div>
     {session.kind === 'workflow' && <div className="workflow-owner"><span>所屬 Workflow · {instance?.title ?? session.workflow.instanceId}</span><Menu label="所屬 Workflow 選單" className="owner-menu" actions={[{ label: '查看流程進度', onSelect: () => onProgress(session.workflow.instanceId) }]}>⋯</Menu></div>}
     <div className={`workspace-body ${context.detailsVisible ? '' : 'details-hidden'}`}>
       <div className="chat-panel">
-        <div className="transcript-frame"><Transcript snapshot={snapshot} session={session} view={view} visible={props.visible} onContext={onContext} store={props.store} ipcState={props.ipcState} pendingPanel={pendingPanel} /></div>
+        <div className="transcript-frame"><Transcript key={session.id} historyStore={props.historyStore ?? props.store} snapshot={snapshot} session={session} view={view} visible={props.visible} onContext={onContext} store={props.store} ipcState={props.ipcState} pendingPanel={pendingPanel} /></div>
         <form className="composer" onSubmit={event => {
           event.preventDefault();
           if (!props.store) { onNotice(`「${session.title}」尚未連接 runtime，草稿已保留，未送出訊息。`); return; }
@@ -116,11 +122,11 @@ export function SessionWorkspace(props: WorkspaceProps) {
           });
         }}>
           <div className="selectors">
-            <label>{session.kind === 'workflow' ? 'Agent · 已鎖定' : 'Agent'}<select aria-label="Agent" aria-describedby={session.kind === 'workflow' ? `${view.id}-agent-lock` : undefined} value={chosen.agentId} disabled={session.kind === 'workflow' || props.store?.isBlocked('session.setAgent', `session:${session.id}`)} onChange={event => {
+            <label>{session.kind === 'workflow' ? 'Agent · 已鎖定' : 'Agent'}<select aria-label="Agent" aria-describedby={readOnly ? 'read-only-reason' : session.kind === 'workflow' ? `${view.id}-agent-lock` : undefined} value={chosen.agentId} {...readOnlyProps(readOnly)} disabled={readOnly || session.kind === 'workflow' || props.store?.isBlocked('session.setAgent', `session:${session.id}`)} onChange={event => {
               const agent = props.agentOptions.find(candidate => candidate.id === event.target.value);
               if (agent) onAgent(agent.id);
             }}>{(session.kind === 'workflow' ? snapshot.agents : props.agentOptions).map(agent => <option key={`${agent.id}:${agent.revision}`} value={agent.id}>{agent.name}</option>)}</select></label>
-            <label>Model<select aria-label="Model" aria-describedby={session.kind === 'workflow' ? `${view.id}-model-lock` : undefined} disabled={props.store?.isBlocked('session.setModel', `session:${session.id}`)} value={`${chosen.model.runtime}:${chosen.model.model}`} onChange={event => {
+            <label>Model<select aria-label="Model" aria-describedby={readOnly ? 'read-only-reason' : session.kind === 'workflow' ? `${view.id}-model-lock` : undefined} {...readOnlyProps(readOnly)} disabled={readOnly || props.store?.isBlocked('session.setModel', `session:${session.id}`)} value={`${chosen.model.runtime}:${chosen.model.model}`} onChange={event => {
               const model = snapshot.modelOptions.find(candidate => `${candidate.runtime}:${candidate.model}` === event.target.value);
               if (model) onModel(model);
             }}>{snapshot.modelOptions.filter(model => !model.hidden).map(model => {
@@ -137,11 +143,11 @@ export function SessionWorkspace(props: WorkspaceProps) {
           <textarea id={`${view.id}-draft`} value={context.draft} onChange={event => onContext({ draft: event.target.value })} placeholder={`傳訊息給 ${session.title}…`} rows={2} />
           <div className="composer-actions"><Menu label="新增附件" shortcut actions={[{ label: 'Add files or photos', hint: 'Ctrl+U', onSelect: () => attach('files') }, { label: 'Add folder', onSelect: () => attach('folder') }]}>＋</Menu>
             <span className="composer-target">附件／訊息目標：{session.title}</span>
-            {canInterrupt && <button type="button" disabled={!props.store || props.ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || interruptBlocked} onClick={() => {
+            {canInterrupt && <button type="button" {...readOnlyProps(readOnly)} disabled={readOnly || !props.store || props.ipcState?.connection !== 'ready' || snapshot.app.status === 'damaged' || interruptBlocked} onClick={() => {
               if (!props.store || interruptBlocked) return;
               void props.store.send({ type: 'session.interrupt', requestId: RequestId.parse(crypto.randomUUID()), sessionId: session.id });
             }}>{interrupt?.result && !interrupt.result.ok ? '中斷結果待核對' : interruptBlocked ? '中斷中…' : '中斷'}</button>}
-            <button type="submit" className="primary" disabled={!context.draft.trim() || activeTurn || blocked}>送出</button>
+            <button type="submit" className="primary" {...readOnlyProps(readOnly)} disabled={!context.draft.trim() || activeTurn || blocked}>送出</button>
           </div>
           {activeTurn && <p className="composer-note">此 session 有執行中的 turn；可編輯草稿，暫不送出。</p>}
           {creating && <p role="status">Session 建立中；完成後才能送出，草稿已保留。</p>}

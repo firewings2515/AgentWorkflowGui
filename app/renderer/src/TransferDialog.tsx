@@ -1,3 +1,4 @@
+import { readOnlyProps } from './read-only';
 import { useEffect, useRef, useState } from 'react';
 import { RequestId, TransferId } from '../../../contracts';
 import type { Command, CommandResult, ModelOption, SessionId, Snapshot, TransferProposal } from '../../../contracts';
@@ -10,7 +11,7 @@ const forSource = (command: Command, snapshot: Snapshot, sourceId: SessionId) =>
   ? command.sourceSessionId === sourceId
   : (command.type === 'transfer.confirm' || command.type === 'transfer.cancel') && snapshot.transfers.some(p => p.id === command.transferId && p.sourceSessionId === sourceId);
 
-function ProposalContent({ proposal, canConfirm, onConfirm }: { proposal: TransferProposal; canConfirm: boolean; onConfirm: () => void }) {
+function ProposalContent({ proposal, canConfirm, onConfirm, readOnly }: { readOnly: boolean; proposal: TransferProposal; canConfirm: boolean; onConfirm: () => void }) {
   const [reviewed, setReviewed] = useState(false);
   return <>
     <div className="transfer-content" role="region" aria-label="轉交內容預覽" tabIndex={0}>
@@ -20,8 +21,8 @@ function ProposalContent({ proposal, canConfirm, onConfirm }: { proposal: Transf
       <h3>目前測試輸出</h3><pre>{proposal.content.testOutput || '未提供測試輸出'}</pre>
     </div>
     {proposal.state === 'awaiting-confirmation' && <>
-      <label className="check-label"><input type="checkbox" checked={reviewed} disabled={!canConfirm} onChange={event => setReviewed(event.target.checked)} />我已審閱以上內容，同意轉交給指定工具與 Model。</label>
-      <button className="primary" disabled={!canConfirm || !reviewed} onClick={onConfirm}>確認轉交</button>
+      <label className="check-label"><input type="checkbox" checked={reviewed} {...readOnlyProps(readOnly)} disabled={!canConfirm} onChange={event => setReviewed(event.target.checked)} />我已審閱以上內容，同意轉交給指定工具與 Model。</label>
+      <button className="primary" {...readOnlyProps(readOnly)} disabled={!canConfirm || !reviewed} onClick={onConfirm}>確認轉交</button>
     </>}
   </>;
 }
@@ -46,7 +47,7 @@ export function TransferDialog({ snapshot, preview, store, ipcState, onClose, on
   const result = receipt ? ipcState?.commands[receipt.command.requestId]?.result ?? receipt.result : undefined;
   const model = options.find(m => `${m.runtime}:${m.model}` === modelKey);
   const uncertain = outstanding.length > 0 || proposals.some(p => p.delivery?.state === 'unknown' || p.provision?.state === 'unknown');
-  const disabled = !store || ipcState?.connection !== 'ready' || pending || uncertain || !source || source.kind !== 'ordinary';
+  const disabled = snapshot.app.status !== 'ready' || !store || ipcState?.connection !== 'ready' || pending || uncertain || !source || source.kind !== 'ordinary';
   const receipts = [...activities, ...(receipt ? [{ command: receipt.command, result: result ?? receipt.result }] : [])];
   const confirmAttempted = receipts.some(a => a.command.type === 'transfer.confirm' && a.command.transferId === proposal?.id && a.command.expectedRevision === proposal.revision && (a.result?.ok || (a.result && !a.result.ok && (blocksResubmit(a.result) || a.result.code === 'stale_revision'))));
   const cancelAccepted = receipts.some(a => a.command.type === 'transfer.cancel' && a.command.transferId === proposal?.id && a.result?.ok);
@@ -89,7 +90,7 @@ export function TransferDialog({ snapshot, preview, store, ipcState, onClose, on
         {proposal.state === 'stale' && <p role="alert" className="command-warning">此提案已過期，舊內容不可確認。請取消舊提案，再重新產生並審閱內容。</p>}
         {proposal.state === 'cancelled' && <p>{proposal.cancelReason ? ({ user: '使用者已取消此提案。', 'source-changed': '來源已變更，請重新產生並審閱轉交預覽。', failed: '轉交失敗，提案已取消。' })[proposal.cancelReason] : '此提案已取消；未記錄取消原因。'}已記錄的建立與送達結果仍保留如下。</p>}
         {proposal.state === 'failed' && <p role="alert">目標建立失敗，工作保留在來源 session。{proposal.failure?.message}</p>}
-        <ProposalContent key={`${proposal.id}:${proposal.revision}:${proposal.payloadHash}`} proposal={proposal} canConfirm={!disabled && !confirmAttempted && !cancelAccepted} onConfirm={() => {
+        <ProposalContent readOnly={snapshot.app.status === 'read-only'} key={`${proposal.id}:${proposal.revision}:${proposal.payloadHash}`} proposal={proposal} canConfirm={!disabled && !confirmAttempted && !cancelAccepted} onConfirm={() => {
           if (disabled || confirmAttempted || cancelAccepted || proposal.state !== 'awaiting-confirmation') return;
           send({ type: 'transfer.confirm', requestId: RequestId.parse(crypto.randomUUID()), transferId: proposal.id, expectedRevision: proposal.revision });
         }} />
@@ -97,7 +98,7 @@ export function TransferDialog({ snapshot, preview, store, ipcState, onClose, on
           <dt>內容送達</dt><dd>{proposal.delivery ? <Status value={proposal.delivery.state} /> : '尚無送達紀錄'}</dd>
           <dt>核准</dt><dd>{proposal.approvedRevision === undefined ? '尚未核准' : `已核准版本 ${proposal.approvedRevision}`}</dd></dl>
         {proposal.createdSessionId && <button disabled={!snapshot.sessions.some(s => s.id === proposal.createdSessionId)} onClick={() => { if (proposal.createdSessionId) onOpen(proposal.createdSessionId); }}>開啟接續 session</button>}
-        {proposal.delivery?.state === 'sent' ? <p>已送達，無法取消；已建立的 session 與已送出的內容不會被收回。</p> : !['cancelled', 'failed'].includes(proposal.state) && <button disabled={!canCancel} onClick={() => {
+        {proposal.delivery?.state === 'sent' ? <p>已送達，無法取消；已建立的 session 與已送出的內容不會被收回。</p> : !['cancelled', 'failed'].includes(proposal.state) && <button {...readOnlyProps(snapshot.app.status === 'read-only')} disabled={!canCancel} onClick={() => {
           if (canCancel) send({ type: 'transfer.cancel', requestId: RequestId.parse(crypto.randomUUID()), transferId: proposal.id });
         }}>取消提案</button>}
       </>}
@@ -105,7 +106,7 @@ export function TransferDialog({ snapshot, preview, store, ipcState, onClose, on
         <legend>{proposal ? '建立新的轉交提案' : '換到另一個工具'}</legend>
         <label>目標 Model<select value={modelKey} onChange={event => setModelKey(event.target.value)}><option value="">選擇目標 Model</option>{options.map(m => <option key={`${m.runtime}:${m.model}`} value={`${m.runtime}:${m.model}`}>{m.displayName} · {m.runtime}</option>)}</select></label>
         <label>交接說明來源<select value={noteSource} onChange={event => setNoteSource(event.target.value === 'agent' ? 'agent' : 'gui-digest')}><option value="gui-digest">GUI 從紀錄整理</option><option value="agent">來源 Agent 撰寫（新增來源 turn）</option></select></label>
-        <button className="primary" disabled={!canPrepare} onClick={() => {
+        <button className="primary" {...readOnlyProps(snapshot.app.status === 'read-only')} disabled={!canPrepare} onClick={() => {
           if (!canPrepare || !model) return;
           const previousId = proposalId;
           const id = TransferId.parse(crypto.randomUUID()); setProposalId(id);

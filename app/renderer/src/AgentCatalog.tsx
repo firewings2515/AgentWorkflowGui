@@ -1,3 +1,4 @@
+import { readOnlyProps } from './read-only';
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { AgentId, CONTRACTS_VERSION } from '../../../contracts';
 import type { AgentDefinition, CommandResult } from '../../../contracts';
@@ -21,8 +22,8 @@ const editDraft = (agent: AgentDefinition, expectedRevision: number | null): Dra
   agent: { ...agent }, expectedRevision, attempted: false, pending: false, error: '', failNext: false, blocked: false, warning: false, conflict: false,
 });
 
-export function DeleteConfirmation({ agent, onClose, onDelete, onDeleted, onAcknowledge, blocked = false }: {
-  agent: AgentDefinition; onClose: () => void; onDelete: () => Promise<CommandResult>; onDeleted: () => void; blocked?: boolean; onAcknowledge?: () => void;
+export function DeleteConfirmation({ agent, onClose, onDelete, onDeleted, onAcknowledge, blocked = false, readOnly = false }: {
+  readOnly?: boolean; agent: AgentDefinition; onClose: () => void; onDelete: () => Promise<CommandResult>; onDeleted: () => void; blocked?: boolean; onAcknowledge?: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [pending, setPending] = useState(false);
@@ -51,7 +52,7 @@ export function DeleteConfirmation({ agent, onClose, onDelete, onDeleted, onAckn
     {result && !result.ok && <p className={result.code === 'unknown_outcome' ? 'command-warning' : 'field-error'} role={result.code === 'unknown_outcome' ? 'status' : 'alert'}>{commandFeedback(result, 'agent.delete')}</p>}
     {!pending && (blocked || (result && blocksResubmit(result))) && <button onClick={() => { onAcknowledge?.(); setResult(null); }}>已核對結果</button>}
     {pending && <p role="status">正在刪除…</p>}
-    <div className="agent-actions"><button onClick={onClose}>取消</button><button disabled={pending || blocked || (!!result && blocksResubmit(result))} onClick={() => {
+    <div className="agent-actions"><button onClick={onClose}>取消</button><button {...readOnlyProps(readOnly)} disabled={pending || blocked || (!!result && blocksResubmit(result))} onClick={() => {
       if (submitting.current) return;
       submitting.current = true; setPending(true);
       void onDelete().catch(() => unknownResult(null)).then(value => {
@@ -64,8 +65,8 @@ export function DeleteConfirmation({ agent, onClose, onDelete, onDeleted, onAckn
   </dialog>;
 }
 
-export function AgentCatalog({ repository, demo, selectedId, visible, onSelect }: {
-  repository: AgentRepository; demo?: AgentDemoControls | undefined; selectedId: string; visible: boolean; onSelect: (id: string) => void;
+export function AgentCatalog({ repository, demo, selectedId, visible, onSelect, readOnly = false }: {
+  readOnly?: boolean; repository: AgentRepository; demo?: AgentDemoControls | undefined; selectedId: string; visible: boolean; onSelect: (id: string) => void;
 }) {
   const agents = useSyncExternalStore(repository.subscribe, repository.getSnapshot);
   const isDemo = repository.mode === 'demo';
@@ -121,6 +122,7 @@ export function AgentCatalog({ repository, demo, selectedId, visible, onSelect }
     onSelect(newAgent.id);
   };
   const save = async () => {
+    if (readOnly) return;
     if (!draft || draft.pending || draft.blocked || repository.isBlocked?.(draft.agent.id) || stale || locks.current.has(draft.agent.id)) return;
     const target = draft.agent.id;
     updateDraft(target, { attempted: true, error: '' });
@@ -165,6 +167,7 @@ export function AgentCatalog({ repository, demo, selectedId, visible, onSelect }
   };
 
   return <section className="agent-catalog" hidden={!visible} aria-label="Agent 管理內容">
+    {readOnly && <p className="storage-banner">唯讀模式：可查看或編輯草稿，無法儲存或刪除 Agent。</p>}
     <header className="agent-catalog-header"><div><span className="eyebrow">設定 / Agents</span><h2>Agent 定義</h2><p className="muted">{isDemo ? '示意資料 · 變更僅保留於本次開啟期間' : '變更透過應用程式服務儲存'}</p></div><button className="primary" onClick={() => beginNew()}>＋ 建立 Agent</button></header>
     <div className="agent-catalog-body">
       <nav ref={agentList} className="agent-list" aria-label="Agent 清單"><h3>已設定 Agents <span className="count">{agents.length}</span></h3>
@@ -175,7 +178,7 @@ export function AgentCatalog({ repository, demo, selectedId, visible, onSelect }
       <section ref={editor} className="agent-editor" aria-label="Agent 定義內容">
         {!agent ? <><h2 ref={heading} tabIndex={-1}>{id ? '找不到指定的 Agent' : '建立第一個 Agent'}</h2><p>{id ? `Agent ID：${id}` : '新增名稱、說明與指示，定義可重用的工作角色。'}</p></> : <>
           <div className="agent-editor-header"><div><h2 ref={heading} tabIndex={-1}>{draft ? (draft.expectedRevision === null ? '新增 Agent' : '編輯 Agent 定義') : agent.name}</h2><p className="muted">{draft ? '尚未儲存' : `revision ${agent.revision}`}</p></div>
-            {!draft && <div className="agent-actions"><button onClick={() => { setDrafts(previous => ({ ...previous, [agent.id]: editDraft(agent, agent.revision) })); setMessages(previous => ({ ...previous, [agent.id]: '' })); }}>編輯</button><button onClick={() => beginNew(agent)}>複製</button><button onClick={() => setDeleteTarget(agent)}>刪除</button></div>}
+            {!draft && <div className="agent-actions"><button onClick={() => { setDrafts(previous => ({ ...previous, [agent.id]: editDraft(agent, agent.revision) })); setMessages(previous => ({ ...previous, [agent.id]: '' })); }}>編輯</button><button onClick={() => beginNew(agent)}>複製</button><button {...readOnlyProps(readOnly)} disabled={readOnly} onClick={() => setDeleteTarget(agent)}>刪除</button></div>}
           </div>
           {messages[id] && !draft && <p className="agent-feedback" role="status">{messages[id]}</p>}
           {draft ? <form noValidate aria-label="Agent 編輯表單" aria-busy={draft.pending} onSubmit={event => { event.preventDefault(); void save(); }}>
@@ -194,13 +197,13 @@ export function AgentCatalog({ repository, demo, selectedId, visible, onSelect }
               {instructionsError && <p id="agent-instructions-error" className="field-error" role="alert">請填寫指示。</p>}
             </fieldset>
             <p className="agent-boundary-note">Model 由 Workflow 節點或 session 的獨立選擇器指定。</p>
-            {demo && <details className="agent-demo-controls"><summary>示意模式測試</summary><label><input type="checkbox" checked={draft.failNext} disabled={draft.pending} onChange={event => { demo.setSaveFailure(id, event.target.checked); updateDraft(id, { failNext: event.target.checked }); }} />下次儲存模擬失敗</label>{saved && <button type="button" disabled={draft.pending || stale} onClick={() => { void simulateExternalUpdate(); }}>模擬他人已更新此 Agent</button>}</details>}
-            <div className="agent-actions agent-form-actions"><span role="status">{draft.pending ? '儲存中…' : '草稿尚未儲存'}</span><button type="button" disabled={draft.pending} onClick={() => { demo?.setSaveFailure(id, false); removeDraft(id); if (!saved) onSelect(''); }}>取消編輯</button><button type="submit" className="primary" disabled={draft.pending || draft.blocked || repository.isBlocked?.(id) || stale}>儲存</button></div>
+            {demo && !readOnly && <details className="agent-demo-controls"><summary>示意模式測試</summary><label><input type="checkbox" checked={draft.failNext} disabled={draft.pending} onChange={event => { demo.setSaveFailure(id, event.target.checked); updateDraft(id, { failNext: event.target.checked }); }} />下次儲存模擬失敗</label>{saved && <button type="button" disabled={draft.pending || stale} onClick={() => { void simulateExternalUpdate(); }}>模擬他人已更新此 Agent</button>}</details>}
+            <div className="agent-actions agent-form-actions"><span role="status">{draft.pending ? '儲存中…' : '草稿尚未儲存'}</span><button type="button" disabled={draft.pending} onClick={() => { demo?.setSaveFailure(id, false); removeDraft(id); if (!saved) onSelect(''); }}>取消編輯</button><button type="submit" className="primary" {...readOnlyProps(readOnly)} disabled={readOnly || draft.pending || draft.blocked || repository.isBlocked?.(id) || stale}>儲存</button></div>
           </form> : <><dl className="agent-definition"><dt>名稱</dt><dd>{agent.name}</dd><dt>說明</dt><dd>{agent.description || '未填寫說明'}</dd><dt>指示</dt><dd>{agent.instructions}</dd></dl><p className="agent-boundary-note">Model 由 Workflow 節點或 session 的獨立選擇器指定。</p><p className="muted">更新時間：<time dateTime={agent.updatedAt}>{new Date(agent.updatedAt).toLocaleString('zh-TW', { hour12: false })}</time></p></>}
         </>}
       </section>
     </div>
-    {deleteTarget && visible && <DeleteConfirmation agent={deleteTarget} blocked={repository.isBlocked?.(deleteTarget.id, 'agent.delete') ?? false} onAcknowledge={() => repository.acknowledge?.(deleteTarget.id, 'agent.delete')} onClose={() => setDeleteTarget(null)} onDelete={() => repository.delete(agentDeleteCommand(deleteTarget))} onDeleted={() => {
+    {deleteTarget && visible && <DeleteConfirmation readOnly={readOnly} agent={deleteTarget} blocked={readOnly || (repository.isBlocked?.(deleteTarget.id, 'agent.delete') ?? false)} onAcknowledge={() => repository.acknowledge?.(deleteTarget.id, 'agent.delete')} onClose={() => setDeleteTarget(null)} onDelete={() => repository.delete(agentDeleteCommand(deleteTarget))} onDeleted={() => {
       removeDraft(deleteTarget.id); setDeleteTarget(null); onSelect('');
       requestAnimationFrame(() => heading.current?.focus());
     }} />}

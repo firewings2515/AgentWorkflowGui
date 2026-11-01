@@ -67,8 +67,9 @@ describe('T026 單 task 進度', () => {
     expect(rows).toHaveLength(3);
     for (const [index, delivery, outcome] of [[0, '等待中', '已取消'], [1, '已送達（不代表已讀）', '已拒絕'], [2, '送達結果未知', '失敗']] as const) {
       const cells = within(rows[index]!).getAllByRole('cell');
-      expect(cells[3]!.textContent).toContain(delivery);
-      expect(cells[4]!.textContent).toContain(outcome);
+      expect(cells[2]!.textContent).toMatch(/第 \d+ 輪/);
+      expect(cells[4]!.textContent).toContain(delivery);
+      expect(cells[5]!.textContent).toContain(outcome);
     }
     expect(within(rows[0]!).getByText('返工交接')).toBeTruthy();
     expect(within(rows[1]!).getByText('一般交接')).toBeTruthy();
