@@ -122,6 +122,7 @@ void app.whenReady().then(async () => {
     dbPath,
     bus,
     createHost: (repository) => new WindowsProcessHost({ repository, log: (_level, message) => log(`[process] ${message}`) }),
+    packaged: { isPackaged: app.isPackaged, resourcesPath: process.resourcesPath },
     codexExecutable: resolveCodexExecutable(),
     resolveRealPath,
     supervisor: supervisorSettings(process.env),

@@ -35,8 +35,11 @@ import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { hashFile, setTimer } from './file-hash';
 import { GitIgnoreRules } from './git-ignore';
+import { type PackagedContext, withUnpackedCommand } from './packaged-paths';
 import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
+
+const NOT_PACKAGED: PackagedContext = { isPackaged: false, resourcesPath: '' };
 
 /** What the main process needs from its process host: the port plus the spawn the adapters use (T013). */
 export type BackendProcessHost = ProcessHost & JobSpawner;
@@ -49,6 +52,8 @@ export interface BackendOptions {
   bus: Pick<EventBus, 'seq' | 'publish'>;
   /** The process host, recording into the backend's own OwnedProcess repository (T013). */
   createHost(processes: OwnedProcessRepository): BackendProcessHost;
+  /** Where the app runs from (packaged-paths.ts); claude.exe is started from `app.asar.unpacked` when packaged. */
+  packaged?: PackagedContext;
   /** The Codex executable (codex-exe.ts); Codex is unavailable without one. */
   codexExecutable?: string | undefined;
   /** Replaces the real adapters (tests). */
@@ -254,7 +259,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         return new ClaudeAdapter({
           sdk: claudeAgentSdk,
           onPermissionRequest: (handle) => hooks.onPermissionRequest(handle),
-          spawnProcess: ({ sessionId: id }) => claudeProcessSpawn(host, id),
+          spawnProcess: ({ sessionId: id }) => withUnpackedCommand(claudeProcessSpawn(host, id), options.packaged ?? NOT_PACKAGED),
           log: adapterLog('claude'),
         });
       }
