@@ -20,7 +20,7 @@ import {
   type McpRejection,
   type MergeAttempt,
   type MessageOrigin,
-  type OperationId,
+  OperationId,
   type ProjectSettings,
   type SessionId,
   type TaskId,
@@ -66,7 +66,24 @@ export interface PipelineHost {
   wakeNodes(instanceId: InstanceId): void;
   /** Root's handoffs held for a decided task list are adopted or cancelled (G-11); in the instance's queue. */
   settleHeld(instanceId: InstanceId): Promise<void>;
+  /**
+   * Tells root something it must know to go on, as a `system-notice` (C-31, G-11 B): through the delivery service, in
+   * the instance's queue. `operationId` names the notice, so doing it again (a restart, two paths at once) finds the
+   * first one and sends nothing more.
+   */
+  noticeRoot(instanceId: InstanceId, operationId: OperationId, text: string): Promise<'accepted' | 'duplicate' | 'failed'>;
 }
+
+/** The notice of an approved task list (G-11 B): named after the list, so it is made once whatever repeats it. */
+export const planNoticeOperationOf = (planId: TaskPlan['id']): OperationId => OperationId.parse(`notice-tasks-${planId}`);
+
+/** What root is told once the user approved its list: the list and every task ID made, in the list's order. */
+export const planNoticeText = (plan: TaskPlan): string =>
+  [
+    `Notice from the GUI (not a message from the user): the user approved your task list ${plan.id}. These tasks were created:`,
+    ...plan.created.map((c) => `- ${c.taskId} (key "${c.key}")`),
+    'Hand each one off naming its taskId. Handoffs you already made for them while the list waited go on by themselves.',
+  ].join('\n');
 
 export interface GuiHandoff {
   instanceId: InstanceId;
@@ -406,6 +423,17 @@ export class TaskPipeline {
     // What root handed off while the list waited: adopted, or cancelled with the list (G-11).
     await this.deps.host.settleHeld(instanceId);
     if (approved) await this.admitNow(instanceId);
+    // Root learns the task IDs only from here (G-11 B); a crash before it is made up for by `recover`.
+    if (approved) await this.noticePlan(instanceId, planId);
+  }
+
+  /** Root's notice of an approved list (G-11 B); none for a list that needed no approval (create_tasks answered it). */
+  private async noticePlan(instanceId: InstanceId, planId: TaskPlan['id']): Promise<void> {
+    const instance = await this.repos.instances.get(instanceId);
+    const plan = instance?.taskPlans.find((p) => p.id === planId);
+    if (instance === undefined || ended(instance) || plan?.state !== 'created' || plan.escalationId === undefined) return;
+    const outcome = await this.deps.host.noticeRoot(instanceId, planNoticeOperationOf(plan.id), planNoticeText(plan));
+    if (outcome === 'failed') this.deps.log(`[pipeline] root could not be told about the tasks of ${plan.id}`);
   }
 
   // ---- handoffs of a task -------------------------------------------------------------------------
@@ -1615,6 +1643,10 @@ export class TaskPipeline {
           if (plan.state !== 'awaiting-confirmation') continue;
           await this.openPlanQuestion(instance, plan);
           await this.carryOutPlan(instance.id, plan.id);
+        }
+        // An approved list's notice to root that a crash cut off is made now; one already made is found (G-11 B).
+        for (const plan of ((await this.repos.instances.get(instance.id)) ?? instance).taskPlans) {
+          if (plan.state === 'created' && plan.escalationId !== undefined) await this.noticePlan(instance.id, plan.id);
         }
         // Held handoffs of a list decided before a crash are settled (G-11): never left orphaned.
         await this.deps.host.settleHeld(instance.id);

@@ -14,6 +14,7 @@ import { agents, IMPL, PLAN, REVIEW, template, WORKFLOW } from '../../core/workf
 import type { OwnedProcess } from '../../contracts';
 import { type Backend, type BackendProcessHost, startBackend } from './backend';
 import { EventBus } from './event-bus';
+import { lastOf, stalledWindow } from './testing/stalled-window';
 
 let dir: string;
 const clients: Client[] = [];
@@ -52,6 +53,7 @@ const ROOT = SessionId.parse('root-main');
 
 interface Started {
   backend: Backend;
+  bus: EventBus;
   envelopes: EventEnvelope[];
   adapters: FakeAdapter[];
   logs: string[];
@@ -125,7 +127,7 @@ const start = async (): Promise<Started> => {
     log: (message) => logs.push(message),
   });
   if (result.status !== 'ready') throw new Error(`backend not ready: ${result.reason}`);
-  return { backend: result, envelopes, adapters, logs, run: (command) => result.facade.execute(command) as Promise<CommandResult> };
+  return { backend: result, bus, envelopes, adapters, logs, run: (command) => result.facade.execute(command) as Promise<CommandResult> };
 };
 
 const settle = async () => {
@@ -220,6 +222,36 @@ describe('the workflow engine in the backend (T024)', () => {
       expect(s.logs.join('\n')).not.toContain(token);
       expect(JSON.stringify(s.envelopes)).not.toContain(token);
     }
+    await s.backend.shutdown();
+  });
+
+  it('T040: a window let go during the run (event-overflow) finds every handoff and escalation it was not sent in the Snapshot it reads next', async () => {
+    const s = await start();
+    await prepare(s);
+    const window = stalledWindow(s.bus, 6);
+    expect(await startRun(s)).toMatchObject({ ok: true });
+    await settle();
+    expect(await call(s, ROOT, 'handoff', { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, content: 'Build the form.' })).toMatchObject({ status: 'accepted' });
+    const impl = await nodeSession(s, IMPL);
+    expect(await call(s, impl, 'handoff', { ruleId: 'to-review', target: { kind: 'node', nodeId: REVIEW }, content: 'Form built.' })).toMatchObject({ status: 'accepted' });
+    const review = await nodeSession(s, REVIEW);
+    expect(await call(s, review, 'handoff', { ruleId: 'rework', target: { kind: 'node', nodeId: IMPL }, content: 'Validate the email.' })).toMatchObject({ status: 'accepted' });
+    expect(await call(s, impl, 'handoff', { ruleId: 'to-review', target: { kind: 'node', nodeId: REVIEW }, content: 'Validation added.' })).toMatchObject({ status: 'accepted' });
+    expect(await call(s, review, 'handoff', { ruleId: 'done', target: { kind: 'root' }, content: 'Approved.' })).toMatchObject({ status: 'accepted' });
+    await settle();
+    expect(window.batcher.stats.overflows).toBeGreaterThanOrEqual(1);
+    const missed = window.missed(s.envelopes);
+    const handoffs = lastOf(missed, 'handoff.updated', (e) => e.handoff);
+    const turnsEnded = lastOf(missed, 'turn.updated', (e) => e.turn).filter((t) => t.state !== 'running');
+    expect(handoffs.length).toBeGreaterThan(0);
+    expect(turnsEnded.length).toBeGreaterThan(0);
+    // It reads the Snapshot (cut first, as the IPC handler does): each one it missed, as last published.
+    window.batcher.cut();
+    const snap = await snapshot(s);
+    for (const h of handoffs) expect(snap.handoffs.find((x) => x.id === h.id)).toEqual(h);
+    for (const t of turnsEnded) expect(snap.turns.find((x) => x.id === t.id && x.sessionId === t.sessionId)).toEqual(t);
+    for (const e of lastOf(missed, 'escalation.updated', (x) => x.escalation)) expect(snap.escalations.find((x) => x.id === e.id)).toEqual(e);
+    window.stop();
     await s.backend.shutdown();
   });
 

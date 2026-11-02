@@ -288,7 +288,7 @@ class Rebuild {
   }
 }
 
-const PAYLOAD_KINDS: readonly PayloadKind[] = ['handoff', 'peer-message', 'transfer', 'user-message'];
+const PAYLOAD_KINDS: readonly PayloadKind[] = ['handoff', 'peer-message', 'transfer', 'user-message', 'system-notice'];
 
 /**
  * The origin this dispatch uses, read once (T020 r3 P1): the caller's `options.origin` is read a single
@@ -475,6 +475,8 @@ export class DeliveryService {
       // A payload that is not the user's says whose it is, so no restart can deliver it as the user's (C-01).
       if ((input.kind === 'handoff' || input.kind === 'peer-message') && input.context.origin === undefined) issues.push(`a ${input.kind} names its origin in context.origin`);
       if (input.context.origin?.kind === 'user' && input.kind !== 'user-message') issues.push(`a ${input.kind} is never from the user`);
+      // The GUI's own words (C-31): never a peer's or an agent's, so no restart can deliver them as someone else's.
+      if (input.kind === 'system-notice' && input.context.origin?.kind !== 'system') issues.push('a system-notice names the system as its origin');
     }
     return issues;
   }

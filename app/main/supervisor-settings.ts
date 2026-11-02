@@ -1,5 +1,5 @@
-// The idle supervisor's settings (T036). Contracts give the user no field for them yet (UiPreferences holds the
-// theme only), so they come from the environment of the main process, else the defaults (SUPERVISOR_DEFAULTS).
+// The idle supervisor's settings from the environment (T036): overriding the user's preferences (C-30,
+// UiPreferences.supervisor) in development runs only — the live and crash tests; a packaged app never reads them.
 //   AWG_IDLE_CLOSE_MS        how long a session goes unused before its runtime is closed (at least 1 s)
 //   AWG_MAX_OPEN_RUNTIMES    how many runtimes may be open at once (0: no limit)
 //   AWG_IDLE_TICK_MS         how often the supervisor looks (at least 1 s)

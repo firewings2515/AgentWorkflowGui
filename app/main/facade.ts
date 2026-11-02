@@ -1,4 +1,4 @@
-import type { Command, CommandResult, Snapshot } from '../../contracts';
+import type { Command, CommandResult, QueryRequest, QueryResult, Snapshot } from '../../contracts';
 
 /**
  * What the IPC layer needs from the application core (backend.ts puts the session service behind it). A
@@ -8,6 +8,8 @@ export interface AppFacade {
   /** State as of `EventBus.seq`: every event up to that seq is already reflected in it. */
   snapshot(): Snapshot | Promise<Snapshot>;
   execute(command: Command): CommandResult | Promise<CommandResult>;
+  /** Read-only queries (C-26, C-28); absent: every query is answered `internal_error`. */
+  query?(request: QueryRequest): QueryResult | Promise<QueryResult>;
 }
 
 type Failure = Extract<CommandResult, { ok: false }>;

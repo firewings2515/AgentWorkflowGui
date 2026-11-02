@@ -27,6 +27,7 @@ import { FakeAdapter } from '../../core/sessions/testing/fake-adapter';
 import { entriesOf, NOTE_REQUEST, targetSessionOf } from '../../core/transfer';
 import { type Backend, type BackendProcessHost, startBackend } from './backend';
 import { EventBus } from './event-bus';
+import { lastOf, stalledWindow } from './testing/stalled-window';
 
 let dir: string;
 beforeEach(() => {
@@ -64,6 +65,7 @@ const at = () => new Date(Date.UTC(2026, 9, 30, 2, 0, 0, Number(next()))).toISOS
 
 interface Started {
   backend: Backend;
+  bus: EventBus;
   envelopes: EventEnvelope[];
   adapters: FakeAdapter[];
   logs: string[];
@@ -141,7 +143,7 @@ const start = async (script: Script): Promise<Started> => {
   });
   if (result.status !== 'ready') throw new Error(`backend not ready: ${result.reason}`);
   ref.backend = result;
-  return { backend: result, envelopes, adapters, logs, run: (command) => result.facade.execute(command) as Promise<CommandResult> };
+  return { backend: result, bus, envelopes, adapters, logs, run: (command) => result.facade.execute(command) as Promise<CommandResult> };
 };
 
 /** One turn of a session as its runtime reports it: running, its items, its reply, completed. */
@@ -208,6 +210,28 @@ const proposalOf = async (s: Started, id: TransferId) => {
 };
 
 describe('cross-tool transfer in the backend (T023)', () => {
+  it('T040: a window let go during a transfer (event-overflow) finds every proposal state and turn end it was not sent in the Snapshot it reads next', async () => {
+    const s = await start({ notes: new Map(), hangStart: new Set() });
+    const window = stalledWindow(s.bus, 4);
+    const source = await sourceSession(s, 'claude-src', CLAUDE);
+    const T = TransferId.parse('tr-overflow');
+    expect(await s.run({ type: 'transfer.prepare', requestId: rid(), transferId: T, sourceSessionId: source, target: CODEX, noteSource: 'gui-digest' })).toMatchObject({ ok: true });
+    await settle();
+    const p = await proposalOf(s, T);
+    expect(await s.run({ type: 'transfer.confirm', requestId: rid(), transferId: T, expectedRevision: p.revision })).toMatchObject({ ok: true });
+    await settle();
+    expect(window.batcher.stats.overflows).toBeGreaterThanOrEqual(1);
+    const missed = window.missed(s.envelopes);
+    const proposals = lastOf(missed, 'transfer.updated', (e) => e.proposal);
+    expect(proposals.map((x) => x.id)).toEqual([T]);
+    window.batcher.cut();
+    const snap = await snapshot(s);
+    for (const x of proposals) expect(snap.transfers.find((y) => y.id === x.id)).toEqual(x);
+    for (const t of lastOf(missed, 'turn.updated', (e) => e.turn).filter((t) => t.state !== 'running')) expect(snap.turns.find((y) => y.id === t.id && y.sessionId === t.sessionId)).toEqual(t);
+    window.stop();
+    await s.backend.shutdown();
+  });
+
   it('Claude → Codex with the GUI digest: nothing of the target before the confirmation, then one new session with the frame', async () => {
     const s = await start({ notes: new Map(), hangStart: new Set() });
     const source = await sourceSession(s, 'claude-src', CLAUDE);

@@ -1387,9 +1387,9 @@ export class SessionService {
     let record = await this.store.get(p.operationId);
     if (record === undefined) {
       if (this.closing) return shuttingDown;
-      // A closed target whose folder is gone is not resumed anywhere (R-06, T036): refused before it is accepted.
+      // A closed target whose folder is gone is not resumed anywhere (R-06, T036): refused before it is accepted (C-30 `folder-missing`).
       const closed = await this.closedRefusal(target);
-      if (closed !== undefined) return { status: 'rejected', rejection: { reason: 'unknown-target', detail: 'the target session is closed and its folder no longer exists' } };
+      if (closed !== undefined) return { status: 'rejected', rejection: { reason: 'folder-missing', detail: 'the target session is closed and its folder no longer exists' } };
       const provisioned = await this.ensureProvisioned(target);
       if (this.closing) return shuttingDown;
       const provision = await this.store.get(provisionOp(target.id));
@@ -1764,16 +1764,20 @@ export class SessionService {
    * The supervisor's close of an idle runtime, in the session's queue (in order with its commands, deliveries and
    * events): `decide()` last, and when it says yes the graceful close starts in that same step (R-14; past
    * `timeoutMs` its Job is ended) and the session is marked closed before this returns, so a delivery that waited
-   * for the release resumes it afterwards. The session stays as it was otherwise (C-07: it resumes on demand).
+   * for the release resumes it afterwards. The session stays as it was otherwise (C-07: it resumes on demand). The
+   * views are told why with `session.activity` `closed` and its `cause` (C-30), right after the record says closed.
    */
-  closeIdle(sessionId: SessionId, decide: () => Promise<boolean>, timeoutMs: number): Promise<'closed' | 'kept'> {
+  closeIdle(sessionId: SessionId, decide: () => Promise<boolean>, timeoutMs: number, cause: 'idle' | 'process-limit' = 'idle'): Promise<'closed' | 'kept'> {
     return this.serial(sessionKey(sessionId), async () => {
       if (this.closing) return 'kept';
       const ref = await this.binding(sessionId);
       if (ref === undefined || this.closing || !this.runtimes.isOpen(ref)) return 'kept';
       if (!(await decide())) return 'kept';
       await this.endRuntime(ref, timeoutMs);
-      if (!this.closed) await this.setActivity(sessionId, 'closed');
+      if (!this.closed) {
+        await this.setActivity(sessionId, 'closed');
+        this.options.publish({ type: 'session.activity', sessionId, activity: 'closed', cause, at: this.options.now() });
+      }
       return 'closed';
     });
   }
@@ -2192,7 +2196,12 @@ export class SessionService {
             ? { kind: 'peerMessage', peerMessageId: peerIdOf(item.operationId) }
             : item.deliveryKind === 'handoff'
               ? await this.handoffRef(item.operationId)
-              : undefined;
+              : item.deliveryKind === 'system-notice'
+                ? // The GUI's own notice to a session (C-31, G-11 B). A delivery-unknown escalation may point only at a handoff,
+                  // peer message, transfer, provision or user message (escalation.delivery-ref): the notice goes as the
+                  // peer-message ref its operation names, which no peer message has, until contracts give it its own (T040 gap).
+                  { kind: 'peerMessage', peerMessageId: peerIdOf(item.operationId) }
+                : undefined;
     if (ref === undefined) return;
     const id = deliveryEscalationId(item.key);
     const existing = await this.repos.escalations.get(id);

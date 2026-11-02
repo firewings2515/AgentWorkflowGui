@@ -11,6 +11,8 @@ import { realFolder } from './exe-search';
 import { faultPointFrom } from './fault-points';
 import { handleFolderRequest } from './folders';
 import { handleTrusted } from './ipc';
+import { type PerfLog, startPerfLog } from './perf-log';
+import { perfLoadFrom, startPerfLoad } from './perf-load';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
 import { resolveRealPath } from './real-path';
 import { createRuntimeLocator } from './runtime-locator';
@@ -31,6 +33,15 @@ let quitting = false;
 let theme: Theme = 'dark';
 
 const log = (message: string) => console.error(message);
+
+// The performance baseline's measurements and delta stream (T040): development runs only, never a packaged app.
+const perfPath = app.isPackaged ? undefined : process.env['AWG_PERF_LOG'];
+let perf: PerfLog | undefined;
+let batcherStats: (() => ReturnType<NonNullable<Parameters<typeof startPerfLog>[0]['stats']>>) | undefined;
+if (perfPath !== undefined && perfPath !== '') {
+  perf = startPerfLog({ path: perfPath, metrics: () => app.getAppMetrics(), stats: () => batcherStats?.() });
+  perf.mark('main-start');
+}
 
 /** The native title bar and the window background follow the app's saved theme (R-15). */
 function applyTheme(next: Theme): void {
@@ -54,6 +65,8 @@ function createWindow(): void {
   });
   win.setMenuBarVisibility(false);
   mainWindow = win;
+  perf?.mark('window-created');
+  if (perf !== undefined) win.webContents.once('did-finish-load', () => perf?.mark('window-loaded'));
   win.on('closed', () => {
     if (mainWindow === win) mainWindow = null;
   });
@@ -109,6 +122,7 @@ app.setName(APP_NAME);
 app.on('web-contents-created', (_event, contents) => guardWebContents(contents, isTrustedUrl));
 
 void app.whenReady().then(async () => {
+  perf?.mark('app-ready');
   guardSession(session.defaultSession);
   handleTrusted(APP_INFO_CHANNEL, getTrustedSender, () => ({ name: APP_NAME, version: app.getVersion() }));
   Menu.setApplicationMenu(Menu.buildFromTemplate(hiddenMenuTemplate(devUrl !== undefined)));
@@ -130,16 +144,29 @@ void app.whenReady().then(async () => {
     // back to the Agent SDK's copy; a development run may.
     runtimes: createRuntimeLocator({ ...(!app.isPackaged && { sdkBundledClaude: () => sdkBundledClaude(app.getAppPath()) }), log }),
     resolveRealPath,
-    supervisor: supervisorSettings(process.env),
+    // The idle supervisor follows the user's preferences (C-30); the environment overrides them in development runs only
+    // (the live and crash tests).
+    ...(!app.isPackaged && { supervisor: supervisorSettings(process.env) }),
     log,
   });
+  perf?.mark('backend-started');
   registerAppIpc({
     facade: backend.facade,
     bus,
     getTrustedSender,
     getEventTarget: () => (mainWindow === null || mainWindow.isDestroyed() ? null : mainWindow.webContents),
     isTrustedUrl,
+    ...(perf !== undefined && {
+      onBatcher: (batcher) => {
+        batcherStats = () => ({ ...batcher.stats });
+      },
+      onSnapshot: (snapshot, ms) => perf?.mark('snapshot', { ms: Math.round(ms), bytes: Buffer.byteLength(JSON.stringify(snapshot)), seq: snapshot.seq }),
+    }),
   });
+  const load = perf === undefined ? undefined : perfLoadFrom(process.env);
+  if (load !== undefined && perf !== undefined) {
+    startPerfLoad(load, (event) => void bus.publish(event), (name, extra) => perf?.mark(name, extra));
+  }
   const facade = backend.facade;
   handleTrusted(FOLDER_CHANNEL, getTrustedSender, (raw: unknown) =>
     handleFolderRequest(raw, {

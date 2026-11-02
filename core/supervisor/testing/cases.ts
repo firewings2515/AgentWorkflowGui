@@ -321,7 +321,7 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       expect(isOpen(w, b)).toBe(false);
       w.gone.add(CWD);
       const result = await w.service.sendMessage({ to: b, content: 'hi' }, { caller: a, operationId: OperationId.parse('peer-op-1'), sourceCallRef: 'call-1' });
-      expect(result).toMatchObject({ status: 'rejected', rejection: { reason: 'unknown-target' } });
+      expect(result).toMatchObject({ status: 'rejected', rejection: { reason: 'folder-missing' } });
       expect(await w.store.get(OperationId.parse('peer-op-1'))).toBeUndefined();
     });
   });
@@ -779,6 +779,50 @@ export const supervisorCases = (name: string, make: MakeSupWorld) => {
       expect(adapter.dispatched.map((d) => d.text)).toEqual(['before']);
       const messages = (await w2.repositories.conversations.get(a)).messages.filter((m) => m.text === 'during resume');
       expect(messages).toHaveLength(1);
+    });
+  });
+
+  describe(`idle supervisor: why a runtime was closed, and the user's limits (C-30, T040) (${name})`, () => {
+    const causes = (w: SupWorld, sessionId: SessionId) =>
+      w.events.flatMap((e) => (e.type === 'session.activity' && e.sessionId === sessionId && e.activity === 'closed' ? [e.cause ?? 'none'] : []));
+
+    it('a close after the idle time says idle; one that only the open-runtime limit made says process-limit', async () => {
+      const w = await make({ maxOpen: 2 });
+      const a = await created(w, 'codex', 'session-a');
+      await exchange(w, 'codex', a);
+      w.clock.advance(1000);
+      const b = await created(w, 'codex', 'session-b');
+      await exchange(w, 'codex', b);
+      w.clock.advance(1000);
+      await created(w, 'codex', 'session-c');
+      await settle();
+      expect(w.closed).toEqual([a]);
+      expect(causes(w, a)).toEqual(['process-limit']);
+      // b goes once its idle time has passed.
+      await idleFor(w, IDLE_MS);
+      expect(causes(w, b)).toEqual(['idle']);
+    });
+
+    it('the closes of the exit say nothing (only the supervisor gives a cause)', async () => {
+      const w = await make();
+      const a = await created(w, 'codex');
+      await exchange(w, 'codex', a);
+      await w.service.shutdown(CLOSE_MS);
+      expect(causes(w, a).filter((c) => c !== 'none')).toEqual([]);
+    });
+
+    it('new limits are used from the next tick on (the user saved the preferences)', async () => {
+      const w = await make();
+      const a = await created(w, 'codex');
+      await exchange(w, 'codex', a);
+      w.supervisor.setLimits({ idleMs: IDLE_MS * 10, maxOpen: 0 });
+      await idleFor(w, IDLE_MS);
+      expect(isOpen(w, a)).toBe(true);
+      w.supervisor.setLimits({ idleMs: IDLE_MS, maxOpen: 0 });
+      expect(w.supervisor.currentLimits()).toEqual({ idleMs: IDLE_MS, maxOpen: 0 });
+      await idleFor(w, 0);
+      expect(isOpen(w, a)).toBe(false);
+      expect(causes(w, a)).toEqual(['idle']);
     });
   });
 };

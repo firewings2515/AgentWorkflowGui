@@ -1,16 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { CommandResult, Snapshot, type Command, type EventEnvelope } from '../../contracts';
+import { CommandResult, EventBatch, QueryResult, Snapshot, type Command, type QueryRequest } from '../../contracts';
 import { fixtureSnapshot } from '../../contracts/fixtures/snapshot';
-import { COMMAND_CHANNEL, EVENT_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
-import { readSnapshot, registerAppIpc, runCommand, SNAPSHOT_UNAVAILABLE, UNKNOWN_REQUEST_ID, type EventTarget } from './app-ipc';
+import { BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
+import { QUERY_FAILED, readSnapshot, registerAppIpc, runCommand, runQuery, SNAPSHOT_UNAVAILABLE, UNKNOWN_REQUEST_ID, type EventTarget } from './app-ipc';
 import { EventBus } from './event-bus';
 import type { AppFacade } from './facade';
 import { createFakeFacade } from './testing/fake-facade';
 import type { IpcSenderEvent, TrustedSender } from './ipc-guard';
 
-const electron = vi.hoisted(() => ({ handlers: new Map<string, (event: unknown, ...args: unknown[]) => unknown>() }));
+const electron = vi.hoisted(() => ({
+  handlers: new Map<string, (event: unknown, ...args: unknown[]) => unknown>(),
+  listeners: new Map<string, (event: unknown, ...args: unknown[]) => void>(),
+}));
 vi.mock('electron', () => ({
-  ipcMain: { handle: (channel: string, handler: (event: unknown, ...args: unknown[]) => unknown) => electron.handlers.set(channel, handler) },
+  ipcMain: {
+    handle: (channel: string, handler: (event: unknown, ...args: unknown[]) => unknown) => electron.handlers.set(channel, handler),
+    on: (channel: string, listener: (event: unknown, ...args: unknown[]) => void) => electron.listeners.set(channel, listener),
+    removeListener: (channel: string) => electron.listeners.delete(channel),
+  },
 }));
 
 const mainFrame = { url: 'http://localhost:5173/' };
@@ -25,12 +32,19 @@ const setPreferences = (requestId = 'req-1'): unknown => ({ type: 'preferences.s
 function setup(overrides: { facade?: AppFacade; target?: EventTarget | null } = {}) {
   const bus = new EventBus({ seq: fixtureSnapshot.seq });
   const facade = overrides.facade ?? createFakeFacade({ bus });
-  const sent: { channel: string; envelope: EventEnvelope }[] = [];
+  const sent: { channel: string; batch: EventBatch }[] = [];
   const target: EventTarget | null =
     overrides.target === undefined
-      ? { isDestroyed: () => false, getURL: () => 'http://localhost:5173/', send: (channel, envelope) => sent.push({ channel, envelope }) }
+      ? { isDestroyed: () => false, getURL: () => 'http://localhost:5173/', send: (channel, batch) => sent.push({ channel, batch: EventBatch.parse(batch) }) }
       : overrides.target;
-  const stop = registerAppIpc({ facade, bus, getTrustedSender: () => trusted, getEventTarget: () => target, isTrustedUrl: (url) => trusted.isTrustedUrl(url) });
+  const stop = registerAppIpc({
+    facade,
+    bus,
+    getTrustedSender: () => trusted,
+    getEventTarget: () => target,
+    isTrustedUrl: (url) => trusted.isTrustedUrl(url),
+    forwarding: { batchMs: 0, maxInFlight: 1 },
+  });
   const call = (channel: string, event: unknown, ...args: unknown[]) => {
     const handler = electron.handlers.get(channel);
     if (!handler) throw new Error(`no handler for ${channel}`);
@@ -41,7 +55,11 @@ function setup(overrides: { facade?: AppFacade; target?: EventTarget | null } = 
 
 beforeEach(() => {
   electron.handlers.clear();
+  electron.listeners.clear();
 });
+
+/** Lets the batch timer (0 ms here) run. */
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 5));
 
 describe('sender checks', () => {
   it.each([
@@ -51,6 +69,7 @@ describe('sender checks', () => {
     const { call } = setup();
     expect(() => call(SNAPSHOT_CHANNEL, event)).toThrow(/untrusted sender/);
     expect(() => call(COMMAND_CHANNEL, event, setPreferences())).toThrow(/untrusted sender/);
+    expect(() => call(QUERY_CHANNEL, event, { type: 'backup.list', requestId: 'q' })).toThrow(/untrusted sender/);
   });
 
   it('does not run the command when the sender is rejected', () => {
@@ -256,38 +275,118 @@ describe('commands', () => {
 });
 
 describe('event forwarding', () => {
-  it('pushes envelopes with increasing seq to the window', async () => {
+  it('pushes batches with increasing seq to the window, without gaps', async () => {
     const { call, sent } = setup();
 
     await call(COMMAND_CHANNEL, trustedEvent, { type: 'session.reparent', requestId: 'r1', sessionId: 's-research', parentId: null, expectedRevision: 2 });
+    await tick();
     await call(COMMAND_CHANNEL, trustedEvent, { type: 'session.reparent', requestId: 'r2', sessionId: 's-research', parentId: 's-plan-notes', expectedRevision: 3 });
+    await tick();
 
-    expect(sent.map((s) => s.channel)).toEqual([EVENT_CHANNEL, EVENT_CHANNEL]);
-    expect(sent.map((s) => s.envelope.seq)).toEqual([fixtureSnapshot.seq + 1, fixtureSnapshot.seq + 2]);
-    expect(sent[0]?.envelope.event.type).toBe('session.updated');
+    expect(sent.map((s) => s.channel)).toEqual([BATCH_CHANNEL]);
+    // The second waits: the first is not acknowledged (in-flight limit 1 here).
+    const ack = electron.listeners.get(BATCH_ACK_CHANNEL)!;
+    ack(trustedEvent, sent[0]!.batch.toSeq);
+    await tick();
+    expect(sent.map((s) => [s.batch.fromSeq, s.batch.toSeq])).toEqual([
+      [fixtureSnapshot.seq + 1, fixtureSnapshot.seq + 1],
+      [fixtureSnapshot.seq + 2, fixtureSnapshot.seq + 2],
+    ]);
+    expect(sent[0]?.batch.envelopes[0]?.event.type).toBe('session.updated');
   });
 
-  it('lets a renderer resume: events after the Snapshot seq continue from it', async () => {
+  it('ignores an acknowledgement from another window or page', async () => {
     const { call, sent } = setup();
-    const before = Snapshot.parse(await call(SNAPSHOT_CHANNEL, trustedEvent));
     await call(COMMAND_CHANNEL, trustedEvent, { type: 'session.reparent', requestId: 'r1', sessionId: 's-research', parentId: null, expectedRevision: 2 });
-    expect(sent[0]?.envelope.seq).toBe(before.seq + 1);
+    await tick();
+    await call(COMMAND_CHANNEL, trustedEvent, { type: 'session.reparent', requestId: 'r2', sessionId: 's-research', parentId: 's-plan-notes', expectedRevision: 3 });
+    await tick();
+    const ack = electron.listeners.get(BATCH_ACK_CHANNEL)!;
+    ack(otherWindowEvent, sent[0]!.batch.toSeq);
+    ack(evilPageEvent, sent[0]!.batch.toSeq);
+    ack(trustedEvent, 'not a seq');
+    await tick();
+    expect(sent.length).toBe(1);
+  });
+
+  it('lets a renderer resume: what waited is sent before the Snapshot seq is read, and batches continue right after it', async () => {
+    const { call, sent, bus } = setup();
+    bus.publish({ type: 'usage.limits', at: '2026-10-26T10:00:00+08:00' });
+    await tick();
+    // Not acknowledged: this one waits behind the in-flight limit.
+    bus.publish({ type: 'usage.limits', at: '2026-10-26T10:00:01+08:00' });
+    await tick();
+    expect(sent.length).toBe(1);
+    const before = Snapshot.parse(await call(SNAPSHOT_CHANNEL, trustedEvent));
+    expect(sent.at(-1)?.batch.toSeq).toBe(before.seq);
+    await call(COMMAND_CHANNEL, trustedEvent, { type: 'session.reparent', requestId: 'r1', sessionId: 's-research', parentId: null, expectedRevision: 2 });
+    await tick();
+    expect(sent.at(-1)?.batch.fromSeq).toBe(before.seq + 1);
   });
 
   it.each([
     ['there is no window', null],
     ['the window is destroyed', { isDestroyed: () => true, getURL: () => 'http://localhost:5173/', send: vi.fn() }],
     ['the window shows a page that is not ours', { isDestroyed: () => false, getURL: () => 'https://example.com/', send: vi.fn() }],
-  ])('sends nothing when %s', (_name, target) => {
+  ])('sends nothing when %s', async (_name, target) => {
     const { bus } = setup({ target });
     expect(() => bus.publish({ type: 'usage.limits', at: '2026-10-26T10:00:00+08:00' })).not.toThrow();
+    await tick();
     if (target) expect(target.send).not.toHaveBeenCalled();
   });
 
-  it('stops forwarding after the returned function is called', () => {
+  it('stops forwarding after the returned function is called', async () => {
     const { bus, sent, stop } = setup();
     stop();
     bus.publish({ type: 'usage.limits', at: '2026-10-26T10:00:00+08:00' });
+    await tick();
     expect(sent).toEqual([]);
+    expect(electron.listeners.has(BATCH_ACK_CHANNEL)).toBe(false);
+  });
+});
+
+describe('queries (C-26, C-28)', () => {
+  const page = { sessionId: 's-research', turns: [], messages: [], items: [], nativeTasks: [], permissionRequests: [], artifacts: [], olderCursor: null };
+  const history = (sessionId = 's-research'): QueryRequest => ({ type: 'session.history', requestId: 'q-1', sessionId, before: 'c-1', limit: 50 }) as QueryRequest;
+  const facadeAnswering = (answer: unknown): AppFacade => ({ snapshot: () => fixtureSnapshot, execute: vi.fn(), query: vi.fn(() => answer as QueryResult) });
+
+  it('answers through the facade, checked against the contract', async () => {
+    const { call } = setup({ facade: facadeAnswering({ ok: true, type: 'session.history', requestId: 'q-1', page }) });
+    expect(QueryResult.parse(await call(QUERY_CHANNEL, trustedEvent, history()))).toMatchObject({ ok: true, page: { sessionId: 's-research' } });
+  });
+
+  it.each([
+    ['not an object', 'hello'],
+    ['an unknown type', { type: 'session.everything', requestId: 'q-1' }],
+    ['a limit above 500', { ...history(), limit: 501 }],
+    ['a path instead of an ID', { type: 'backup.list', requestId: 'q-1', path: 'C:/x' }],
+  ])('answers invalid_request for %s without calling the facade', async (_name, raw) => {
+    const query = vi.fn();
+    const facade: AppFacade = { snapshot: () => fixtureSnapshot, execute: vi.fn(), query };
+    const result = await runQuery(facade, raw);
+    expect(result).toMatchObject({ ok: false, code: 'invalid_request' });
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a page of another session', { ok: true, type: 'session.history', requestId: 'q-1', page: { ...page, sessionId: 's-plan-notes' } }],
+    ['the answer to another request', { ok: true, type: 'session.history', requestId: 'q-2', page }],
+    ['an answer of another type', { ok: true, type: 'backup.list', requestId: 'q-1', backups: [] }],
+    ['something outside the contract', { ok: 'maybe' }],
+  ])('never passes on %s', async (_name, answer) => {
+    const log = vi.fn();
+    expect(await runQuery(facadeAnswering(answer), history(), log)).toEqual({ ok: false, requestId: 'q-1', code: 'internal_error', message: QUERY_FAILED });
+  });
+
+  it('turns a throwing facade into fixed text, keeping its message out of the result and the log', async () => {
+    const log = vi.fn();
+    const facade: AppFacade = { snapshot: () => fixtureSnapshot, execute: vi.fn(), query: () => Promise.reject(new Error('C:/Users/someone/secret')) };
+    const result = await runQuery(facade, history(), log);
+    expect(result).toMatchObject({ ok: false, code: 'internal_error' });
+    expect(JSON.stringify([result, log.mock.calls])).not.toContain('someone');
+  });
+
+  it('answers internal_error when the facade has no queries', async () => {
+    expect(await runQuery({ snapshot: () => fixtureSnapshot, execute: vi.fn() }, history())).toMatchObject({ ok: false, code: 'internal_error' });
   });
 });
