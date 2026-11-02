@@ -319,6 +319,107 @@ export const noHistoryCases = (name: string, makeSup: MakeSup, makeFlow: MakeFlo
       });
     }
 
+    /**
+     * r3 P1: two deliveries to one session at once. The first one's resume is refused and its session's `error` is being
+     * written (held here) when the second begins; the first must still be told its own reason, whatever the second does.
+     */
+    const holdErrorWrite = (r: SupWorld) => {
+      const held = gate();
+      const sessions = r.repositories.sessions as unknown as { update: (record: { activity: string }, revision: number) => Promise<unknown> };
+      const update = sessions.update.bind(sessions);
+      let armed = true;
+      sessions.update = async (record, revision) => {
+        if (armed && record.activity === 'error') {
+          armed = false;
+          await held.promise;
+        }
+        return update(record, revision);
+      };
+      return held;
+    };
+    const twoUnknown = async () => {
+      const w = await withDisk(makeSup);
+      const a = await created(w, 'claude');
+      adapterOf(w, 'claude', a).dispatchModes.push('lost', 'lost');
+      await send(w, a, 'first');
+      await send(w, a, 'second');
+      await supSettle();
+      const r = await crash(w);
+      const open = await openEscalations(r, 'delivery-unknown');
+      const of = async (text: string) => {
+        const [record] = (await r.store.listByTarget(a)).filter((x) => x.kind === 'user-message' && x.payload === text);
+        return { record: record!, escalation: open.find((e) => e.ref?.kind === 'message' && e.ref.operationId === record!.operationId)! };
+      };
+      return { r, a, first: await of('first'), second: await of('second') };
+    };
+
+    it("r3 P1: two retries at once: the first, refused while the second is undecided, is told its own reason, not ok", async () => {
+      const { r, a, first, second } = await twoUnknown();
+      const held = holdErrorWrite(r);
+      const retry = (id: Escalation['id']) => r.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: id, decision: 'retry', acceptDuplicateRisk: true });
+      const one = retry(first.escalation.id);
+      await supSettle();
+      const two = retry(second.escalation.id);
+      await supSettle();
+      held.open();
+      const [r1, r2] = await Promise.all([one, two]);
+      await supSettle();
+      expect(r1).toMatchObject({ ok: false, code: 'runtime_unavailable' });
+      expect(r1.ok ? '' : r1.message).toMatch(/^The retry is saved, but it cannot be sent: An earlier message may have reached this session/);
+      // The second goes once: by then every attempt to the session is one the user retried.
+      expect(r2).toMatchObject({ ok: true });
+      expect(textsOf(r, 'claude', a)).toEqual(['second']);
+      expect((await r.store.get(first.record.operationId))!.delivery).toMatchObject({ state: 'pending', attempts: [{ resolution: { decision: 'retry' } }] });
+    });
+
+    it('r3 P1: a send and a retry at once: the refused send is told why and never sent later; the retry goes once', async () => {
+      const { r, a, first } = await twoUnknown();
+      const held = holdErrorWrite(r);
+      const sent = send(r, a, 'third');
+      await supSettle();
+      const retried = r.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: first.escalation.id, decision: 'retry', acceptDuplicateRisk: true });
+      await supSettle();
+      held.open();
+      const [s, t] = await Promise.all([sent, retried]);
+      await supSettle();
+      expect(s).toMatchObject({ ok: false, code: 'invalid_transition' });
+      expect(s.ok ? '' : s.message).toMatch(/^An earlier message may have reached this session/);
+      const [third] = (await r.store.listByTarget(a)).filter((x) => x.kind === 'user-message' && x.payload === 'third');
+      expect(third!.outcome).toMatchObject({ kind: 'cancelled' });
+      expect(t).toMatchObject({ ok: false, code: 'runtime_unavailable' });
+      expect(textsOf(r, 'claude', a)).toEqual([]);
+      // Nothing of the refused send goes at a later start either.
+      const next = await crash(r);
+      expect(textsOf(next, 'claude', a)).not.toContain('third');
+    });
+
+    it('r3 P2: a message the user cancelled, sent again under its own ID, is told it will not go; the session does not wait on it', async () => {
+      const w = await withDisk(makeSup);
+      const a = await created(w, 'claude');
+      adapterOf(w, 'claude', a).dispatchModes.push('lost');
+      await send(w, a, 'lost one');
+      await supSettle();
+      const escalation = await messageEscalation(w, a);
+      expect(await w.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: escalation.id, decision: 'cancel', acceptDuplicateRisk: false })).toMatchObject({ ok: true });
+      await supSettle();
+      const [record] = (await w.store.listByTarget(a)).filter((x) => x.kind === 'user-message');
+      const textsBefore = textsOf(w, 'claude', a).length;
+      const again = await w.run({
+        type: 'session.send',
+        requestId: supRid(),
+        sessionId: a,
+        messageId: record!.operationId.slice('user-message:'.length) as never,
+        expectedRevision: (await w.repositories.sessions.get(a))!.revision,
+        text: 'lost one',
+        attachments: [],
+      });
+      expect(again).toMatchObject({ ok: false, code: 'invalid_transition', retryable: false });
+      expect(again.ok ? '' : again.message).toBe('This message was cancelled and will not be sent');
+      expect(await activityOf(w, a)).toBe('idle');
+      expect(await openEscalations(w)).toEqual([]);
+      expect(textsOf(w, 'claude', a)).toHaveLength(textsBefore);
+    });
+
     it('claude: a session that had a message sent is never opened again, even when its transcript cannot be found', async () => {
       const w = await withDisk(makeSup);
       const a = await created(w, 'claude');

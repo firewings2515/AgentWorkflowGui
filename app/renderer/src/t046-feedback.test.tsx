@@ -38,6 +38,9 @@ describe('T046: what a refused retry or send tells the user', () => {
   it('a refused send says the message was not sent and to start a new session', () => {
     const send = commandFeedback(failure('invalid_transition'), 'session.send');
     expect(send).toContain('訊息沒有送出');
+    // r3 P2: the message itself may be the one that ended (the session still takes new ones), or the session cannot take any.
+    expect(send).toContain('這則訊息已經結束、不會再送');
+    expect(send).toContain('可以用新的訊息重送');
     expect(send).toContain('另開一個新的 session');
     expect(commandFeedback(failure('invalid_transition'), 'agent.delete')).toBe('Agent 仍被 Workflow 或 session 使用，無法刪除。');
     expect(commandFeedback(failure('invalid_transition'))).toBe('目前狀態不允許此操作。');

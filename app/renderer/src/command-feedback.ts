@@ -22,7 +22,7 @@ export const blocksResubmit = (result: CommandResult) => !result.ok && (result.m
 const byOperation: Partial<Record<string, Partial<Record<ErrorCode, string>>>> = {
   'agent.delete': { invalid_transition: 'Agent 仍被 Workflow 或 session 使用，無法刪除。' },
   'delivery.resolve': { runtime_unavailable: '重試已保存，但這個 session 現在接不回來，所以還沒有送出；下次啟動時會再試一次。要現在繼續，請另開一個新的 session。' },
-  'session.send': { invalid_transition: '訊息沒有送出：這個 session 目前不能接收訊息（例如資料夾已不在，或 session 接不回來）。可以另開一個新的 session 繼續。' },
+  'session.send': { invalid_transition: '訊息沒有送出：這則訊息已經結束、不會再送，或這個 session 目前不能接收訊息（例如資料夾已不在，或 session 接不回來）。可以用新的訊息重送；session 接不回來時，請另開一個新的 session 繼續。' },
 };
 
 export function commandFeedback(result: Failure, operation?: string): string {

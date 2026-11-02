@@ -158,6 +158,14 @@ export interface SupervisorHooks {
 const USE_EVENTS = new Set<RuntimeEvent['type']>(['session.activity', 'turn.updated', 'message.delta', 'message.completed', 'item.updated', 'item.outputDelta', 'permission.updated', 'nativeTask.updated']);
 
 /** Why a session whose folder is gone is not resumed (R-06, SP-07 G5: never in another folder). */
+/**
+ * A resume refused for a reason its sender is told as it is (T036, T046): the folder is gone, the session is kept read
+ * only, or it cannot be resumed nor opened again. Anything else a resume throws is a failure the sender may try again.
+ */
+class ResumeRefused extends Error {
+  override name = 'ResumeRefused';
+}
+
 const folderGone = (cwd: string) => `This session's folder ${cwd} no longer exists, so it cannot be resumed there (nor in any other folder); its conversation can only be viewed.`;
 
 /** How a workflow payload enters its target: a formal handoff waits for the target's turn to end (SP-05). */
@@ -356,9 +364,11 @@ export class SessionService {
   /** The resume of each session under way (T036 r1 P1-3). */
   private readonly resumes = new Map<SessionId, Promise<void>>();
   /** Why the last resume of a session was refused (its folder is gone, R-06), until one succeeds (T036). */
-  private readonly resumeRefused = new Map<SessionId, string>();
-  /** Sessions whose last resume failed otherwise (the runtime not usable now, a CLI that did not start), until one succeeds (T046). */
-  private readonly resumeFailed = new Set<SessionId>();
+  /**
+   * What the resume before a delivery's own claim met, by delivery (T036, T046 r3 P1): refused with a reason, or failed
+   * otherwise. Only that delivery's sender reads it, once; another delivery to the same session never sees it.
+   */
+  private readonly notTaken = new Map<OperationId, { refused: string } | { failed: true }>();
   /**
    * Turns a dispatch's ack named that were not seen to end yet, per session (T023 r1-P1-4): the session is
    * not at its turn boundary while one is here, even before the runtime reported it running. Only an end of
@@ -939,6 +949,9 @@ export class SessionService {
     // r2-P1-8): a message ID taken elsewhere is refused before anything is accepted or sent.
     // One that ended apart from delivery (refused to the user, T046; cancelled by its workflow run) is never sent: said so.
     if (existing?.outcome !== undefined) return fail(requestId, 'invalid_transition', `This message was not sent and will not be: ${existing.outcome.detail}`);
+    // Nor one the user cancelled when its outcome stayed unknown (r3 P2): its question is answered, nothing waits.
+    if (existing?.delivery.state === 'unknown' && existing.delivery.attempts.at(-1)?.resolution?.decision === 'cancel')
+      return fail(requestId, 'invalid_transition', 'This message was cancelled and will not be sent');
     const written = await this.writeUserMessage(sessionId, messageId, text, existing?.acceptedAt ?? this.options.now());
     if (written === 'taken') return fail(requestId, 'invalid_request', 'This message ID was already used for another message');
     if (this.closing) return closingFailure(requestId);
@@ -982,7 +995,8 @@ export class SessionService {
         });
       default: {
         // Its folder went while the message was on its way (T036): said plainly, never resumed elsewhere.
-        const refused = this.resumeRefused.get(sessionId);
+        const notTaken = this.takeNotTaken(operationId);
+        const refused = notTaken !== undefined && 'refused' in notTaken ? notTaken.refused : undefined;
         if (refused !== undefined) {
           // Told it is not sent, so it is never sent later either (T046): no restart's recovery sends it unseen.
           await this.store.recordOutcome(operationId, { kind: 'cancelled', detail: 'its session could not be resumed, so it was not sent', at: this.options.now() });
@@ -1168,12 +1182,6 @@ export class SessionService {
     for (const [sessionId, mark] of this.handoffTurns) if (mark.operationId === attempt.operationId) this.handoffTurns.delete(sessionId);
     let retried: Awaited<ReturnType<SessionService['retryPending']>> = undefined;
     if (decision === 'retry') {
-      // Only this retry's own resume tells the user why it did not go (r2 P1): an earlier one's is forgotten.
-      const before = (await this.store.get(attempt.operationId))?.target.sessionId;
-      if (before !== undefined) {
-        this.resumeRefused.delete(before);
-        this.resumeFailed.delete(before);
-      }
       retried = await this.retryPending(attempt.operationId);
       if (escalation.ref?.kind === 'provision') for (const blocked of escalation.ref.blocked) await this.retryPending(blocked);
     }
@@ -1183,12 +1191,11 @@ export class SessionService {
     const target = record?.target.sessionId;
     if (record?.kind === 'user-message' && target !== undefined) await this.leaveReconciling(target, record.target.nativeSessionRef);
     // A retry its session could not take (T046, F-2): said plainly instead of waiting in pending unseen (r1 P1-2).
-    if (retried === 'pending' && target !== undefined) {
-      const refused = this.resumeRefused.get(target);
-      if (refused !== undefined) return fail(requestId, 'runtime_unavailable', `The retry is saved, but it cannot be sent: ${refused}`);
-      if (this.resumeFailed.has(target))
-        return fail(requestId, 'runtime_unavailable', 'The retry is saved, but its session could not be resumed now. It is tried again when the app starts next; or start a new session.');
-    }
+    // Only this delivery's own resume is told (r3 P1): another retry or send to the session never takes its reason.
+    const notTaken = retried === 'pending' ? this.takeNotTaken(attempt.operationId) : undefined;
+    if (notTaken !== undefined && 'refused' in notTaken) return fail(requestId, 'runtime_unavailable', `The retry is saved, but it cannot be sent: ${notTaken.refused}`);
+    if (notTaken !== undefined)
+      return fail(requestId, 'runtime_unavailable', 'The retry is saved, but its session could not be resumed now. It is tried again when the app starts next; or start a new session.');
     return ok(requestId);
   }
 
@@ -1965,7 +1972,13 @@ export class SessionService {
    * it here, and the claim follows with nothing in between to wait for.
    */
   private async prepareTarget(record: PayloadDelivery): Promise<void> {
-    await this.resumeTarget(record);
+    this.notTaken.delete(record.operationId);
+    try {
+      await this.resumeTarget(record);
+    } catch (error) {
+      this.notTaken.set(record.operationId, error instanceof ResumeRefused ? { refused: error.message } : { failed: true });
+      throw error;
+    }
     if (record.kind === 'transfer' && this.transfer !== undefined && !(await this.transfer.mayDispatch(record))) throw new Error('the transfer no longer sends this');
   }
 
@@ -2002,14 +2015,10 @@ export class SessionService {
   private async resumeNow(record: PayloadDelivery, sessionId: SessionId, ref: string): Promise<void> {
     const session = await this.repos.sessions.get(sessionId);
     const cwd = record.context.cwd;
-    // Only this attempt's refusal or failure is told to the sender.
-    this.resumeRefused.delete(sessionId);
-    this.resumeFailed.delete(sessionId);
     const refused = await this.resumeRefusal(session, cwd);
     if (refused !== undefined) {
-      this.resumeRefused.set(sessionId, refused);
       this.log(`resuming ${sessionId} was refused (its folder is gone or kept read only)`);
-      throw new Error(refused);
+      throw new ResumeRefused(refused);
     }
     const settings = session === undefined ? record.context.session : await this.settingsOf(session);
     // Looked at again after every await (KNOWLEDGE §5): opened meanwhile, it is not resumed a second time.
@@ -2023,18 +2032,11 @@ export class SessionService {
       });
     } catch (error) {
       // Claude reports a folder removed meanwhile as a binary that cannot start (SP-07 G5): said plainly instead.
-      if (this.options.resolveRealPath(cwd) === null) {
-        this.resumeRefused.set(sessionId, folderGone(cwd));
-        // eslint-disable-next-line preserve-caught-error
-        throw new Error(folderGone(cwd));
-      }
+      if (this.options.resolveRealPath(cwd) === null) throw new ResumeRefused(folderGone(cwd));
       // Fixed words only: the runtime's error may quote paths or content.
       this.log(`resuming ${sessionId} failed (${record.context.runtime})`);
-      this.resumeFailed.add(sessionId);
       if (!(await this.reopen(record, sessionId, ref, settings))) throw error;
     }
-    this.resumeRefused.delete(sessionId);
-    this.resumeFailed.delete(sessionId);
     await this.setActivity(sessionId, 'idle');
   }
 
@@ -2047,18 +2049,17 @@ export class SessionService {
    *   - the runtime's own read-only look finds nothing stored under that ID (Claude: no transcript).
    * Not finding it is never the proof by itself (CR-2). Nothing is sent here: what was pending goes on through its own
    * claim. When an attempt is still undecided, or the runtime cannot tell, nothing is opened: the session shows
-   * `error` and the sender is told why. Answers whether it was opened.
+   * `error` and the sender is told why (`ResumeRefused`). Answers whether it was opened.
    */
   private async reopen(record: PayloadDelivery, sessionId: SessionId, ref: string, settings: SessionSettings): Promise<boolean> {
     const handed = await this.handedOver(sessionId);
     // A payload sent is stored by the runtime: this resume failed for another reason, and is tried again next time.
     if (handed === 'sent') return false;
     if (handed === 'undecided') {
-      await this.unresumable(
+      return this.unresumable(
         sessionId,
         'An earlier message may have reached this session, and its runtime has nothing stored to resume it from, so it is not opened again. Retrying that message sends it here again; otherwise start a new session.',
       );
-      return false;
     }
     const { runtime, cwd } = record.context;
     const stored = await this.runtimes.reconcileProvision(runtime, sessionId, { cwd, preallocatedRef: ref }).catch(() => undefined);
@@ -2066,16 +2067,14 @@ export class SessionService {
     // failed for another reason, and is tried again next time.
     if (stored === undefined || stored.state === 'sent') return false;
     if (stored.reason !== 'not-found') {
-      await this.unresumable(sessionId, 'This session could not be resumed, and its runtime cannot confirm that nothing of it is stored, so it is not opened again. Start a new session.');
-      return false;
+      return this.unresumable(sessionId, 'This session could not be resumed, and its runtime cannot confirm that nothing of it is stored, so it is not opened again. Start a new session.');
     }
     if (this.closing || this.runtimes.isOpen(ref)) return this.runtimes.isOpen(ref);
     const info = await this.runtimes.startSession(runtime, { sessionId, cwd, preallocatedRef: ref, ...settings });
     if (info.nativeSessionRef !== ref) {
       // Never bound to another native session: the one just made is let go.
       await this.runtimes.closeSession(info.nativeSessionRef).catch(() => undefined);
-      await this.unresumable(sessionId, 'This session could not be opened again under its own ID. Start a new session.');
-      return false;
+      return this.unresumable(sessionId, 'This session could not be opened again under its own ID. Start a new session.');
     }
     this.log(`${sessionId} had nothing stored and nothing was handed to it unasked: opened again under its own ID (${handed})`);
     return true;
@@ -2093,10 +2092,17 @@ export class SessionService {
   }
 
   /** A session that cannot be resumed nor opened again (T046): it shows `error`, and the sender is told why. */
-  private async unresumable(sessionId: SessionId, why: string): Promise<void> {
-    this.resumeRefused.set(sessionId, why);
+  private async unresumable(sessionId: SessionId, why: string): Promise<never> {
     this.log(`${sessionId} cannot be resumed and is not opened again`);
     await this.setActivity(sessionId, 'error');
+    throw new ResumeRefused(why);
+  }
+
+  /** What this delivery's own resume met, read once by its sender (r3 P1). */
+  private takeNotTaken(operationId: OperationId): { refused: string } | { failed: true } | undefined {
+    const notTaken = this.notTaken.get(operationId);
+    this.notTaken.delete(operationId);
+    return notTaken;
   }
 
   /** Why a closed session cannot be resumed in `cwd`, or undefined (R-06, T032 read-only sessions, T036). */
