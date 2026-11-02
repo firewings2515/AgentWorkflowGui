@@ -979,7 +979,11 @@ export class SessionService {
       default: {
         // Its folder went while the message was on its way (T036): said plainly, never resumed elsewhere.
         const refused = this.resumeRefused.get(sessionId);
-        if (refused !== undefined) return fail(requestId, 'invalid_transition', refused);
+        if (refused !== undefined) {
+          // Told it is not sent, so it is never sent later either (T046): no restart's recovery sends it unseen.
+          await this.store.recordOutcome(operationId, { kind: 'cancelled', detail: 'its session could not be resumed, so it was not sent', at: this.options.now() });
+          return fail(requestId, 'invalid_transition', refused);
+        }
         return fail(requestId, 'runtime_unavailable', 'The message is saved but could not be handed to the session yet', { retryable: true });
       }
     }
@@ -2111,13 +2115,14 @@ export class SessionService {
   private async dispatchOne(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry }): Promise<DispatchOutcome | undefined> {
     if (this.closing) return undefined;
     // Every way a user message is dispatched (sent at once, recovered, retried) passes here (T024 r3-P1-2).
-    const record = this.workflow === undefined && this.transfer === undefined ? undefined : await this.store.get(operationId);
+    const record = await this.store.get(operationId);
     // Every transfer delivery passes here too: never once its proposal is cancelled or failed (T023).
     if (record?.kind === 'transfer' && this.transfer !== undefined) {
       if (record.outcome !== undefined || !(await this.transfer.mayDispatch(record))) return undefined;
     }
+    // A user message that ended apart from delivery (cancelled by its workflow run, or refused to the user, T046) is never sent.
+    if (record?.kind === 'user-message' && record.outcome !== undefined) return undefined;
     if (record?.kind === 'user-message' && this.workflow !== undefined) {
-      if (record.outcome !== undefined) return undefined;
       const fate = await this.workflow.userMessageFate(record);
       if (fate === 'wait') return undefined;
       if (fate === 'cancel') {

@@ -259,6 +259,12 @@ export const noHistoryCases = (name: string, makeSup: MakeSup, makeFlow: MakeFlo
         // The escalation is still the user's to answer.
         expect((await openEscalations(r, 'delivery-unknown')).map((e) => e.id)).toEqual([escalation.id]);
         await retryAfter(r, runtime, a, ref, escalation, 'the work');
+        // The refused message was told not sent: no later start sends it unseen, even once the session can resume.
+        const [refused] = (await r.store.listByTarget(a)).filter((x) => x.kind === 'user-message' && x.payload === 'next');
+        expect(refused!.outcome).toMatchObject({ kind: 'cancelled' });
+        const again = await crash(r);
+        expect(textsOf(again, runtime, a)).toEqual([]);
+        expect((await again.store.get(refused!.operationId))!.delivery).toMatchObject({ state: 'pending', attempts: [] });
       });
     }
 
