@@ -106,10 +106,10 @@ export const crashCases = (name: string, makeSup: MakeSup, makeFlow: MakeFlow) =
         expect(adapterOf(r, runtime, a).reconciled.map((x) => x.clientMessageId)).toEqual([before!.delivery.attempts[0]!.clientMessageId]);
         expect(sentTexts(r, runtime, a)).toEqual([]);
         expect(resumedOf(r, runtime, a)).toEqual([]);
-        // G-1: contracts have the escalation for it (`EscalationRef` kind `message`, C-02), but `escalateDelivery`
-        // does not raise it for a user's own message yet (T046): the session only shows it is reconciling. The
-        // message itself is stored once.
+        // G-1 (T046): the session shows it is reconciling and the user decides with the message's escalation
+        // (`EscalationRef` kind `message`, C-02). The message itself is stored once.
         expect((await r.repositories.sessions.get(a))?.activity).toBe('reconciling');
+        expect(await openEscalations(r, 'delivery-unknown')).toMatchObject([{ ref: { kind: 'message', operationId: before!.operationId } }]);
         expect((await r.repositories.conversations.get(a)).messages.filter((m) => m.role === 'user')).toHaveLength(1);
         // Sending the same message ID again does not send it again either.
         const message = (await r.repositories.conversations.get(a)).messages.find((m) => m.role === 'user')!;

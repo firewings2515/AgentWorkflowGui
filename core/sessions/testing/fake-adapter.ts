@@ -7,6 +7,7 @@ import type {
   HistoryResult,
   NativeSessionInfo,
   PermissionHandle,
+  ReconcileProvisionRequest,
   ReconcileProvisionResult,
   ReconcileRequest,
   ReconcileResult,
@@ -21,6 +22,15 @@ import type {
  * nothing). `reject`: refused locally, nothing left the process.
  */
 export type FakeDispatch = 'ack' | 'unknown' | 'lost' | 'reject';
+
+/**
+ * What the runtimes keep on disk across GUI restarts (T046): the native sessions they stored. A runtime stores a
+ * session only once a payload reached it (Claude writes the transcript with the first message, Codex the rollout
+ * with the first turn); until then it cannot resume it.
+ */
+export class RuntimeDisk {
+  readonly stored = new Set<string>();
+}
 
 export class FakeAdapter implements RuntimeAdapter {
   readonly calls: string[] = [];
@@ -55,6 +65,11 @@ export class FakeAdapter implements RuntimeAdapter {
   /** When set, start() and resumeSession() wait for it (an initialize or a resume that hangs). */
   startGate: Promise<void> | undefined;
   resumeGate: Promise<void> | undefined;
+  /**
+   * The disk this runtime stores sessions on (T046), when the test models it: a resume of a session it did not store
+   * fails as the real runtime's does; Claude also refuses to start a session ID it stored and can look one up.
+   */
+  diskOf: () => RuntimeDisk | undefined = () => undefined;
 
   async start(): Promise<void> {
     this.calls.push('start');
@@ -72,6 +87,9 @@ export class FakeAdapter implements RuntimeAdapter {
     const mode = this.startModes.shift() ?? 'ok';
     if (mode === 'fail') return Promise.reject(new Error(this.startError));
     if (mode === 'lost') return Promise.reject(new Error('the create response was lost'));
+    // Claude CLI 2.1.309: `Error: Session ID <id> is already in use.`
+    if (this.runtime === 'claude' && options.preallocatedRef !== undefined && this.diskOf()?.stored.has(options.preallocatedRef) === true)
+      return Promise.reject(new Error(`Session ID ${options.preallocatedRef} is already in use.`));
     const ref = options.preallocatedRef ?? `thread-${++this.next}`;
     const info: NativeSessionInfo = { sessionId: options.sessionId, nativeSessionRef: ref, cwd: options.cwd, model: this.openedModel };
     if (mode === 'held') return new Promise((resolve) => this.held.push(() => resolve(info)));
@@ -87,6 +105,13 @@ export class FakeAdapter implements RuntimeAdapter {
     this.calls.push('resumeSession');
     this.resumed.push(options);
     await this.resumeGate;
+    const disk = this.diskOf();
+    if (disk !== undefined && !disk.stored.has(options.nativeSessionRef))
+      throw new Error(
+        this.runtime === 'claude'
+          ? `resumeSession: no stored Claude session ${options.nativeSessionRef} under ${options.cwd}`
+          : `thread/resume: no rollout found for thread id ${options.nativeSessionRef}`,
+      );
     return { sessionId: options.sessionId, nativeSessionRef: options.nativeSessionRef, cwd: options.cwd, model: this.openedModel };
   }
 
@@ -96,8 +121,14 @@ export class FakeAdapter implements RuntimeAdapter {
     return Promise.resolve({ forced: false });
   }
 
-  reconcileProvision(): Promise<ReconcileProvisionResult> {
-    return Promise.resolve({ state: 'unknown', reason: 'unsupported', detail: 'fake' });
+  /** With a disk, Claude looks a pre-allocated ID up there (C-08); Codex has no ID to look up before thread/start. */
+  readonly provisionLookups: ReconcileProvisionRequest[] = [];
+  reconcileProvision(request?: ReconcileProvisionRequest): Promise<ReconcileProvisionResult> {
+    if (request !== undefined) this.provisionLookups.push(request);
+    const disk = this.diskOf();
+    if (disk === undefined || this.runtime !== 'claude' || request?.preallocatedRef === undefined) return Promise.resolve({ state: 'unknown', reason: 'unsupported', detail: 'fake' });
+    if (disk.stored.has(request.preallocatedRef)) return Promise.resolve({ state: 'sent', nativeSessionRef: request.preallocatedRef });
+    return Promise.resolve({ state: 'unknown', reason: 'not-found', detail: 'no stored transcript for the pre-allocated session' });
   }
 
   dispatchOnce(request: DispatchRequest): Promise<DispatchResult> {
@@ -107,6 +138,7 @@ export class FakeAdapter implements RuntimeAdapter {
     if (mode === 'lost') return Promise.resolve({ state: 'unknown', reason: 'disconnected', written: true, detail: 'connection lost' });
     if (mode === 'reject') return Promise.resolve({ state: 'unknown', reason: 'rejected', written: false, detail: 'refused' });
     this.history.set(request.attempt.clientMessageId, { ref: request.nativeSessionRef, text: request.text });
+    this.diskOf()?.stored.add(request.nativeSessionRef);
     if (mode === 'unknown') return Promise.resolve({ state: 'unknown', reason: 'timeout', written: true, detail: 'no ack' });
     return Promise.resolve({
       state: 'sent',

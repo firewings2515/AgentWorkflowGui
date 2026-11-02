@@ -209,6 +209,15 @@ export class SessionRuntimes {
   }
 
   /**
+   * The runtime's read-only look for a session it stored (C-08), e.g. whether a Claude session has a transcript
+   * (T046). On the session's adapter, started if needed; the session itself is never opened.
+   */
+  async reconcileProvision(runtime: Runtime, sessionId: SessionId, request: ReconcileProvisionRequest): Promise<ReconcileProvisionResult> {
+    const adapter = await this.adapterFor(runtime, sessionId);
+    return adapter.reconcileProvision(request);
+  }
+
+  /**
    * Start or resume with a new mount. An adapter error is rethrown with every token redacted; a session that
    * comes up after closing began is closed again at once and never counted as open (R-14).
    */

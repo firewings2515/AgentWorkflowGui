@@ -1164,7 +1164,22 @@ export class SessionService {
     }
     // A transfer follows the user's decision on its target or payload (T023).
     if (decision === 'cancel') await this.transfer?.deliveryResolved(attempt.operationId, decision);
+    const record = await this.store.get(attempt.operationId);
+    const target = record?.target.sessionId;
+    if (record?.kind === 'user-message' && target !== undefined) await this.leaveReconciling(target, record.target.nativeSessionRef);
+    // A retry its session cannot take (T046, F-2): said plainly instead of waiting in pending unseen.
+    const refused = decision === 'retry' && record?.delivery.state === 'pending' && target !== undefined ? this.resumeRefused.get(target) : undefined;
+    if (refused !== undefined) return fail(requestId, 'runtime_unavailable', `The retry is saved, but it cannot be sent: ${refused}`);
     return ok(requestId);
+  }
+
+  /** A session stops showing `reconciling` once none of its user's messages is undecided any more (G-1). */
+  private async leaveReconciling(sessionId: SessionId, ref: string | undefined): Promise<void> {
+    if ((await this.repos.sessions.get(sessionId))?.activity !== 'reconciling') return;
+    const undecided = (await this.store.listByTarget(sessionId)).some(
+      (r) => r.kind === 'user-message' && r.delivery.state === 'unknown' && r.delivery.attempts.at(-1)?.resolution?.decision !== 'cancel',
+    );
+    if (!undecided) await this.setActivity(sessionId, ref !== undefined && this.runtimes.isOpen(ref) ? 'idle' : 'closed');
   }
 
   /** A pending delivery the user retried: a formal handoff waits in its target's queue like any other (r1-P1-2). */
@@ -1995,10 +2010,73 @@ export class SessionService {
         // eslint-disable-next-line preserve-caught-error
         throw new Error(folderGone(cwd));
       }
-      throw error;
+      // Fixed words only: the runtime's error may quote paths or content.
+      this.log(`resuming ${sessionId} failed (${record.context.runtime})`);
+      if (!(await this.reopen(record, sessionId, ref, settings))) throw error;
     }
     this.resumeRefused.delete(sessionId);
     await this.setActivity(sessionId, 'idle');
+  }
+
+  /**
+   * After a failed resume (T046, F-1/F-2): a runtime stores nothing of a session before its first payload (Claude
+   * writes the transcript with the first message, Codex the rollout with the first turn), so such a session cannot be
+   * resumed. It is opened again under its own native ID only when both say nothing can be lost:
+   *   - the delivery records: no payload to the session ever crossed the dispatch boundary, or every crossing is an
+   *     attempt the user chose to send again (`retry`, accepting the duplicate risk); none was sent;
+   *   - the runtime's own read-only look finds nothing stored under that ID (Claude: no transcript).
+   * Not finding it is never the proof by itself (CR-2). Nothing is sent here: what was pending goes on through its own
+   * claim. When an attempt is still undecided, or the runtime cannot tell, nothing is opened: the session shows
+   * `error` and the sender is told why. Answers whether it was opened.
+   */
+  private async reopen(record: PayloadDelivery, sessionId: SessionId, ref: string, settings: SessionSettings): Promise<boolean> {
+    const handed = await this.handedOver(sessionId);
+    // A payload sent is stored by the runtime: this resume failed for another reason, and is tried again next time.
+    if (handed === 'sent') return false;
+    if (handed === 'undecided') {
+      await this.unresumable(
+        sessionId,
+        'An earlier message may have reached this session, and its runtime has nothing stored to resume it from, so it is not opened again. Retrying that message sends it here again; otherwise start a new session.',
+      );
+      return false;
+    }
+    const { runtime, cwd } = record.context;
+    const stored = await this.runtimes.reconcileProvision(runtime, sessionId, { cwd, preallocatedRef: ref }).catch(() => undefined);
+    // The runtime cannot be asked now (not usable, closing: T045), or it has the session stored after all: this resume
+    // failed for another reason, and is tried again next time.
+    if (stored === undefined || stored.state === 'sent') return false;
+    if (stored.reason !== 'not-found') {
+      await this.unresumable(sessionId, 'This session could not be resumed, and its runtime cannot confirm that nothing of it is stored, so it is not opened again. Start a new session.');
+      return false;
+    }
+    if (this.closing || this.runtimes.isOpen(ref)) return this.runtimes.isOpen(ref);
+    const info = await this.runtimes.startSession(runtime, { sessionId, cwd, preallocatedRef: ref, ...settings });
+    if (info.nativeSessionRef !== ref) {
+      // Never bound to another native session: the one just made is let go.
+      await this.runtimes.closeSession(info.nativeSessionRef).catch(() => undefined);
+      await this.unresumable(sessionId, 'This session could not be opened again under its own ID. Start a new session.');
+      return false;
+    }
+    this.log(`${sessionId} had nothing stored and nothing was handed to it unasked: opened again under its own ID (${handed})`);
+    return true;
+  }
+
+  /**
+   * What of the payloads to a session ever crossed the dispatch boundary (T046): `nothing`; only attempts the user
+   * chose to send again (`retried`); one that was `sent`; or one still `undecided` (unknown, waited on or cancelled).
+   */
+  private async handedOver(sessionId: SessionId): Promise<'nothing' | 'retried' | 'sent' | 'undecided'> {
+    const attempts = (await this.store.listByTarget(sessionId)).filter((r) => r.kind !== 'provision' && r.target.sessionId === sessionId).flatMap((r) => r.delivery.attempts);
+    if (attempts.some((a) => a.state === 'sent')) return 'sent';
+    if (attempts.some((a) => a.resolution?.decision !== 'retry')) return 'undecided';
+    return attempts.length === 0 ? 'nothing' : 'retried';
+  }
+
+  /** A session that cannot be resumed nor opened again (T046): it shows `error`, and the sender is told why. */
+  private async unresumable(sessionId: SessionId, why: string): Promise<void> {
+    this.resumeRefused.set(sessionId, why);
+    this.log(`${sessionId} cannot be resumed and is not opened again`);
+    await this.setActivity(sessionId, 'error');
   }
 
   /** Why a closed session cannot be resumed in `cwd`, or undefined (R-06, T032 read-only sessions, T036). */
@@ -2063,26 +2141,25 @@ export class SessionService {
   private async escalateDelivery(item: DeliveryEscalation): Promise<void> {
     const sessionId = item.target.sessionId;
     if (sessionId === undefined) return;
-    if (item.deliveryKind === 'user-message') {
-      // Contracts have no escalation ref for a user's own message: the session shows it is reconciling.
-      await this.setActivity(sessionId, 'reconciling');
-      return;
-    }
+    // A user's own message (G-1, C-02): the session shows it is reconciling, and the user decides with `delivery.resolve`.
+    if (item.deliveryKind === 'user-message') await this.setActivity(sessionId, 'reconciling');
     // A transfer's own deliveries, and its target's creation, are shown at the source session (T023).
     const transferred = await this.transfer?.escalationFor(item);
     const ref: Escalation['ref'] = transferred
       ? transferred.ref
-      : item.deliveryKind === 'provision'
-        ? {
-            kind: 'provision',
-            operationId: item.operationId,
-            blocked: item.blocked ?? [],
-          }
-        : item.deliveryKind === 'peer-message'
-          ? { kind: 'peerMessage', peerMessageId: peerIdOf(item.operationId) }
-          : item.deliveryKind === 'handoff'
-            ? await this.handoffRef(item.operationId)
-            : undefined;
+      : item.deliveryKind === 'user-message'
+        ? { kind: 'message', operationId: item.operationId, messageId: MessageId.parse(item.operationId.slice('user-message:'.length)) }
+        : item.deliveryKind === 'provision'
+          ? {
+              kind: 'provision',
+              operationId: item.operationId,
+              blocked: item.blocked ?? [],
+            }
+          : item.deliveryKind === 'peer-message'
+            ? { kind: 'peerMessage', peerMessageId: peerIdOf(item.operationId) }
+            : item.deliveryKind === 'handoff'
+              ? await this.handoffRef(item.operationId)
+              : undefined;
     if (ref === undefined) return;
     const id = deliveryEscalationId(item.key);
     if ((await this.repos.escalations.get(id)) !== undefined) return;
