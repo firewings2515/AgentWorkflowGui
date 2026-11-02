@@ -64,6 +64,14 @@ export type AcceptOutcome =
   /** The store could not confirm its commit. Accept again with the same operationId to find out. */
   | { status: 'commit-uncertain'; detail: string };
 
+/**
+ * One dispatch call's own record (T046 r4): what preparing its target threw, when it did. Written for this call alone,
+ * so its caller reads why its own call did not go, never another call's to the same delivery or session.
+ */
+export interface DispatchCall {
+  prepareError?: unknown;
+}
+
 export interface DispatchOptions {
   /**
    * How the payload enters the target session, chosen by the caller (idle: new turn; busy peer message:
@@ -80,6 +88,8 @@ export interface DispatchOptions {
    * payloads are marked as not from the user). Absent means the user. Ignored for a provision.
    */
   origin?: MessageOrigin;
+  /** Filled in when the target's preparation fails in this call (see DispatchCall). */
+  call?: DispatchCall;
 }
 
 /** Why the runtime was not called. The delivery is unchanged unless `commit-uncertain` says otherwise. */

@@ -18,9 +18,20 @@ const explanations: Record<ErrorCode, string> = {
 };
 
 export const blocksResubmit = (result: CommandResult) => !result.ok && (result.mayHaveSideEffects || result.code === 'unknown_outcome');
+/** What a code means for one operation, where the general words would leave the user without a way on (T046). */
+const byOperation: Partial<Record<string, Partial<Record<ErrorCode, string>>>> = {
+  'agent.delete': { invalid_transition: 'Agent 仍被 Workflow 或 session 使用，無法刪除。' },
+  'delivery.resolve': { runtime_unavailable: '重試已保存，但這個 session 現在接不回來，所以還沒有送出；下次啟動時會再試一次。要現在繼續，請另開一個新的 session。' },
+  'session.send': { invalid_transition: '訊息沒有送出：這則訊息已經結束、不會再送，或這個 session 目前不能接收訊息（例如資料夾已不在，或 session 接不回來）。可以用新的訊息重送；session 接不回來時，請另開一個新的 session 繼續。' },
+};
+
 export function commandFeedback(result: Failure, operation?: string): string {
-  const explanation = operation === 'agent.delete' && result.code === 'invalid_transition'
-    ? 'Agent 仍被 Workflow 或 session 使用，無法刪除。' : explanations[result.code];
+  // A retry is "saved" only when the service says a change was made (r4 P2): one refused before it (the app closing)
+  // saved nothing and keeps the general words.
+  const savedRetry = operation === 'delivery.resolve' && result.code === 'runtime_unavailable' && result.mayHaveSideEffects;
+  if (savedRetry) return byOperation['delivery.resolve']!.runtime_unavailable!;
+  const words = operation === undefined || operation === 'delivery.resolve' ? undefined : byOperation[operation]?.[result.code];
+  const explanation = words ?? explanations[result.code];
   return explanation + (result.mayHaveSideEffects && result.code !== 'unknown_outcome' ? ' 可能已產生變更，請先核對；不可直接重試。' : '');
 }
 

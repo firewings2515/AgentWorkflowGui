@@ -429,12 +429,15 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const ref = request.preallocatedRef;
     if (ref === undefined || !isWireUuid(ref)) return { state: 'unknown', reason: 'unsupported', detail: 'only a pre-allocated Claude session UUID can be looked up' };
     let lines: WireTranscriptEntry[];
+    let complete: boolean;
     try {
-      ({ lines } = await this.options.sdk.readTranscript(ref, { dir: request.cwd }));
+      ({ lines, complete } = await this.options.sdk.readTranscript(ref, { dir: request.cwd }));
     } catch {
       // Fixed text: the SDK's error may quote paths or transcript content, and this result can end up in an escalation.
       return { state: 'unknown', reason: 'read-failed', detail: 'the stored transcript could not be read' };
     }
+    // Nothing read from a transcript that was not read whole is not "none stored" (T046 r1 P1-1).
+    if (lines.length === 0 && !complete) return { state: 'unknown', reason: 'read-failed', detail: 'the stored transcript could not be read whole' };
     if (lines.length === 0) return { state: 'unknown', reason: 'not-found', detail: 'no stored transcript for the pre-allocated session' };
     const recorded = recordedCwd(lines);
     if (recorded !== undefined && !sameFolder(recorded, request.cwd)) return { state: 'unknown', reason: 'read-failed', detail: 'the stored session ran in another folder' };

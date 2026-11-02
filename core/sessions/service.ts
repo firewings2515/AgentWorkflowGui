@@ -42,7 +42,7 @@ import {
   type WorkflowInstance,
   AttemptId,
 } from '../../contracts';
-import { DeliveryService, type DeliveryEscalation, type DispatchOutcome, type PayloadDelivery, type RecoveryReport } from '../delivery';
+import { DeliveryService, type DeliveryEscalation, type DispatchCall, type DispatchOutcome, type PayloadDelivery, type RecoveryReport } from '../delivery';
 import { type AbortLike, LockCoordinator, type LockCoordinatorOptions, type LockEscalation } from '../locks';
 import type {
   AppRepositories,
@@ -132,8 +132,8 @@ export interface TransferHooks {
   mayDispatch(record: PayloadDelivery): Promise<boolean>;
   /** A session a transfer created: its provision is left to the transfer service at a restart. */
   isTarget(session: LogicalSession): boolean;
-  /** Re-dispatches a `transfer` delivery the user retried, in the transfer's own order. */
-  redeliver(operationId: OperationId): Promise<void>;
+  /** Re-dispatches a `transfer` delivery the user retried, in the transfer's own order; `call` goes with that delivery's dispatch. */
+  redeliver(operationId: OperationId, call?: DispatchCall): Promise<void>;
   /** Where an unknown transfer delivery, or a transfer target's provision, is shown: the source session. */
   escalationFor(item: DeliveryEscalation): Promise<{ ref: NonNullable<Escalation['ref']>; rootSessionId: SessionId } | undefined>;
   /** The user decided on an unknown delivery with `delivery.resolve` (already recorded). */
@@ -158,6 +158,23 @@ export interface SupervisorHooks {
 const USE_EVENTS = new Set<RuntimeEvent['type']>(['session.activity', 'turn.updated', 'message.delta', 'message.completed', 'item.updated', 'item.outputDelta', 'permission.updated', 'nativeTask.updated']);
 
 /** Why a session whose folder is gone is not resumed (R-06, SP-07 G5: never in another folder). */
+/**
+ * A resume refused for a reason its sender is told as it is (T036, T046): the folder is gone, the session is kept read
+ * only, or it cannot be resumed nor opened again. Anything else a resume throws is a failure the sender may try again.
+ */
+class ResumeRefused extends Error {
+  override name = 'ResumeRefused';
+}
+
+/** A resume that failed otherwise (the runtime not usable now, a CLI that did not start): tried again later (T046). */
+class ResumeFailed extends Error {
+  override name = 'ResumeFailed';
+}
+
+/** Why one dispatch call did not go, from its own record (T046 r4): refused with a reason, failed to resume, or neither. */
+const notTakenOf = (call: DispatchCall): { refused: string } | { failed: true } | undefined =>
+  call.prepareError instanceof ResumeRefused ? { refused: call.prepareError.message } : call.prepareError instanceof ResumeFailed ? { failed: true } : undefined;
+
 const folderGone = (cwd: string) => `This session's folder ${cwd} no longer exists, so it cannot be resumed there (nor in any other folder); its conversation can only be viewed.`;
 
 /** How a workflow payload enters its target: a formal handoff waits for the target's turn to end (SP-05). */
@@ -355,8 +372,6 @@ export class SessionService {
   private supervisor: SupervisorHooks | undefined;
   /** The resume of each session under way (T036 r1 P1-3). */
   private readonly resumes = new Map<SessionId, Promise<void>>();
-  /** Why the last resume of a session was refused (its folder is gone, R-06), until one succeeds (T036). */
-  private readonly resumeRefused = new Map<SessionId, string>();
   /**
    * Turns a dispatch's ack named that were not seen to end yet, per session (T023 r1-P1-4): the session is
    * not at its turn boundary while one is here, even before the runtime reported it running. Only an end of
@@ -935,6 +950,11 @@ export class SessionService {
     }
     // The renderer's message under its ID comes first, and must really be in this session (r1-P1-8,
     // r2-P1-8): a message ID taken elsewhere is refused before anything is accepted or sent.
+    // One that ended apart from delivery (refused to the user, T046; cancelled by its workflow run) is never sent: said so.
+    if (existing?.outcome !== undefined) return fail(requestId, 'invalid_transition', `This message was not sent and will not be: ${existing.outcome.detail}`);
+    // Nor one the user cancelled when its outcome stayed unknown (r3 P2): its question is answered, nothing waits.
+    if (existing?.delivery.state === 'unknown' && existing.delivery.attempts.at(-1)?.resolution?.decision === 'cancel')
+      return fail(requestId, 'invalid_transition', 'This message was cancelled and will not be sent');
     const written = await this.writeUserMessage(sessionId, messageId, text, existing?.acceptedAt ?? this.options.now());
     if (written === 'taken') return fail(requestId, 'invalid_request', 'This message ID was already used for another message');
     if (this.closing) return closingFailure(requestId);
@@ -964,8 +984,10 @@ export class SessionService {
       if (accepted.status !== 'accepted' && accepted.status !== 'duplicate') return fail(requestId, 'internal_error', 'The message could not be accepted');
     }
     if (this.closing) return closingFailure(requestId);
+    const call: DispatchCall = {};
     const outcome = await this.dispatchPending(operationId, {
       origin: { kind: 'user' },
+      call,
     });
     const created = [{ kind: 'message' as const, id: messageId }];
     switch (outcome) {
@@ -978,8 +1000,18 @@ export class SessionService {
         });
       default: {
         // Its folder went while the message was on its way (T036): said plainly, never resumed elsewhere.
-        const refused = this.resumeRefused.get(sessionId);
-        if (refused !== undefined) return fail(requestId, 'invalid_transition', refused);
+        const notTaken = notTakenOf(call);
+        const refused = notTaken !== undefined && 'refused' in notTaken ? notTaken.refused : undefined;
+        if (refused !== undefined) {
+          // Told it is not sent, so it is never sent later either (T046): no restart's recovery sends it unseen. Except a
+          // message the user chose to retry: that retry was told it goes at the next start, and still does (r4 P1). Read
+          // again here, not the record from before the dispatch: a retry may have been decided while this send ran.
+          const now = await this.store.get(operationId);
+          const retriedByUser = now?.delivery.attempts.some((a) => a.resolution?.decision === 'retry') === true;
+          if (!retriedByUser)
+            await this.store.recordOutcome(operationId, { kind: 'cancelled', detail: 'its session could not be resumed, so it was not sent', at: this.options.now() });
+          return fail(requestId, 'invalid_transition', refused);
+        }
         return fail(requestId, 'runtime_unavailable', 'The message is saved but could not be handed to the session yet', { retryable: true });
       }
     }
@@ -1158,28 +1190,49 @@ export class SessionService {
     await this.closeEscalation(escalation, 'resolved', 'user');
     // The user decided on that attempt: its turn is no longer waited for (T024 r1-P1-2).
     for (const [sessionId, mark] of this.handoffTurns) if (mark.operationId === attempt.operationId) this.handoffTurns.delete(sessionId);
+    let retried: Awaited<ReturnType<SessionService['retryPending']>> = undefined;
+    // This retry's own dispatch call: what its resume met is read from here alone (r4 P1).
+    const call: DispatchCall = {};
     if (decision === 'retry') {
-      await this.retryPending(attempt.operationId);
+      retried = await this.retryPending(attempt.operationId, call);
       if (escalation.ref?.kind === 'provision') for (const blocked of escalation.ref.blocked) await this.retryPending(blocked);
     }
     // A transfer follows the user's decision on its target or payload (T023).
     if (decision === 'cancel') await this.transfer?.deliveryResolved(attempt.operationId, decision);
+    const record = await this.store.get(attempt.operationId);
+    const target = record?.target.sessionId;
+    if (record?.kind === 'user-message' && target !== undefined) await this.leaveReconciling(target, record.target.nativeSessionRef);
+    // A retry its session could not take (T046, F-2): said plainly instead of waiting in pending unseen (r1 P1-2).
+    // Only this call's own resume is told (r3 P1, r4 P1): another retry or send, even of the same message, never takes it.
+    const notTaken = retried === 'pending' ? notTakenOf(call) : undefined;
+    // The decision is saved: a change was made, which is how the GUI tells this from a retry refused before it (r4 P2).
+    const saved = { mayHaveSideEffects: true };
+    if (notTaken !== undefined && 'refused' in notTaken) return fail(requestId, 'runtime_unavailable', `The retry is saved, but it cannot be sent: ${notTaken.refused}`, saved);
+    if (notTaken !== undefined)
+      return fail(requestId, 'runtime_unavailable', 'The retry is saved, but its session could not be resumed now. It is tried again when the app starts next; or start a new session.', saved);
     return ok(requestId);
   }
 
+  /** A session stops showing `reconciling` once none of its user's messages is undecided any more (G-1). */
+  private async leaveReconciling(sessionId: SessionId, ref: string | undefined): Promise<void> {
+    if ((await this.repos.sessions.get(sessionId))?.activity !== 'reconciling') return;
+    const undecided = (await this.store.listByTarget(sessionId)).some(
+      (r) => r.kind === 'user-message' && r.delivery.state === 'unknown' && r.delivery.attempts.at(-1)?.resolution?.decision !== 'cancel',
+    );
+    if (!undecided) await this.setActivity(sessionId, ref !== undefined && this.runtimes.isOpen(ref) ? 'idle' : 'closed');
+  }
+
   /** A pending delivery the user retried: a formal handoff waits in its target's queue like any other (r1-P1-2). */
-  private async retryPending(operationId: OperationId): Promise<void> {
+  private async retryPending(operationId: OperationId, call?: DispatchCall): Promise<DeliveryState | 'queued' | undefined> {
     const record = await this.store.get(operationId);
     // A transfer delivery goes in its transfer's order, which a cancel also takes (T023).
     if (record?.kind === 'transfer' && this.transfer !== undefined) {
-      await this.transfer.redeliver(operationId);
-      return;
+      await this.transfer.redeliver(operationId, call);
+      // Where it stands now, so a resume that failed is told as for any other retry (T046 r2 P1).
+      return (await this.store.get(operationId))?.delivery.state;
     }
-    if (record?.kind === 'handoff' && record.target.sessionId !== undefined) {
-      await this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn');
-      return;
-    }
-    await this.dispatchPending(operationId, { origin: await this.originOf(operationId) });
+    if (record?.kind === 'handoff' && record.target.sessionId !== undefined) return this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn', call);
+    return this.dispatchPending(operationId, { origin: await this.originOf(operationId), ...(call !== undefined && { call }) });
   }
 
   // ---- MCP send_message -----------------------------------------------------------------------------
@@ -1546,7 +1599,7 @@ export class SessionService {
    * provision first when needed. `after-turn` (a formal handoff) leaves it pending while the session's own
    * turn runs (SP-05), answering `queued`; `insert-if-busy` joins that turn.
    */
-  deliverWorkflow(operationId: OperationId, sessionId: SessionId, entry: WorkflowEntry): Promise<DeliveryState | 'queued'> {
+  deliverWorkflow(operationId: OperationId, sessionId: SessionId, entry: WorkflowEntry, call?: DispatchCall): Promise<DeliveryState | 'queued'> {
     return this.serial(sessionKey(sessionId), async (): Promise<DeliveryState | 'queued'> => {
       const record = await this.store.get(operationId);
       if (record === undefined || record.delivery.state !== 'pending') return record?.delivery.state ?? 'pending';
@@ -1554,11 +1607,11 @@ export class SessionService {
       if (this.closing || session === undefined) return 'pending';
       const provisioned = await this.ensureProvisioned(session);
       if (!provisioned.ok || this.closing) return 'pending';
-      if (entry === 'after-turn') return this.dispatchHandoff(operationId, sessionId);
+      if (entry === 'after-turn') return this.dispatchHandoff(operationId, sessionId, call);
       const origin = await this.originOf(operationId);
       const current = (await this.repos.sessions.get(sessionId)) ?? session;
       const inTurn = await this.inMainTurn(current);
-      return this.dispatchPending(operationId, { origin, entry: inTurn ? { kind: 'insert' } : { kind: 'new-turn' } });
+      return this.dispatchPending(operationId, { origin, entry: inTurn ? { kind: 'insert' } : { kind: 'new-turn' }, ...(call !== undefined && { call }) });
     });
   }
 
@@ -1571,7 +1624,7 @@ export class SessionService {
    * yet, a task stopped at a limit) no longer holds the ones behind it (T031). It then starts one new turn;
    * anything else waits (`queued`).
    */
-  private async dispatchHandoff(operationId: OperationId, sessionId: SessionId): Promise<DeliveryState | 'queued'> {
+  private async dispatchHandoff(operationId: OperationId, sessionId: SessionId, call?: DispatchCall): Promise<DeliveryState | 'queued'> {
     if (this.handoffTurns.has(sessionId)) return 'queued';
     const conversation = await this.repos.conversations.get(sessionId);
     if (runningMainTurn(conversation) !== undefined) return 'queued';
@@ -1590,7 +1643,9 @@ export class SessionService {
     const known = new Set<string>(conversation.turns.filter((t) => t.nativeTaskId === undefined).map((t) => t.id));
     const mark: { operationId: OperationId; known: Set<string>; started?: string; expected?: string } = { operationId: next.operationId, known };
     this.handoffTurns.set(sessionId, mark);
-    const state = await this.dispatchPending(next.operationId, { origin: await this.originOf(next.operationId), entry: { kind: 'new-turn' } });
+    // The caller's call only for its own delivery: another one the gate sends instead is not what it asked about.
+    const own = next.operationId === operationId && call !== undefined ? { call } : {};
+    const state = await this.dispatchPending(next.operationId, { origin: await this.originOf(next.operationId), entry: { kind: 'new-turn' }, ...own });
     // Nothing crossed the boundary: no turn to wait for. Sent or unknown: its turn is waited for.
     if (state === 'pending' && this.handoffTurns.get(sessionId) === mark) this.handoffTurns.delete(sessionId);
     // The runtime's ack names the turn it started (Claude's frame, Codex's turn/start): only that turn's end
@@ -1743,7 +1798,7 @@ export class SessionService {
    * Dispatches a pending `transfer` delivery in its session's queue, as a new turn and only at the session's
    * turn boundary (`queued` while its own turn runs); its provision first when needed (CR2 §3).
    */
-  deliverTransfer(operationId: OperationId, sessionId: SessionId): Promise<DeliveryState | 'queued'> {
+  deliverTransfer(operationId: OperationId, sessionId: SessionId, call?: DispatchCall): Promise<DeliveryState | 'queued'> {
     return this.serial(sessionKey(sessionId), async (): Promise<DeliveryState | 'queued'> => {
       const record = await this.store.get(operationId);
       if (record === undefined || record.delivery.state !== 'pending') return record?.delivery.state ?? 'pending';
@@ -1752,7 +1807,7 @@ export class SessionService {
       const provisioned = await this.ensureProvisioned(session);
       if (!provisioned.ok || this.closing) return 'pending';
       if (runningMainTurn(await this.repos.conversations.get(sessionId)) !== undefined) return 'queued';
-      return this.dispatchPending(operationId, { origin: await this.originOf(operationId), entry: { kind: 'new-turn' } });
+      return this.dispatchPending(operationId, { origin: await this.originOf(operationId), entry: { kind: 'new-turn' }, ...(call !== undefined && { call }) });
     });
   }
 
@@ -1933,7 +1988,12 @@ export class SessionService {
    * it here, and the claim follows with nothing in between to wait for.
    */
   private async prepareTarget(record: PayloadDelivery): Promise<void> {
-    await this.resumeTarget(record);
+    try {
+      await this.resumeTarget(record);
+    } catch (error) {
+      // Told apart from the transfer gate below: only a resume's failure is the sender's "could not be resumed now".
+      throw error instanceof ResumeRefused ? error : new ResumeFailed(error instanceof Error ? error.message : String(error), { cause: error });
+    }
     if (record.kind === 'transfer' && this.transfer !== undefined && !(await this.transfer.mayDispatch(record))) throw new Error('the transfer no longer sends this');
   }
 
@@ -1970,13 +2030,10 @@ export class SessionService {
   private async resumeNow(record: PayloadDelivery, sessionId: SessionId, ref: string): Promise<void> {
     const session = await this.repos.sessions.get(sessionId);
     const cwd = record.context.cwd;
-    // Only this attempt's refusal is told to the sender.
-    this.resumeRefused.delete(sessionId);
     const refused = await this.resumeRefusal(session, cwd);
     if (refused !== undefined) {
-      this.resumeRefused.set(sessionId, refused);
       this.log(`resuming ${sessionId} was refused (its folder is gone or kept read only)`);
-      throw new Error(refused);
+      throw new ResumeRefused(refused);
     }
     const settings = session === undefined ? record.context.session : await this.settingsOf(session);
     // Looked at again after every await (KNOWLEDGE §5): opened meanwhile, it is not resumed a second time.
@@ -1990,15 +2047,70 @@ export class SessionService {
       });
     } catch (error) {
       // Claude reports a folder removed meanwhile as a binary that cannot start (SP-07 G5): said plainly instead.
-      if (this.options.resolveRealPath(cwd) === null) {
-        this.resumeRefused.set(sessionId, folderGone(cwd));
-        // eslint-disable-next-line preserve-caught-error
-        throw new Error(folderGone(cwd));
-      }
-      throw error;
+      if (this.options.resolveRealPath(cwd) === null) throw new ResumeRefused(folderGone(cwd));
+      // Fixed words only: the runtime's error may quote paths or content.
+      this.log(`resuming ${sessionId} failed (${record.context.runtime})`);
+      if (!(await this.reopen(record, sessionId, ref, settings))) throw error;
     }
-    this.resumeRefused.delete(sessionId);
     await this.setActivity(sessionId, 'idle');
+  }
+
+  /**
+   * After a failed resume (T046, F-1/F-2): a runtime stores nothing of a session before its first payload (Claude
+   * writes the transcript with the first message, Codex the rollout with the first turn), so such a session cannot be
+   * resumed. It is opened again under its own native ID only when both say nothing can be lost:
+   *   - the delivery records: no payload to the session ever crossed the dispatch boundary, or every crossing is an
+   *     attempt the user chose to send again (`retry`, accepting the duplicate risk); none was sent;
+   *   - the runtime's own read-only look finds nothing stored under that ID (Claude: no transcript).
+   * Not finding it is never the proof by itself (CR-2). Nothing is sent here: what was pending goes on through its own
+   * claim. When an attempt is still undecided, or the runtime cannot tell, nothing is opened: the session shows
+   * `error` and the sender is told why (`ResumeRefused`). Answers whether it was opened.
+   */
+  private async reopen(record: PayloadDelivery, sessionId: SessionId, ref: string, settings: SessionSettings): Promise<boolean> {
+    const handed = await this.handedOver(sessionId);
+    // A payload sent is stored by the runtime: this resume failed for another reason, and is tried again next time.
+    if (handed === 'sent') return false;
+    if (handed === 'undecided') {
+      return this.unresumable(
+        sessionId,
+        'An earlier message may have reached this session, and its runtime has nothing stored to resume it from, so it is not opened again. Retrying that message sends it here again; otherwise start a new session.',
+      );
+    }
+    const { runtime, cwd } = record.context;
+    const stored = await this.runtimes.reconcileProvision(runtime, sessionId, { cwd, preallocatedRef: ref }).catch(() => undefined);
+    // The runtime cannot be asked now (not usable, closing: T045), or it has the session stored after all: this resume
+    // failed for another reason, and is tried again next time.
+    if (stored === undefined || stored.state === 'sent') return false;
+    if (stored.reason !== 'not-found') {
+      return this.unresumable(sessionId, 'This session could not be resumed, and its runtime cannot confirm that nothing of it is stored, so it is not opened again. Start a new session.');
+    }
+    if (this.closing || this.runtimes.isOpen(ref)) return this.runtimes.isOpen(ref);
+    const info = await this.runtimes.startSession(runtime, { sessionId, cwd, preallocatedRef: ref, ...settings });
+    if (info.nativeSessionRef !== ref) {
+      // Never bound to another native session: the one just made is let go.
+      await this.runtimes.closeSession(info.nativeSessionRef).catch(() => undefined);
+      return this.unresumable(sessionId, 'This session could not be opened again under its own ID. Start a new session.');
+    }
+    this.log(`${sessionId} had nothing stored and nothing was handed to it unasked: opened again under its own ID (${handed})`);
+    return true;
+  }
+
+  /**
+   * What of the payloads to a session ever crossed the dispatch boundary (T046): `nothing`; only attempts the user
+   * chose to send again (`retried`); one that was `sent`; or one still `undecided` (unknown, waited on or cancelled).
+   */
+  private async handedOver(sessionId: SessionId): Promise<'nothing' | 'retried' | 'sent' | 'undecided'> {
+    const attempts = (await this.store.listByTarget(sessionId)).filter((r) => r.kind !== 'provision' && r.target.sessionId === sessionId).flatMap((r) => r.delivery.attempts);
+    if (attempts.some((a) => a.state === 'sent')) return 'sent';
+    if (attempts.some((a) => a.resolution?.decision !== 'retry')) return 'undecided';
+    return attempts.length === 0 ? 'nothing' : 'retried';
+  }
+
+  /** A session that cannot be resumed nor opened again (T046): it shows `error`, and the sender is told why. */
+  private async unresumable(sessionId: SessionId, why: string): Promise<never> {
+    this.log(`${sessionId} cannot be resumed and is not opened again`);
+    await this.setActivity(sessionId, 'error');
+    throw new ResumeRefused(why);
   }
 
   /** Why a closed session cannot be resumed in `cwd`, or undefined (R-06, T032 read-only sessions, T036). */
@@ -2018,7 +2130,7 @@ export class SessionService {
   }
 
   /** Dispatches a delivery that is still pending; returns its state afterwards. */
-  private async dispatchPending(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry }): Promise<'sent' | 'unknown' | 'pending'> {
+  private async dispatchPending(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry; call?: DispatchCall }): Promise<'sent' | 'unknown' | 'pending'> {
     const record = await this.store.get(operationId);
     if (record === undefined) return 'pending';
     if (record.delivery.state !== 'pending') return record.delivery.state;
@@ -2030,16 +2142,17 @@ export class SessionService {
    * One dispatch; undefined when closing began (nothing new reaches a runtime then, r2-P1-4). A user message
    * that was sent is registered for its echo from the outcome (r1-P1-9, r2-P1-7).
    */
-  private async dispatchOne(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry }): Promise<DispatchOutcome | undefined> {
+  private async dispatchOne(operationId: OperationId, options: { origin?: MessageOrigin; entry?: DispatchEntry; call?: DispatchCall }): Promise<DispatchOutcome | undefined> {
     if (this.closing) return undefined;
     // Every way a user message is dispatched (sent at once, recovered, retried) passes here (T024 r3-P1-2).
-    const record = this.workflow === undefined && this.transfer === undefined ? undefined : await this.store.get(operationId);
+    const record = await this.store.get(operationId);
     // Every transfer delivery passes here too: never once its proposal is cancelled or failed (T023).
     if (record?.kind === 'transfer' && this.transfer !== undefined) {
       if (record.outcome !== undefined || !(await this.transfer.mayDispatch(record))) return undefined;
     }
+    // A user message that ended apart from delivery (cancelled by its workflow run, or refused to the user, T046) is never sent.
+    if (record?.kind === 'user-message' && record.outcome !== undefined) return undefined;
     if (record?.kind === 'user-message' && this.workflow !== undefined) {
-      if (record.outcome !== undefined) return undefined;
       const fate = await this.workflow.userMessageFate(record);
       if (fate === 'wait') return undefined;
       if (fate === 'cancel') {
@@ -2063,29 +2176,30 @@ export class SessionService {
   private async escalateDelivery(item: DeliveryEscalation): Promise<void> {
     const sessionId = item.target.sessionId;
     if (sessionId === undefined) return;
-    if (item.deliveryKind === 'user-message') {
-      // Contracts have no escalation ref for a user's own message: the session shows it is reconciling.
-      await this.setActivity(sessionId, 'reconciling');
-      return;
-    }
     // A transfer's own deliveries, and its target's creation, are shown at the source session (T023).
     const transferred = await this.transfer?.escalationFor(item);
     const ref: Escalation['ref'] = transferred
       ? transferred.ref
-      : item.deliveryKind === 'provision'
-        ? {
-            kind: 'provision',
-            operationId: item.operationId,
-            blocked: item.blocked ?? [],
-          }
-        : item.deliveryKind === 'peer-message'
-          ? { kind: 'peerMessage', peerMessageId: peerIdOf(item.operationId) }
-          : item.deliveryKind === 'handoff'
-            ? await this.handoffRef(item.operationId)
-            : undefined;
+      : item.deliveryKind === 'user-message'
+        ? { kind: 'message', operationId: item.operationId, messageId: MessageId.parse(item.operationId.slice('user-message:'.length)) }
+        : item.deliveryKind === 'provision'
+          ? {
+              kind: 'provision',
+              operationId: item.operationId,
+              blocked: item.blocked ?? [],
+            }
+          : item.deliveryKind === 'peer-message'
+            ? { kind: 'peerMessage', peerMessageId: peerIdOf(item.operationId) }
+            : item.deliveryKind === 'handoff'
+              ? await this.handoffRef(item.operationId)
+              : undefined;
     if (ref === undefined) return;
     const id = deliveryEscalationId(item.key);
-    if ((await this.repos.escalations.get(id)) !== undefined) return;
+    const existing = await this.repos.escalations.get(id);
+    // A user's own message (G-1, C-02): the session shows it is reconciling while its question is open, and the user
+    // decides with `delivery.resolve`; one already decided (a reconcile after a restart, r1 P1-3) changes nothing.
+    if (item.deliveryKind === 'user-message' && (existing === undefined || existing.state === 'open')) await this.setActivity(sessionId, 'reconciling');
+    if (existing !== undefined) return;
     // A workflow session's question goes to its instance's root (R-05).
     const target = await this.repos.sessions.get(sessionId);
     const root = transferred ? { rootSessionId: transferred.rootSessionId } : target === undefined ? { rootSessionId: sessionId } : await this.rootOf(target);

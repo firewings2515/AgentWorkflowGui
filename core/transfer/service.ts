@@ -251,7 +251,7 @@ export class TransferService implements TransferHooks {
    * and dispatched first, and the draft finishes when the turn it started has ended. `final` (a restart):
    * that turn is over whatever was recorded of it.
    */
-  private async advance(p: TransferProposal, final = false): Promise<void> {
+  private async advance(p: TransferProposal, final = false, call?: Parameters<TransferHooks['redeliver']>[1]): Promise<void> {
     if (p.state !== 'draft') return;
     const { sessions } = this.options;
     const source = await this.repos.sessions.get(p.sourceSessionId);
@@ -281,7 +281,7 @@ export class TransferService implements TransferHooks {
     }
     if (note === undefined || note.kind === 'provision' || note.outcome !== undefined) return;
     if (note.delivery.state === 'pending') {
-      await sessions.deliverTransfer(op, source.id);
+      await sessions.deliverTransfer(op, source.id, call);
       return;
     }
     // Unknown: escalated at the source; the user decides (CR-2).
@@ -399,7 +399,7 @@ export class TransferService implements TransferHooks {
   // ---- after the confirmation -----------------------------------------------------------------------
 
   /** The steps after the approval, from wherever they stopped; each is recognised by its fixed ID. */
-  private async proceed(p: TransferProposal): Promise<Progress> {
+  private async proceed(p: TransferProposal, call?: Parameters<TransferHooks['redeliver']>[1]): Promise<Progress> {
     if (p.state === 'cancelled') return 'cancelled';
     if (p.state !== 'approved' || p.approvedRevision === undefined) return 'failed';
     const { sessions } = this.options;
@@ -454,7 +454,7 @@ export class TransferService implements TransferHooks {
     // d. Provision first, then the payload, in the new session's queue.
     if (payload.delivery.state === 'pending') {
       if (sessions.isClosing()) return 'waiting';
-      await sessions.deliverTransfer(p.operationId, targetId);
+      await sessions.deliverTransfer(p.operationId, targetId, call);
       payload = (await this.store.get(p.operationId)) ?? payload;
     }
     if (payload.delivery.state === 'sent') return 'sent';
@@ -616,14 +616,15 @@ export class TransferService implements TransferHooks {
     return session.derivedFromSessionId !== undefined && transferOfSession(session.id) !== undefined;
   }
 
-  redeliver(operationId: Parameters<TransferHooks['redeliver']>[0]): Promise<void> {
+  redeliver(operationId: Parameters<TransferHooks['redeliver']>[0], call?: Parameters<TransferHooks['redeliver']>[1]): Promise<void> {
     const of = transferOfOperation(operationId);
     if (of === undefined) return Promise.resolve();
     return this.serial(of.transferId, async () => {
       const p = await this.repos.transfers.get(of.transferId);
       if (p === undefined) return;
-      if (of.part === 'note') await this.advance(p);
-      else if (p.state === 'approved') await this.proceed(p);
+      // The user's own retry call goes with that delivery's dispatch (T046 r4): it is told why its own call did not go.
+      if (of.part === 'note') await this.advance(p, false, call);
+      else if (p.state === 'approved') await this.proceed(p, call);
       await this.publish(p.id);
     });
   }

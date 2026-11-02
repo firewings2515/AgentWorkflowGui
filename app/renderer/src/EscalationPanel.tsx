@@ -118,7 +118,7 @@ function EscalationCard({ escalation, permission, snapshot, store, ipcState }: {
       </fieldset>
     </form>
     {validation && <p role="alert" className="field-error">{validation}</p>}
-    {activity && <p role={activity.result && !activity.result.ok ? 'alert' : 'status'}>{!activity.result ? '正在送出決定…' : activity.result.ok ? accepted ? '決定已接受，等待最新狀態。' : '已選擇繼續等待，仍可另行決定取消或重試。' : `${commandFeedback(activity.result)}（${activity.result.code}）`}</p>}
+    {activity && <p role={activity.result && !activity.result.ok ? 'alert' : 'status'}>{!activity.result ? '正在送出決定…' : activity.result.ok ? accepted ? '決定已接受，等待最新狀態。' : '已選擇繼續等待，仍可另行決定取消或重試。' : `${commandFeedback(activity.result, activity.command.type)}（${activity.result.code}）`}</p>}
   </article>;
 }
 

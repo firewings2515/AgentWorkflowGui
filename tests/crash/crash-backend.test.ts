@@ -10,7 +10,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { type ItemId, MessageId, type OwnedProcess, RequestId, type Runtime, SessionId, TurnId } from '../../contracts';
 import type { OwnedProcessRepository, PermissionHandle } from '../../core/ports';
-import { FakeAdapter } from '../../core/sessions/testing/fake-adapter';
+import { FakeAdapter, RuntimeDisk } from '../../core/sessions/testing/fake-adapter';
 import { agent } from '../../core/sessions/testing/harness';
 import { type Backend, type BackendProcessHost, startBackend } from '../../app/main/backend';
 import { EventBus } from '../../app/main/event-bus';
@@ -51,7 +51,7 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const start = async (stillRunning: (p: OwnedProcess) => boolean = () => true, faultPoint?: FaultPoint) => {
+const start = async (stillRunning: (p: OwnedProcess) => boolean = () => true, faultPoint?: FaultPoint, disk?: RuntimeDisk) => {
   const adapters: FakeAdapter[] = [];
   const logs: string[] = [];
   let host: Host | undefined;
@@ -61,6 +61,7 @@ const start = async (stillRunning: (p: OwnedProcess) => boolean = () => true, fa
     createHost: (repository) => (host = new Host(repository, stillRunning)),
     createAdapter: (runtime: Runtime, _sessionId, hooks: { onPermissionRequest(h: PermissionHandle): unknown }) => {
       const adapter = new FakeAdapter(runtime, (h) => hooks.onPermissionRequest(h));
+      adapter.diskOf = () => disk;
       adapters.push(adapter);
       return adapter;
     },
@@ -168,6 +169,83 @@ describe('T039 r1-P1-1: a normal exit after a restart that only reconciled', () 
       db.close();
       expect(rows.map((r) => r['pid'])).toEqual([5101, 5102]);
       expect(rows.every((r) => typeof r['ended_at'] === 'string')).toBe(true);
+    });
+  }
+});
+
+describe('T046 through the backend: a session its runtime stored nothing of, after a crash', () => {
+  for (const runtime of ['claude', 'codex'] as const) {
+    const sessionOf = async (b: Backend, sessionId: SessionId) => (await b.facade.snapshot()).sessions.find((s) => s.id === sessionId)!;
+    const sendTo = async (b: Backend, sessionId: SessionId, id: string, text: string) =>
+      b.facade.execute({ requestId: rid(), type: 'session.send', sessionId, messageId: MessageId.parse(id), expectedRevision: (await sessionOf(b, sessionId)).revision, text, attachments: [] });
+    const make = async (b: Backend, sessionId: SessionId) => {
+      const run = (command: object) => b.facade.execute({ requestId: rid(), ...command } as never);
+      await run({ type: 'agent.save', agent: agent(), expectedRevision: null });
+      expect(await run({ type: 'session.create', sessionId, kind: 'ordinary', agentId: agent().id, model: { runtime, model: `${runtime}-m` }, cwd: dir })).toMatchObject({ ok: true });
+      await settle();
+    };
+
+    it(`${runtime}: created, never sent to, then the GUI dies: the first message ${runtime === 'claude' ? 'opens it again under its own session ID' : 'is refused plainly; the session shows error'}`, async () => {
+      const disk = new RuntimeDisk();
+      const sessionId = SessionId.parse(`t046-none-${runtime}`);
+      const first = await start(() => false, undefined, disk);
+      await make(first.backend, sessionId);
+      const ref = first.adapters.flatMap((a) => a.started).find((s) => s.sessionId === sessionId)?.preallocatedRef;
+
+      const second = await start(() => false, undefined, disk);
+      const result = await sendTo(second.backend, sessionId, `t046-none-${runtime}-1`, 'first');
+      await settle();
+      const mine = second.adapters.filter((a) => a.runtime === runtime);
+      expect(mine.flatMap((a) => a.resumed).map((o) => o.sessionId)).toEqual([sessionId]);
+      if (runtime === 'claude') {
+        expect(result).toMatchObject({ ok: true });
+        expect(mine.flatMap((a) => a.started).map((s) => s.preallocatedRef)).toEqual([ref]);
+        expect(mine.flatMap((a) => a.dispatched).map((d) => d.text)).toEqual(['first']);
+      } else {
+        expect(result).toMatchObject({ ok: false, code: 'invalid_transition' });
+        expect(mine.flatMap((a) => a.started)).toEqual([]);
+        expect(mine.flatMap((a) => a.dispatched)).toEqual([]);
+        expect((await sessionOf(second.backend, sessionId)).activity).toBe('error');
+      }
+    });
+
+    it(`${runtime}: the GUI dies at the dispatch fault point of its first message: escalated (G-1), not opened or sent again; the user's retry ${runtime === 'claude' ? 'opens it again and sends once' : 'is refused plainly'}`, async () => {
+      const disk = new RuntimeDisk();
+      const sessionId = SessionId.parse(`t046-fault-${runtime}`);
+      const first = await start(() => false, { point: 'dispatch', sessionId }, disk);
+      await make(first.backend, sessionId);
+      const ref = first.adapters.flatMap((a) => a.started).find((s) => s.sessionId === sessionId)?.preallocatedRef;
+      void sendTo(first.backend, sessionId, `t046-fault-${runtime}-1`, 'the work');
+      await settle();
+      expect(first.logs.some((l) => l.startsWith(`[fault] dispatch reached session=${sessionId} `))).toBe(true);
+      expect(first.adapters.flatMap((a) => a.dispatched)).toEqual([]);
+
+      const second = await start(() => false, undefined, disk);
+      const snapshot = await second.backend.facade.snapshot();
+      const escalation = snapshot.escalations.find((e) => e.kind === 'delivery-unknown' && e.state === 'open');
+      expect(escalation).toMatchObject({ rootSessionId: sessionId, fromSessionId: sessionId, ref: { kind: 'message', messageId: `t046-fault-${runtime}-1` } });
+      expect(snapshot.sessions.find((s) => s.id === sessionId)?.activity).toBe('reconciling');
+      const mine = () => second.adapters.filter((a) => a.runtime === runtime);
+
+      // Another message cannot be told apart from what may have arrived: nothing is opened, nothing sent.
+      expect(await sendTo(second.backend, sessionId, `t046-fault-${runtime}-2`, 'next')).toMatchObject({ ok: false, code: 'invalid_transition' });
+      await settle();
+      expect(mine().flatMap((a) => a.started)).toEqual([]);
+      expect(mine().flatMap((a) => a.dispatched)).toEqual([]);
+      expect((await sessionOf(second.backend, sessionId)).activity).toBe('error');
+
+      const retried = await second.backend.facade.execute({ requestId: rid(), type: 'delivery.resolve', escalationId: escalation!.id, decision: 'retry', acceptDuplicateRisk: true });
+      await settle();
+      if (runtime === 'claude') {
+        expect(retried).toMatchObject({ ok: true });
+        expect(mine().flatMap((a) => a.started).map((s) => s.preallocatedRef)).toEqual([ref]);
+        expect(mine().flatMap((a) => a.dispatched).map((d) => d.text)).toEqual(['the work']);
+        expect((await sessionOf(second.backend, sessionId)).activity).toBe('idle');
+      } else {
+        expect(retried).toMatchObject({ ok: false, code: 'runtime_unavailable' });
+        expect(mine().flatMap((a) => a.dispatched)).toEqual([]);
+        expect((await sessionOf(second.backend, sessionId)).activity).toBe('error');
+      }
     });
   }
 });

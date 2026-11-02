@@ -27,7 +27,7 @@ import { MemoryDeliveryStore } from '../../delivery/testing/memory-store';
 import type { WorktreeFiles } from '../../pipeline';
 import type { AppRepositories, DeliveryStore, DispatchRequest, GitPort, McpMount, PermissionPolicy, PolicyDecision, StoredDelivery } from '../../ports';
 import { SessionService } from '../../sessions';
-import { FakeAdapter } from '../../sessions/testing/fake-adapter';
+import { FakeAdapter, type RuntimeDisk } from '../../sessions/testing/fake-adapter';
 import { MemoryRepositories } from '../../sessions/testing/memory-repositories';
 import { FakeCommands, FakeFiles } from '../../pipeline/testing/fakes';
 import { MemoryGit } from '../../pipeline/testing/memory-git';
@@ -242,6 +242,8 @@ export interface World {
   dispatchGate: ((request: DispatchRequest) => Promise<void> | undefined) | undefined;
   /** Called with every new Codex adapter before it is used (e.g. to hold its session's start). Not carried over. */
   onNewCodex: ((adapter: FakeAdapter, sessionId: SessionId) => void) | undefined;
+  /** When set, what the runtimes stored (T046): every adapter resumes only what is on it. Kept across a restart. */
+  disk: RuntimeDisk | undefined;
 }
 
 let turns = 0;
@@ -301,6 +303,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     open: new Map<SessionId, string>(),
     timers: new Set<{ at: string; fn: () => void }>(),
     closed: [] as SessionId[],
+    disk: previous?.disk,
   } as unknown as World;
   world.git = previous?.git ?? new MemoryGit();
   if (previous === undefined) world.git.init(CWD, { 'README.md': 'readme\n', 'src/app.txt': 'app\n' });
@@ -323,6 +326,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
   const resolveReal = (path: string) => (real !== undefined ? path : path.startsWith('E:\\work') ? path.replace('E:\\work', 'E:\\real') : null);
   let mounts = 0;
   world.claude = withTurns(new FakeAdapter('claude', (handle) => world.service.onPermissionRequest(handle)), world);
+  world.claude.diskOf = () => world.disk;
   world.service = new SessionService({
     repositories,
     store,
@@ -338,6 +342,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     createAdapter: (runtime: Runtime, sessionId: SessionId) => {
       if (runtime === 'claude') return world.claude;
       const adapter = withTurns(new FakeAdapter('codex', (handle) => world.service.onPermissionRequest(handle)), world, sessionId);
+      adapter.diskOf = () => world.disk;
       world.codex.set(sessionId, adapter);
       world.onNewCodex?.(adapter, sessionId);
       return adapter;

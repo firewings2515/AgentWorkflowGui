@@ -10,8 +10,8 @@
 //                                     supervisor, a task's cleanup, the exit), the runtime is still running
 //   AWG_FAULT_SESSION  the GUI session whose runtime stops there, or
 //   AWG_FAULT_RUNTIME  claude | codex: every session of that runtime
-//   AWG_FAULT_SKIP     optional: that many calls of each such adapter go through first (a Claude session must have
-//                      had a turn before a restart can resume it, T046)
+//   AWG_FAULT_SKIP     optional: that many calls of each such adapter go through first (e.g. a session's first turn,
+//                      so that the restart resumes a session its runtime stored; T046 covers one it did not)
 //
 // The model probes (`models-*`) are never stopped.
 import type { Runtime, SessionId } from '../../contracts';

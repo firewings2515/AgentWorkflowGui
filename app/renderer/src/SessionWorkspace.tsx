@@ -149,6 +149,7 @@ export function SessionWorkspace(props: WorkspaceProps) {
             }}>{interrupt?.result && !interrupt.result.ok ? '中斷結果待核對' : interruptBlocked ? '中斷中…' : '中斷'}</button>}
             <button type="submit" className="primary" {...readOnlyProps(readOnly)} disabled={!context.draft.trim() || activeTurn || blocked}>送出</button>
           </div>
+          {session.activity === 'error' && <p role="status" className="command-warning" data-session-error>此 session 處於錯誤狀態，可能接不回來，新的訊息不一定送得出去。可以另開一個新的 session 繼續。</p>}
           {activeTurn && <p className="composer-note">此 session 有執行中的 turn；可編輯草稿，暫不送出。</p>}
           {creating && <p role="status">Session 建立中；完成後才能送出，草稿已保留。</p>}
           {props.store && props.ipcState?.connection !== 'ready' && <p role="status">資料尚未同步完成；完成後才能送出，草稿已保留。</p>}

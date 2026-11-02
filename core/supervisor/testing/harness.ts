@@ -23,7 +23,7 @@ import type {
   StartSessionOptions,
 } from '../../ports';
 import { SessionService } from '../../sessions';
-import { FakeAdapter } from '../../sessions/testing/fake-adapter';
+import { FakeAdapter, type RuntimeDisk } from '../../sessions/testing/fake-adapter';
 import { AGENT, agent, CWD } from '../../sessions/testing/harness';
 import { IdleSupervisor } from '../supervisor';
 
@@ -134,6 +134,8 @@ export interface SupWorld {
   onNewAdapter: ((adapter: HoldingAdapter) => void) | undefined;
   /** The exit and close deadlines (SessionServiceOptions.sleep); by default they never pass. */
   sleeper: (ms: number) => Promise<void>;
+  /** When set, what the runtimes stored (T046): every adapter resumes only what is on it. Kept across a restart. */
+  disk: RuntimeDisk | undefined;
   run(command: Command): Promise<CommandResult>;
   restart(): SupWorld;
 }
@@ -169,6 +171,7 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
     decide: previous?.decide ?? ((): PolicyDecision => ({ action: 'approve' })),
     storeGate: undefined as Promise<void> | undefined,
     sleeper: (): Promise<void> => new Promise<void>(() => undefined),
+    disk: previous?.disk,
   } as unknown as SupWorld;
   // The store with its state listings held while `storeGate` is set, and one `recordSent` held after its commit.
   world.store = new Proxy(rawStore, {
@@ -225,6 +228,7 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
   const policy: PermissionPolicy = { evaluate: (request) => world.decide(request.sessionId) };
   const onPermission = (handle: PermissionHandle) => world.service.onPermissionRequest(handle);
   world.claude = new HoldingAdapter('claude', onPermission);
+  world.claude.diskOf = () => world.disk;
   let mounts = 0;
   const { clock } = world;
   // E:\work is a junction to E:\real; a folder in `gone`, or anything elsewhere, does not resolve.
@@ -251,6 +255,7 @@ const build = (rawRepositories: AppRepositories, rawStore: DeliveryStore, o: Sup
       if (runtime === 'claude' && o.claudePerSession !== true) return world.claude;
       // Its requests go through the router's hooks, which know the opening they belong to (T036 r3 P1-2).
       const adapter = new HoldingAdapter(runtime, (handle) => hooks.onPermissionRequest(handle));
+      adapter.diskOf = () => world.disk;
       if (runtime === 'claude') world.claude = adapter;
       else world.codex.set(sessionId, adapter);
       world.all.set(sessionId, [...(world.all.get(sessionId) ?? []), adapter]);

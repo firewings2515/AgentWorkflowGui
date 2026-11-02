@@ -128,8 +128,10 @@ describe('session.send (CR-2)', () => {
     expect(codex.reconciled).toHaveLength(1);
     expect((await w.store.get(OperationId.parse('user-message:m-3')))?.delivery.state).toBe('unknown');
     expect((await session(w, 'session-a')).activity).toBe('reconciling');
-    // Contracts have no escalation ref for a user's own message; nothing is opened.
-    expect(escalations(w)).toEqual([]);
+    // The user decides (G-1, T046): one delivery-unknown escalation at the session, pointing at the message (C-02).
+    expect(escalations(w)).toMatchObject([
+      { kind: 'delivery-unknown', rootSessionId: 'session-a', fromSessionId: 'session-a', state: 'open', ref: { kind: 'message', operationId: 'user-message:m-3', messageId: 'm-3' } },
+    ]);
     // A resend of the same command never dispatches it again.
     expect(failed(await send(w, sessionId, 'maybe', 'm-3', await latest(w, 'session-a')))).toBe('unknown_outcome');
     expect(codex.dispatched).toHaveLength(1);
