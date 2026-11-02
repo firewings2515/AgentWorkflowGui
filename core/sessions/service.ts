@@ -372,7 +372,6 @@ export class SessionService {
   private supervisor: SupervisorHooks | undefined;
   /** The resume of each session under way (T036 r1 P1-3). */
   private readonly resumes = new Map<SessionId, Promise<void>>();
-  /** Why the last resume of a session was refused (its folder is gone, R-06), until one succeeds (T036). */
   /**
    * Turns a dispatch's ack named that were not seen to end yet, per session (T023 r1-P1-4): the session is
    * not at its turn boundary while one is here, even before the runtime reported it running. Only an end of
@@ -1005,8 +1004,10 @@ export class SessionService {
         const refused = notTaken !== undefined && 'refused' in notTaken ? notTaken.refused : undefined;
         if (refused !== undefined) {
           // Told it is not sent, so it is never sent later either (T046): no restart's recovery sends it unseen. Except a
-          // message the user chose to retry: that retry was told it goes at the next start, and still does (r4 P1).
-          const retriedByUser = existing?.delivery.attempts.some((a) => a.resolution?.decision === 'retry') === true;
+          // message the user chose to retry: that retry was told it goes at the next start, and still does (r4 P1). Read
+          // again here, not the record from before the dispatch: a retry may have been decided while this send ran.
+          const now = await this.store.get(operationId);
+          const retriedByUser = now?.delivery.attempts.some((a) => a.resolution?.decision === 'retry') === true;
           if (!retriedByUser)
             await this.store.recordOutcome(operationId, { kind: 'cancelled', detail: 'its session could not be resumed, so it was not sent', at: this.options.now() });
           return fail(requestId, 'invalid_transition', refused);
@@ -2111,8 +2112,6 @@ export class SessionService {
     await this.setActivity(sessionId, 'error');
     throw new ResumeRefused(why);
   }
-
-
 
   /** Why a closed session cannot be resumed in `cwd`, or undefined (R-06, T032 read-only sessions, T036). */
   private async resumeRefusal(session: LogicalSession | undefined, cwd: string): Promise<string | undefined> {
