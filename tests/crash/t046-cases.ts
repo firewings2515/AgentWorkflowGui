@@ -268,6 +268,51 @@ export const noHistoryCases = (name: string, makeSup: MakeSup, makeFlow: MakeFlo
       });
     }
 
+    it('r1 P1-3: a message the user cancelled does not leave the session reconciling after a restart', async () => {
+      const w = await withDisk(makeSup);
+      const a = await created(w, 'claude');
+      adapterOf(w, 'claude', a).dispatchModes.push('lost');
+      await send(w, a, 'lost one');
+      await supSettle();
+      const escalation = await messageEscalation(w, a);
+      expect(await w.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: escalation.id, decision: 'cancel', acceptDuplicateRisk: false })).toMatchObject({ ok: true });
+      await supSettle();
+      expect(await activityOf(w, a)).toBe('idle');
+      // The restart reconciles the cancelled attempt again: still not found, and still decided.
+      const r = await crash(w);
+      expect(await openEscalations(r)).toEqual([]);
+      expect(await activityOf(r, a)).toBe('closed');
+      expect((await r.service.idleFacts(a))?.activity).not.toBe('reconciling');
+    });
+
+    for (const how of ['the runtime cannot be asked', 'the opening again fails'] as const) {
+      it(`r1 P1-2: claude, a retry whose session could not be opened now (${how}) is said plainly, stays saved, and goes once at the next start`, async () => {
+        const w = await withDisk(makeSup);
+        const a = await created(w, 'claude');
+        const ref = await nativeOf(w, a);
+        holdDispatch(adapterOf(w, 'claude', a));
+        void send(w, a, 'the work');
+        await supSettle();
+        const r = await crash(w);
+        const escalation = await messageEscalation(r, a);
+        if (how === 'the runtime cannot be asked') r.claude.reconcileProvision = () => Promise.reject(new Error('claude is not usable now'));
+        else r.claude.startModes.push('fail');
+        const result = await r.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: escalation.id, decision: 'retry', acceptDuplicateRisk: true });
+        await supSettle();
+        expect(result).toMatchObject({ ok: false, code: 'runtime_unavailable' });
+        expect(result.ok ? '' : result.message).toMatch(/^The retry is saved, but its session could not be resumed now\. It is tried again when the app starts next/);
+        const [record] = (await r.store.listByTarget(a)).filter((x) => x.kind === 'user-message');
+        expect(record!.delivery).toMatchObject({ state: 'pending' });
+        expect(record!.delivery.attempts).toHaveLength(1);
+        expect(textsOf(r, 'claude', a)).toEqual([]);
+        // The next start sends what the user chose to retry, once, in the session opened again under its own ID.
+        const next = await crash(r);
+        expect(startsOf(next, 'claude', a).map((s) => s.preallocatedRef)).toEqual([ref]);
+        expect(textsOf(next, 'claude', a)).toEqual(['the work']);
+        expect((await next.store.get(record!.operationId))!.delivery).toMatchObject({ state: 'sent' });
+      });
+    }
+
     it('claude: a session that had a message sent is never opened again, even when its transcript cannot be found', async () => {
       const w = await withDisk(makeSup);
       const a = await created(w, 'claude');

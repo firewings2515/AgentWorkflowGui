@@ -357,6 +357,8 @@ export class SessionService {
   private readonly resumes = new Map<SessionId, Promise<void>>();
   /** Why the last resume of a session was refused (its folder is gone, R-06), until one succeeds (T036). */
   private readonly resumeRefused = new Map<SessionId, string>();
+  /** Sessions whose last resume failed otherwise (the runtime not usable now, a CLI that did not start), until one succeeds (T046). */
+  private readonly resumeFailed = new Set<SessionId>();
   /**
    * Turns a dispatch's ack named that were not seen to end yet, per session (T023 r1-P1-4): the session is
    * not at its turn boundary while one is here, even before the runtime reported it running. Only an end of
@@ -1162,8 +1164,9 @@ export class SessionService {
     await this.closeEscalation(escalation, 'resolved', 'user');
     // The user decided on that attempt: its turn is no longer waited for (T024 r1-P1-2).
     for (const [sessionId, mark] of this.handoffTurns) if (mark.operationId === attempt.operationId) this.handoffTurns.delete(sessionId);
+    let retried: Awaited<ReturnType<SessionService['retryPending']>> = undefined;
     if (decision === 'retry') {
-      await this.retryPending(attempt.operationId);
+      retried = await this.retryPending(attempt.operationId);
       if (escalation.ref?.kind === 'provision') for (const blocked of escalation.ref.blocked) await this.retryPending(blocked);
     }
     // A transfer follows the user's decision on its target or payload (T023).
@@ -1171,9 +1174,13 @@ export class SessionService {
     const record = await this.store.get(attempt.operationId);
     const target = record?.target.sessionId;
     if (record?.kind === 'user-message' && target !== undefined) await this.leaveReconciling(target, record.target.nativeSessionRef);
-    // A retry its session cannot take (T046, F-2): said plainly instead of waiting in pending unseen.
-    const refused = decision === 'retry' && record?.delivery.state === 'pending' && target !== undefined ? this.resumeRefused.get(target) : undefined;
-    if (refused !== undefined) return fail(requestId, 'runtime_unavailable', `The retry is saved, but it cannot be sent: ${refused}`);
+    // A retry its session could not take (T046, F-2): said plainly instead of waiting in pending unseen (r1 P1-2).
+    if (retried === 'pending' && target !== undefined) {
+      const refused = this.resumeRefused.get(target);
+      if (refused !== undefined) return fail(requestId, 'runtime_unavailable', `The retry is saved, but it cannot be sent: ${refused}`);
+      if (this.resumeFailed.has(target))
+        return fail(requestId, 'runtime_unavailable', 'The retry is saved, but its session could not be resumed now. It is tried again when the app starts next; or start a new session.');
+    }
     return ok(requestId);
   }
 
@@ -1187,18 +1194,15 @@ export class SessionService {
   }
 
   /** A pending delivery the user retried: a formal handoff waits in its target's queue like any other (r1-P1-2). */
-  private async retryPending(operationId: OperationId): Promise<void> {
+  private async retryPending(operationId: OperationId): Promise<DeliveryState | 'queued' | undefined> {
     const record = await this.store.get(operationId);
     // A transfer delivery goes in its transfer's order, which a cancel also takes (T023).
     if (record?.kind === 'transfer' && this.transfer !== undefined) {
       await this.transfer.redeliver(operationId);
-      return;
+      return undefined;
     }
-    if (record?.kind === 'handoff' && record.target.sessionId !== undefined) {
-      await this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn');
-      return;
-    }
-    await this.dispatchPending(operationId, { origin: await this.originOf(operationId) });
+    if (record?.kind === 'handoff' && record.target.sessionId !== undefined) return this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn');
+    return this.dispatchPending(operationId, { origin: await this.originOf(operationId) });
   }
 
   // ---- MCP send_message -----------------------------------------------------------------------------
@@ -1989,8 +1993,9 @@ export class SessionService {
   private async resumeNow(record: PayloadDelivery, sessionId: SessionId, ref: string): Promise<void> {
     const session = await this.repos.sessions.get(sessionId);
     const cwd = record.context.cwd;
-    // Only this attempt's refusal is told to the sender.
+    // Only this attempt's refusal or failure is told to the sender.
     this.resumeRefused.delete(sessionId);
+    this.resumeFailed.delete(sessionId);
     const refused = await this.resumeRefusal(session, cwd);
     if (refused !== undefined) {
       this.resumeRefused.set(sessionId, refused);
@@ -2016,9 +2021,11 @@ export class SessionService {
       }
       // Fixed words only: the runtime's error may quote paths or content.
       this.log(`resuming ${sessionId} failed (${record.context.runtime})`);
+      this.resumeFailed.add(sessionId);
       if (!(await this.reopen(record, sessionId, ref, settings))) throw error;
     }
     this.resumeRefused.delete(sessionId);
+    this.resumeFailed.delete(sessionId);
     await this.setActivity(sessionId, 'idle');
   }
 
@@ -2146,8 +2153,6 @@ export class SessionService {
   private async escalateDelivery(item: DeliveryEscalation): Promise<void> {
     const sessionId = item.target.sessionId;
     if (sessionId === undefined) return;
-    // A user's own message (G-1, C-02): the session shows it is reconciling, and the user decides with `delivery.resolve`.
-    if (item.deliveryKind === 'user-message') await this.setActivity(sessionId, 'reconciling');
     // A transfer's own deliveries, and its target's creation, are shown at the source session (T023).
     const transferred = await this.transfer?.escalationFor(item);
     const ref: Escalation['ref'] = transferred
@@ -2167,7 +2172,11 @@ export class SessionService {
               : undefined;
     if (ref === undefined) return;
     const id = deliveryEscalationId(item.key);
-    if ((await this.repos.escalations.get(id)) !== undefined) return;
+    const existing = await this.repos.escalations.get(id);
+    // A user's own message (G-1, C-02): the session shows it is reconciling while its question is open, and the user
+    // decides with `delivery.resolve`; one already decided (a reconcile after a restart, r1 P1-3) changes nothing.
+    if (item.deliveryKind === 'user-message' && (existing === undefined || existing.state === 'open')) await this.setActivity(sessionId, 'reconciling');
+    if (existing !== undefined) return;
     // A workflow session's question goes to its instance's root (R-05).
     const target = await this.repos.sessions.get(sessionId);
     const root = transferred ? { rootSessionId: transferred.rootSessionId } : target === undefined ? { rootSessionId: sessionId } : await this.rootOf(target);

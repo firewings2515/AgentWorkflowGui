@@ -115,6 +115,22 @@ const cases = (name: string, make: () => Promise<{ w: SupWorld; sdk: FakeSdk }>)
       expect(isOpen(w, a)).toBe(false);
     });
 
+    it('r1 P1-1: nothing handed over, but the transcript was not read whole and nothing came of it: not opened again; the session shows error', async () => {
+      const { w, sdk } = await make();
+      const a = await created(w, 'claude');
+      await idleClose(w);
+      const queries = sdk.queries.length;
+      sdk.readTranscript = (sessionId) => {
+        sdk.reads.push(`transcript:${sessionId}`);
+        return Promise.resolve({ lines: [], complete: false, detail: 'the transcript changed while it was read' });
+      };
+      const result = await send(w, a, 'first');
+      await settle();
+      expect(result).toMatchObject({ ok: false, code: 'invalid_transition' });
+      expect(sdk.queries).toHaveLength(queries);
+      expect(await activityOf(w, a)).toBe('error');
+    });
+
     it('nothing handed over, but the transcript cannot be read: not opened again; the session shows error', async () => {
       const { w, sdk } = await make();
       const a = await created(w, 'claude');
