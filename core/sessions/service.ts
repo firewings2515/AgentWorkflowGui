@@ -937,6 +937,8 @@ export class SessionService {
     }
     // The renderer's message under its ID comes first, and must really be in this session (r1-P1-8,
     // r2-P1-8): a message ID taken elsewhere is refused before anything is accepted or sent.
+    // One that ended apart from delivery (refused to the user, T046; cancelled by its workflow run) is never sent: said so.
+    if (existing?.outcome !== undefined) return fail(requestId, 'invalid_transition', `This message was not sent and will not be: ${existing.outcome.detail}`);
     const written = await this.writeUserMessage(sessionId, messageId, text, existing?.acceptedAt ?? this.options.now());
     if (written === 'taken') return fail(requestId, 'invalid_request', 'This message ID was already used for another message');
     if (this.closing) return closingFailure(requestId);
@@ -1166,6 +1168,12 @@ export class SessionService {
     for (const [sessionId, mark] of this.handoffTurns) if (mark.operationId === attempt.operationId) this.handoffTurns.delete(sessionId);
     let retried: Awaited<ReturnType<SessionService['retryPending']>> = undefined;
     if (decision === 'retry') {
+      // Only this retry's own resume tells the user why it did not go (r2 P1): an earlier one's is forgotten.
+      const before = (await this.store.get(attempt.operationId))?.target.sessionId;
+      if (before !== undefined) {
+        this.resumeRefused.delete(before);
+        this.resumeFailed.delete(before);
+      }
       retried = await this.retryPending(attempt.operationId);
       if (escalation.ref?.kind === 'provision') for (const blocked of escalation.ref.blocked) await this.retryPending(blocked);
     }
@@ -1199,7 +1207,8 @@ export class SessionService {
     // A transfer delivery goes in its transfer's order, which a cancel also takes (T023).
     if (record?.kind === 'transfer' && this.transfer !== undefined) {
       await this.transfer.redeliver(operationId);
-      return undefined;
+      // Where it stands now, so a resume that failed is told as for any other retry (T046 r2 P1).
+      return (await this.store.get(operationId))?.delivery.state;
     }
     if (record?.kind === 'handoff' && record.target.sessionId !== undefined) return this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn');
     return this.dispatchPending(operationId, { origin: await this.originOf(operationId) });

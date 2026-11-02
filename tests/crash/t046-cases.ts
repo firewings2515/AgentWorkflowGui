@@ -262,6 +262,12 @@ export const noHistoryCases = (name: string, makeSup: MakeSup, makeFlow: MakeFlo
         // The refused message was told not sent: no later start sends it unseen, even once the session can resume.
         const [refused] = (await r.store.listByTarget(a)).filter((x) => x.kind === 'user-message' && x.payload === 'next');
         expect(refused!.outcome).toMatchObject({ kind: 'cancelled' });
+        // The same message sent again under its own ID is told it will not go (r2 P2), not "saved, try again".
+        const messageId = refused!.operationId.slice('user-message:'.length);
+        const resent = await r.run({ type: 'session.send', requestId: supRid(), sessionId: a, messageId: messageId as never, expectedRevision: (await r.repositories.sessions.get(a))!.revision, text: 'next', attachments: [] });
+        expect(resent).toMatchObject({ ok: false, code: 'invalid_transition', retryable: false });
+        expect(resent.ok ? '' : resent.message).toMatch(/^This message was not sent and will not be: /);
+        expect(textsOf(r, runtime, a).filter((t) => t === 'next')).toEqual([]);
         const again = await crash(r);
         expect(textsOf(again, runtime, a)).toEqual([]);
         expect((await again.store.get(refused!.operationId))!.delivery).toMatchObject({ state: 'pending', attempts: [] });
