@@ -36,6 +36,8 @@ import { permissionPolicy } from '../../core/policy';
 import type {
   AppRepositories,
   BackupStore,
+  DispatchRequest,
+  DispatchResult,
   GitPort,
   OwnedProcessRepository,
   PermissionHandle,
@@ -43,6 +45,7 @@ import type {
   ProcessHost,
   RuntimeAdapter,
   RuntimeLocator,
+  StartSessionOptions,
   StorageHealth,
 } from '../../core/ports';
 import { StorageReadOnlyError, StorageWriteError } from '../../core/ports';
@@ -54,6 +57,8 @@ import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { type FaultPoint, faultApplies, withFaultPoint } from './fault-points';
 import { hashFile, setTimer } from './file-hash';
+import { addMissed, type MissedRecords, sessionsToRead } from './missed-records';
+import type { FolderState } from './real-path';
 import { GitIgnoreRules } from './git-ignore';
 import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
@@ -84,6 +89,8 @@ export interface BackendOptions {
   listModels?: (runtime: Runtime) => Promise<ModelOption[]>;
   policy?: PermissionPolicy;
   resolveRealPath(absolutePath: string): string | null;
+  /** Whether a session's folder is still there (`real-path.ts`, T040 r1 P1-4). Absent (tests): what resolveRealPath resolves. */
+  folderState?: (absolutePath: string) => FolderState;
   /** Replaces fs.watch (tests). */
   watch?: WatchFn;
   now?: () => Date;
@@ -113,6 +120,12 @@ const READ_ONLY_COMMANDS: ReadonlySet<Command['type']> = new Set(['backup.restor
 
 /** The fixed text of a command refused while the data is read-only. */
 export const STORAGE_READ_ONLY = 'The data is read-only now; nothing was changed';
+
+/**
+ * The fixed text of a command during which the data turned read-only (T040 r1 P1-3): what it did before that (an
+ * earlier write, a claim) may stand, so it is never said to have changed nothing.
+ */
+export const STORAGE_TURNED_READ_ONLY = 'The data turned read-only while this command ran; part of it may have been carried out. Check what is shown before trying again';
 
 export interface Backend {
   status: 'ready';
@@ -392,9 +405,32 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   // callers see a failure before any runtime is called: a delivery stays pending, never claimed and never unknown.
   const { faultPoint } = options;
   if (faultPoint !== undefined) log(`[fault] armed: ${faultPoint.point} of ${faultPoint.sessionId ?? `every ${String(faultPoint.runtime)} session`}`);
+  // C-29 (T040 r1 P1-3): a command that passed the read-only check may still be on its way to a runtime when the data
+  // turns read-only (another write filled the disk). Right before it would leave, a payload is held back (its attempt,
+  // already committed unknown, says `written: false`, CR-2) and no session is created.
+  const heldBack = 'the GUI data turned read-only before this was sent; nothing left the GUI';
+  // One gate per adapter: an injected factory that shares one adapter still hands out one object.
+  const gates = new WeakMap<RuntimeAdapter, RuntimeAdapter>();
+  const readOnlyGate = (adapter: RuntimeAdapter): RuntimeAdapter => {
+    let gate = gates.get(adapter);
+    if (gate === undefined) gates.set(adapter, (gate = gatedAdapter(adapter)));
+    return gate;
+  };
+  const gatedAdapter = (adapter: RuntimeAdapter): RuntimeAdapter =>
+    new Proxy(adapter, {
+      get(target, key): unknown {
+        if (key === 'dispatchOnce')
+          return (request: DispatchRequest): Promise<DispatchResult> =>
+            readOnly === undefined ? target.dispatchOnce(request) : Promise.resolve({ state: 'unknown', reason: 'rejected', written: false, detail: heldBack });
+        if (key === 'startSession')
+          return (request: StartSessionOptions) => (readOnly === undefined ? target.startSession(request) : Promise.reject(new StorageReadOnlyError(readOnly)));
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
   const createAdapter: AdapterFactory = (runtime, sessionId, hooks) => {
     if (options.runtimes !== undefined && !isRuntimeAvailable(runtime)) throw new RuntimeUnavailableError(runtime);
-    const adapter = makeAdapter(runtime, sessionId, hooks);
+    const adapter = readOnlyGate(makeAdapter(runtime, sessionId, hooks));
     return faultPoint !== undefined && faultApplies(faultPoint, runtime, sessionId) ? withFaultPoint(adapter, sessionId, faultPoint, log) : adapter;
   };
   const hooks ={ onPermissionRequest: (handle: PermissionHandle) => (ref.service === undefined ? Promise.reject(new Error('not ready')) : ref.service.onPermissionRequest(handle)) };
@@ -528,6 +564,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     uuid,
     hashPayload: sha256,
     resolveRealPath: (path) => options.resolveRealPath(path),
+    ...(options.folderState !== undefined && { folderState: options.folderState }),
     // The router's hooks: each opening's requests know whether that opening still serves the session (T036 r3 P1-2).
     createAdapter: (runtime, sessionId, sessionHooks) => createAdapter(runtime, sessionId, sessionHooks),
     mountMcp: (sessionId) => {
@@ -677,11 +714,22 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       return { ok: true, requestId: command.requestId, created: [] };
     });
   const facade: AppFacade = {
-    async snapshot(): Promise<Snapshot> {
+    async snapshot(missed?: MissedRecords): Promise<Snapshot> {
       // The seq first: anything published after it is applied again by the renderer, never skipped.
       const seq = bus.seq;
       // C-26: each session's last turns (and whatever is open); older pages through `session.history`.
       const data = await repositories.readSnapshotData({ recentTurns: options.snapshotTurns ?? SNAPSHOT_TURNS });
+      // And what the window was not sent (T040 r1 P1-1), read after the rest, so never older than the seq: a far-back
+      // turn that ended meanwhile, an answered request. Only sessions of which something is not held yet are read.
+      let conversations = data.conversations;
+      if (missed !== undefined && missed.size > 0) {
+        const known = new Set(data.sessions.map((s) => s.id));
+        for (const sessionId of sessionsToRead(conversations, missed)) {
+          const session = missed.get(sessionId);
+          if (session === undefined || !known.has(sessionId)) continue;
+          conversations = addMissed(conversations, await repositories.conversations.get(sessionId), session);
+        }
+      }
       const storage = await storageInfo();
       return {
         schemaVersion: CONTRACTS_VERSION,
@@ -691,12 +739,12 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         workflows: data.workflows,
         modelOptions,
         sessions: data.sessions,
-        messages: data.conversations.messages,
-        turns: data.conversations.turns,
-        items: data.conversations.items,
-        permissionRequests: data.conversations.permissionRequests,
-        nativeTasks: data.conversations.nativeTasks,
-        artifacts: data.conversations.artifacts,
+        messages: conversations.messages,
+        turns: conversations.turns,
+        items: conversations.items,
+        permissionRequests: conversations.permissionRequests,
+        nativeTasks: conversations.nativeTasks,
+        artifacts: conversations.artifacts,
         instances: data.instances,
         handoffs: data.handoffs,
         peerMessages: data.peerMessages,
@@ -726,9 +774,10 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         return await service.execute(command);
       } catch (error) {
         log(`[backend] ${command.type} failed (${describe(error)})`);
-        // A write refused, or rolled back for lack of space, changed nothing, and the data is read-only now (C-29).
+        // The data turned read-only while the command ran (C-29): the write refused, or rolled back for lack of space,
+        // changed nothing, but what the command did before it may stand (T040 r1 P1-3), so it is not said otherwise.
         if (error instanceof StorageReadOnlyError || (error instanceof StorageWriteError && error.kind === 'disk-full')) {
-          return failure(command.requestId, 'storage_read_only', STORAGE_READ_ONLY);
+          return failure(command.requestId, 'storage_read_only', STORAGE_TURNED_READ_ONLY, { mayHaveSideEffects: true });
         }
         const storage = error instanceof StorageWriteError || (error instanceof Error && (error.name === 'StoredDataError' || error.name === 'InvalidRecordError'));
         return failure(command.requestId, storage ? 'storage_failed' : 'internal_error', storage ? 'The stored data could not be read or written' : 'The command failed', {

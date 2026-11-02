@@ -37,7 +37,7 @@ class Clock {
 type Speed = 'fast' | 'slow' | 'stalled';
 
 /** A bus, a batcher and a renderer that acknowledges each batch after `ackMs` (never when stalled). */
-function rig(options: { speed?: Speed; ackMs?: number; batcher?: Partial<BatcherOptions>; available?: () => boolean } = {}) {
+function rig(options: { speed?: Speed; ackMs?: number; batcher?: Partial<BatcherOptions>; available?: () => boolean; fail?: (batch: EventBatch) => boolean } = {}) {
   const clock = new Clock();
   const bus = new EventBus({ seq: 0, onRejected: (reason) => { throw new Error(reason); } });
   const ledger = new BatchLedger();
@@ -55,6 +55,8 @@ function rig(options: { speed?: Speed; ackMs?: number; batcher?: Partial<Batcher
     target: () => ({
       isAvailable: options.available ?? (() => true),
       send: (batch) => {
+        // A send that throws (r1 P1-2): the window never got it.
+        if (options.fail?.(batch) === true) throw new Error('send failed');
         // Every batch the main process sends must pass the contract.
         EventBatch.parse(batch);
         ledger.apply(batch);
@@ -330,5 +332,107 @@ describe('B-6 a window that is gone or reloaded', () => {
     r.bus.publish(delta('s1', 'm1', 'c'));
     r.clock.advance(100);
     expect(r.ledger.batches.at(-1)?.envelopes[0]?.event).toEqual(delta('s1', 'm1', 'c'));
+  });
+});
+
+describe('B-7 a batch that could not be sent (r1 P1-2)', () => {
+  const permission = (): AppEvent => ({ type: 'permission.updated', request: f.permissionRequests[0]! });
+  const limits = (): AppEvent => ({ type: 'usage.limits', at: '2026-11-03T10:00:00.000Z' });
+
+  it('a permission request whose batch throws: the window is told to read again, and no later batch hides the gap', () => {
+    const r = rig({ fail: (b) => b.envelopes.some((e) => e.event.type === 'permission.updated') });
+    r.bus.publish(delta('s1', 'm1', 'a'));
+    r.clock.advance(100);
+    r.bus.publish(permission());
+    // Sent by the timer: the failure does not escape it.
+    expect(() => r.clock.advance(100)).not.toThrow();
+    r.bus.publish(limits());
+    r.clock.advance(100);
+    expect(r.batcher.stats.overflows).toBe(1);
+    expect(r.reloads()).toBe(1);
+    // Seq 1, then the invalidation alone after the gap: never {fromSeq: 2, toSeq: 3} without the request.
+    expect(r.ledger.batches.map((b) => [b.fromSeq, b.toSeq, b.envelopes.map((e) => e.event.type)])).toEqual([
+      [1, 1, ['message.delta']],
+      [3, 3, ['snapshot.invalidated']],
+    ]);
+    expect(r.ledger.gaps).toBe(1);
+    // The request is owed to the Snapshot the window reads next.
+    const missed = r.batcher.cut();
+    expect(missed.get('s-wf-build-b' as SessionId)?.turns).toEqual(new Set(['turn-b1']));
+    expect(r.batcher.cut().size).toBe(0);
+    // Fed again right after the Snapshot's seq.
+    const seq = r.bus.seq;
+    r.bus.publish(limits());
+    r.clock.advance(100);
+    expect(r.ledger.batches.at(-1)).toMatchObject({ fromSeq: seq + 1, toSeq: seq + 1 });
+  });
+
+  it('the invalidation cannot be sent either: the next envelope goes alone, and its gap tells the renderer instead', () => {
+    let failing = true;
+    const r = rig({ fail: (b) => failing && b.envelopes.some((e) => e.event.type === 'permission.updated' || e.event.type === 'snapshot.invalidated') });
+    r.bus.publish(delta('s1', 'm1', 'a'));
+    r.clock.advance(100);
+    r.bus.publish(permission());
+    expect(() => r.clock.advance(100)).not.toThrow();
+    failing = false;
+    r.bus.publish(limits());
+    r.clock.advance(100);
+    r.bus.publish(limits());
+    r.clock.advance(100);
+    // Seq 1; the request (2) and the invalidation (3) never arrived; 4 alone, after the gap; nothing after it.
+    expect(r.ledger.batches.map((b) => [b.fromSeq, b.toSeq])).toEqual([
+      [1, 1],
+      [4, 4],
+    ]);
+    expect(r.ledger.gaps).toBe(1);
+    expect(r.batcher.cut().get('s-wf-build-b' as SessionId)?.turns.has('turn-b1')).toBe(true);
+  });
+
+  it('a Snapshot read that failed: what it was to bring back is owed to the next one', () => {
+    const r = rig({ fail: (b) => b.envelopes.some((e) => e.event.type === 'permission.updated') });
+    r.bus.publish(permission());
+    r.clock.advance(100);
+    const missed = r.batcher.cut();
+    expect(missed.size).toBe(1);
+    r.batcher.keepMissed(missed);
+    expect(r.batcher.cut()).toEqual(missed);
+  });
+});
+
+describe('B-8 what a let-go window was not sent is owed to its next Snapshot (r1 P1-1)', () => {
+  it('the records of the queue let go and of every event while let go; a session past the limit is taken whole', () => {
+    const r = rig({ speed: 'stalled', batcher: { maxPending: 50, maxInFlight: 1 } });
+    for (let i = 0; i < 60; i++) r.bus.publish({ type: 'turn.updated', turn: { id: `t-${String(i)}` as never, sessionId: 's1' as SessionId, state: 'running', startedAt: '2026-11-03T10:00:00.000Z' } });
+    r.clock.advance(100);
+    expect(r.batcher.stats.overflows).toBe(1);
+    r.bus.publish({ type: 'turn.updated', turn: { id: 't-late' as never, sessionId: 's2' as SessionId, state: 'completed', startedAt: '2026-11-03T10:00:00.000Z', endedAt: '2026-11-03T10:00:01.000Z' } });
+    r.bus.publish(delta('s3', 'm-free', 'x'));
+    const missed = r.batcher.cut();
+    // Queued past the limit before the first batch left (51), then let go meanwhile (9): all 60 are owed.
+    expect(missed.get('s1' as SessionId)?.turns.size).toBe(60);
+    expect(missed.get('s2' as SessionId)?.turns).toEqual(new Set(['t-late']));
+    expect(missed.get('s3' as SessionId)?.records).toEqual(new Set(['m:m-free']));
+    // Past the limit: the session whole, with nothing listed.
+    const big = rig({ speed: 'stalled', batcher: { maxPending: 10, maxInFlight: 1 } });
+    for (let i = 0; i < 2_100; i++) big.bus.publish({ type: 'turn.updated', turn: { id: `t-${String(i)}` as never, sessionId: 's1' as SessionId, state: 'running', startedAt: '2026-11-03T10:00:00.000Z' } });
+    expect(big.batcher.cut().get('s1' as SessionId)).toEqual({ turns: new Set(), records: new Set(), whole: true });
+  });
+});
+
+describe('B-9 the merge keys do not outlive the queue (r1 P2)', () => {
+  it('100 messages streamed, sent and acknowledged: no key is kept; deltas still merge afterwards', () => {
+    const r = rig();
+    for (let i = 0; i < 100; i++) r.bus.publish(delta('s1', `m-${String(i)}`, 'x'));
+    r.clock.advance(1_000);
+    expect(r.batcher.pendingCount).toBe(0);
+    expect(r.batcher.mergeKeys).toBe(0);
+    const merged = r.batcher.stats.merged;
+    r.bus.publish(delta('s1', 'm-0', 'a'));
+    r.bus.publish(delta('s1', 'm-0', 'b'));
+    expect(r.batcher.mergeKeys).toBeGreaterThan(0);
+    r.clock.advance(1_000);
+    expect(r.batcher.stats.merged).toBe(merged + 1);
+    expect(r.batcher.mergeKeys).toBe(0);
+    expectNothingLost(r);
   });
 });

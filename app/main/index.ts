@@ -14,7 +14,7 @@ import { handleTrusted } from './ipc';
 import { type PerfLog, startPerfLog } from './perf-log';
 import { perfLoadFrom, startPerfLoad } from './perf-load';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
-import { resolveRealPath } from './real-path';
+import { folderState, resolveRealPath } from './real-path';
 import { createRuntimeLocator } from './runtime-locator';
 import { supervisorSettings } from './supervisor-settings';
 import { hiddenMenuTemplate, themeOf, WINDOW_BACKGROUND } from './window-chrome';
@@ -144,6 +144,8 @@ void app.whenReady().then(async () => {
     // back to the Agent SDK's copy; a development run may.
     runtimes: createRuntimeLocator({ ...(!app.isPackaged && { sdkBundledClaude: () => sdkBundledClaude(app.getAppPath()) }), log }),
     resolveRealPath,
+    // A closed session whose folder the file system says is gone is refused as such (C-30 `folder-missing`).
+    folderState,
     // The idle supervisor follows the user's preferences (C-30); the environment overrides them in development runs only
     // (the live and crash tests).
     ...(!app.isPackaged && { supervisor: supervisorSettings(process.env) }),

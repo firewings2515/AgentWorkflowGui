@@ -3,6 +3,7 @@ import { Command, CommandResult, type EventBatch, type EventEnvelope, QueryReque
 import { BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
 import { type BatcherOptions, WindowBatcher } from './event-batcher';
 import type { EventBus } from './event-bus';
+import type { MissedRecords } from './missed-records';
 import { failure, type AppFacade } from './facade';
 import { handleTrusted } from './ipc';
 import { isTrustedSender, type IpcSenderEvent, type TrustedSender } from './ipc-guard';
@@ -42,11 +43,11 @@ export const SNAPSHOT_UNAVAILABLE = 'The state snapshot is not available';
  * The Snapshot, checked against the contract before it leaves the main process. Electron hands a handler's
  * thrown message to the renderer, so a failure is logged here (field paths only) and rethrown as fixed text.
  */
-export async function readSnapshot(facade: AppFacade, log: (message: string) => void = console.error): Promise<Snapshot> {
+export async function readSnapshot(facade: AppFacade, log: (message: string) => void = console.error, missed?: MissedRecords): Promise<Snapshot> {
   let raw: unknown;
   let failed = false;
   try {
-    raw = await facade.snapshot();
+    raw = await (missed === undefined ? facade.snapshot() : facade.snapshot(missed));
   } catch (error) {
     log(`[ipc] the backend failed to produce a snapshot (${error instanceof Error ? error.name : 'non-error thrown'})`);
     failed = true;
@@ -165,9 +166,13 @@ export function registerAppIpc(options: AppIpcOptions): () => void {
   // Everything queued goes out before the Snapshot's seq is read, in the same synchronous step (facade.snapshot reads
   // the seq before its first await), so the next batch starts right after that seq (C-27).
   handleTrusted(SNAPSHOT_CHANNEL, getTrustedSender, () => {
-    batcher.cut();
+    const missed = batcher.cut();
     const began = performance.now();
-    const read = readSnapshot(facade);
+    // What the window was not sent comes back with this read; a read that fails owes it to the next one.
+    const read = readSnapshot(facade, console.error, missed).catch((error: unknown) => {
+      batcher.keepMissed(missed);
+      throw error;
+    });
     const { onSnapshot } = options;
     return onSnapshot === undefined ? read : read.then((snapshot) => (onSnapshot(snapshot, performance.now() - began), snapshot));
   });

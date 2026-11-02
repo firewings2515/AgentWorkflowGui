@@ -192,6 +192,12 @@ export interface SessionServiceOptions {
   /** Node-side link resolution; null when it cannot be confirmed (PolicyContext.resolveRealPath). */
   resolveRealPath(absolutePath: string): string | null;
   /**
+   * Whether a session's folder is still there (R-06, C-30 `folder-missing`, T040 r1 P1-4): only `missing` (the file
+   * system says it does not exist) refuses a resume as gone; `unknown` (access denied, ...) is never reported so.
+   * Absent (tests): gone when `resolveRealPath` cannot resolve it.
+   */
+  folderState?: (absolutePath: string) => 'exists' | 'missing' | 'unknown';
+  /**
    * The adapter that serves one opening of a session (see SessionRuntimes): a new one per call, so an earlier
    * opening's late events and requests are told apart (T036 r2/r3). Its approval requests go to `hooks` (they know
    * the opening they belong to); an adapter that calls this service's `onPermissionRequest` itself works too, without
@@ -1232,6 +1238,8 @@ export class SessionService {
       return (await this.store.get(operationId))?.delivery.state;
     }
     if (record?.kind === 'handoff' && record.target.sessionId !== undefined) return this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn', call);
+    // A notice to root joins its running turn, as it did the first time (G-11 B, T040 r1 P1-5): never a new turn there.
+    if (record?.kind === 'system-notice' && record.target.sessionId !== undefined) return this.deliverWorkflow(operationId, record.target.sessionId, 'insert-if-busy', call);
     return this.dispatchPending(operationId, { origin: await this.originOf(operationId), ...(call !== undefined && { call }) });
   }
 
@@ -2051,7 +2059,7 @@ export class SessionService {
       });
     } catch (error) {
       // Claude reports a folder removed meanwhile as a binary that cannot start (SP-07 G5): said plainly instead.
-      if (this.options.resolveRealPath(cwd) === null) throw new ResumeRefused(folderGone(cwd));
+      if (this.folderMissing(cwd)) throw new ResumeRefused(folderGone(cwd));
       // Fixed words only: the runtime's error may quote paths or content.
       this.log(`resuming ${sessionId} failed (${record.context.runtime})`);
       if (!(await this.reopen(record, sessionId, ref, settings))) throw error;
@@ -2123,7 +2131,13 @@ export class SessionService {
       const refused = await this.workflow?.sessionAccess?.(session.id);
       if (refused !== undefined) return refused;
     }
-    return this.options.resolveRealPath(cwd) === null ? folderGone(cwd) : undefined;
+    return this.folderMissing(cwd) ? folderGone(cwd) : undefined;
+  }
+
+  /** The folder is gone, as the file system says (T040 r1 P1-4); one that cannot be looked at is not. */
+  private folderMissing(cwd: string): boolean {
+    const { folderState } = this.options;
+    return folderState === undefined ? this.options.resolveRealPath(cwd) === null : folderState(cwd) === 'missing';
   }
 
   /** Why a send to this session would not reach it: it is closed and cannot be resumed (T036); undefined when it can. */

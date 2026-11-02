@@ -1,7 +1,7 @@
 // T040 on the assembled backend with a real SQLite file (and the in-memory database where the case allows): the
 // Snapshot's history pages and `session.history` (C-26), backups and restores (C-28), read-only data (C-29), and a
 // renderer that falls behind (C-27): what it was not sent is in the Snapshot it reads next.
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -31,8 +31,9 @@ import type { PermissionHandle, PolicyDecision } from '../../core/ports';
 import { FakeAdapter, permissionRequest } from '../../core/sessions/testing/fake-adapter';
 import { agent } from '../../core/sessions/testing/harness';
 import { forwardEvents } from './app-ipc';
-import { type Backend, type BackendProcessHost, startBackend, STORAGE_READ_ONLY } from './backend';
+import { type Backend, type BackendProcessHost, startBackend, STORAGE_READ_ONLY, STORAGE_TURNED_READ_ONLY } from './backend';
 import { EventBus } from './event-bus';
+import { type FolderState, folderState, resolveRealPath } from './real-path';
 
 let dir: string;
 let running: Backend[] = [];
@@ -77,7 +78,9 @@ interface Started {
   run(command: Command): Promise<CommandResult>;
 }
 
-const start = async (options: { dbPath?: string; faults?: InjectedStorageFaults; decide?: () => PolicyDecision } = {}): Promise<Started> => {
+const start = async (
+  options: { dbPath?: string; faults?: InjectedStorageFaults; decide?: () => PolicyDecision; realPath?: (path: string) => string | null; folders?: (path: string) => FolderState } = {},
+): Promise<Started> => {
   const logs: string[] = [];
   const adapters: FakeAdapter[] = [];
   const bus = new EventBus();
@@ -95,7 +98,8 @@ const start = async (options: { dbPath?: string; faults?: InjectedStorageFaults;
     listModels: (runtime: Runtime) => Promise.resolve([{ runtime, model: `${runtime}-m`, displayName: 'M', efforts: [], isDefault: true, hidden: false }]),
     ...(options.decide !== undefined && { policy: { evaluate: options.decide } }),
     ...(options.faults !== undefined && { storageHooks: options.faults }),
-    resolveRealPath: (p) => p,
+    resolveRealPath: options.realPath ?? ((p) => p),
+    ...(options.folders !== undefined && { folderState: options.folders }),
     now: () => new Date(at),
     watch: () => {
       const watcher = { close: () => undefined, on: () => watcher };
@@ -288,7 +292,8 @@ describe('C-29: read-only data', () => {
 
     faults.failNextWrite('disk-full');
     const failed = await s.run({ type: 'preferences.set', requestId: rid(), preferences: { theme: 'light', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } } });
-    expect(failed).toMatchObject({ ok: false, code: 'storage_read_only', message: STORAGE_READ_ONLY });
+    // The write that filled the disk changed nothing, but the reply does not claim more than it knows (r1 P1-3).
+    expect(failed).toMatchObject({ ok: false, code: 'storage_read_only', message: STORAGE_TURNED_READ_ONLY, mayHaveSideEffects: true });
     expect(s.envelopes.map((e) => e.event)).toContainEqual(expect.objectContaining({ type: 'app.readOnly', reason: 'disk-full' }));
     const snap = await snapshot(s);
     expect(snap.app).toMatchObject({ status: 'read-only', reason: 'disk-full' });
@@ -296,7 +301,8 @@ describe('C-29: read-only data', () => {
     expect(snap.preferences.theme).toBe('dark');
 
     const send = await s.run({ type: 'session.send', requestId: rid(), sessionId: SessionId.parse('session-a'), messageId: MessageId.parse('m-ro'), expectedRevision: snap.sessions[0]!.revision, text: 'hi', attachments: [] });
-    expect(send).toMatchObject({ ok: false, code: 'storage_read_only' });
+    // Refused at the door: here nothing was changed.
+    expect(send).toMatchObject({ ok: false, code: 'storage_read_only', message: STORAGE_READ_ONLY, mayHaveSideEffects: false });
     expect(adapter.dispatched.length).toBe(dispatched);
     // A peer message too: the core cannot accept it, so nothing reaches the runtime.
     await createSession(s, 'session-b').catch(() => undefined);
@@ -313,6 +319,50 @@ describe('C-29: read-only data', () => {
     }
     await s.backend.shutdown();
   });
+
+  it.each(['file', ':memory:'])(
+    'the data turns read-only after a send was claimed and before it left (%s): nothing reaches the runtime, and the reply does not say nothing changed',
+    async (kind) => {
+      const faults = new InjectedStorageFaults();
+      // Another write fills the disk in the step between the send's claim and its dispatch (r1 P1-3).
+      let armed = false;
+      let filled = false;
+      const hooks = {
+        beforeWrite: () => faults.beforeWrite(),
+        migration: (db: DatabaseSync, sql: string) => faults.migration(db, sql),
+        beforeCommit: () => {
+          faults.beforeCommit();
+          if (!armed || !/DeliveryStore\.claim/.test(new Error().stack ?? '')) return;
+          armed = false;
+          queueMicrotask(() => {
+            faults.failNextWrite('disk-full');
+            void s.backend.repositories.preferences.set({ ...held.snap!.preferences, theme: 'light' }).catch(() => undefined);
+            filled = true;
+          });
+        },
+      };
+      const held: { snap?: Snapshot } = {};
+      const s = await start({ faults: hooks as unknown as InjectedStorageFaults, ...(kind === ':memory:' && { dbPath: ':memory:' }) });
+      await createSession(s);
+      const adapter = s.adapters[0]!;
+      const dispatched = adapter.dispatched.length;
+      const snap = await snapshot(s);
+      held.snap = snap;
+      armed = true;
+      const send = await s.run({ type: 'session.send', requestId: rid(), sessionId: SessionId.parse('session-a'), messageId: MessageId.parse('m-mid'), expectedRevision: snap.sessions[0]!.revision, text: 'hi', attachments: [] });
+      await settle();
+      expect(filled).toBe(true);
+      expect(s.envelopes.map((e) => e.event)).toContainEqual(expect.objectContaining({ type: 'app.readOnly', reason: 'disk-full' }));
+      // Held back at the door: the runtime never got it.
+      expect(adapter.dispatched.length).toBe(dispatched);
+      // Not "nothing was changed": the message was accepted and claimed before the data turned read-only.
+      expect(send).toMatchObject({ ok: false, code: 'storage_read_only', message: STORAGE_TURNED_READ_ONLY, mayHaveSideEffects: true });
+      // Its attempt stays unknown, and says nothing was written (CR-2: never sent again by itself).
+      const record = (await s.backend.service.storage.store.listByTarget(SessionId.parse('session-a'))).find((r) => r.kind === 'user-message');
+      expect(record?.delivery.state).toBe('unknown');
+      await s.backend.shutdown();
+    },
+  );
 
   it('a full disk already during the start (the orphan cleanup writes first): read-only from there on, nothing recovered', async () => {
     const path = join(dir, 'awg.sqlite');
@@ -375,6 +425,49 @@ describe('C-30: the idle supervisor follows the saved preferences', () => {
   });
 });
 
+describe('C-30: folder-missing with the real path functions (T040 r1 P1-4), on SQLite', () => {
+  const denied = () => {
+    throw Object.assign(new Error('denied'), { code: 'EACCES' });
+  };
+  /** a in the temp folder, b in a folder of its own, both closed by a restart; the second start uses `second`. */
+  const closedPair = async (second: { realPath: (path: string) => string | null; folders: (path: string) => FolderState }) => {
+    const path = join(dir, 'awg.sqlite');
+    const folder = join(dir, 'b');
+    mkdirSync(folder);
+    const first = await start({ dbPath: path, realPath: (p) => resolveRealPath(p), folders: (p) => folderState(p) });
+    await createSession(first, 'session-a');
+    const made = await first.run({ type: 'session.create', requestId: rid(), sessionId: SessionId.parse('session-b'), kind: 'ordinary', agentId: agent().id, model: { runtime: 'codex', model: 'codex-m' }, cwd: folder });
+    expect(made).toMatchObject({ ok: true });
+    await settle();
+    await first.backend.shutdown();
+    return { s: await start({ dbPath: path, ...second }), folder };
+  };
+  const call = (s: Started, operationId: string) =>
+    s.backend.service.sendMessage({ to: SessionId.parse('session-b'), content: 'ping' }, { caller: SessionId.parse('session-a'), operationId: operationId as never, sourceCallRef: `call-${operationId}` });
+
+  it('the target folder deleted: folder-missing, nothing accepted, nothing resumed', async () => {
+    const { s, folder } = await closedPair({ realPath: (p) => resolveRealPath(p), folders: (p) => folderState(p) });
+    rmSync(folder, { recursive: true });
+    const before = s.adapters.length;
+    expect(await call(s, 'op-gone')).toEqual({ status: 'rejected', rejection: { reason: 'folder-missing', detail: 'the target session is closed and its folder no longer exists' } });
+    expect(await s.backend.service.storage.store.get('op-gone' as never)).toBeUndefined();
+    expect(s.adapters.slice(before).flatMap((a) => a.calls).filter((c) => c === 'resumeSession')).toEqual([]);
+    await s.backend.shutdown();
+  });
+
+  it('the folder there: accepted and sent', async () => {
+    const { s } = await closedPair({ realPath: (p) => resolveRealPath(p), folders: (p) => folderState(p) });
+    expect(await call(s, 'op-there')).toMatchObject({ status: 'accepted', delivery: 'sent' });
+    await s.backend.shutdown();
+  });
+
+  it('the folder cannot be looked at (EACCES): never reported as gone', async () => {
+    const { s } = await closedPair({ realPath: (p) => resolveRealPath(p, denied), folders: (p) => folderState(p, denied) });
+    expect(await call(s, 'op-denied')).not.toMatchObject({ rejection: { reason: 'folder-missing' } });
+    await s.backend.shutdown();
+  });
+});
+
 describe('C-27: a renderer that falls behind under a stream of deltas', () => {
   it.each(['file', ':memory:'])(
     'is let go and told to read again (%s); the Snapshot it then reads holds the permission request, the turn end and the escalation it was not sent',
@@ -432,4 +525,57 @@ describe('C-27: a renderer that falls behind under a stream of deltas', () => {
       await s.backend.shutdown();
     },
   );
+});
+
+describe('C-27 with C-26: a far-back record that changed while the renderer was let go (r1 P1-1)', () => {
+  it.each(['file', ':memory:'])('comes back in the Snapshot it then reads, though older than the last 50 turns (%s)', async (kind) => {
+    const s = await start(kind === ':memory:' ? { dbPath: ':memory:' } : {});
+    await createSession(s);
+    const sessionId = SessionId.parse('session-a');
+    const adapter = s.adapters[0]!;
+    const time = (i: number) => new Date(Date.parse('2026-11-01T00:00:00.000Z') + i * 60_000).toISOString();
+    // The oldest turn still runs, its reply streaming; 60 later turns came and went meanwhile (a native task's turn).
+    const oldest = 'turn-old' as TurnId;
+    adapter.emit({ type: 'turn.updated', turn: { id: oldest, sessionId, state: 'running', startedAt: time(0) } });
+    for (let i = 1; i <= 60; i++) {
+      const turnId = `turn-${String(i)}` as TurnId;
+      adapter.emit({ type: 'turn.updated', turn: { id: turnId, sessionId, state: 'completed', startedAt: time(i), endedAt: time(i) } });
+      adapter.emit({ type: 'message.completed', message: { id: MessageId.parse(`m-${String(i)}`), sessionId, turnId, role: 'assistant', origin: { kind: 'agent' }, text: 'r', attachments: [], createdAt: time(i) } });
+    }
+    await settle();
+    const before = await snapshot(s);
+    expect(before.turns).toContainEqual(expect.objectContaining({ id: oldest, state: 'running' }));
+
+    // A window that never acknowledges: let go under the stream, and while let go the old turn ends.
+    const sent: EventBatch[] = [];
+    const { batcher, stop } = forwardEvents(s.bus, () => ({ isDestroyed: () => false, getURL: () => 'app://x', send: (_c, b) => sent.push(EventBatch.parse(b)) }), () => true, {
+      batchMs: 1,
+      maxPending: 20,
+      maxInFlight: 1,
+    });
+    for (let i = 0; i < 40; i++) {
+      adapter.emit({ type: 'message.delta', sessionId, turnId: oldest, messageId: MessageId.parse('m-old'), delta: 'x' });
+      adapter.emit({ type: 'session.activity', sessionId, activity: 'running', at });
+    }
+    await settle();
+    expect(batcher.stats.overflows).toBe(1);
+    adapter.emit({ type: 'message.completed', message: { id: MessageId.parse('m-old'), sessionId, turnId: oldest, role: 'assistant', origin: { kind: 'agent' }, text: 'x'.repeat(40), attachments: [], createdAt: time(0) } });
+    adapter.emit({ type: 'turn.updated', turn: { id: oldest, sessionId, state: 'completed', startedAt: time(0), endedAt: time(61) } });
+    await settle();
+    const delivered = new Set(sent.flatMap((b) => b.envelopes.map((e) => e.seq)));
+    expect(s.envelopes.filter((e) => e.event.type === 'turn.updated' && e.event.turn.id === oldest && !delivered.has(e.seq))).not.toHaveLength(0);
+
+    // Without what was missed the Snapshot would not have it at all (the review's repro): neither running nor completed.
+    expect((await snapshot(s)).turns.some((t) => t.id === oldest)).toBe(false);
+    // The read as the IPC handler does it: the cut hands over what the window missed.
+    const snap = Snapshot.parse(await s.backend.facade.snapshot(batcher.cut()));
+    expect(snap.turns).toContainEqual(expect.objectContaining({ id: oldest, state: 'completed' }));
+    // The streamed message is there completed, so the renderer drops its stream (renderer-store keeps one otherwise).
+    expect(snap.messages).toContainEqual(expect.objectContaining({ id: 'm-old', text: 'x'.repeat(40) }));
+    expect(snap.turns.filter((t) => t.sessionId === sessionId)).toHaveLength(51);
+    // Owed once: the next read is the plain Snapshot again.
+    expect(Snapshot.parse(await s.backend.facade.snapshot(batcher.cut())).turns.some((t) => t.id === oldest)).toBe(false);
+    stop();
+    await s.backend.shutdown();
+  });
 });

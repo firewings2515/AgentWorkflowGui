@@ -13,6 +13,7 @@ import { fixtureSnapshot } from '../../contracts/fixtures/snapshot';
 import { createRepositories, openDatabase } from '../../adapters/storage';
 import type { AppRepositories, Conversation } from '../../core/ports';
 import { MemoryRepositories } from '../../core/sessions/testing/memory-repositories';
+import { addMissed, type MissedRecords, noteMissed, sessionsToRead } from './missed-records';
 
 const opened: { db: DatabaseSync; dir: string }[] = [];
 afterEach(() => {
@@ -111,4 +112,47 @@ describe.each(backends)('history pages (C-26, T040) on %s', (_name, make) => {
     expect(new Set(turns)).toEqual(new Set(history.turns.map((t) => t.id)));
     expect(pages.flatMap((p) => p.messages).every((m) => m.sessionId === A)).toBe(true);
   }, 300_000);
+
+  // r1 P1-1: what a window was not sent comes back with the Snapshot, however old.
+  it('records the window missed, far older than the Snapshot turns, are added whole and once; nothing of another session', async () => {
+    const repos = make();
+    const history = await seed(repos, 120);
+    const snap = await repos.readSnapshotData({ recentTurns: 50 });
+    const old = history.turns[3]!;
+    const free = { ...history.messages[0]!, id: 'm-free' as never, turnId: undefined };
+    await repos.conversations.appendMessage(free);
+    expect(snap.conversations.turns.some((t) => t.id === old.id)).toBe(false);
+    const missed: MissedRecords = new Map();
+    noteMissed(missed, { type: 'turn.updated', turn: old });
+    noteMissed(missed, { type: 'message.completed', message: free });
+    // A turn the Snapshot holds anyway asks for no read.
+    const recent = history.turns.at(-1)!;
+    noteMissed(missed, { type: 'turn.updated', turn: recent });
+    expect(sessionsToRead(snap.conversations, missed)).toEqual([A]);
+    const held = (await repos.readSnapshotData({ recentTurns: 50 })).conversations;
+    const merged = addMissed(held, await repos.conversations.get(A), missed.get(A)!);
+    const whole = await repos.conversations.get(A);
+    const of = ofTurns(whole, new Set([old.id]));
+    expect(merged.turns.filter((t) => t.id === old.id)).toEqual(of.turns);
+    for (const m of of.messages) expect(merged.messages).toContainEqual(m);
+    for (const i of of.items) expect(merged.items).toContainEqual(i);
+    expect(merged.messages).toContainEqual(free);
+    // Nothing twice; everything held is still there; messages in time order; B untouched.
+    const ids = merged.messages.map((m) => `${m.sessionId}/${m.id}`);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const m of held.messages) expect(merged.messages).toContainEqual(m);
+    expect(merged.messages.map((m) => Date.parse(m.createdAt))).toEqual([...merged.messages.map((m) => Date.parse(m.createdAt))].sort((a, b) => a - b));
+    expect(merged.messages.filter((m) => m.sessionId === B)).toEqual(held.messages.filter((m) => m.sessionId === B));
+    expect(merged.turns.length).toBe(held.turns.length + 1);
+  });
+
+  it('a session missed past the limit is added whole', async () => {
+    const repos = make();
+    await seed(repos, 80);
+    const held = (await repos.readSnapshotData({ recentTurns: 50 })).conversations;
+    const whole = await repos.conversations.get(A);
+    const merged = addMissed(held, whole, { turns: new Set(), records: new Set(), whole: true });
+    expect(merged.turns.filter((t) => t.sessionId === A)).toHaveLength(80);
+    expect(merged.messages.filter((m) => m.sessionId === A)).toHaveLength(160);
+  });
 });

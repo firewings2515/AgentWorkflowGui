@@ -153,6 +153,41 @@ describe('snapshot', () => {
       await expect(call(SNAPSHOT_CHANNEL, trustedEvent)).rejects.toThrow(SNAPSHOT_UNAVAILABLE);
     });
   });
+
+  // r1 P1-1/P1-2: the records of a batch that could not be sent reach the Snapshot read; a read that fails keeps them.
+  it('hands the Snapshot read what the window was not sent, and keeps it for the next read when that one fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const asked: unknown[] = [];
+    let fail = true;
+    const target: EventTarget = {
+      isDestroyed: () => false,
+      getURL: () => 'http://localhost:5173/',
+      send: () => {
+        throw new Error('render frame disposed');
+      },
+    };
+    const { call, bus } = setup({
+      target,
+      facade: {
+        snapshot: (missed) => {
+          asked.push(missed);
+          if (fail) throw new Error('read failed');
+          return { ...fixtureSnapshot, seq: bus.seq };
+        },
+        execute: vi.fn(),
+      },
+    });
+    bus.publish({ type: 'permission.updated', request: fixtureSnapshot.permissionRequests[0]! });
+    await tick();
+    await expect(call(SNAPSHOT_CHANNEL, trustedEvent)).rejects.toThrow(SNAPSHOT_UNAVAILABLE);
+    fail = false;
+    await call(SNAPSHOT_CHANNEL, trustedEvent);
+    const owed = (m: unknown) => (m as Map<string, { turns: Set<string> }>).get('s-wf-build-b')?.turns.has('turn-b1');
+    expect(asked.map(owed)).toEqual([true, true]);
+    // Brought back once: the read after it is owed nothing.
+    await call(SNAPSHOT_CHANNEL, trustedEvent);
+    expect((asked[2] as Map<string, unknown>).size).toBe(0);
+  });
 });
 
 describe('commands', () => {

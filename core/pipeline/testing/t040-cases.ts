@@ -150,4 +150,32 @@ export const t040NoticeCases = (backend: string, make: (workflow?: WorkflowTempl
       if (decision === 'retry') expect(notices([w], op)).toHaveLength(2);
       else expect(notices([w], op)).toHaveLength(1);
     });
+
+    // r1 P1-5: the user's retry enters root the way the first try did: into its running turn, else as a new turn.
+    it.each([
+      ['still runs', 'insert'],
+      ['has ended', 'new-turn'],
+    ] as const)('a retried notice while root %s goes in as %s, as the first try did', async (rootState, expected) => {
+      const w = await begin(make, true);
+      const asked = await createTasks(w, [item('a', 'A')], `call-retry-${expected}`);
+      if (asked.status !== 'awaiting-confirmation') throw new Error('not asked');
+      const op = planNoticeOperationOf(asked.taskPlanId);
+      const root = (await instanceOf(w)).rootSessionId;
+      w.emitTurn(root, 'turn-busy', 'running');
+      await settle();
+      w.claude.dispatchModes.push('lost');
+      await respond(w, asked.escalationId, 'approve');
+      await settle();
+      expect(notices([w], op).map((d) => d.entry.kind)).toEqual(['insert']);
+      if (rootState === 'has ended') {
+        w.emitTurn(root, 'turn-busy', 'completed');
+        await settle();
+      }
+      const [escalation] = (await w.repositories.escalations.list({ state: 'open' })).filter((e) => e.kind === 'delivery-unknown');
+      if (escalation === undefined) throw new Error('no escalation');
+      expect(await w.run({ type: 'delivery.resolve', requestId: rid(), escalationId: escalation.id, decision: 'retry', acceptDuplicateRisk: true })).toMatchObject({ ok: true });
+      await settle();
+      expect(notices([w], op).map((d) => d.entry.kind)).toEqual(['insert', expected]);
+      expect(await w.store.get(op)).toMatchObject({ delivery: { state: 'sent' } });
+    });
   });
