@@ -239,12 +239,21 @@ describe('T025 escalation decisions', () => {
 
   it('T046: a retry its session cannot take says on the card that it is saved and to start a new session', async () => {
     const { fake } = await setup();
-    fake.bridge.send.mockImplementation(command => Promise.resolve({ ok: false, requestId: RequestId.parse(command.requestId), code: 'runtime_unavailable', message: 'SUCCESS: sent', retryable: false, mayHaveSideEffects: false }));
+    fake.bridge.send.mockImplementation(command => Promise.resolve({ ok: false, requestId: RequestId.parse(command.requestId), code: 'runtime_unavailable', message: 'SUCCESS: sent', retryable: false, mayHaveSideEffects: true }));
     fireEvent.click(deliveryCard().getByRole('checkbox', { name: /可能重複送達/ }));
     fireEvent.click(deliveryCard().getByRole('button', { name: '重試送達' }));
     const said = await deliveryCard().findByText(/重試已保存/);
     expect(said.textContent).toContain('另開一個新的 session');
     expect(said.textContent).not.toContain('SUCCESS');
+  });
+
+  it('T046 r4 P2: a retry refused before anything was saved (the app closing) is not said to be saved', async () => {
+    const { fake } = await setup();
+    fake.bridge.send.mockImplementation(command => Promise.resolve({ ok: false, requestId: RequestId.parse(command.requestId), code: 'runtime_unavailable', message: 'The application is closing', retryable: false, mayHaveSideEffects: false }));
+    fireEvent.click(deliveryCard().getByRole('checkbox', { name: /可能重複送達/ }));
+    fireEvent.click(deliveryCard().getByRole('button', { name: '重試送達' }));
+    const said = await deliveryCard().findByText(/Runtime 目前無法使用/);
+    expect(said.textContent).not.toContain('重試已保存');
   });
 
   it('keeps wait actionable and supports message refs without treating a missing delivery record as unsent', async () => {

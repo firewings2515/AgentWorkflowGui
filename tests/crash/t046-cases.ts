@@ -137,8 +137,8 @@ const retryAfter = async (r: SupWorld, runtime: Runtime, a: SessionId, ref: stri
     expect(r.logs).toContain(`[sessions] ${a} had nothing stored and nothing was handed to it unasked: opened again under its own ID (retried)`);
     return;
   }
-  // F-2: said plainly, never left waiting unseen.
-  expect(result).toMatchObject({ ok: false, code: 'runtime_unavailable' });
+  // F-2: said plainly, never left waiting unseen; the decision is saved, so a change was made (r4 P2).
+  expect(result).toMatchObject({ ok: false, code: 'runtime_unavailable', mayHaveSideEffects: true });
   expect(result.ok ? '' : result.message).toMatch(/^The retry is saved, but it cannot be sent: /);
   expect(record!.delivery.state).toBe('pending');
   expect(record!.delivery.attempts).toHaveLength(1);
@@ -337,10 +337,10 @@ export const noHistoryCases = (name: string, makeSup: MakeSup, makeFlow: MakeFlo
       };
       return held;
     };
-    const twoUnknown = async () => {
+    const twoUnknown = async (runtime: Runtime = 'claude') => {
       const w = await withDisk(makeSup);
-      const a = await created(w, 'claude');
-      adapterOf(w, 'claude', a).dispatchModes.push('lost', 'lost');
+      const a = await created(w, runtime);
+      adapterOf(w, runtime, a).dispatchModes.push('lost', 'lost');
       await send(w, a, 'first');
       await send(w, a, 'second');
       await supSettle();
@@ -391,6 +391,88 @@ export const noHistoryCases = (name: string, makeSup: MakeSup, makeFlow: MakeFlo
       // Nothing of the refused send goes at a later start either.
       const next = await crash(r);
       expect(textsOf(next, 'claude', a)).not.toContain('third');
+    });
+
+    /**
+     * r4 P1: holds the retry once its own resume has failed, at its read of the delivery (`resolveDelivery` after the
+     * dispatch returned): whatever runs meanwhile must not take or clear what that call met.
+     */
+    const holdAfterFailedResume = (r: SupWorld, runtime: Runtime, a: SessionId, operationId: string) => {
+      const held = gate();
+      let armed = false;
+      const adapter = adapterOf(r, runtime, a);
+      const resume = adapter.resumeSession.bind(adapter);
+      adapter.resumeSession = async (options) => {
+        try {
+          return await resume(options);
+        } catch (error) {
+          armed = true;
+          throw error;
+        }
+      };
+      const store = r.store as unknown as { get: (id: string) => Promise<unknown> };
+      const get = store.get.bind(store);
+      store.get = async (id) => {
+        if (armed && id === operationId) {
+          armed = false;
+          await held.promise;
+        }
+        return get(id);
+      };
+      return held;
+    };
+
+    it('r4 P1: a retry and a send of the same message at once: the retry is told its own reason, the send its own; the retried message stays to go', async () => {
+      const { r, a, first } = await twoUnknown('codex');
+      // The second message is decided first (cancel), so only the first is in question.
+      const [second] = (await openEscalations(r, 'delivery-unknown')).filter((e) => e.ref?.kind === 'message' && e.ref.operationId !== first.record.operationId);
+      expect(await r.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: second!.id, decision: 'cancel', acceptDuplicateRisk: false })).toMatchObject({ ok: true });
+      const held = holdAfterFailedResume(r, 'codex', a, first.record.operationId);
+      const retry = r.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: first.escalation.id, decision: 'retry', acceptDuplicateRisk: true });
+      await supSettle();
+      // The same message, under its own ID, sent again while the retry is held after its resume failed.
+      const messageId = first.record.operationId.slice('user-message:'.length);
+      const resent = await r.run({ type: 'session.send', requestId: supRid(), sessionId: a, messageId: messageId as never, expectedRevision: (await r.repositories.sessions.get(a))!.revision, text: 'first', attachments: [] });
+      await supSettle();
+      held.open();
+      const retried = await retry;
+      await supSettle();
+      expect(resent).toMatchObject({ ok: false, code: 'invalid_transition' });
+      expect(retried).toMatchObject({ ok: false, code: 'runtime_unavailable', mayHaveSideEffects: true });
+      expect(retried.ok ? '' : retried.message).toMatch(/^The retry is saved, but it cannot be sent: /);
+      // The retry the user chose still goes at the next start: the refused resend did not cancel it.
+      const kept = (await r.store.get(first.record.operationId))!;
+      expect(kept.outcome).toBeUndefined();
+      expect(kept.delivery).toMatchObject({ state: 'pending', attempts: [{ resolution: { decision: 'retry' } }] });
+      expect(textsOf(r, 'codex', a)).toEqual([]);
+    });
+
+    it('r4 P1 (the R11 window): a second retry runs to its end while the first is held after its resume failed: the first is still told its own reason', async () => {
+      const { r, a, first, second } = await twoUnknown('claude');
+      const held = holdAfterFailedResume(r, 'claude', a, first.record.operationId);
+      const one = r.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: first.escalation.id, decision: 'retry', acceptDuplicateRisk: true });
+      await supSettle();
+      // The second retry goes all the way: by now every attempt to the session is one the user retried, so it opens again.
+      const two = await r.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: second.escalation.id, decision: 'retry', acceptDuplicateRisk: true });
+      await supSettle();
+      expect(two).toMatchObject({ ok: true });
+      expect(textsOf(r, 'claude', a)).toEqual(['second']);
+      held.open();
+      const r1 = await one;
+      expect(r1).toMatchObject({ ok: false, code: 'runtime_unavailable', mayHaveSideEffects: true });
+      expect(r1.ok ? '' : r1.message).toMatch(/^The retry is saved, but it cannot be sent: An earlier message may have reached this session/);
+      expect((await r.store.get(first.record.operationId))!.delivery).toMatchObject({ state: 'pending', attempts: [{ resolution: { decision: 'retry' } }] });
+    });
+
+    it('r4 P2: a retry refused because the app is closing saved nothing, and says so (no change made)', async () => {
+      const { r, first } = await twoUnknown('claude');
+      r.service.beginClose();
+      const result = await r.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: first.escalation.id, decision: 'retry', acceptDuplicateRisk: true });
+      expect(result).toMatchObject({ ok: false, code: 'runtime_unavailable', mayHaveSideEffects: false });
+      const record = (await r.store.get(first.record.operationId))!;
+      expect(record.delivery.state).toBe('unknown');
+      expect(record.delivery.attempts.at(-1)?.resolution).toBeUndefined();
+      expect((await openEscalations(r, 'delivery-unknown')).map((e) => e.id)).toContain(first.escalation.id);
     });
 
     it('r3 P2: a message the user cancelled, sent again under its own ID, is told it will not go; the session does not wait on it', async () => {

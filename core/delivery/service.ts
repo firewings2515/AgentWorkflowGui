@@ -503,6 +503,7 @@ export class DeliveryService {
       try {
         await this.options.prepareTarget(record);
       } catch (error) {
+        if (options.call !== undefined) options.call.prepareError = error;
         return notDispatched('prepare-failed', errorText(error));
       }
     }

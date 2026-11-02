@@ -26,7 +26,12 @@ const byOperation: Partial<Record<string, Partial<Record<ErrorCode, string>>>> =
 };
 
 export function commandFeedback(result: Failure, operation?: string): string {
-  const explanation = (operation === undefined ? undefined : byOperation[operation]?.[result.code]) ?? explanations[result.code];
+  // A retry is "saved" only when the service says a change was made (r4 P2): one refused before it (the app closing)
+  // saved nothing and keeps the general words.
+  const savedRetry = operation === 'delivery.resolve' && result.code === 'runtime_unavailable' && result.mayHaveSideEffects;
+  if (savedRetry) return byOperation['delivery.resolve']!.runtime_unavailable!;
+  const words = operation === undefined || operation === 'delivery.resolve' ? undefined : byOperation[operation]?.[result.code];
+  const explanation = words ?? explanations[result.code];
   return explanation + (result.mayHaveSideEffects && result.code !== 'unknown_outcome' ? ' 可能已產生變更，請先核對；不可直接重試。' : '');
 }
 

@@ -22,15 +22,18 @@ afterEach(() => {
   stores.length = 0;
 });
 
-const failure = (code: 'runtime_unavailable' | 'invalid_transition') => ({ ok: false as const, requestId: null, code, message: 'SUCCESS: sent', retryable: false, mayHaveSideEffects: false });
+const failure = (code: 'runtime_unavailable' | 'invalid_transition', mayHaveSideEffects = false) => ({ ok: false as const, requestId: null, code, message: 'SUCCESS: sent', retryable: false, mayHaveSideEffects });
 
 describe('T046: what a refused retry or send tells the user', () => {
   it('a refused retry says it is saved, when it is tried again, and to start a new session; other operations keep the general words', () => {
-    const retry = commandFeedback(failure('runtime_unavailable'), 'delivery.resolve');
+    // Saved: the service says a change was made (the decision is recorded).
+    const retry = commandFeedback(failure('runtime_unavailable', true), 'delivery.resolve');
     expect(retry).toContain('重試已保存');
     expect(retry).toContain('下次啟動時會再試一次');
     expect(retry).toContain('另開一個新的 session');
     expect(retry).not.toContain('SUCCESS');
+    // r4 P2: refused before anything was saved (the app closing): never told it is saved.
+    expect(commandFeedback(failure('runtime_unavailable'), 'delivery.resolve')).toBe('Runtime 目前無法使用。');
     expect(commandFeedback(failure('runtime_unavailable'), 'session.send')).toBe('Runtime 目前無法使用。');
     expect(commandFeedback(failure('runtime_unavailable'))).toBe('Runtime 目前無法使用。');
   });
@@ -51,7 +54,7 @@ describe('T046: what a refused retry or send tells the user', () => {
     const store = createRendererStore(fake.bridge);
     stores.push(store);
     await store.start();
-    fake.bridge.send.mockResolvedValueOnce({ ...failure('runtime_unavailable'), requestId: RequestId.parse('t046-retry') });
+    fake.bridge.send.mockResolvedValueOnce({ ...failure('runtime_unavailable', true), requestId: RequestId.parse('t046-retry') });
     await store.send({ type: 'delivery.resolve', requestId: RequestId.parse('t046-retry'), escalationId: EscalationId.parse('delivery:op/attempt-1'), decision: 'retry', acceptDuplicateRisk: true });
     render(<ConnectionStatus state={store.getSnapshot()} store={store} />);
     fireEvent.click(screen.getByText(/^操作結果/));
