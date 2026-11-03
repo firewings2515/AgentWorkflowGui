@@ -1,0 +1,4 @@
+// virtual-path: core/sessions/work-folders.ts
+// expect: error
+// T048 r3: nor by loading node:fs at run time.
+export const remove = async (path: string) => (await import('node:fs/promises')).rm(path);

@@ -526,6 +526,30 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       expect((await get(next, 's-3')).cwd).toBe(folderOf(env, '004'));
     });
 
+    it('r3 P2-1: a claim the next start cannot drop either is released there and never reused once writes work again', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const sessions: Pick<AppRepositories['sessions'], 'create'> = w.repositories.sessions;
+      const claims: Pick<AppRepositories['workFolders'], 'remove' | 'markReleased'> = w.repositories.workFolders;
+      const [create0, remove0, released0] = [sessions.create.bind(sessions), claims.remove.bind(claims), claims.markReleased.bind(claims)];
+      let refusing = true;
+      sessions.create = (session) => (refusing ? Promise.reject(new StorageReadOnlyError('disk-full')) : create0(session));
+      claims.remove = (sessionId) => (refusing ? Promise.reject(new StorageReadOnlyError('disk-full')) : remove0(sessionId));
+      claims.markReleased = (sessionId) => (refusing ? Promise.reject(new StorageReadOnlyError('disk-full')) : released0(sessionId));
+      // Its release and its mark both refused: storage still says made.
+      await expect(create(w, 's-1')).rejects.toBeInstanceOf(StorageReadOnlyError);
+      expect(await w.repositories.workFolders.get(SessionId.parse('s-1'))).toMatchObject({ state: 'made', path: folderOf(env, '001') });
+      // The next start: its check cannot drop the claim (nor mark it) either.
+      const next = await env.restart();
+      expect(await next.repositories.workFolders.get(SessionId.parse('s-1'))).toMatchObject({ state: 'made' });
+      expect(next.logs.some((l) => l.includes('it is not reused'))).toBe(true);
+      // Writable again in the same run: the same ID gets the next folder, never 001.
+      refusing = false;
+      expect(await create(next, 's-1')).toMatchObject({ ok: true });
+      expect((await get(next, 's-1')).cwd).toBe(folderOf(env, '002'));
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+    });
+
     it('r1 P1-4: a preferences save refused (read-only data) makes no folder', async () => {
       const env = await setup(storage);
       const { w, folders } = env;

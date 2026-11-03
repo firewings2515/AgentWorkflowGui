@@ -200,11 +200,35 @@ describe('T048 on the backend', () => {
     expect(existsSync(join(dir, 'elsewhere'))).toBe(false);
   });
 
-  it('r2: the work folder code removes nothing: no remove call in the port, the allocator or the node:fs side', () => {
-    for (const file of ['core/ports/work-folders.ts', 'core/sessions/work-folders.ts', 'app/main/work-folders.ts']) {
-      const code = readFileSync(join(process.cwd(), file), 'utf8').replace(/\/\/.*$|\/\*[\s\S]*?\*\//gm, '');
-      expect(code).not.toMatch(/rmdir|rmSync|unlink|removeEmpty|\brm\(/);
-    }
+  // T048 r3 P2-2. Core cannot remove a folder: WorkFolderFs has no remove, and the layer rule keeps node:fs, require and
+  // dynamic imports out of core (tests/lint-fixtures/core-work-folders-*.txt). What implements the port in main is held
+  // to what it imports and to every name it uses, however it is written (spaced calls, aliases, strings).
+  const removeProblems = (source: string): string[] => {
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    const problems: string[] = [];
+    const imports = [...code.matchAll(/^import\s+(type\s+)?([\s\S]*?)\s+from\s+'([^']+)';/gm)].filter((m) => m[1] === undefined).map((m) => `${m[3]!} ${m[2]!.replace(/\s+/g, ' ')}`);
+    const allowed = ['node:fs { mkdirSync, readdirSync }', 'node:os { homedir }', 'node:path { win32 }'];
+    for (const i of imports) if (!allowed.includes(i)) problems.push(`import ${i}`);
+    if ((code.match(/^import\b/gm)?.length ?? 0) !== (code.match(/^import\s+(type\s+)?[\s\S]*?\s+from\s+'[^']+';/gm)?.length ?? 0)) problems.push('another import form');
+    if (/\brequire\b|\bimport\s*\(|\bprocess\b/.test(code)) problems.push('a module loaded another way');
+    const words = new Set(code.match(/[A-Za-z_$][\w$]*/g) ?? []);
+    for (const banned of ['rm', 'rmSync', 'rmdir', 'rmdirSync', 'unlink', 'unlinkSync', 'rimraf', 'promises', 'removeEmpty', 'rename', 'renameSync'])
+      if (words.has(banned)) problems.push(banned);
+    return problems;
+  };
+
+  it('r3: the node:fs side of the work folders imports only mkdirSync and readdirSync, and no remove name appears in it', () => {
+    expect(removeProblems(readFileSync(join(process.cwd(), 'app/main/work-folders.ts'), 'utf8'))).toEqual([]);
+    // The ways r3 found around the earlier scan, and others, are all caught.
+    for (const bypass of [
+      "import * as fs from 'node:fs';\nfs.rm (path);",
+      "import { mkdirSync, readdirSync, rm } from 'node:fs';\nrm (path);",
+      "import fs from 'node:fs';\nconst { rm: erase } = fs;\nerase(path);",
+      "import { mkdirSync, readdirSync } from 'node:fs';\nimport { rm as erase } from 'node:fs/promises';\nvoid erase(path);",
+      "import { mkdirSync, readdirSync } from 'node:fs';\nconst fs = require('node:fs');\nfs['rmdirSync'](path);",
+      "import { mkdirSync, readdirSync } from 'node:fs';\nvoid import('node:fs').then((m) => m.promises.rm(path));",
+    ])
+      expect(removeProblems(bypass), bypass).not.toEqual([]);
   });
 
   it('without work folders: the Snapshot names %USERPROFILE%\\AgentWorkflowGui for display, and a session needs a folder', async () => {

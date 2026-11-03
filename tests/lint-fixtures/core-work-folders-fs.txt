@@ -1,0 +1,5 @@
+// virtual-path: core/sessions/work-folders.ts
+// expect: error
+// T048 r3: the allocator reaches the file system only through WorkFolderFs, so it can never remove a folder itself.
+import { rmdirSync } from 'node:fs';
+export const remove = (path: string) => rmdirSync(path);

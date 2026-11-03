@@ -99,10 +99,11 @@ export class WorkFolders {
       for (const claim of await this.options.claims.list()) {
         if (claim.state !== 'released' && (await ownerInUse(claim))) continue;
         try {
-          await this.options.claims.remove(claim.sessionId);
+          await this.drop(claim);
           this.log(`dropped the claim of ${claim.sessionId}; its folder ${claim.path} is left as it is`);
         } catch (error) {
-          this.log(`dropping the claim of ${claim.sessionId} failed (${nameOf(error)})`);
+          // Released all the same (r3 P2-1): never reused, in this run in any case, and from storage once that works.
+          this.log(`dropping the claim of ${claim.sessionId} failed (${nameOf(error)}); it is not reused`);
         }
       }
     });
