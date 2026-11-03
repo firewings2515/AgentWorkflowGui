@@ -107,6 +107,12 @@ export interface WorkflowHooks {
    * or a session whose folder is gone), or undefined when it may.
    */
   sessionAccess?(sessionId: SessionId): Promise<string | undefined>;
+  /**
+   * How a pending delivery the engine made, retried by the user, enters its session: `insert-if-busy` for a report to
+   * root, which joined root's running turn the first time (SP-05, T040 r1); undefined for anything else, which keeps
+   * its stored entry.
+   */
+  retryEntry?(record: StoredDelivery): Promise<WorkflowEntry | undefined>;
 }
 
 export type TransferCommand = CommandOf<'transfer.prepare' | 'transfer.confirm' | 'transfer.cancel'>;
@@ -1240,6 +1246,10 @@ export class SessionService {
     if (record?.kind === 'handoff' && record.target.sessionId !== undefined) return this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn', call);
     // A notice to root joins its running turn, as it did the first time (G-11 B, T040 r1 P1-5): never a new turn there.
     if (record?.kind === 'system-notice' && record.target.sessionId !== undefined) return this.deliverWorkflow(operationId, record.target.sessionId, 'insert-if-busy', call);
+    // A report to root likewise (report_to_root): the engine knows its reports; any other peer message is unchanged.
+    if (record?.kind === 'peer-message' && record.target.sessionId !== undefined && (await this.workflow?.retryEntry?.(record)) === 'insert-if-busy') {
+      return this.deliverWorkflow(operationId, record.target.sessionId, 'insert-if-busy', call);
+    }
     return this.dispatchPending(operationId, { origin: await this.originOf(operationId), ...(call !== undefined && { call }) });
   }
 

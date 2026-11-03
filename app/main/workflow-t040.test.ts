@@ -8,6 +8,7 @@ import { afterEach } from 'vitest';
 import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../adapters/storage';
 import { t040NoticeCases } from '../../core/pipeline/testing/t040-cases';
 import { worldOn } from '../../core/workflow/testing/harness';
+import { t040ReportRetryCases } from '../../core/workflow/testing/t040-report-cases';
 
 const opened: { db: DatabaseSync; dir: string }[] = [];
 afterEach(() => {
@@ -18,6 +19,13 @@ afterEach(() => {
 });
 
 t040NoticeCases('SQLite', (workflow) => {
+  const dir = mkdtempSync(join(tmpdir(), 'awg-t040-'));
+  const db = openDatabase(join(dir, 'awg.sqlite'));
+  opened.push({ db, dir });
+  return worldOn(createRepositories(db), new SqliteDeliveryStore(db), workflow);
+});
+
+t040ReportRetryCases('SQLite', (workflow) => {
   const dir = mkdtempSync(join(tmpdir(), 'awg-t040-'));
   const db = openDatabase(join(dir, 'awg.sqlite'));
   opened.push({ db, dir });

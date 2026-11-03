@@ -1314,6 +1314,16 @@ export class WorkflowEngine implements WorkflowHooks {
   }
 
   /**
+   * `WorkflowHooks.retryEntry` (T040 r1): a report to root that the user retried joins root's running turn, as
+   * `deliverReport` sent it the first time; only a report of a run to that run's root session.
+   */
+  async retryEntry(record: StoredDelivery): Promise<'insert-if-busy' | undefined> {
+    if (record.kind !== 'peer-message' || !record.operationId.startsWith(REPORT) || record.peer?.instanceId === undefined) return undefined;
+    const instance = await this.repos.instances.get(record.peer.instanceId);
+    return instance !== undefined && record.target.sessionId === instance.rootSessionId && record.peer.toSessionId === instance.rootSessionId ? 'insert-if-busy' : undefined;
+  }
+
+  /**
    * `WorkflowHooks.userMessageFate` (r3-P1-2): a run's first message goes only to the root session of that
    * run, once the run exists. While its session or instance is not there yet it waits (the start is being
    * finished or repeated); when the session belongs to anything else it is cancelled and never sent.
