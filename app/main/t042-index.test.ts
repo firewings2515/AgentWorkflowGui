@@ -61,6 +61,8 @@ describe('T042 index.ts installs the guards', () => {
     hoisted.startBackend.mockResolvedValue({ status: 'ready', facade: { snapshot: () => ({ preferences: { theme: 'dark' } }) }, unfinishedWork: () => Promise.resolve({}), shutdown: () => Promise.resolve() });
     await import('./index');
     await vi.waitFor(() => expect(hoisted.startBackend).toHaveBeenCalledTimes(1));
+    // T040 r1 P1-4: the backend gets the file system's folder check, not a stand-in.
+    expect((hoisted.startBackend.mock.calls[0]![0] as { folderState?: unknown }).folderState).toBe((await import('./real-path')).folderState);
 
     const created = hoisted.appListeners.get('web-contents-created');
     expect(created).toBeDefined();

@@ -58,6 +58,9 @@ interface Row {
   body: string;
 }
 
+/** Turns looked up per statement when a page gathers their records. */
+const TURN_LIST = 50;
+
 export class SqliteConversationRepository implements ConversationRepository {
   private readonly cursors = new HistoryCursors();
   private readonly statements = new Map<string, StatementSync>();
@@ -111,8 +114,15 @@ export class SqliteConversationRepository implements ConversationRepository {
       const collect = (where: string, values: SQLInputValue[], index = '') => {
         for (const row of this.historyStatement(`SELECT rowid AS position, at_ms, id, session_id, has_blob, body FROM ${k.table} ${index} WHERE session_id = ? AND ${where}${includeOpen ? '' : ' AND history_open = 0'}`).all(sessionId, ...values) as unknown as (Row & { position: number; at_ms: number })[]) found.set(row.id, row);
       };
-      // Separate indexed seeks avoid an OR that would read the entire session's history.
-      for (const id of turns.keys()) collect('history_turn = ?', [id]);
+      // The page's turns in fixed-size lists, each one seek per turn on `<table>_history_turn` (T040). Named, because
+      // SQLite otherwise takes `<table>_history_open` (session_id, history_open) for this query and reads the
+      // session's whole history once per turn. A short list repeats its first ID, so one statement serves every page.
+      const ids = [...turns.keys()];
+      for (let i = 0; i < ids.length; i += TURN_LIST) {
+        const chunk = ids.slice(i, i + TURN_LIST);
+        while (chunk.length < TURN_LIST) chunk.push(chunk[0]!);
+        collect(`history_turn IN (${chunk.map(() => '?').join(', ')})`, chunk, `INDEXED BY ${k.table}_history_turn`);
+      }
       const timeArgs: SQLInputValue[] = [];
       let timeWhere = 'history_turn IS NULL';
       if (lower !== undefined) { timeWhere += ' AND at_ms >= ?'; timeArgs.push(lower); }

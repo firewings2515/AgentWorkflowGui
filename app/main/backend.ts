@@ -15,19 +15,40 @@ import {
   type ModelOption,
   type OwnedProcess,
   type PayloadHash,
+  type QueryRequest,
+  type QueryResult,
+  type ReadOnlyReason,
   type Runtime,
   type RuntimeStatus,
   type SessionId,
   type Snapshot,
+  type StorageInfo,
+  type UiPreferences,
 } from '../../contracts';
 import { ClaudeAdapter, claudeAgentSdk } from '../../adapters/claude';
 import { CodexAdapter } from '../../adapters/codex';
 import { GitAdapter } from '../../adapters/git';
 import { GuiMcpServer, type McpToolHandlers } from '../../adapters/mcp-server';
 import { claudeProcessSpawn, codexAppServerSpawn, type JobSpawner } from '../../adapters/process';
-import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../adapters/storage';
+import { createRepositories, openDatabase, openStorage, SqliteDeliveryStore, storageHealth } from '../../adapters/storage';
+import type { StorageHooks } from '../../adapters/storage/health';
 import { permissionPolicy } from '../../core/policy';
-import type { AppRepositories, GitPort, OwnedProcessRepository, PermissionHandle, PermissionPolicy, ProcessHost, RuntimeAdapter, RuntimeLocator } from '../../core/ports';
+import type {
+  AppRepositories,
+  BackupStore,
+  DispatchRequest,
+  DispatchResult,
+  GitPort,
+  OwnedProcessRepository,
+  PermissionHandle,
+  PermissionPolicy,
+  ProcessHost,
+  RuntimeAdapter,
+  RuntimeLocator,
+  StartSessionOptions,
+  StorageHealth,
+} from '../../core/ports';
+import { StorageReadOnlyError, StorageWriteError } from '../../core/ports';
 import { Redactor, SessionService } from '../../core/sessions';
 import { IdleSupervisor, SUPERVISOR_DEFAULTS } from '../../core/supervisor';
 import { TransferService } from '../../core/transfer';
@@ -36,6 +57,8 @@ import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { type FaultPoint, faultApplies, withFaultPoint } from './fault-points';
 import { hashFile, setTimer } from './file-hash';
+import { type MissedRecords, withMissed } from './missed-records';
+import type { FolderState } from './real-path';
 import { GitIgnoreRules } from './git-ignore';
 import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
@@ -66,6 +89,8 @@ export interface BackendOptions {
   listModels?: (runtime: Runtime) => Promise<ModelOption[]>;
   policy?: PermissionPolicy;
   resolveRealPath(absolutePath: string): string | null;
+  /** Whether a session's folder is still there (`real-path.ts`, T040 r1 P1-4). Absent (tests): what resolveRealPath resolves. */
+  folderState?: (absolutePath: string) => FolderState;
   /** Replaces fs.watch (tests). */
   watch?: WatchFn;
   now?: () => Date;
@@ -74,13 +99,33 @@ export interface BackendOptions {
   log: (message: string) => void;
   closeTimeoutMs?: number;
   /**
-   * The idle supervisor (T036): how long a session goes unused before its runtime is closed, how many runtimes may
-   * be open at once (0: no limit), and how often it looks. Defaults: SUPERVISOR_DEFAULTS.
+   * The idle supervisor (T036): how often it looks (default SUPERVISOR_DEFAULTS.tickMs). How long a session goes unused
+   * before its runtime is closed and how many runtimes may be open come from the user's preferences (C-30); `idleMs` and
+   * `maxOpen` here override them (tests and development runs only; 0: no limit).
    */
   supervisor?: { idleMs?: number; maxOpen?: number; tickMs?: number };
   /** A development run's fault point for the crash tests (fault-points.ts, T039); never set in a packaged app. */
   faultPoint?: FaultPoint;
+  /** Storage fault hooks (adapters/storage/testing, T038): tests only. */
+  storageHooks?: StorageHooks;
+  /** Turns of each session's history in the Snapshot (C-26); older ones are read with `session.history`. Default 50. */
+  snapshotTurns?: number;
 }
+
+/** Turns per session in the Snapshot by default: the renderer reads older history 50 turns a page (T041). */
+export const SNAPSHOT_TURNS = 50;
+
+/** Commands accepted while the data is read-only (C-29): they write nothing of the app's database. */
+const READ_ONLY_COMMANDS: ReadonlySet<Command['type']> = new Set(['backup.restore', 'backup.cancelRestore', 'runtime.detect']);
+
+/** The fixed text of a command refused while the data is read-only. */
+export const STORAGE_READ_ONLY = 'The data is read-only now; nothing was changed';
+
+/**
+ * The fixed text of a command during which the data turned read-only (T040 r1 P1-3): what it did before that (an
+ * earlier write, a claim) may stand, so it is never said to have changed nothing.
+ */
+export const STORAGE_TURNED_READ_ONLY = 'The data turned read-only while this command ran; part of it may have been carried out. Check what is shown before trying again';
 
 export interface Backend {
   status: 'ready';
@@ -198,20 +243,41 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   // 1-2. Storage, read once in full: a damaged record stops everything here (T015 fails closed).
   // The deliveries recovery will read are read here too (r1-P1-6): pending and unknown ones.
   let db: DatabaseSync | undefined;
+  let closeStorage: () => void = () => db?.close();
   let repositories: AppRepositories;
   let store: SqliteDeliveryStore;
+  // Backups (C-28): none for an in-memory database (tests), which has no folder of its own.
+  let backups: BackupStore | undefined;
+  let health: StorageHealth;
   const damaged = (error: unknown): DamagedBackend => {
     const reason = describe(error);
     log(`[backend] the database cannot be used (${reason}); nothing is started`);
     try {
-      db?.close();
+      closeStorage();
     } catch {
       // Already unusable.
     }
     return { status: 'damaged', facade: damagedFacade(reason, options.dbPath), dbPath: options.dbPath, reason, shutdown: () => Promise.resolve() };
   };
   try {
-    db = openDatabase(options.dbPath);
+    // T038: a pending restore, migrations after their backup, the day's backup and pruning, in that order; data that
+    // cannot be written opens read-only (C-29).
+    if (options.dbPath === ':memory:') {
+      db = openDatabase(options.dbPath);
+      health = storageHealth(db);
+      if (options.storageHooks !== undefined) storageHealth(db).hooks = options.storageHooks;
+    } else {
+      const opened = await openStorage(options.dbPath, { now: now(), ...(options.storageHooks !== undefined && { hooks: options.storageHooks }) });
+      db = opened.db;
+      closeStorage = opened.close;
+      backups = opened.backups;
+      health = opened.health;
+      const report = opened.report;
+      if (report.restored !== undefined) log('[backend] a backup was restored at start');
+      if (report.restoreFailure !== undefined) log(`[backend] the restore asked for did not happen (${report.restoreFailure.reason})`);
+      for (const f of report.backupFailures) log(`[backend] backup ${f.operation} failed (${f.reason})`);
+      if (report.state.status === 'read-only') log(`[backend] the data opened read-only (${report.state.reason})`);
+    }
     repositories = createRepositories(db);
     store = new SqliteDeliveryStore(db);
     await repositories.readSnapshotData();
@@ -221,6 +287,26 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     return damaged(error);
   }
   const host = options.createHost(repositories.processes);
+
+  // Read-only (C-29): the data opened so, or turned so while the app runs (a full disk); never ready again before a
+  // restart. Writing commands are refused before they reach the core, so nothing is dispatched to a runtime.
+  const opened = health.state();
+  let readOnly: ReadOnlyReason | undefined = opened.status === 'read-only' ? opened.reason : undefined;
+  // Listened to from here on, before anything else writes (the orphan cleanup below may already fill the disk): the
+  // views are told, nothing more is stored or dispatched, and no idle runtime is closed any more.
+  const late: { supervisor?: IdleSupervisor } = {};
+  /** The supervisor's limits from the user's preferences (C-30), unless the options override them. */
+  const limitsOf = (preferences: UiPreferences | undefined) => ({
+    idleMs: options.supervisor?.idleMs ?? (preferences === undefined ? SUPERVISOR_DEFAULTS.idleMs : preferences.supervisor.idleCloseMinutes * 60_000),
+    maxOpen: options.supervisor?.maxOpen ?? preferences?.supervisor.maxOpenRuntimes ?? SUPERVISOR_DEFAULTS.maxOpen,
+  });
+  health.onReadOnly((reason) => {
+    if (readOnly !== undefined) return;
+    readOnly = reason;
+    log(`[backend] the data turned read-only (${reason})`);
+    late.supervisor?.stop();
+    void bus.publish({ type: 'app.readOnly', reason, location: options.dbPath, at: now() });
+  });
 
   // 3. A crashed run's processes: only those whose PID and creation time both still match are ended.
   try {
@@ -250,13 +336,17 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   // 4-5. MCP server, adapters, the session service. Handlers and hooks reach the service once it exists.
   const ref: { service?: SessionService; workflow?: WorkflowEngine } = {};
   const starting = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is starting' } } as const;
+  // A tool that would store something, while the data is read-only (C-29): the agent may call again later. McpRejection
+  // has no reason of its own for it; `busy` says "not now".
+  const frozen = { status: 'rejected', rejection: { reason: 'busy', detail: 'the GUI cannot store anything now (its data is read-only)' } } as const;
   const handlers: McpToolHandlers = {
-    handoff: (input, ctx) => ref.workflow?.handoff(input, ctx) ?? Promise.resolve(starting),
-    create_tasks: (input, ctx) => ref.workflow?.createTasks(input, ctx) ?? Promise.resolve(starting),
-    report_to_root: (input, ctx) => ref.workflow?.reportToRoot(input, ctx) ?? Promise.resolve(starting),
-    // Same-folder locks (R-07): ordinary and workflow sessions alike.
+    handoff: (input, ctx) => (readOnly !== undefined ? Promise.resolve(frozen) : (ref.workflow?.handoff(input, ctx) ?? Promise.resolve(starting))),
+    create_tasks: (input, ctx) => (readOnly !== undefined ? Promise.resolve(frozen) : (ref.workflow?.createTasks(input, ctx) ?? Promise.resolve(starting))),
+    report_to_root: (input, ctx) => (readOnly !== undefined ? Promise.resolve(frozen) : (ref.workflow?.reportToRoot(input, ctx) ?? Promise.resolve(starting))),
+    // Same-folder locks (R-07): ordinary and workflow sessions alike. Held in memory only, so read-only data leaves them.
     wait_for_file: (input, ctx) => ref.service?.waitForFile(input, ctx) ?? Promise.resolve(starting),
     send_message: (input, ctx) => {
+      if (readOnly !== undefined) return Promise.resolve(frozen);
       if (ref.service === undefined) return Promise.resolve({ status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is starting' } });
       return ref.service.sendMessage(input, ctx);
     },
@@ -315,9 +405,32 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   // callers see a failure before any runtime is called: a delivery stays pending, never claimed and never unknown.
   const { faultPoint } = options;
   if (faultPoint !== undefined) log(`[fault] armed: ${faultPoint.point} of ${faultPoint.sessionId ?? `every ${String(faultPoint.runtime)} session`}`);
+  // C-29 (T040 r1 P1-3): a command that passed the read-only check may still be on its way to a runtime when the data
+  // turns read-only (another write filled the disk). Right before it would leave, a payload is held back (its attempt,
+  // already committed unknown, says `written: false`, CR-2) and no session is created.
+  const heldBack = 'the GUI data turned read-only before this was sent; nothing left the GUI';
+  // One gate per adapter: an injected factory that shares one adapter still hands out one object.
+  const gates = new WeakMap<RuntimeAdapter, RuntimeAdapter>();
+  const readOnlyGate = (adapter: RuntimeAdapter): RuntimeAdapter => {
+    let gate = gates.get(adapter);
+    if (gate === undefined) gates.set(adapter, (gate = gatedAdapter(adapter)));
+    return gate;
+  };
+  const gatedAdapter = (adapter: RuntimeAdapter): RuntimeAdapter =>
+    new Proxy(adapter, {
+      get(target, key): unknown {
+        if (key === 'dispatchOnce')
+          return (request: DispatchRequest): Promise<DispatchResult> =>
+            readOnly === undefined ? target.dispatchOnce(request) : Promise.resolve({ state: 'unknown', reason: 'rejected', written: false, detail: heldBack });
+        if (key === 'startSession')
+          return (request: StartSessionOptions) => (readOnly === undefined ? target.startSession(request) : Promise.reject(new StorageReadOnlyError(readOnly)));
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
   const createAdapter: AdapterFactory = (runtime, sessionId, hooks) => {
     if (options.runtimes !== undefined && !isRuntimeAvailable(runtime)) throw new RuntimeUnavailableError(runtime);
-    const adapter = makeAdapter(runtime, sessionId, hooks);
+    const adapter = readOnlyGate(makeAdapter(runtime, sessionId, hooks));
     return faultPoint !== undefined && faultApplies(faultPoint, runtime, sessionId) ? withFaultPoint(adapter, sessionId, faultPoint, log) : adapter;
   };
   const hooks ={ onPermissionRequest: (handle: PermissionHandle) => (ref.service === undefined ? Promise.reject(new Error('not ready')) : ref.service.onPermissionRequest(handle)) };
@@ -384,7 +497,13 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     detecting.set(runtime, tracked);
     return tracked;
   };
-  const detect = (runtime: Runtime): Promise<void> => detecting.get(runtime) ?? track(runtime, probe(runtime).then(() => refreshModels(runtime)));
+  /** Read-only data (C-29): the runtime is looked for, but no model probe starts it; its status is published as is. */
+  const publishStatus = (runtime: Runtime): void => {
+    const status = statuses.get(runtime);
+    if (status !== undefined) void bus.publish({ type: 'runtime.status', status });
+  };
+  const detect = (runtime: Runtime): Promise<void> =>
+    detecting.get(runtime) ?? track(runtime, probe(runtime).then(() => (readOnly !== undefined ? publishStatus(runtime) : refreshModels(runtime))));
   const RUNTIMES: readonly Runtime[] = ['claude', 'codex'];
   /** Before a runtime is used: when it is not available now, it is looked for once more (not more often than redetectMinMs). */
   const lastTried = new Map<Runtime, number>();
@@ -434,6 +553,9 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     store,
     policy: options.policy ?? permissionPolicy,
     publish: (event) => {
+      // C-30: saved preferences are the supervisor's limits from now on; published in the order they were stored, so
+      // the last one saved is the one used, however many `preferences.set` ran at once.
+      if (event.type === 'preferences.updated') late.supervisor?.setLimits(limitsOf(event.preferences));
       void bus.publish(event);
       // T031: a delivery decision may end a round's branch.
       ref.workflow?.observe(event);
@@ -442,6 +564,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     uuid,
     hashPayload: sha256,
     resolveRealPath: (path) => options.resolveRealPath(path),
+    ...(options.folderState !== undefined && { folderState: options.folderState }),
     // The router's hooks: each opening's requests know whether that opening still serves the session (T036 r3 P1-2).
     createAdapter: (runtime, sessionId, sessionHooks) => createAdapter(runtime, sessionId, sessionHooks),
     mountMcp: (sessionId) => {
@@ -501,18 +624,21 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   // T023: transfer.prepare / confirm / cancel; it reaches storage and runtimes through the service too.
   const transfer = new TransferService({ sessions: service, publish: (event) => void bus.publish(event), now, hashPayload: sha256, log });
   service.attachTransfer(transfer);
-  // T036: idle runtimes closed while the app runs (never after it, D-03); the next delivery resumes them.
+  // T036: idle runtimes closed while the app runs (never after it, D-03); the next delivery resumes them. Its limits
+  // are the user's (C-30), read once here and again with each saved change.
+  const limits = limitsOf(await repositories.preferences.get().catch(() => undefined));
   const supervisor = new IdleSupervisor({
     sessions: service,
     now,
-    idleMs: options.supervisor?.idleMs ?? SUPERVISOR_DEFAULTS.idleMs,
-    maxOpen: options.supervisor?.maxOpen ?? SUPERVISOR_DEFAULTS.maxOpen,
+    idleMs: limits.idleMs,
+    maxOpen: limits.maxOpen,
     closeTimeoutMs,
     // A background command or a Codex Start-Process child would end with the session's Job (R-14).
     ownedCommands: async (sessionId) => (await host.listOwned(sessionId)).filter((p) => p.kind === 'command' && p.endedAt === undefined).length,
     log,
   });
   service.attachSupervisor(supervisor);
+  late.supervisor = supervisor;
 
   // 5b. The runtimes found on this computer, before recovery asks whether a runtime can be used (C-33). Their model
   // lists come later, in the background.
@@ -520,7 +646,10 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
 
   // 6. Restart recovery (CR-2): unknown only reconciled, pending through the one dispatch entry. Stored data
   // it cannot read stops the start like damaged data does (r1-P1-6): no model probe, no runtime.
-  try {
+  // Nothing is recovered from read-only data: recovery writes, and dispatches (C-29). A restart once the data can be
+  // written again (space freed, a backup restored, a newer app) recovers it then.
+  if (readOnly !== undefined) log('[backend] read-only data: deliveries, runs and transfers are not recovered now');
+  else try {
     const report = await service.start();
     if (report.failed.length > 0) log(`[backend] ${String(report.failed.length)} delivery(ies) could not be recovered`);
     // Each run's tasks rebuilt from its handoffs, the record of what was counted (T024).
@@ -536,8 +665,10 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     return damaged(error);
   }
 
-  // 7. Model lists, in the background: the window does not wait for them (R-12).
-  for (const runtime of RUNTIMES) {
+  // 7. Model lists, in the background: the window does not wait for them (R-12). None from read-only data: a probe
+  // would start a runtime for nothing that can be used now.
+  if (readOnly !== undefined) supervisor.stop();
+  for (const runtime of readOnly === undefined ? RUNTIMES : []) {
     if (options.runtimes !== undefined) {
       void track(runtime, refreshModels(runtime));
       continue;
@@ -556,25 +687,56 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   idleTimer.unref();
 
   let closing: Promise<void> | undefined;
+  /** What the views show of backups and restores (C-28); a catalog that cannot be read shows nothing. */
+  const storageInfo = async (): Promise<StorageInfo> => {
+    try {
+      return (await backups?.info()) ?? {};
+    } catch (error) {
+      log(`[backend] the backup catalog could not be read (${describe(error)})`);
+      return {};
+    }
+  };
+  // Backup commands one at a time, each publishing the StorageInfo it left: two at once could otherwise publish their
+  // reads out of order, and the views would keep the older one.
+  let storageQueue: Promise<unknown> = Promise.resolve();
+  const inStorageQueue = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = storageQueue.then(fn, fn);
+    storageQueue = run.catch(() => undefined);
+    return run;
+  };
+  const backupCommand = (command: Extract<Command, { type: 'backup.restore' | 'backup.cancelRestore' }>): Promise<CommandResult> =>
+    inStorageQueue(async () => {
+      if (backups === undefined) return failure(command.requestId, 'unsupported', 'This database has no backups');
+      if (command.type === 'backup.restore') {
+        if ((await backups.scheduleRestore(command.backupId, now())) === 'not-found') return failure(command.requestId, 'not_found', 'No such backup');
+      } else await backups.cancelRestore();
+      void bus.publish({ type: 'storage.updated', storage: await storageInfo(), at: now() });
+      return { ok: true, requestId: command.requestId, created: [] };
+    });
   const facade: AppFacade = {
-    async snapshot(): Promise<Snapshot> {
+    async snapshot(missed?: MissedRecords): Promise<Snapshot> {
       // The seq first: anything published after it is applied again by the renderer, never skipped.
       const seq = bus.seq;
-      const data = await repositories.readSnapshotData();
+      // C-26: each session's last turns (and whatever is open); older pages through `session.history`.
+      const data = await repositories.readSnapshotData({ recentTurns: options.snapshotTurns ?? SNAPSHOT_TURNS });
+      // And what the window was not sent (T040 r1 P1-1), read after the rest, so never older than the seq: a far-back
+      // turn that ended meanwhile, an answered request. Only sessions of which something is not held yet are read.
+      const conversations = await withMissed(data.conversations, data.sessions, missed, (sessionId) => repositories.conversations.get(sessionId));
+      const storage = await storageInfo();
       return {
         schemaVersion: CONTRACTS_VERSION,
-        app: { status: 'ready' },
+        app: readOnly === undefined ? { status: 'ready' } : { status: 'read-only', reason: readOnly, location: options.dbPath },
         seq,
         agents: data.agents,
         workflows: data.workflows,
         modelOptions,
         sessions: data.sessions,
-        messages: data.conversations.messages,
-        turns: data.conversations.turns,
-        items: data.conversations.items,
-        permissionRequests: data.conversations.permissionRequests,
-        nativeTasks: data.conversations.nativeTasks,
-        artifacts: data.conversations.artifacts,
+        messages: conversations.messages,
+        turns: conversations.turns,
+        items: conversations.items,
+        permissionRequests: conversations.permissionRequests,
+        nativeTasks: conversations.nativeTasks,
+        artifacts: conversations.artifacts,
         instances: data.instances,
         handoffs: data.handoffs,
         peerMessages: data.peerMessages,
@@ -584,15 +746,17 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         // File locks (R-07) live in memory only: the lock table's list now.
         locks: service.locks?.list() ?? [],
         preferences: data.preferences,
-        // Paging and backups (C-26, C-28) are wired in T040: every session's whole history for now.
-        historyPages: [],
-        storage: {},
+        historyPages: data.historyPages,
+        storage,
         runtimes: RUNTIMES.flatMap((runtime) => statuses.get(runtime) ?? []),
       };
     },
     async execute(command: Command): Promise<CommandResult> {
       if (closing !== undefined) return failure(command.requestId, 'runtime_unavailable', 'The application is closing');
+      // C-29: refused before the core sees it, so nothing is stored or dispatched.
+      if (readOnly !== undefined && !READ_ONLY_COMMANDS.has(command.type)) return failure(command.requestId, 'storage_read_only', STORAGE_READ_ONLY);
       try {
+        if (command.type === 'backup.restore' || command.type === 'backup.cancelRestore') return await backupCommand(command);
         if (command.type === 'runtime.detect') {
           if (options.runtimes === undefined) return failure(command.requestId, 'unsupported', 'runtime.detect is not available');
           await Promise.all((command.runtime === undefined ? RUNTIMES : [command.runtime]).map(detect));
@@ -602,10 +766,32 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         return await service.execute(command);
       } catch (error) {
         log(`[backend] ${command.type} failed (${describe(error)})`);
-        const storage = error instanceof Error && (error.name === 'StoredDataError' || error.name === 'InvalidRecordError');
+        // The data turned read-only while the command ran (C-29): the write refused, or rolled back for lack of space,
+        // changed nothing, but what the command did before it may stand (T040 r1 P1-3), so it is not said otherwise.
+        if (error instanceof StorageReadOnlyError || (error instanceof StorageWriteError && error.kind === 'disk-full')) {
+          return failure(command.requestId, 'storage_read_only', STORAGE_TURNED_READ_ONLY, { mayHaveSideEffects: true });
+        }
+        const storage = error instanceof StorageWriteError || (error instanceof Error && (error.name === 'StoredDataError' || error.name === 'InvalidRecordError'));
         return failure(command.requestId, storage ? 'storage_failed' : 'internal_error', storage ? 'The stored data could not be read or written' : 'The command failed', {
           mayHaveSideEffects: true,
         });
+      }
+    },
+    async query(request: QueryRequest): Promise<QueryResult> {
+      // Read-only queries (C-26, C-28): answered in read-only mode too.
+      try {
+        if (request.type === 'backup.list') return { ok: true, type: 'backup.list', requestId: request.requestId, backups: (await backups?.list()) ?? [] };
+        if ((await repositories.sessions.get(request.sessionId)) === undefined) return { ok: false, requestId: request.requestId, code: 'not_found', message: 'No such session' };
+        const page = await repositories.conversations.page(request.sessionId, request.before, request.limit);
+        // A cursor of another session, one never handed out, or one too old to be kept (C-26).
+        if (page === 'invalid-cursor') {
+          return { ok: false, requestId: request.requestId, code: 'invalid_request', message: 'The history cursor is not valid for this session; read the Snapshot again' };
+        }
+        return { ok: true, type: 'session.history', requestId: request.requestId, page };
+      } catch (error) {
+        log(`[backend] ${request.type} failed (${describe(error)})`);
+        const storage = error instanceof Error && (error.name === 'StoredDataError' || error.name === 'InvalidRecordError');
+        return { ok: false, requestId: request.requestId, code: storage ? 'storage_failed' : 'internal_error', message: storage ? 'The stored data could not be read' : 'The query failed' };
       }
     },
   };
@@ -628,7 +814,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       await endJobs();
       watchers.stopAll();
       ignored.close();
-      db.close();
+      closeStorage();
     })();
     return closing;
   };

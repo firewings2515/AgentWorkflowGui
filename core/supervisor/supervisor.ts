@@ -30,9 +30,10 @@ export interface SupervisedSessions {
   idleFacts(sessionId: SessionId): Promise<Omit<IdleFacts, 'ownedCommands'> | undefined>;
   /**
    * In the session's queue: `decide()` and, when it says yes, the runtime closed (R-14) and the session marked
-   * closed. The graceful close starts in the same synchronous step that `decide` resolved in.
+   * closed. The graceful close starts in the same synchronous step that `decide` resolved in. `cause` is why
+   * (C-30): the idle time passed, or only the open-runtime limit made it go.
    */
-  closeIdle(sessionId: SessionId, decide: () => Promise<boolean>, timeoutMs: number): Promise<'closed' | 'kept'>;
+  closeIdle(sessionId: SessionId, decide: () => Promise<boolean>, timeoutMs: number, cause: CloseCause): Promise<'closed' | 'kept'>;
 }
 
 export interface SupervisorOptions {
@@ -51,6 +52,15 @@ export interface SupervisorOptions {
 
 export const SUPERVISOR_DEFAULTS = { idleMs: 15 * 60_000, maxOpen: 6, tickMs: 30_000 } as const;
 
+/** Why the supervisor closed a runtime (C-30, `session.activity` `cause`). */
+export type CloseCause = 'idle' | 'process-limit';
+
+/** The limits the user can set (C-30, `UiPreferences.supervisor`). */
+export interface SupervisorLimits {
+  idleMs: number;
+  maxOpen: number;
+}
+
 interface Watch {
   lastUse: number;
   phase: 'none' | 'checking' | 'releasing';
@@ -64,12 +74,26 @@ interface Watch {
 
 export class IdleSupervisor {
   private readonly watches = new Map<SessionId, Watch>();
+  /** The options' limits, until the user's preferences change them (`setLimits`). */
+  private limits: SupervisorLimits;
   private stopped = false;
   private ticking: Promise<void> | undefined;
   /** A tick was asked for while one ran: it runs once more afterwards. */
   private again = false;
 
-  constructor(private readonly options: SupervisorOptions) {}
+  constructor(private readonly options: SupervisorOptions) {
+    this.limits = { idleMs: options.idleMs, maxOpen: options.maxOpen };
+  }
+
+  /** New limits (the user saved the preferences, C-30); the next tick uses them. */
+  setLimits(limits: SupervisorLimits): void {
+    this.limits = { ...limits };
+  }
+
+  /** The limits in use now. */
+  currentLimits(): SupervisorLimits {
+    return { ...this.limits };
+  }
 
   /**
    * The session is in use (a delivery about to be claimed, or one of its runtime events). Returns the release
@@ -86,7 +110,7 @@ export class IdleSupervisor {
   /** A session's runtime came up (start or resume): in use now; above the limit, the oldest idle ones go. */
   opened(sessionId: SessionId): void {
     void this.touch(sessionId);
-    if (this.options.maxOpen > 0 && this.options.sessions.openSessions().length > this.options.maxOpen) void this.tick();
+    if (this.limits.maxOpen > 0 && this.options.sessions.openSessions().length > this.limits.maxOpen) void this.tick();
   }
 
   /** No new closes from now on (the app is exiting); a release under way finishes. */
@@ -128,20 +152,24 @@ export class IdleSupervisor {
     const open = this.options.sessions.openSessions();
     // Oldest use first; a session first seen now counts as used now.
     const order = open.map((s) => ({ sessionId: s.sessionId, lastUse: this.watch(s.sessionId).lastUse })).sort((a, b) => a.lastUse - b.lastUse);
-    let over = this.options.maxOpen > 0 ? open.length - this.options.maxOpen : 0;
+    const { maxOpen } = this.limits;
+    let over = maxOpen > 0 ? open.length - maxOpen : 0;
     for (const { sessionId } of order) {
       if (this.halted()) return;
       const closed = await this.tryClose(sessionId, over > 0);
       if (closed) over--;
     }
-    if (over > 0) this.log(`${String(over)} runtime(s) above the limit of ${String(this.options.maxOpen)}: no idle session to close`);
+    if (over > 0) this.log(`${String(over)} runtime(s) above the limit of ${String(maxOpen)}: no idle session to close`);
   }
 
   /** One close of one session, when it is (still) due and every fact says idle. */
   private async tryClose(sessionId: SessionId, overLimit: boolean): Promise<boolean> {
     const w = this.watch(sessionId);
     // Checked and marked in one step: a use from here on cancels it.
-    if (w.phase !== 'none' || (!overLimit && this.nowMs() - w.lastUse < this.options.idleMs)) return false;
+    const idle = this.nowMs() - w.lastUse >= this.limits.idleMs;
+    if (w.phase !== 'none' || (!overLimit && !idle)) return false;
+    // Idle long enough is the reason whenever it holds; only the limit otherwise (C-30).
+    const cause: CloseCause = idle ? 'idle' : 'process-limit';
     w.phase = 'checking';
     w.aborted = false;
     let released: (() => void) | undefined;
@@ -169,6 +197,7 @@ export class IdleSupervisor {
           return true;
         },
         this.options.closeTimeoutMs,
+        cause,
       );
       if (outcome === 'closed') this.log(`closed the idle runtime of ${sessionId}`);
       return outcome === 'closed';

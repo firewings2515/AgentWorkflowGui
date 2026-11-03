@@ -42,6 +42,8 @@ export interface World {
   contexts: PolicyContext[];
   decide: (context: PolicyContext) => PolicyDecision;
   realPath: (path: string) => string | null;
+  /** The folder check (SessionServiceOptions.folderState); by default gone when `realPath` cannot resolve it. */
+  folderState?: (path: string) => 'exists' | 'missing' | 'unknown';
   /** Called with every new Codex adapter before it is used. */
   configure: (adapter: FakeAdapter) => void;
   /** The exit deadline (SessionServiceOptions.sleep); by default it never passes. */
@@ -77,6 +79,7 @@ const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, pre
     contexts: [] as PolicyContext[],
     decide: previous?.decide ?? ((): PolicyDecision => ({ action: 'approve' })),
     // E:\work is a junction to E:\real; anything else cannot be resolved.
+    ...(previous?.folderState !== undefined && { folderState: previous.folderState }),
     realPath: previous?.realPath ?? ((path: string) => (path.startsWith('E:\\work') ? path.replace('E:\\work', 'E:\\real') : path.startsWith('E:\\real') ? path : null)),
     logs: [] as string[],
     configure: previous?.configure ?? (() => undefined),
@@ -100,6 +103,7 @@ const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, pre
     uuid,
     hashPayload: hashOf,
     resolveRealPath: (path) => world.realPath(path),
+    folderState: (path) => world.folderState?.(path) ?? (world.realPath(path) === null ? 'missing' : 'exists'),
     createAdapter: (runtime: Runtime, sessionId: SessionId) => {
       if (runtime === 'claude') return world.claude;
       const adapter = new FakeAdapter('codex', (handle) => world.service.onPermissionRequest(handle));

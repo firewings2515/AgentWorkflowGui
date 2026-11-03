@@ -107,6 +107,12 @@ export interface WorkflowHooks {
    * or a session whose folder is gone), or undefined when it may.
    */
   sessionAccess?(sessionId: SessionId): Promise<string | undefined>;
+  /**
+   * How a pending delivery the engine made, retried by the user, enters its session: `insert-if-busy` for a report to
+   * root, which joined root's running turn the first time (SP-05, T040 r1); undefined for anything else, which keeps
+   * its stored entry.
+   */
+  retryEntry?(record: StoredDelivery): Promise<WorkflowEntry | undefined>;
 }
 
 export type TransferCommand = CommandOf<'transfer.prepare' | 'transfer.confirm' | 'transfer.cancel'>;
@@ -191,6 +197,12 @@ export interface SessionServiceOptions {
   hashPayload(text: string): PayloadHash | Promise<PayloadHash>;
   /** Node-side link resolution; null when it cannot be confirmed (PolicyContext.resolveRealPath). */
   resolveRealPath(absolutePath: string): string | null;
+  /**
+   * Whether a session's folder is still there (R-06, C-30 `folder-missing`, T040 r1 P1-4): only `missing` (the file
+   * system says it does not exist) refuses a resume as gone; `unknown` (access denied, ...) is never reported so.
+   * Absent (tests): gone when `resolveRealPath` cannot resolve it.
+   */
+  folderState?: (absolutePath: string) => 'exists' | 'missing' | 'unknown';
   /**
    * The adapter that serves one opening of a session (see SessionRuntimes): a new one per call, so an earlier
    * opening's late events and requests are told apart (T036 r2/r3). Its approval requests go to `hooks` (they know
@@ -1232,6 +1244,12 @@ export class SessionService {
       return (await this.store.get(operationId))?.delivery.state;
     }
     if (record?.kind === 'handoff' && record.target.sessionId !== undefined) return this.deliverWorkflow(operationId, record.target.sessionId, 'after-turn', call);
+    // A notice to root joins its running turn, as it did the first time (G-11 B, T040 r1 P1-5): never a new turn there.
+    if (record?.kind === 'system-notice' && record.target.sessionId !== undefined) return this.deliverWorkflow(operationId, record.target.sessionId, 'insert-if-busy', call);
+    // A report to root likewise (report_to_root): the engine knows its reports; any other peer message is unchanged.
+    if (record?.kind === 'peer-message' && record.target.sessionId !== undefined && (await this.workflow?.retryEntry?.(record)) === 'insert-if-busy') {
+      return this.deliverWorkflow(operationId, record.target.sessionId, 'insert-if-busy', call);
+    }
     return this.dispatchPending(operationId, { origin: await this.originOf(operationId), ...(call !== undefined && { call }) });
   }
 
@@ -1387,9 +1405,9 @@ export class SessionService {
     let record = await this.store.get(p.operationId);
     if (record === undefined) {
       if (this.closing) return shuttingDown;
-      // A closed target whose folder is gone is not resumed anywhere (R-06, T036): refused before it is accepted.
+      // A closed target whose folder is gone is not resumed anywhere (R-06, T036): refused before it is accepted (C-30 `folder-missing`).
       const closed = await this.closedRefusal(target);
-      if (closed !== undefined) return { status: 'rejected', rejection: { reason: 'unknown-target', detail: 'the target session is closed and its folder no longer exists' } };
+      if (closed !== undefined) return { status: 'rejected', rejection: { reason: 'folder-missing', detail: 'the target session is closed and its folder no longer exists' } };
       const provisioned = await this.ensureProvisioned(target);
       if (this.closing) return shuttingDown;
       const provision = await this.store.get(provisionOp(target.id));
@@ -1764,16 +1782,20 @@ export class SessionService {
    * The supervisor's close of an idle runtime, in the session's queue (in order with its commands, deliveries and
    * events): `decide()` last, and when it says yes the graceful close starts in that same step (R-14; past
    * `timeoutMs` its Job is ended) and the session is marked closed before this returns, so a delivery that waited
-   * for the release resumes it afterwards. The session stays as it was otherwise (C-07: it resumes on demand).
+   * for the release resumes it afterwards. The session stays as it was otherwise (C-07: it resumes on demand). The
+   * views are told why with `session.activity` `closed` and its `cause` (C-30), right after the record says closed.
    */
-  closeIdle(sessionId: SessionId, decide: () => Promise<boolean>, timeoutMs: number): Promise<'closed' | 'kept'> {
+  closeIdle(sessionId: SessionId, decide: () => Promise<boolean>, timeoutMs: number, cause: 'idle' | 'process-limit' = 'idle'): Promise<'closed' | 'kept'> {
     return this.serial(sessionKey(sessionId), async () => {
       if (this.closing) return 'kept';
       const ref = await this.binding(sessionId);
       if (ref === undefined || this.closing || !this.runtimes.isOpen(ref)) return 'kept';
       if (!(await decide())) return 'kept';
       await this.endRuntime(ref, timeoutMs);
-      if (!this.closed) await this.setActivity(sessionId, 'closed');
+      if (!this.closed) {
+        await this.setActivity(sessionId, 'closed');
+        this.options.publish({ type: 'session.activity', sessionId, activity: 'closed', cause, at: this.options.now() });
+      }
       return 'closed';
     });
   }
@@ -2047,7 +2069,7 @@ export class SessionService {
       });
     } catch (error) {
       // Claude reports a folder removed meanwhile as a binary that cannot start (SP-07 G5): said plainly instead.
-      if (this.options.resolveRealPath(cwd) === null) throw new ResumeRefused(folderGone(cwd));
+      if (this.folderMissing(cwd)) throw new ResumeRefused(folderGone(cwd));
       // Fixed words only: the runtime's error may quote paths or content.
       this.log(`resuming ${sessionId} failed (${record.context.runtime})`);
       if (!(await this.reopen(record, sessionId, ref, settings))) throw error;
@@ -2119,7 +2141,13 @@ export class SessionService {
       const refused = await this.workflow?.sessionAccess?.(session.id);
       if (refused !== undefined) return refused;
     }
-    return this.options.resolveRealPath(cwd) === null ? folderGone(cwd) : undefined;
+    return this.folderMissing(cwd) ? folderGone(cwd) : undefined;
+  }
+
+  /** The folder is gone, as the file system says (T040 r1 P1-4); one that cannot be looked at is not. */
+  private folderMissing(cwd: string): boolean {
+    const { folderState } = this.options;
+    return folderState === undefined ? this.options.resolveRealPath(cwd) === null : folderState(cwd) === 'missing';
   }
 
   /** Why a send to this session would not reach it: it is closed and cannot be resumed (T036); undefined when it can. */
@@ -2192,7 +2220,12 @@ export class SessionService {
             ? { kind: 'peerMessage', peerMessageId: peerIdOf(item.operationId) }
             : item.deliveryKind === 'handoff'
               ? await this.handoffRef(item.operationId)
-              : undefined;
+              : item.deliveryKind === 'system-notice'
+                ? // The GUI's own notice to a session (C-31, G-11 B). A delivery-unknown escalation may point only at a handoff,
+                  // peer message, transfer, provision or user message (escalation.delivery-ref): the notice goes as the
+                  // peer-message ref its operation names, which no peer message has, until contracts give it its own (T040 gap).
+                  { kind: 'peerMessage', peerMessageId: peerIdOf(item.operationId) }
+                : undefined;
     if (ref === undefined) return;
     const id = deliveryEscalationId(item.key);
     const existing = await this.repos.escalations.get(id);

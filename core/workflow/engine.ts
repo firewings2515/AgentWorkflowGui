@@ -216,6 +216,7 @@ export class WorkflowEngine implements WorkflowHooks {
               wakeTask: (instanceId, taskId) => this.wakeTask(instanceId, taskId),
               wakeNodes: (instanceId) => this.wakeNodes(instanceId),
               settleHeld: (instanceId) => this.settleHeldNow(instanceId),
+              noticeRoot: (instanceId, operationId, text) => this.noticeRoot(instanceId, operationId, text),
             },
           });
   }
@@ -713,6 +714,45 @@ export class WorkflowEngine implements WorkflowHooks {
       if (await this.deliverableNow(instance.id, taskId, to)) await this.deliver(input.operationId, targetSessionId, handoffId);
       return accepted.status;
     });
+  }
+
+  /**
+   * A `system-notice` to root (C-31, T032 G-11 B): the GUI's own words, origin `system`, accepted and dispatched through
+   * the delivery service like a report (it joins a running turn, SP-05). The operation is named by the caller, so a
+   * second call (a restart, two paths at once) is the same operation: one record, one dispatch (CR-2); a pending one
+   * goes on, an unknown one stays with its escalation. Called in the instance's queue (the pipeline holds it), so not
+   * queued again here.
+   */
+  private async noticeRoot(instanceId: InstanceId, operationId: OperationId, text: string): Promise<'accepted' | 'duplicate' | 'failed'> {
+    const instance = await this.repos.instances.get(instanceId);
+    if (instance === undefined || this.options.sessions.isClosing()) return 'failed';
+    const rootId = instance.rootSessionId;
+    const known = await this.store.get(operationId);
+    if (known !== undefined) {
+      if (known.kind !== 'system-notice') return 'failed';
+      if (known.delivery.state === 'pending') await this.options.sessions.deliverWorkflow(operationId, rootId, 'insert-if-busy');
+      return 'duplicate';
+    }
+    const target = await this.options.sessions.payloadTarget(rootId);
+    const context = await this.options.sessions.payloadContext(rootId, { kind: 'system' });
+    if (target === undefined || context === undefined) return 'failed';
+    const accepted = await this.delivery.accept({
+      kind: 'system-notice',
+      operationId,
+      sourceCallRef: operationId,
+      payloadHash: await this.options.hashPayload(text),
+      payload: text,
+      proposalRevision: instance.workflowRevision,
+      target,
+      at: this.options.now(),
+      context: { ...context, entry: { kind: 'new-turn' } },
+    });
+    if (accepted.status !== 'accepted' && accepted.status !== 'duplicate') {
+      this.log(`a notice to root of ${instanceId} was not accepted (${accepted.status})`);
+      return 'failed';
+    }
+    await this.options.sessions.deliverWorkflow(operationId, rootId, 'insert-if-busy');
+    return accepted.status;
   }
 
   /** Every node with a concurrency limit: its waiting handoffs are tried again (T032, after a merge ended). */
@@ -1271,6 +1311,16 @@ export class WorkflowEngine implements WorkflowHooks {
       }
     }
     return false;
+  }
+
+  /**
+   * `WorkflowHooks.retryEntry` (T040 r1): a report to root that the user retried joins root's running turn, as
+   * `deliverReport` sent it the first time; only a report of a run to that run's root session.
+   */
+  async retryEntry(record: StoredDelivery): Promise<'insert-if-busy' | undefined> {
+    if (record.kind !== 'peer-message' || !record.operationId.startsWith(REPORT) || record.peer?.instanceId === undefined) return undefined;
+    const instance = await this.repos.instances.get(record.peer.instanceId);
+    return instance !== undefined && record.target.sessionId === instance.rootSessionId && record.peer.toSessionId === instance.rootSessionId ? 'insert-if-busy' : undefined;
   }
 
   /**
