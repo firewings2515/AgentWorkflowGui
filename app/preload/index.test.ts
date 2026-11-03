@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { type EventBatch, type EventEnvelope, FolderRequest, QueryRequest } from '../../contracts';
 import type { AppBridge } from './bridge-types';
-import { APP_INFO_CHANNEL, BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, EVENT_CHANNEL, FOLDER_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL } from './channels';
+import { APP_INFO_CHANNEL, BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, EVENT_CHANNEL, FOLDER_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL, SNAPSHOT_READ_CHANNEL, WINDOW_REPORT_CHANNEL } from './channels';
 
 type Listener = (event: unknown, batch: EventBatch) => void;
 
@@ -47,7 +47,7 @@ beforeEach(() => {
 describe('preload bridge', () => {
   it('exposes exactly the typed API and no ipcRenderer', async () => {
     const bridge = await loadBridge();
-    expect(Object.keys(bridge).sort()).toEqual(['folders', 'getAppInfo', 'onBatch', 'onEvent', 'query', 'send', 'snapshot']);
+    expect(Object.keys(bridge).sort()).toEqual(['folders', 'getAppInfo', 'onBatch', 'onEvent', 'query', 'readSnapshot', 'report', 'send', 'snapshot']);
     expect(Object.keys(bridge.folders ?? {})).toEqual(['request']);
     expect(electron.exposed.size).toBe(1);
   });
@@ -62,6 +62,19 @@ describe('preload bridge', () => {
     await bridge.send(command);
 
     expect(electron.invoke.mock.calls).toEqual([[SNAPSHOT_CHANNEL], [APP_INFO_CHANNEL], [COMMAND_CHANNEL, command]]);
+  });
+
+  it('routes the numbered Snapshot read and the window reports to their own channels (T040 r3)', async () => {
+    const bridge = await loadBridge();
+    electron.invoke.mockResolvedValue('answer');
+    await bridge.readSnapshot();
+    bridge.report({ kind: 'adopted', read: 3, seq: 40 });
+    bridge.report({ kind: 'applied', toSeq: 41 });
+    expect(electron.invoke.mock.calls).toEqual([[SNAPSHOT_READ_CHANNEL]]);
+    expect(electron.send.mock.calls).toEqual([
+      [WINDOW_REPORT_CHANNEL, { kind: 'adopted', read: 3, seq: 40 }],
+      [WINDOW_REPORT_CHANNEL, { kind: 'applied', toSeq: 41 }],
+    ]);
   });
 
   it('routes folder requests to their own channel (C-24)', async () => {

@@ -29,6 +29,19 @@ export interface AwgBridge {
   folders?: { request(request: FolderRequest): Promise<FolderResult> };
 }
 
+/** One Snapshot read (T040 r3): `read` names it, so the renderer can say it took this one and no other. */
+export interface SnapshotRead {
+  readonly read: number;
+  readonly snapshot: Snapshot;
+}
+
+/**
+ * What the renderer did with what it was sent (T040 r3), so the main process knows what reached it instead of guessing:
+ * `applied`, it applied the batch ending at `toSeq` (not held back, not dropped); `adopted`, it took the Snapshot of
+ * read `read` and applied what it held back after it, up to `seq`.
+ */
+export type WindowReport = { readonly kind: 'applied'; readonly toSeq: number } | { readonly kind: 'adopted'; readonly read: number; readonly seq: number };
+
 /** What the preload script exposes (T040): the bridge plus batches and queries, which the renderer treats as optional. */
 export interface AppBridge extends AwgBridge {
   /**
@@ -38,4 +51,8 @@ export interface AppBridge extends AwgBridge {
   onBatch(listener: (batch: EventBatch) => void): () => void;
   /** Read-only queries (C-26, C-28): history pages, backups. Never rejects for a bad request. */
   query(request: QueryRequest): Promise<QueryResult>;
+  /** Loads the current Snapshot, named by the number of this read (T040 r3). */
+  readSnapshot(): Promise<SnapshotRead>;
+  /** Tells the main process what the renderer did with a batch or a Snapshot read (T040 r3). */
+  report(report: WindowReport): void;
 }

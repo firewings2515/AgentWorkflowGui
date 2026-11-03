@@ -1,13 +1,13 @@
 import { AppEvent, HistoryCursor, QueryRequest, QueryResult, RequestId, Snapshot } from '../../../contracts';
 import type { EventBatch, HistoryPage } from '../../../contracts';
-import type { AwgBridge } from '../../preload/bridge-types';
+import type { AppBridge, AwgBridge } from '../../preload/bridge-types';
 import { fixtureBackupList } from '../../../contracts/fixtures/snapshot';
 import { longConversation } from '../../../contracts/fixtures/long-conversation';
 
 /** T040 integration: expose query and optionally onBatch on window.awg.
  * When onBatch exists it replaces onEvent; do not subscribe to both transports. */
 export interface QueryBridge { query(request: QueryRequest): Promise<QueryResult> }
-export type RendererBridge = AwgBridge & Partial<QueryBridge> & {
+export type RendererBridge = AwgBridge & Partial<QueryBridge> & Partial<Pick<AppBridge, 'readSnapshot' | 'report'>> & {
   onBatch?: (listener: (batch: EventBatch) => void) => () => void;
 };
 

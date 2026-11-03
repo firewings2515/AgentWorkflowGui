@@ -568,19 +568,23 @@ describe('C-27 with C-26: a far-back record that changed while the renderer was 
     // Without what was missed the Snapshot would not have it at all (the review's repro): neither running nor completed.
     expect((await snapshot(s)).turns.some((t) => t.id === oldest)).toBe(false);
     // The read as the IPC handler does it: the cut hands over what the window missed.
-    const snap = await readForWindow(batcher, s.backend.facade);
+    const { snapshot: snap } = await readForWindow(batcher, s.backend.facade);
     expect(snap.turns).toContainEqual(expect.objectContaining({ id: oldest, state: 'completed' }));
     // The streamed message is there completed, so the renderer drops its stream (renderer-store keeps one otherwise).
     expect(snap.messages).toContainEqual(expect.objectContaining({ id: 'm-old', text: 'x'.repeat(40) }));
     expect(snap.turns.filter((t) => t.sessionId === sessionId)).toHaveLength(51);
-    // Owed until the window is known to hold that Snapshot (r2): a read now brings it back again.
-    expect((await readForWindow(batcher, s.backend.facade)).turns.some((t) => t.id === oldest)).toBe(true);
-    // A batch sent after the answer, acknowledged: the window holds it, and the next read is the plain Snapshot again.
+    // Owed until the renderer says it took that read (r3): a read now brings it back again.
+    const again = await readForWindow(batcher, s.backend.facade);
+    expect(again.snapshot.turns.some((t) => t.id === oldest)).toBe(true);
+    // Acknowledged batches say nothing; the renderer naming the read does: the next read is the plain Snapshot again.
     adapter.emit({ type: 'session.activity', sessionId, activity: 'idle', at });
     await settle();
     await new Promise((resolve) => setTimeout(resolve, 20));
     batcher.ack(sent.at(-1)!.toSeq);
-    expect((await readForWindow(batcher, s.backend.facade)).turns.some((t) => t.id === oldest)).toBe(false);
+    expect((await readForWindow(batcher, s.backend.facade)).snapshot.turns.some((t) => t.id === oldest)).toBe(true);
+    const last = await readForWindow(batcher, s.backend.facade);
+    batcher.adopted(last.read, last.snapshot.seq);
+    expect((await readForWindow(batcher, s.backend.facade)).snapshot.turns.some((t) => t.id === oldest)).toBe(false);
     stop();
     await s.backend.shutdown();
   });

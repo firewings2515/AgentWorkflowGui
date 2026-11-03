@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { CommandResult, EventBatch, QueryResult, Snapshot, type Command, type QueryRequest } from '../../contracts';
 import { fixtureSnapshot } from '../../contracts/fixtures/snapshot';
-import { BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
-import { QUERY_FAILED, readSnapshot, registerAppIpc, runCommand, runQuery, SNAPSHOT_UNAVAILABLE, UNKNOWN_REQUEST_ID, type EventTarget } from './app-ipc';
+import { BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL, SNAPSHOT_READ_CHANNEL, WINDOW_REPORT_CHANNEL } from '../preload/channels';
+import { QUERY_FAILED, readSnapshot, registerAppIpc, runCommand, runQuery, SNAPSHOT_UNAVAILABLE, UNKNOWN_REQUEST_ID, windowReport, type EventTarget } from './app-ipc';
 import { EventBus } from './event-bus';
 import type { AppFacade } from './facade';
 import { createFakeFacade } from './testing/fake-facade';
@@ -183,18 +183,36 @@ describe('snapshot', () => {
     await tick();
     await expect(call(SNAPSHOT_CHANNEL, trustedEvent)).rejects.toThrow(SNAPSHOT_UNAVAILABLE);
     fail = false;
-    await call(SNAPSHOT_CHANNEL, trustedEvent);
-    // Answered, but no batch since it was taken: the window may not hold it, so the next read brings it back too (r2).
-    await call(SNAPSHOT_CHANNEL, trustedEvent);
+    // Answered without a number (the plain channel): nothing of it counts as taken, so the next read brings it back.
+    expect(Snapshot.parse(await call(SNAPSHOT_CHANNEL, trustedEvent)).seq).toBe(bus.seq);
+    const first = (await call(SNAPSHOT_READ_CHANNEL, trustedEvent)) as { read: number; snapshot: unknown };
     const owed = (m: unknown) => (m as Map<string, { turns: Set<string> }>).get('s-wf-build-b')?.turns.has('turn-b1');
     expect(asked.map(owed)).toEqual([true, true, true]);
-    // A batch sent after that answer, acknowledged by the window: it holds that Snapshot, and nothing is owed.
+    // Acknowledged batches say nothing (r3); another window's report, a malformed one, an older read: nothing either.
     bus.publish({ type: 'usage.limits', at: '2026-11-03T10:00:00.000Z' });
     await tick();
-    const ack = electron.listeners.get(BATCH_ACK_CHANNEL)!;
-    ack(trustedEvent, sent.at(-1)!.toSeq);
-    await call(SNAPSHOT_CHANNEL, trustedEvent);
-    expect((asked[3] as Map<string, unknown>).size).toBe(0);
+    electron.listeners.get(BATCH_ACK_CHANNEL)!(trustedEvent, sent.at(-1)!.toSeq);
+    const report = electron.listeners.get(WINDOW_REPORT_CHANNEL)!;
+    report(otherWindowEvent, { kind: 'adopted', read: first.read, seq: bus.seq });
+    report(trustedEvent, { kind: 'adopted', read: String(first.read), seq: bus.seq });
+    const second = (await call(SNAPSHOT_READ_CHANNEL, trustedEvent)) as { read: number };
+    expect(second.read).toBeGreaterThan(first.read);
+    report(trustedEvent, { kind: 'adopted', read: first.read, seq: bus.seq });
+    await call(SNAPSHOT_READ_CHANNEL, trustedEvent);
+    expect(asked.map(owed)).toEqual([true, true, true, true, true]);
+    // The window names the last read as taken: nothing is owed any more.
+    const third = (await call(SNAPSHOT_READ_CHANNEL, trustedEvent)) as { read: number };
+    report(trustedEvent, { kind: 'adopted', read: third.read, seq: bus.seq });
+    await call(SNAPSHOT_READ_CHANNEL, trustedEvent);
+    expect((asked.at(-1) as Map<string, unknown>).size).toBe(0);
+  });
+
+  it('reads window reports strictly (T040 r3)', () => {
+    expect(windowReport({ kind: 'applied', toSeq: 4 })).toEqual({ kind: 'applied', toSeq: 4 });
+    expect(windowReport({ kind: 'adopted', read: 2, seq: 9 })).toEqual({ kind: 'adopted', read: 2, seq: 9 });
+    for (const bad of [null, 4, 'applied', { kind: 'applied' }, { kind: 'applied', toSeq: -1 }, { kind: 'applied', toSeq: 1.5 }, { kind: 'applied', toSeq: 1, extra: 1 }, { kind: 'adopted', read: 1 }, { kind: 'adopted', read: 1, seq: Number.MAX_VALUE }, { kind: 'other', toSeq: 1 }]) {
+      expect(windowReport(bad)).toBeUndefined();
+    }
   });
 });
 

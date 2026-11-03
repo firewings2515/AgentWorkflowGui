@@ -6,6 +6,12 @@ export const APP_INFO_CHANNEL = 'app:get-info';
 /** Renderer -> main: load the current Snapshot (invoke). */
 export const SNAPSHOT_CHANNEL = 'app:snapshot';
 
+/** Renderer -> main: load the current Snapshot with the number of this read, a SnapshotRead (invoke, T040 r3). */
+export const SNAPSHOT_READ_CHANNEL = 'app:snapshot-read';
+
+/** Renderer -> main: what the renderer did with what it was sent, a WindowReport (send, T040 r3). */
+export const WINDOW_REPORT_CHANNEL = 'app:window-report';
+
 /** Renderer -> main: run one Command, answered with a CommandResult (invoke). */
 export const COMMAND_CHANNEL = 'app:command';
 

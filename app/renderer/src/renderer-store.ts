@@ -202,6 +202,7 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
     if (delivery.toSeq <= (state.snapshot?.seq ?? -1)) return;
     if (invalidation || delivery.fromSeq !== (state.snapshot?.seq ?? 0) + 1) { void reconnect(); buffer = [delivery]; return; }
     publish(applyDelivery(state, delivery), delivery.envelopes.every(e => isDelta(e.event)));
+    bridge.report?.({ kind: 'applied', toSeq: delivery.toSeq });
   };
   const receive = (envelope: EventEnvelope) => {
     const parsed = EventEnvelope.safeParse(envelope);
@@ -238,10 +239,12 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
       for (let attempt = 0; attempt < 5; attempt++) {
         let timer: ReturnType<typeof setTimeout> | undefined;
         let snapshot: Snapshot;
+        let read: unknown;
         try {
-          snapshot = Snapshot.parse(await Promise.race([bridge.snapshot(), new Promise<never>((_resolve, reject) => {
+          const answer = await Promise.race([bridge.readSnapshot ? bridge.readSnapshot() : bridge.snapshot().then(s => ({ read: undefined, snapshot: s })), new Promise<never>((_resolve, reject) => {
             timer = setTimeout(() => reject(new Error('snapshot timeout')), timeoutMs);
-          })]));
+          })]);
+          snapshot = Snapshot.parse(answer.snapshot); read = answer.read;
         } finally { clearTimeout(timer); }
         if (current !== generation) return;
         if (state.snapshot && snapshot.seq < state.snapshot.seq) throw new Error('snapshot regressed');
@@ -268,6 +271,7 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
         }
         buffer = null;
         publish(next);
+        if (typeof read === 'number') bridge.report?.({ kind: 'adopted', read, seq: next.snapshot!.seq });
         return;
       }
       throw new Error('snapshot did not converge after 5 reads');

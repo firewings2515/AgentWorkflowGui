@@ -357,16 +357,16 @@ describe('B-7 a batch that could not be sent (r1 P1-2)', () => {
     ]);
     expect(r.ledger.gaps).toBe(1);
     // The request is owed to the Snapshot the window reads next.
-    const missed = r.batcher.cut();
-    expect(missed.get('s-wf-build-b' as SessionId)?.turns).toEqual(new Set(['turn-b1']));
-    r.batcher.answered(missed);
+    const { read, owed } = r.batcher.cut();
+    expect(owed.get('s-wf-build-b' as SessionId)?.turns).toEqual(new Set(['turn-b1']));
     // Fed again right after the Snapshot's seq.
     const seq = r.bus.seq;
     r.bus.publish(limits());
     r.clock.advance(100);
     expect(r.ledger.batches.at(-1)).toMatchObject({ fromSeq: seq + 1, toSeq: seq + 1 });
-    // That batch, sent after the answer, was acknowledged: the window holds the Snapshot, so nothing is owed (r2).
-    expect(r.batcher.cut().size).toBe(0);
+    // The renderer says it took that read: nothing is owed any more (r3).
+    r.batcher.adopted(read, r.bus.seq);
+    expect(r.batcher.cut().owed.size).toBe(0);
   });
 
   it('the invalidation cannot be sent either: the next envelope goes alone, and its gap tells the renderer instead', () => {
@@ -387,19 +387,19 @@ describe('B-7 a batch that could not be sent (r1 P1-2)', () => {
       [4, 4],
     ]);
     expect(r.ledger.gaps).toBe(1);
-    expect(r.batcher.cut().get('s-wf-build-b' as SessionId)?.turns.has('turn-b1')).toBe(true);
+    expect(r.batcher.cut().owed.get('s-wf-build-b' as SessionId)?.turns.has('turn-b1')).toBe(true);
   });
 
-  it('a Snapshot read that failed (never answered): what it was to bring back is owed to the next one', () => {
+  it('a Snapshot read the renderer never said it took (it failed): what it was to bring back is owed to the next one', () => {
     const r = rig({ fail: (b) => b.envelopes.some((e) => e.event.type === 'permission.updated') });
     r.bus.publish(permission());
     r.clock.advance(100);
-    const missed = r.batcher.cut();
-    expect(missed.size).toBe(1);
-    // Batches go on and are acknowledged; without an answer they show nothing.
+    const { owed } = r.batcher.cut();
+    expect(owed.size).toBe(1);
+    // Batches go on and are acknowledged; that says nothing of the read.
     r.bus.publish(limits());
     r.clock.advance(100);
-    expect(r.batcher.cut()).toEqual(missed);
+    expect(r.batcher.cut().owed).toEqual(owed);
   });
 });
 
@@ -411,7 +411,7 @@ describe('B-8 what a let-go window was not sent is owed to its next Snapshot (r1
     expect(r.batcher.stats.overflows).toBe(1);
     r.bus.publish({ type: 'turn.updated', turn: { id: 't-late' as never, sessionId: 's2' as SessionId, state: 'completed', startedAt: '2026-11-03T10:00:00.000Z', endedAt: '2026-11-03T10:00:01.000Z' } });
     r.bus.publish(delta('s3', 'm-free', 'x'));
-    const missed = r.batcher.cut();
+    const missed = r.batcher.cut().owed;
     // Queued past the limit before the first batch left (51), then let go meanwhile (9): all 60 are owed.
     expect(missed.get('s1' as SessionId)?.turns.size).toBe(60);
     expect(missed.get('s2' as SessionId)?.turns).toEqual(new Set(['t-late']));
@@ -419,7 +419,7 @@ describe('B-8 what a let-go window was not sent is owed to its next Snapshot (r1
     // Past the limit: the session whole, with nothing listed.
     const big = rig({ speed: 'stalled', batcher: { maxPending: 10, maxInFlight: 1 } });
     for (let i = 0; i < 2_100; i++) big.bus.publish({ type: 'turn.updated', turn: { id: `t-${String(i)}` as never, sessionId: 's1' as SessionId, state: 'running', startedAt: '2026-11-03T10:00:00.000Z' } });
-    expect(big.batcher.cut().get('s1' as SessionId)).toEqual({ turns: new Set(), records: new Set(), whole: true });
+    expect(big.batcher.cut().owed.get('s1' as SessionId)).toEqual({ turns: new Set(), records: new Set(), whole: true });
   });
 });
 
@@ -441,30 +441,90 @@ describe('B-9 the merge keys do not outlive the queue (r1 P2)', () => {
   });
 });
 
-describe('B-10 a record stays owed until the window is known to hold the Snapshot that brought it back (r2)', () => {
+describe('B-10 a record is owed until the renderer says it reached it (r2, r3)', () => {
   const turn = (id: string, state: 'running' | 'completed' = 'completed'): AppEvent => ({
     type: 'turn.updated',
     turn: { id: id as never, sessionId: 's1' as SessionId, state, startedAt: '2026-11-03T10:00:00.000Z', ...(state === 'completed' && { endedAt: '2026-11-03T10:00:01.000Z' }) },
   });
   const limits = (): AppEvent => ({ type: 'usage.limits', at: '2026-11-03T10:00:00.000Z' });
-  const owes = (missed: ReturnType<WindowBatcher['cut']>, id: string) => missed.get('s1' as SessionId)?.turns.has(id) === true;
-  /** A rig whose window holds a Snapshot: read, answered, and a batch sent after the answer acknowledged. */
-  const holding = (options: Parameters<typeof rig>[0] = {}) => {
+  const owes = (cut: ReturnType<WindowBatcher['cut']>, id: string) => cut.owed.get('s1' as SessionId)?.turns.has(id) === true;
+  /** A rig whose renderer took a Snapshot and owes nothing. */
+  const taken = (options: Parameters<typeof rig>[0] = {}) => {
     const r = rig(options);
-    const owed = r.batcher.cut();
-    r.batcher.answered(owed);
-    r.bus.publish(limits());
-    r.clock.advance(100);
-    expect(r.batcher.cut().size).toBe(0);
-    r.batcher.answered(r.batcher.cut());
-    r.bus.publish(limits());
-    r.clock.advance(100);
+    const { read } = r.batcher.cut();
+    r.batcher.adopted(read, r.bus.seq);
     return r;
   };
+  const lastToSeq = (r: ReturnType<typeof rig>) => r.ledger.batches.at(-1)!.toSeq;
 
-  it('the envelope sent alone after a lost invalidation is owed though it was sent (P1-a)', () => {
+  it('sent and acknowledged, but not said applied (held while reading, dropped in the error state): owed at the next cut', () => {
+    const r = taken();
+    r.bus.publish(turn('t-held'));
+    r.clock.advance(100);
+    expect(r.batcher.inFlightCount).toBe(0);
+    expect(owes(r.batcher.cut(), 't-held')).toBe(true);
+  });
+
+  it('said applied: not owed; applied up to a seq covers the batches before it and none after', () => {
+    const r = taken({ batcher: { maxBatch: 1 } });
+    r.bus.publish(turn('t-a'));
+    r.bus.publish(turn('t-b'));
+    r.bus.publish(turn('t-c'));
+    r.clock.advance(100);
+    const [, b] = r.ledger.batches.slice(-3);
+    r.batcher.applied(b!.toSeq);
+    const cut = r.batcher.cut();
+    expect([owes(cut, 't-a'), owes(cut, 't-b'), owes(cut, 't-c')]).toEqual([false, false, true]);
+  });
+
+  it('what a read was handed stays owed until the renderer names that read as taken', () => {
+    const r = taken();
+    r.bus.publish(turn('t-owed'));
+    r.clock.advance(100);
+    const first = r.batcher.cut();
+    expect(owes(first, 't-owed')).toBe(true);
+    // Batches go on and are acknowledged: no proof of anything (r3 P1-1: their acks may come before the answer).
+    r.bus.publish(limits());
+    r.clock.advance(100);
+    const second = r.batcher.cut();
+    expect(owes(second, 't-owed')).toBe(true);
+    // The renderer names the first read (an answer it got late, after the second was cut): no proof for the second.
+    r.batcher.adopted(first.read, r.bus.seq);
+    const third = r.batcher.cut();
+    expect(owes(third, 't-owed')).toBe(true);
+    // It names the last read: what it was handed reached it.
+    r.batcher.adopted(third.read, r.bus.seq);
+    expect(r.batcher.cut().owed.size).toBe(0);
+  });
+
+  it('a read never named (failed, given up after 15 s, dropped for a newer invalidation): handed again, however much is acknowledged', () => {
+    const r = taken();
+    r.bus.publish(turn('t-given-up'));
+    r.clock.advance(100);
+    r.batcher.cut();
+    for (let i = 0; i < 20; i++) {
+      r.bus.publish(limits());
+      r.clock.advance(20_000);
+    }
+    expect(owes(r.batcher.cut(), 't-given-up')).toBe(true);
+  });
+
+  it('adopted up to a seq: the batches after the cut it applied with the Snapshot are not owed, later ones are', () => {
+    const r = taken({ batcher: { maxBatch: 1 } });
+    const { read } = r.batcher.cut();
+    r.bus.publish(turn('t-replayed'));
+    r.clock.advance(100);
+    const replayedTo = lastToSeq(r);
+    r.bus.publish(turn('t-after'));
+    r.clock.advance(100);
+    r.batcher.adopted(read, replayedTo);
+    const cut = r.batcher.cut();
+    expect([owes(cut, 't-replayed'), owes(cut, 't-after')]).toEqual([false, true]);
+  });
+
+  it('the envelope sent alone after a lost invalidation is owed though it was sent (r2 P1-a)', () => {
     let failing = true;
-    const r = holding({ fail: (b) => failing && b.envelopes.some((e) => e.event.type === 'permission.updated' || e.event.type === 'snapshot.invalidated') });
+    const r = taken({ fail: (b) => failing && b.envelopes.some((e) => e.event.type === 'permission.updated' || e.event.type === 'snapshot.invalidated') });
     r.bus.publish({ type: 'permission.updated', request: f.permissionRequests[0]! });
     r.clock.advance(100);
     failing = false;
@@ -475,135 +535,43 @@ describe('B-10 a record stays owed until the window is known to hold the Snapsho
     expect(owes(r.batcher.cut(), 't-far')).toBe(true);
   });
 
-  it('a batch sent after one that could not be, before the window reads again, is owed (the renderer drops it under the seq)', () => {
-    let available = true;
-    const r = holding({ available: () => available });
-    available = false;
-    r.bus.publish(limits());
-    r.clock.advance(100);
-    available = true;
-    r.bus.publish(turn('t-after-gap'));
-    r.clock.advance(100);
-    expect(r.ledger.batches.at(-1)?.envelopes.map((e) => e.event.type)).toEqual(['turn.updated']);
-    expect(owes(r.batcher.cut(), 't-after-gap')).toBe(true);
-  });
-
-  it('let go again before the read was answered: the next read is handed what that one was (P1-b)', () => {
-    const r = holding({ batcher: { maxPending: 5 } });
-    r.batcher.cut();
-    for (let i = 0; i < 10; i++) r.bus.publish(limits());
-    r.bus.publish(turn('t-let-go'));
-    const first = r.batcher.cut();
-    expect(owes(first, 't-let-go')).toBe(true);
-    // During the read: let go again; answered after.
-    for (let i = 0; i < 10; i++) r.bus.publish(limits());
-    expect(r.batcher.stats.overflows).toBe(2);
-    r.batcher.answered(first);
-    r.bus.publish(limits());
-    r.clock.advance(100);
-    expect(owes(r.batcher.cut(), 't-let-go')).toBe(true);
-  });
-
-  it('answered and a batch sent after the answer acknowledged: nothing is owed any more; sent before the answer, still owed', () => {
-    const r = holding({ ackMs: 50 });
-    r.bus.publish(turn('t-owed'));
-    const owed = r.batcher.cut();
-    expect(owes(owed, 't-owed')).toBe(true);
-    // A batch sent between the cut and the answer: its acknowledgement shows nothing of the Snapshot.
-    r.bus.publish(limits());
-    r.clock.advance(20);
-    expect(r.batcher.inFlightCount).toBe(1);
-    r.batcher.answered(owed);
-    r.clock.advance(100);
-    const again = r.batcher.cut();
-    expect(owes(again, 't-owed')).toBe(true);
-    r.batcher.answered(again);
-    // Sent after the answer, before the window is known to hold it: written down, then taken with the Snapshot.
-    r.bus.publish(turn('t-taken'));
-    r.clock.advance(100);
-    expect(r.batcher.cut().size).toBe(0);
-  });
-
-  it('a gap after the answer, before the acknowledgement: still owed', () => {
-    let available = true;
-    const r = holding({ available: () => available });
-    r.bus.publish(turn('t-gap-after'));
-    const owed = r.batcher.cut();
-    r.batcher.answered(owed);
-    available = false;
-    r.bus.publish(limits());
-    r.clock.advance(100);
-    available = true;
-    r.bus.publish(limits());
-    r.clock.advance(100);
-    expect(owes(r.batcher.cut(), 't-gap-after')).toBe(true);
-  });
-
-  it('a window that held reads again (a reason of its own): what is sent after the cut is owed should that read be dropped', () => {
-    const r = holding();
-    r.batcher.cut();
-    r.bus.publish(turn('t-between'));
-    r.clock.advance(100);
-    r.bus.publish({ type: 'snapshot.invalidated', reason: 'event-write-failed', at: '2026-11-03T10:00:00.000Z' });
-    r.clock.advance(100);
-    expect(owes(r.batcher.cut(), 't-between')).toBe(true);
-  });
-
-  it('an answer later than the renderer waits: still owed after an acknowledgement', () => {
-    const r = holding({ batcher: { answerWithinMs: 10_000 } });
-    r.bus.publish(turn('t-late'));
-    const owed = r.batcher.cut();
-    r.clock.advance(10_001);
-    r.batcher.answered(owed);
-    r.bus.publish(limits());
-    r.clock.advance(100);
-    expect(owes(r.batcher.cut(), 't-late')).toBe(true);
-  });
-
-  it('a gap during the read (a batch that could not be sent) leaves it owed though answered', () => {
-    let available = true;
-    const r = holding({ available: () => available });
-    r.bus.publish(turn('t-gap-read'));
-    const owed = r.batcher.cut();
-    available = false;
-    r.bus.publish(limits());
-    r.clock.advance(100);
-    available = true;
-    r.batcher.answered(owed);
-    r.bus.publish(limits());
-    r.clock.advance(100);
-    expect(owes(r.batcher.cut(), 't-gap-read')).toBe(true);
-  });
-
-  it('let go during the read (the queue): owed though answered and acknowledged after', () => {
-    const r = holding({ batcher: { maxPending: 5 } });
-    r.bus.publish(turn('t-overflow-read'));
-    const owed = r.batcher.cut();
-    for (let i = 0; i < 10; i++) r.bus.publish(limits());
-    expect(r.batcher.stats.overflows).toBe(1);
-    r.batcher.answered(owed);
-    r.bus.publish(limits());
-    r.clock.advance(100);
-    expect(owes(r.batcher.cut(), 't-overflow-read')).toBe(true);
-  });
-
-  it('a snapshot.invalidated of any reason: the window reads again, so what is sent until then is owed', () => {
-    const r = holding();
-    r.bus.publish({ type: 'snapshot.invalidated', reason: 'event-write-failed', at: '2026-11-03T10:00:00.000Z' });
-    r.bus.publish(turn('t-after-invalidation'));
-    r.clock.advance(100);
-    expect(r.ledger.batches.flatMap((b) => b.envelopes).some((e) => e.event.type === 'turn.updated')).toBe(true);
-    expect(owes(r.batcher.cut(), 't-after-invalidation')).toBe(true);
-  });
-
-  it('what the cut itself sends is owed (the reading renderer drops it under the seq); a window that holds owes nothing else', () => {
-    const r = holding();
-    r.bus.publish(turn('t-sent'));
-    r.clock.advance(100);
+  it('what the cut itself sends is owed (the reading renderer drops it under the seq)', () => {
+    const r = taken();
     r.bus.publish(turn('t-at-cut'));
-    const owed = r.batcher.cut();
-    expect(owes(owed, 't-at-cut')).toBe(true);
-    // Sent and acknowledged while the window held its Snapshot: taken, nothing owed.
-    expect(owes(owed, 't-sent')).toBe(false);
+    expect(owes(r.batcher.cut(), 't-at-cut')).toBe(true);
+  });
+
+  it('let go, or a batch not sent: owed as before, whatever the renderer says afterwards about later batches', () => {
+    let available = true;
+    const r = taken({ available: () => available, batcher: { maxPending: 5 } });
+    available = false;
+    r.bus.publish(turn('t-not-sent'));
+    r.clock.advance(100);
+    available = true;
+    r.bus.publish(limits());
+    r.clock.advance(100);
+    r.batcher.applied(r.bus.seq);
+    expect(owes(r.batcher.cut(), 't-not-sent')).toBe(true);
+  });
+
+  it('a renderer that says everything (P2): nothing piles up on a steady connection', () => {
+    const r = taken();
+    for (let i = 0; i < 1000; i++) {
+      r.bus.publish(turn(`t-${String(i)}`, 'running'));
+      r.clock.advance(20);
+      r.batcher.applied(lastToSeq(r));
+    }
+    expect(r.batcher.awaitingCount).toBe(0);
+    expect(r.batcher.cut().owed.size).toBe(0);
+  });
+
+  it('a renderer that says nothing: the batches kept for it stay bounded, and what they held is owed', () => {
+    const r = taken({ batcher: { maxBatch: 1 } });
+    for (let i = 0; i < 300; i++) {
+      r.bus.publish(turn(`t-${String(i)}`));
+      r.clock.advance(20);
+    }
+    expect(r.batcher.awaitingCount).toBeLessThanOrEqual(64);
+    expect(r.batcher.cut().owed.get('s1' as SessionId)?.turns.size).toBe(300);
   });
 });

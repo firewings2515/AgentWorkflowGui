@@ -1,6 +1,7 @@
 import { ipcMain } from 'electron';
 import { Command, CommandResult, type EventBatch, type EventEnvelope, QueryRequest, QueryResult, RequestId, Snapshot } from '../../contracts';
-import { BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
+import type { SnapshotRead } from '../preload/bridge-types';
+import { BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL, SNAPSHOT_READ_CHANNEL, WINDOW_REPORT_CHANNEL } from '../preload/channels';
 import { type BatcherOptions, WindowBatcher } from './event-batcher';
 import type { EventBus } from './event-bus';
 import type { MissedRecords } from './missed-records';
@@ -109,7 +110,7 @@ export interface EventTarget {
 
 export type ForwardingOptions = Pick<
   BatcherOptions,
-  'batchMs' | 'maxBatch' | 'maxInFlight' | 'maxPending' | 'maxPendingBytes' | 'stallMs' | 'answerWithinMs' | 'log' | 'now' | 'setTimer' | 'clearTimer'
+  'batchMs' | 'maxBatch' | 'maxInFlight' | 'maxPending' | 'maxPendingBytes' | 'stallMs' | 'log' | 'now' | 'setTimer' | 'clearTimer'
 >;
 
 /**
@@ -159,20 +160,28 @@ export interface AppIpcOptions {
 }
 
 /**
- * One Snapshot read of the window (the SNAPSHOT handler; the T040 recovery tests drive it as the renderer does). The cut
- * comes first, in the same synchronous step as the seq the facade reads (C-27). What is owed comes back with this read
- * and stays owed until the window is known to hold it (event-batcher.ts): the answer is marked last, right before it
- * goes to the window, and a read that fails leaves it owed to the next one.
+ * One Snapshot read of the window (the snapshot handlers; the T040 recovery tests drive it as the renderer does). The
+ * cut comes first, in the same synchronous step as the seq the facade reads (C-27). What is owed comes back with this
+ * read, named by its number, and stays owed until the renderer says it took this read (event-batcher.ts, r3).
  */
-export function readForWindow(batcher: WindowBatcher, facade: AppFacade, onSnapshot?: (snapshot: Snapshot, ms: number) => void): Promise<Snapshot> {
-  const owed = batcher.cut();
+export function readForWindow(batcher: WindowBatcher, facade: AppFacade, onSnapshot?: (snapshot: Snapshot, ms: number) => void): Promise<SnapshotRead> {
+  const { read, owed } = batcher.cut();
   const began = performance.now();
   return readSnapshot(facade, console.error, owed).then((snapshot) => {
     onSnapshot?.(snapshot, performance.now() - began);
-    batcher.answered(owed);
-    return snapshot;
+    return { read, snapshot };
   });
 }
+
+/** A WindowReport from the renderer, checked; anything else is undefined (and ignored). */
+export const windowReport = (raw: unknown): { kind: 'applied'; toSeq: number } | { kind: 'adopted'; read: number; seq: number } | undefined => {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  const seq = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+  if (r.kind === 'applied' && seq(r.toSeq) && Object.keys(r).length === 2) return { kind: 'applied', toSeq: r.toSeq };
+  if (r.kind === 'adopted' && seq(r.read) && seq(r.seq) && Object.keys(r).length === 3) return { kind: 'adopted', read: r.read, seq: r.seq };
+  return undefined;
+};
 
 /**
  * Registers the snapshot, command and query handlers and the batch acknowledgement, and starts forwarding events.
@@ -184,7 +193,9 @@ export function registerAppIpc(options: AppIpcOptions): () => void {
   options.onBatcher?.(batcher);
   // Everything queued goes out before the Snapshot's seq is read, in the same synchronous step (facade.snapshot reads
   // the seq before its first await), so the next batch starts right after that seq (C-27).
-  handleTrusted(SNAPSHOT_CHANNEL, getTrustedSender, () => readForWindow(batcher, facade, options.onSnapshot));
+  // The read without its number (an older preload): nothing it brings back is taken as reached, so it stays owed.
+  handleTrusted(SNAPSHOT_CHANNEL, getTrustedSender, () => readForWindow(batcher, facade, options.onSnapshot).then((r) => r.snapshot));
+  handleTrusted(SNAPSHOT_READ_CHANNEL, getTrustedSender, () => readForWindow(batcher, facade, options.onSnapshot));
   handleTrusted(COMMAND_CHANNEL, getTrustedSender, (raw: unknown) => runCommand(facade, raw));
   handleTrusted(QUERY_CHANNEL, getTrustedSender, (raw: unknown) => runQuery(facade, raw));
   const onAck = (event: IpcSenderEvent, toSeq: unknown) => {
@@ -193,8 +204,17 @@ export function registerAppIpc(options: AppIpcOptions): () => void {
     if (typeof toSeq === 'number' && Number.isSafeInteger(toSeq)) batcher.ack(toSeq);
   };
   ipcMain.on(BATCH_ACK_CHANNEL, onAck);
+  // What the renderer says reached it (T040 r3): only that lets the batcher stop owing a record.
+  const onReport = (event: IpcSenderEvent, raw: unknown) => {
+    if (!isTrustedSender(event, getTrustedSender())) return;
+    const report = windowReport(raw);
+    if (report?.kind === 'applied') batcher.applied(report.toSeq);
+    else if (report?.kind === 'adopted') batcher.adopted(report.read, report.seq);
+  };
+  ipcMain.on(WINDOW_REPORT_CHANNEL, onReport);
   return () => {
     ipcMain.removeListener(BATCH_ACK_CHANNEL, onAck);
+    ipcMain.removeListener(WINDOW_REPORT_CHANNEL, onReport);
     stop();
   };
 }
