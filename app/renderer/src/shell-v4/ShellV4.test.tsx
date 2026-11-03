@@ -136,12 +136,12 @@ describe('T047 sidebar modes', () => {
   it('switches between 對話 and Workflow with the same parts, and counts escalations waiting in the other mode', () => {
     open('shell=v4');
     expect(mode(/^對話$/).getAttribute('aria-pressed')).toBe('true');
-    expect(mode(/^Workflow，待處理 3 件$/)).toBeTruthy();
+    expect(mode(/^Workflow，有待處理項目$/)).toBeTruthy();
     expect(sidebar().getByRole('button', { name: '新對話' })).toBeTruthy();
     expect(sidebar().queryByRole('button', { name: '模板' })).toBeNull();
     fireEvent.click(mode(/^Workflow/));
     expect(mode(/^Workflow$/).getAttribute('aria-pressed')).toBe('true');
-    expect(mode(/^對話，待處理 1 件$/)).toBeTruthy();
+    expect(mode(/^對話，有待處理項目$/)).toBeTruthy();
     expect(sidebar().getByRole('button', { name: '開始 Workflow' })).toBeTruthy();
     expect(sidebar().getByRole('button', { name: '模板' })).toBeTruthy();
     expect(sidebar().getByRole('button', { name: 'Agent' })).toBeTruthy();
@@ -153,7 +153,10 @@ describe('T047 sidebar modes', () => {
   it('lists one row per run with its state, folded by default', () => {
     open('shell=v4&mode=workflow');
     const runs = within(sidebar().getByRole('region', { name: '執行' }));
-    expect(runs.getByRole('button', { name: /^登入功能.*等待核准/ })).toBeTruthy();
+    const login = runs.getByRole('button', { name: /^登入功能.*等待核准/ });
+    // Pending items are a dot with text for screen readers, never a count.
+    expect(within(login).getByRole('img', { name: '有待處理項目' }).textContent).toBe('');
+    expect(runs.getByRole('button', { name: /^文件 review/ }).querySelector('.v4-alert')).toBeNull();
     expect(runs.getByRole('button', { name: /^文件 review.*執行中/ })).toBeTruthy();
     expect(runs.getByRole('button', { name: /^匯出報表.*失敗/ })).toBeTruthy();
     expect(within(sidebar().getByRole('region', { name: '釘選' })).getByRole('button', { name: /^新人文件整理.*完成/ })).toBeTruthy();

@@ -45,7 +45,8 @@
 .v4-activity[data-state='running'] { background: var(--running); }
 .v4-activity[data-state='waiting-user'], .v4-activity[data-state='waiting-lock'] { background: var(--warning); }
 .v4-activity[data-state='error'] { background: var(--error); }
-.v4-pending { min-width: 18px; padding: 0 5px; border-radius: 9px; background: var(--warning); color: var(--bg); font-size: 11px; font-weight: 700; text-align: center; }
+/* A dot that says "something is waiting for you"; the count is not shown (REVISION_V0_4 §3.1). */
+.v4-alert { flex: 0 0 8px; width: 8px; height: 8px; margin-right: 4px; border-radius: 50%; background: var(--warning); box-shadow: 0 0 0 2px var(--panel), 0 0 6px var(--warning); }
 .v4-run-title { flex: 1; min-width: 0; padding: 5px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13px; }
 .v4-run-state { font-size: 11px; padding-right: 8px; }
 .v4-sidebar-foot { display: grid; gap: 2px; padding-top: 8px; border-top: 1px solid var(--line); }
@@ -217,7 +218,7 @@
 .v4-mode button { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 5px 8px; border: 0; border-radius: 7px; background: var(--transparent); color: var(--muted); font-weight: 600; font-size: 13px; }
 .v4-shell .v4-mode button:hover:not(:disabled) { background: var(--transparent); color: var(--text); }
 .v4-shell .v4-mode button[aria-pressed='true'] { background: var(--raised); color: var(--text); box-shadow: 0 1px 2px var(--shadow); }
-.v4-mode .v4-pending { min-width: 16px; padding: 0 4px; font-size: 10px; line-height: 16px; }
+.v4-mode .v4-alert { margin-right: 0; box-shadow: 0 0 6px var(--warning); }
 .v4-mode-links { display: grid; gap: 2px; }
 .v4-row-current { box-shadow: inset 2px 0 0 var(--accent); }
 .v4-row-tag { flex: 0 1 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 11px; }

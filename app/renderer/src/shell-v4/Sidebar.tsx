@@ -60,7 +60,7 @@ export function Sidebar(props: SidebarProps) {
   const pendingFrom = (id: string) => snapshot.escalations.filter(item => item.state === 'open' && item.fromSessionId === id).length;
   const pendingIn = (value: SidebarMode) => snapshot.escalations.filter(item => item.state === 'open' && modeOf(snapshot, item.fromSessionId) === value).length;
 
-  /** One list row, the same for a chat, a node session and a run: toggle, main button, children. */
+  /** One list row, the same for a chat, a node session and a run: toggle, main button, children. Pending items show as a dot, not a count. */
   const listRow = (row: {
     key: string; data: Record<string, string>; label: string; tooltip: string; dot: string; pending: number; extra?: ReactNode;
     selected: boolean; current?: boolean; children: ReactNode[]; defaultOpen: boolean; onOpen: () => void; menu: ContextTarget['kind'];
@@ -81,7 +81,7 @@ export function Sidebar(props: SidebarProps) {
           <span className="v4-activity" data-state={row.dot} aria-hidden="true" />
           <span className="v4-session-title">{row.label}</span>
           {row.extra}
-          {row.pending > 0 && <span className="v4-pending" aria-label={`待處理 ${row.pending} 件`}>{row.pending}</span>}
+          {row.pending > 0 && <span className="v4-alert" role="img" aria-label="有待處理項目" />}
         </button>}
       </div>
       {row.children.length > 0 && expanded && <ul>{row.children}</ul>}
@@ -142,8 +142,8 @@ export function Sidebar(props: SidebarProps) {
       <div className="v4-mode" role="group" aria-label="側欄模式">
         {(['chat', 'workflow'] as const).map(value => {
           const count = value === mode ? 0 : pendingIn(value);
-          return <button type="button" key={value} aria-pressed={value === mode} aria-label={count ? `${modeLabels[value]}，待處理 ${count} 件` : modeLabels[value]}
-            onClick={() => props.onMode(value)}>{modeLabels[value]}{count > 0 && <span className="v4-pending" aria-hidden="true">{count}</span>}</button>;
+          return <button type="button" key={value} aria-pressed={value === mode} aria-label={count ? `${modeLabels[value]}，有待處理項目` : modeLabels[value]}
+            onClick={() => props.onMode(value)}>{modeLabels[value]}{count > 0 && <span className="v4-alert" aria-hidden="true" />}</button>;
         })}
       </div>
       <button type="button" className="v4-icon" aria-label="收合側欄" title="收合側欄" onClick={() => props.onCollapse(true)}>«</button>
