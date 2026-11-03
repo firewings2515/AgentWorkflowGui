@@ -6,9 +6,25 @@ import { fixtureSnapshotInput } from '../../../../contracts/fixtures/snapshot';
 
 const t = (time: string) => `2026-10-24T${time}:00+08:00`;
 
-/** The fixture plus a conversation for 「實作：Session 儲存」 with tool calls, a held push and sub-tasks. */
+const docsRun = fixtureSnapshotInput.instances.find(instance => instance.id === 'inst-docs')!;
+const docsLead = fixtureSnapshotInput.sessions.find(session => session.id === 's-docs-lead')!;
+/** Two earlier runs, so the Workflow list shows every state: completed, and blocked (shown as failed, see T047-report.md). */
+const pastRun = (id: string, title: string, state: 'completed' | 'blocked', time: string) => ({
+  instance: { ...docsRun, id, title, rootSessionId: `s-${id}-lead`, state, tasks: [], rounds: [], createdAt: t(time) },
+  session: { ...docsLead, id: `s-${id}-lead`, title: `${title}（root）`, activity: 'idle', workflow: { instanceId: id, nodeId: 'n-lead' }, createdAt: t(time), updatedAt: t(time) },
+});
+const pastRuns = [pastRun('inst-onboard', '新人文件整理', 'completed', '09:20'), pastRun('inst-export', '匯出報表', 'blocked', '08:40')];
+
+/** The fixture plus a conversation for 「實作：Session 儲存」 with tool calls, a held push and sub-tasks, two earlier runs and a chat escalation. */
 export const v4DemoSnapshot = Snapshot.parse({
   ...fixtureSnapshotInput,
+  sessions: [...fixtureSnapshotInput.sessions, ...pastRuns.map(run => run.session)],
+  instances: [...fixtureSnapshotInput.instances, ...pastRuns.map(run => run.instance)],
+  escalations: [
+    ...fixtureSnapshotInput.escalations,
+    // An ordinary chat waiting for the user, so the 對話 switch shows a count while the sidebar is in Workflow mode.
+    { id: 'esc-chat-1', rootSessionId: 's-handoff-codex', fromSessionId: 's-handoff-codex', kind: 'confirmation', title: '確認轉交內容', detail: '轉交 Codex 的目標與備註', state: 'open', createdAt: t('10:41') },
+  ],
   messages: [
     ...(fixtureSnapshotInput.messages ?? []),
     { id: 'm-b1', sessionId: 's-wf-build-b', turnId: 'turn-b1', role: 'user', origin: { kind: 'handoff', fromSessionId: 's-wf-root', handoffId: 'h-3' },
@@ -34,8 +50,9 @@ export const v4DemoSnapshot = Snapshot.parse({
   ],
 });
 
-/** U2: pinned sessions are a per-user preference the backend should store. */
-export const demoPinned: readonly string[] = ['s-handoff-codex'];
+export type SidebarMode = 'chat' | 'workflow';
+/** U2: pinned items are a per-user preference the backend should store, one list per sidebar mode (REVISION_V0_4 §3.1). */
+export const demoPinned: Record<SidebarMode, readonly string[]> = { chat: ['s-handoff-codex'], workflow: ['inst-onboard'] };
 
 /** U2: default location for auto-created folders (Q-1). Shown unexpanded, as the user would type it. */
 export const defaultFolderRoot = '%USERPROFILE%\\AgentWorkflowGui';

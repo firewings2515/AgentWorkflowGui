@@ -13,7 +13,7 @@
 .v4-rail { flex-basis: 52px; width: 52px; align-items: center; padding: 12px 0; }
 .v4-sidebar-overlay { position: fixed; inset: 0 auto 0 0; box-shadow: 0 0 32px var(--shadow); width: min(300px, 86vw); }
 .v4-scrim { position: fixed; inset: 0; z-index: 2; background: var(--backdrop); }
-.v4-sidebar-top { display: flex; align-items: center; justify-content: space-between; padding: 0 4px 4px 8px; }
+.v4-sidebar-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 2px 4px 2px; }
 .v4-brand { font-size: 14px; letter-spacing: 0.01em; }
 .v4-brand span { color: var(--accent); margin-right: 4px; }
 .v4-new { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px; border-color: var(--transparent); background: var(--transparent); text-align: left; font-weight: 600; }
@@ -209,7 +209,21 @@
 .v4-chip-menu .popup-menu button { padding: 8px 10px; font-size: 13px; }
 .v4-section h2 { display: flex; align-items: center; }
 .v4-section h2 > button:first-child { flex: 1; min-width: 0; }
-.v4-section h2 > .v4-section-action { flex: 0 0 auto; width: 26px; min-width: 26px; height: 24px; padding: 0; font-size: 14px; }
 .v4-message .v4-time { position: absolute; bottom: -17px; right: 4px; margin: 0; }
 .v4-runtime { margin-bottom: 16px; }
 .v4-runtime .settings-heading { margin-top: 8px; }
+/* REVISION_V0_4 §3.1: the 對話｜Workflow switch on top of the sidebar, and what differs per mode. */
+.v4-mode { flex: 1; display: flex; padding: 3px; gap: 2px; border-radius: 10px; background: var(--surface); border: 1px solid var(--line); }
+.v4-mode button { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 5px 8px; border: 0; border-radius: 7px; background: var(--transparent); color: var(--muted); font-weight: 600; font-size: 13px; }
+.v4-shell .v4-mode button:hover:not(:disabled) { background: var(--transparent); color: var(--text); }
+.v4-shell .v4-mode button[aria-pressed='true'] { background: var(--raised); color: var(--text); box-shadow: 0 1px 2px var(--shadow); }
+.v4-mode .v4-pending { min-width: 16px; padding: 0 4px; font-size: 10px; line-height: 16px; }
+.v4-mode-links { display: grid; gap: 2px; }
+.v4-row-current { box-shadow: inset 2px 0 0 var(--accent); }
+.v4-row-tag { flex: 0 1 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 11px; }
+.v4-run .v4-session-title { font-weight: 600; }
+.v4-run-state { flex: 0 0 auto; color: var(--muted); padding-right: 2px; }
+.v4-activity[data-state='waiting'] { background: var(--warning); }
+.v4-activity[data-state='completed'] { background: var(--success); }
+.v4-activity[data-state='blocked'] { background: var(--error); }
+.v4-rename { flex: 1; min-width: 0; margin: 2px 4px 2px 0; padding: 4px 6px; font-size: 13px; }

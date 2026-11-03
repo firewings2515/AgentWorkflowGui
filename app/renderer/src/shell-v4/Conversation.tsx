@@ -66,6 +66,8 @@ function TaskList({ tasks }: { tasks: NativeTask[] }) {
 
 export interface ConversationProps {
   snapshot: Snapshot; pane: V4Pane; title: string; active: boolean; split: boolean;
+  /** The owning run's title, after any rename in the sidebar. */
+  runTitle?: string | undefined;
   agents: readonly AgentDefinition[]; draft: string; choice: ComposerChoice; editTitle: number;
   onDraft: (text: string) => void; onChoice: (choice: ComposerChoice) => void;
   onPane: (patch: Partial<V4Pane>) => void; onRename: (title: string) => void; onClose: () => void; onFocus: () => void;
@@ -113,7 +115,7 @@ export function Conversation(props: ConversationProps) {
         {session.kind === 'workflow' && <HoverMenu label="所屬 Workflow 選單" items={[
           { label: '查看流程進度', onSelect: () => props.onProgress(session.workflow.instanceId) },
           ...(instance && instance.rootSessionId !== session.id ? [{ label: '開啟 root session', onSelect: () => props.onOpen(instance.rootSessionId) }] : []),
-        ]}>Workflow：{instance?.title ?? session.workflow.instanceId} <span aria-hidden="true">⋯</span></HoverMenu>}
+        ]}>Workflow：{props.runTitle ?? instance?.title ?? session.workflow.instanceId} <span aria-hidden="true">⋯</span></HoverMenu>}
         <span className="v4-titlebar-spacer" />
         <Status value={session.activity} />
         <button type="button" className="v4-icon" aria-pressed={pane.details} aria-label={pane.details ? '關閉細節窗格' : '開啟細節窗格'} title="細節" onClick={() => onPane({ details: !pane.details })}>◫</button>

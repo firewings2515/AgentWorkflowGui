@@ -12,9 +12,9 @@ import { defaultModelKey } from './Composer';
 import type { ComposerChoice } from './Composer';
 import { Conversation } from './Conversation';
 import { demoPinned, nextAutoFolder, v4DemoSnapshot } from './demo-data';
-import type { V4Page, V4Pane } from './demo-data';
+import type { SidebarMode, V4Page, V4Pane } from './demo-data';
 import { NewChat, SettingsV4, WorkflowStartV4 } from './Pages';
-import { Sidebar } from './Sidebar';
+import { modeOf, Sidebar } from './Sidebar';
 import '../styles.css';
 import './shell-v4.css';
 
@@ -28,6 +28,8 @@ const subscribeWidth = (onChange: () => void) => {
 };
 const pages: readonly V4Page[] = ['new', 'chat', 'settings', 'workflow-start', 'agents', 'templates', 'progress'];
 const tabs = ['files', 'tasks', 'messages', 'info'] as const;
+// Pages that belong to one sidebar mode; going there switches the sidebar too. Settings keeps the current mode.
+const pageModes: Partial<Record<V4Page, SidebarMode>> = { new: 'chat', 'workflow-start': 'workflow', agents: 'workflow', templates: 'workflow', progress: 'workflow' };
 
 /** Initial state from the URL, so each screenshot state can be opened directly. Interaction works from there as usual. */
 function initial(snapshot: Snapshot) {
@@ -41,12 +43,16 @@ function initial(snapshot: Snapshot) {
     ...(first ? [{ id: 'pane-1', sessionId: first, details: params.get('details') === '1', tab }] : []),
     ...(second ? [{ id: 'pane-2', sessionId: second, details: false, tab: 'files' as const }] : []),
   ];
-  return { page: page === 'chat' && !panes.length ? 'new' as const : page, panes, sidebar: params.get('sidebar') !== '0', instance: params.get('instance') ?? snapshot.instances[0]?.id ?? '' };
+  const shown = page === 'chat' && !panes.length ? 'new' as const : page;
+  const mode = (['chat', 'workflow'] as const).find(value => value === params.get('mode'))
+    ?? (shown === 'chat' && first ? modeOf(snapshot, first) : pageModes[shown] ?? 'chat');
+  return { page: shown, panes, mode, sidebar: params.get('sidebar') !== '0', instance: params.get('instance') ?? snapshot.instances[0]?.id ?? '' };
 }
 
 export function ShellV4({ snapshot = v4DemoSnapshot }: { snapshot?: Snapshot }) {
   const start = useMemo(() => initial(snapshot), [snapshot]);
   const [page, setPage] = useState<V4Page>(start.page);
+  const [mode, setMode] = useState<SidebarMode>(start.mode);
   const [panes, setPanes] = useState<V4Pane[]>(start.panes);
   const [activePane, setActivePane] = useState('pane-1');
   const [nextPane, setNextPane] = useState(3);
@@ -56,7 +62,7 @@ export function ShellV4({ snapshot = v4DemoSnapshot }: { snapshot?: Snapshot }) 
   const [sidebarOpen, setSidebarOpen] = useState(start.sidebar);
   const [narrowOpen, setNarrowOpen] = useState(false);
   const [titles, setTitles] = useState<Record<string, string>>({});
-  const [pinned, setPinned] = useState<Set<string>>(() => new Set(demoPinned));
+  const [pinned, setPinned] = useState<Record<SidebarMode, ReadonlySet<string>>>(() => ({ chat: new Set(demoPinned.chat), workflow: new Set(demoPinned.workflow) }));
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [choices, setChoices] = useState<Record<string, ComposerChoice>>({});
   const [editTitle, setEditTitle] = useState<{ sessionId: string; nonce: number }>({ sessionId: '', nonce: 0 });
@@ -79,13 +85,15 @@ export function ShellV4({ snapshot = v4DemoSnapshot }: { snapshot?: Snapshot }) 
   const choiceFor = (key: string, session?: Snapshot['sessions'][number]): ComposerChoice => choices[key] ?? (session
     ? { folder: { kind: 'picked', path: session.cwd }, agentId: session.agent.id, modelKey: `${session.requestedModel.runtime}:${session.requestedModel.model}` }
     : { folder: { kind: 'auto' }, agentId: '', modelKey: defaultModelKey(snapshot.modelOptions) });
-  const go = (next: V4Page) => { setPage(next); if (narrow) setNarrowOpen(false); };
+  const go = (next: V4Page) => { setPage(next); const nextMode = pageModes[next]; if (nextMode) setMode(nextMode); if (narrow) setNarrowOpen(false); };
   const patchPane = (id: string, patch: Partial<V4Pane>) => setPanes(previous => previous.map(pane => pane.id === id ? { ...pane, ...patch } : pane));
   const open = (sessionId: SessionId) => {
     const shown = panes.find(pane => pane.sessionId === sessionId);
     if (shown) setActivePane(shown.id);
     else if (active) patchPane(active.id, { sessionId });
     else { setPanes([{ id: 'pane-1', sessionId, details: false, tab: 'files' }]); setActivePane('pane-1'); }
+    // Opening a node session from anywhere (split view, search, a link) shows it in Workflow mode, under its run.
+    setMode(modeOf(snapshot, sessionId));
     go('chat');
   };
   const split = (sessionId: SessionId) => {
@@ -93,6 +101,7 @@ export function ShellV4({ snapshot = v4DemoSnapshot }: { snapshot?: Snapshot }) 
     if (!active) { open(sessionId); return; }
     if (other) { patchPane(other.id, { sessionId }); setActivePane(other.id); }
     else { const id = `pane-${nextPane}`; setNextPane(nextPane + 1); setPanes([...panes, { id, sessionId, details: false, tab: 'files' }]); setActivePane(id); }
+    setMode(modeOf(snapshot, sessionId));
     go('chat');
   };
   const closePane = (id: string) => {
@@ -105,7 +114,8 @@ export function ShellV4({ snapshot = v4DemoSnapshot }: { snapshot?: Snapshot }) 
   if (page === 'chat' && panes.length) main = <div className={`v4-panes ${panes.length > 1 ? 'v4-split' : ''}`}>{panes.map(pane => {
     const session = snapshot.sessions.find(item => item.id === pane.sessionId);
     const title = titles[pane.sessionId] ?? session?.title ?? pane.sessionId;
-    return <Conversation key={pane.id} snapshot={snapshot} pane={pane} title={title} active={pane.id === active?.id} split={panes.length > 1}
+    const runTitle = session?.kind === 'workflow' ? titles[session.workflow.instanceId] : undefined;
+    return <Conversation key={pane.id} snapshot={snapshot} pane={pane} title={title} runTitle={runTitle} active={pane.id === active?.id} split={panes.length > 1}
       agents={agents} draft={drafts[pane.sessionId] ?? ''} choice={choiceFor(pane.sessionId, session)}
       editTitle={editTitle.sessionId === pane.sessionId ? editTitle.nonce : 0}
       onDraft={text => setDrafts(previous => ({ ...previous, [pane.sessionId]: text }))}
@@ -122,15 +132,22 @@ export function ShellV4({ snapshot = v4DemoSnapshot }: { snapshot?: Snapshot }) 
     choice={choiceFor('new')} onChoice={choice => setChoices(previous => ({ ...previous, new: choice }))} autoFolder={autoFolder} onNotice={setNotice} />;
 
   return <div className={`v4-shell ${collapsed ? 'v4-collapsed' : ''} ${narrow ? 'v4-narrow' : ''}`} data-testid="shell-v4">
-    <Sidebar snapshot={snapshot} titles={titles} pinned={pinned} selectedId={active?.sessionId} page={page} collapsed={collapsed} overlay={narrow} theme={theme}
+    <Sidebar snapshot={snapshot} titles={titles} pinned={pinned} mode={mode} selectedId={active?.sessionId} page={page} collapsed={collapsed} overlay={narrow} theme={theme}
       onCollapse={value => { if (narrow) setNarrowOpen(!value); else setSidebarOpen(!value); }}
+      onMode={value => { setMode(value); if (page === 'new' && value === 'workflow') go('workflow-start'); else if (page === 'workflow-start' && value === 'chat') go('new'); }}
       onNewChat={() => go('new')} onStartWorkflow={() => go('workflow-start')} onOpen={open} onSplit={split} onTheme={setTheme} onPage={go}
-      onPin={id => setPinned(previous => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; })}
+      onPin={id => setPinned(previous => {
+        const key = modeOf(snapshot, id); const next = new Set(previous[key]);
+        if (next.has(id)) next.delete(id); else next.add(id);
+        return { ...previous, [key]: next };
+      })}
+      onRenameRun={(id, name) => setTitles(previous => ({ ...previous, [id]: name }))}
       onRename={id => { open(id); setEditTitle(previous => ({ sessionId: id, nonce: previous.nonce + 1 })); }} />
     {narrow && narrowOpen && <div className="v4-scrim" aria-hidden="true" onClick={() => setNarrowOpen(false)} />}
     <main className="v4-main">
       {narrow && collapsed && <div className="v4-narrow-bar"><button type="button" className="v4-icon" aria-label="開啟側欄" onClick={() => setNarrowOpen(true)}>☰</button><strong>AgentWorkflowGui</strong>
-        <button type="button" className="v4-icon" aria-label="新對話" onClick={() => go('new')}>＋</button></div>}
+        {mode === 'chat' ? <button type="button" className="v4-icon" aria-label="新對話" onClick={() => go('new')}>＋</button>
+          : <button type="button" className="v4-icon" aria-label="開始 Workflow" onClick={() => go('workflow-start')}>＋</button>}</div>}
       {page === 'new' && <div className="v4-main-actions"><button type="button" onClick={() => go('workflow-start')}>開始 Workflow…</button></div>}
       {main}
       <div className="v4-page v4-page-wide" hidden={page !== 'agents'}>

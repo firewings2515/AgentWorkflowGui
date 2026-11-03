@@ -97,10 +97,10 @@ describe('T047 sidebar', () => {
     fireEvent.change(sidebar().getByRole('searchbox'), { target: { value: 'review' } });
     expect(sidebar().getByRole('region', { name: '搜尋結果' })).toBeTruthy();
     expect(sidebar().queryByRole('button', { name: '規劃想法' })).toBeNull();
-    expect(row('Review：表單驗證')).toBeTruthy();
+    expect(sidebar().getByRole('button', { name: /^Review：表單驗證登入功能/ })).toBeTruthy();
   });
   it('opens the context menu by right click or Shift+F10, closes on Esc and returns focus', () => {
-    open('shell=v4&page=chat&session=s-wf-build-b');
+    open('shell=v4&page=chat&session=s-wf-build-b&mode=chat');
     const target = row('規劃想法');
     fireEvent.contextMenu(target, { clientX: 40, clientY: 200 });
     const menu = screen.getByRole('menu', { name: '規劃想法 的選單' });
@@ -114,7 +114,7 @@ describe('T047 sidebar', () => {
     expect(screen.getByRole('menu', { name: '規劃想法 的選單' })).toBeTruthy();
   });
   it('opens a second conversation side by side from the context menu, and closes one side', () => {
-    open('shell=v4&page=chat&session=s-wf-build-b');
+    open('shell=v4&page=chat&session=s-wf-build-b&mode=chat');
     fireEvent.contextMenu(row('規劃想法'));
     fireEvent.click(screen.getByRole('menuitem', { name: '在分割畫面開啟' }));
     expect(pane('實作：Session 儲存')).toBeTruthy();
@@ -127,6 +127,85 @@ describe('T047 sidebar', () => {
     fireEvent.contextMenu(row('參考資料整理'));
     fireEvent.click(screen.getByRole('menuitem', { name: '釘選' }));
     expect(within(sidebar().getByRole('region', { name: '釘選' })).getByRole('button', { name: '參考資料整理' })).toBeTruthy();
+  });
+});
+
+describe('T047 sidebar modes', () => {
+  const mode = (name: RegExp) => sidebar().getByRole('button', { name });
+  const like = (name: RegExp) => sidebar().getByRole('button', { name });
+  it('switches between 對話 and Workflow with the same parts, and counts escalations waiting in the other mode', () => {
+    open('shell=v4');
+    expect(mode(/^對話$/).getAttribute('aria-pressed')).toBe('true');
+    expect(mode(/^Workflow，待處理 3 件$/)).toBeTruthy();
+    expect(sidebar().getByRole('button', { name: '新對話' })).toBeTruthy();
+    expect(sidebar().queryByRole('button', { name: '模板' })).toBeNull();
+    fireEvent.click(mode(/^Workflow/));
+    expect(mode(/^Workflow$/).getAttribute('aria-pressed')).toBe('true');
+    expect(mode(/^對話，待處理 1 件$/)).toBeTruthy();
+    expect(sidebar().getByRole('button', { name: '開始 Workflow' })).toBeTruthy();
+    expect(sidebar().getByRole('button', { name: '模板' })).toBeTruthy();
+    expect(sidebar().getByRole('button', { name: 'Agent' })).toBeTruthy();
+    expect(sidebar().getByRole('searchbox')).toBeTruthy();
+    expect(sidebar().getByRole('button', { name: '設定' })).toBeTruthy();
+    // The new-chat page belongs to 對話; switching modes moves to the Workflow start page.
+    expect(screen.getByRole('heading', { name: '開始 Workflow' })).toBeTruthy();
+  });
+  it('lists one row per run with its state, folded by default', () => {
+    open('shell=v4&mode=workflow');
+    const runs = within(sidebar().getByRole('region', { name: '執行' }));
+    expect(runs.getByRole('button', { name: /^登入功能.*等待核准/ })).toBeTruthy();
+    expect(runs.getByRole('button', { name: /^文件 review.*執行中/ })).toBeTruthy();
+    expect(runs.getByRole('button', { name: /^匯出報表.*失敗/ })).toBeTruthy();
+    expect(within(sidebar().getByRole('region', { name: '釘選' })).getByRole('button', { name: /^新人文件整理.*完成/ })).toBeTruthy();
+    expect(runs.queryByRole('button', { name: /^實作：Session 儲存/ })).toBeNull();
+    const run = runs.getByRole('button', { name: /^登入功能/ });
+    run.focus();
+    fireEvent.keyDown(run, { key: 'ArrowRight' });
+    expect(runs.getByRole('button', { name: /^實作：Session 儲存/ })).toBeTruthy();
+    expect(runs.getByRole('button', { name: 'Review：表單驗證' })).toBeTruthy();
+  });
+  it('switches to Workflow mode and marks the run when a node session is opened from search', () => {
+    open('shell=v4');
+    fireEvent.change(sidebar().getByRole('searchbox'), { target: { value: 'session 儲存' } });
+    fireEvent.click(like(/^實作：Session 儲存登入功能/));
+    fireEvent.change(sidebar().getByRole('searchbox'), { target: { value: '' } });
+    expect(mode(/^Workflow$/).getAttribute('aria-pressed')).toBe('true');
+    const node = like(/^實作：Session 儲存/);
+    expect(node.getAttribute('aria-current')).toBe('true');
+    expect(node.closest('li.v4-run')?.querySelector('.v4-row-current')).toBeTruthy();
+  });
+  it('switches modes when a split view opens a session of the other mode', () => {
+    open('shell=v4&page=chat&session=s-plan-notes');
+    expect(mode(/^對話$/).getAttribute('aria-pressed')).toBe('true');
+    fireEvent.change(sidebar().getByRole('searchbox'), { target: { value: 'review：表單' } });
+    fireEvent.contextMenu(like(/^Review：表單驗證/));
+    fireEvent.click(screen.getByRole('menuitem', { name: '在分割畫面開啟' }));
+    expect(pane('規劃想法')).toBeTruthy();
+    expect(pane('Review：表單驗證')).toBeTruthy();
+    expect(mode(/^Workflow$/).getAttribute('aria-pressed')).toBe('true');
+  });
+  it('keeps one pinned list per mode', () => {
+    open('shell=v4');
+    fireEvent.contextMenu(row('參考資料整理'));
+    fireEvent.click(screen.getByRole('menuitem', { name: '釘選' }));
+    fireEvent.click(mode(/^Workflow/));
+    const pins = within(sidebar().getByRole('region', { name: '釘選' }));
+    expect(pins.queryByRole('button', { name: '參考資料整理' })).toBeNull();
+    fireEvent.contextMenu(pins.getByRole('button', { name: /^新人文件整理/ }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '取消釘選' }));
+    expect(sidebar().queryByRole('region', { name: '釘選' })).toBeNull();
+    fireEvent.click(mode(/^對話/));
+    expect(within(sidebar().getByRole('region', { name: '釘選' })).getByRole('button', { name: '參考資料整理' })).toBeTruthy();
+  });
+  it('renames a run in place from its context menu', () => {
+    open('shell=v4&mode=workflow');
+    fireEvent.contextMenu(like(/^匯出報表/));
+    fireEvent.click(screen.getByRole('menuitem', { name: '重新命名' }));
+    const input = screen.getByRole<HTMLInputElement>('textbox', { name: '執行名稱' });
+    fireEvent.change(input, { target: { value: '月報匯出' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    fireEvent.blur(input);
+    expect(like(/^月報匯出失敗/)).toBeTruthy();
   });
 });
 
