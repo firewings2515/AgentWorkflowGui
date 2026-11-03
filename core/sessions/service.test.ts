@@ -32,7 +32,8 @@ describe('session.create', () => {
     expect(result).toMatchObject({ ok: true, revision: 0, created: [{ kind: 'session', id: 'session-a' }] });
     const s = await session(w, 'session-a');
     expect(LogicalSession.parse(s)).toBeTruthy();
-    expect(s).toMatchObject({ kind: 'ordinary', title: 'Reviewer', cwd: CWD, folderScope: { source: 'session-cwd', workspaceRoot: REAL_CWD, writableRoots: [REAL_CWD] }, activity: 'idle' });
+    // T048: named by its first message, so the placeholder until then.
+    expect(s).toMatchObject({ kind: 'ordinary', title: '新對話', autoTitle: true, cwd: CWD, folderScope: { source: 'session-cwd', workspaceRoot: REAL_CWD, writableRoots: [REAL_CWD] }, activity: 'idle' });
     const codex = w.codex.get(sessionId)!;
     expect(codex.started).toHaveLength(1);
     expect(codex.started[0]).toMatchObject({ sessionId, cwd: CWD, model: { runtime: 'codex', model: 'gpt-6-luna' }, instructions: 'Review carefully.', mcp: w.mounts[0]!.mount });

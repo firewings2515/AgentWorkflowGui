@@ -309,6 +309,7 @@ export const fixtureSnapshotInput: z.input<typeof Snapshot> = {
       waiters: [{ sessionId: 's-plan-notes', via: 'wait_for_file', since: t('10:25'), deadline: t('10:35') }] },
   ],
   preferences: { theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } },
+  defaultWorkFolderRoot: 'C:/Users/demo/AgentWorkflowGui',
   historyPages: [{ sessionId: 's-plan-notes', olderCursor: 'cursor-plan-notes-1' }],
   storage: { lastBackupAt: t('09:00') },
   // C-33: Claude Code found on PATH and signed in with a subscription; Codex installed but too old.

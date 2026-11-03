@@ -161,7 +161,7 @@ const prepare = async (s: Started) => {
 };
 
 const startRun = (s: Started) =>
-  s.run({ type: 'workflow.start', requestId: rid(), instanceId: INSTANCE, rootSessionId: ROOT, workflowId: WORKFLOW, workflowRevision: 0, title: 'Login page', cwd: dir, firstMessage: 'Plan a login page.', crossToolConsent: true });
+  s.run({ type: 'workflow.start', requestId: rid(), instanceId: INSTANCE, rootSessionId: ROOT, workflowId: WORKFLOW, workflowRevision: 0, title: 'Login page', workFolder: dir, projectFolder: dir, firstMessage: 'Plan a login page.', crossToolConsent: true });
 
 const nodeSession = async (s: Started, nodeId: string) => {
   const snap = await snapshot(s);

@@ -89,6 +89,17 @@ describe('RuntimeAdapter port', () => {
     expect(h.fake.mismatches).toEqual([]);
   });
 
+  it('T048: a session without an Agent starts with no developer instructions of ours', async () => {
+    const h = setup([...init(), out('thread/start', 2, { cwd: CWD, model: 'gpt-6-luna' }), reply(2, recordedResult(sp01, 'thread/start'))]);
+    await h.adapter.start();
+    await h.adapter.startSession({ sessionId: SESSION, cwd: CWD, model: { runtime: 'codex', model: 'gpt-6-luna' }, readOnly: false, preallocatedRef: 'ignored-by-codex' });
+    const params = sentParams(h.fake, 'thread/start');
+    expect(params).toMatchObject({ cwd: CWD, model: 'gpt-6-luna' });
+    expect(params).not.toHaveProperty('developerInstructions');
+    expect(params).not.toHaveProperty('baseInstructions');
+    expect(h.fake.mismatches).toEqual([]);
+  });
+
   it('resumes a session with its model and lets an explicit entry model win over a pending one', async () => {
     const h = setup([
       ...init(),

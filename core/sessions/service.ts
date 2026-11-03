@@ -12,7 +12,10 @@ import {
   type AppEvent,
   type Command,
   type CommandResult,
+  DEFAULT_SESSION_TITLE,
   type DeliveryTarget,
+  SESSION_TITLE_MAX_LENGTH,
+  titleFromMessage,
   type Escalation,
   EscalationId,
   type InstanceId,
@@ -61,10 +64,14 @@ import type {
   RuntimeEvent,
   SessionSettings,
   StoredDelivery,
+  WorkFolderClaim,
+  WorkFolderFs,
 } from '../ports';
+import { CommitUncertainError } from '../ports/delivery';
 import type { IdleFacts } from '../supervisor/idle';
 import { PermissionGate } from './permissions';
 import { SessionRuntimes } from './runtimes';
+import { type Allocated, WorkFolders } from './work-folders';
 import { WrittenPaths, type WrittenPathsOptions } from './written-paths';
 import { gated, ServiceClosedError } from './write-gate';
 
@@ -227,6 +234,11 @@ export interface SessionServiceOptions {
    * (tests that are not about locks).
    */
   locks?: Pick<LockCoordinatorOptions, 'hashFile' | 'setTimer' | 'holdMs' | 'waitMs' | 'isIgnored'>;
+  /**
+   * Work folders made for sessions and runs started without one (T048, U-02). `defaultRoot` is where they go when
+   * the user set no `workFolderRoot` (`%USERPROFILE%\AgentWorkflowGui`). Absent: a folder must always be given.
+   */
+  workFolders?: { fs: WorkFolderFs; defaultRoot: string; day?: (at: Timestamp) => string };
   log?(message: string): void;
 }
 
@@ -282,6 +294,12 @@ const RESEND_MISMATCH: Refusal = { reason: 'resend-mismatch', detail: 'this oper
 /** One queue per session for its commands and its runtime events (r1-P1-4). */
 const sessionKey = (sessionId: SessionId) => `session:${sessionId}`;
 const closingFailure = (requestId: Failure['requestId']) => fail(requestId, 'runtime_unavailable', 'The application is closing');
+/** The session with its title fixed: no `autoTitle` any more. */
+const withoutAutoTitle = (s: LogicalSession): LogicalSession => {
+  const next = { ...s };
+  delete next.autoTitle;
+  return next;
+};
 /** Why a request of a released opening of its session is declined (T036 r3 P1-2). */
 const EARLIER_OPENING = 'the session was closed and opened again since this request; it is not approved';
 
@@ -403,12 +421,26 @@ export class SessionService {
    * is in `known` and never ends the wait; until it ends, no other handoff goes to that session.
    */
   private readonly handoffTurns = new Map<SessionId, { operationId: OperationId; known: Set<string>; started?: string; expected?: string }>();
+  /** Folders made for sessions and runs started without one (T048); absent without `options.workFolders`. */
+  private readonly workFolders: WorkFolders | undefined;
 
   constructor(private readonly options: SessionServiceOptions) {
     // Storage only through the write gate: once shutdown returned, nothing reaches it (r2-P1-4).
     this.repos = gated(options.repositories, () => this.closed);
     this.store = gated(options.store, () => this.closed);
     this.written = new WrittenPaths(options.written);
+    if (options.workFolders !== undefined) {
+      const { fs, defaultRoot, day } = options.workFolders;
+      this.workFolders = new WorkFolders({
+        claims: this.repos.workFolders,
+        fs,
+        location: async () => (await this.repos.preferences.get()).workFolderRoot ?? defaultRoot,
+        now: () => options.now(),
+        ...(day !== undefined && { day }),
+        resolveRealPath: (path) => options.resolveRealPath(path),
+        log: (message) => options.log?.(message),
+      });
+    }
     if (options.locks !== undefined) {
       this.locks = new LockCoordinator({
         ...options.locks,
@@ -829,7 +861,10 @@ export class SessionService {
       this.serial(sessionKey(sessionId), () => (this.closing ? Promise.resolve(closingFailure(command.requestId)) : run()));
     switch (command.type) {
       case 'session.create':
-        return this.create(command);
+        // In its session's queue (T048): a repeat of the same ID waits for the first and finds its session and folder.
+        return queued(command.sessionId, () => this.create(command));
+      case 'session.rename':
+        return queued(command.sessionId, () => this.rename(command));
       case 'session.send':
         return queued(command.sessionId, () => this.send(command));
       case 'session.interrupt':
@@ -855,15 +890,9 @@ export class SessionService {
         return this.respond(command);
       case 'delivery.resolve':
         return this.resolveDelivery(command);
-      case 'preferences.set': {
-        const preferences = await this.repos.preferences.set(command.preferences);
-        this.options.publish({
-          type: 'preferences.updated',
-          preferences,
-          at: this.options.now(),
-        });
-        return ok(command.requestId);
-      }
+      case 'preferences.set':
+        // One at a time, in order (T048): the folder check reads what is saved before the next one writes.
+        return this.serial('preferences', () => (this.closing ? Promise.resolve(closingFailure(command.requestId)) : this.setPreferences(command)));
       case 'workflow.start':
         if (this.workflow !== undefined) return this.workflow.start(command);
         return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
@@ -892,22 +921,38 @@ export class SessionService {
   }
 
   private async create(command: CommandOf<'session.create'>): Promise<CommandResult> {
-    const { requestId, sessionId, agentId, model, cwd, parentId } = command;
+    const { requestId, sessionId, agentId, model, parentId } = command;
     const repositories = this.repos;
-    const agent = await repositories.agents.get(agentId);
-    if (agent === undefined) return fail(requestId, 'not_found', 'Unknown agent');
+    // Without an Agent the runtime gets no instructions of ours (U-01).
+    const agent = agentId === undefined ? undefined : await repositories.agents.get(agentId);
+    if (agentId !== undefined && agent === undefined) return fail(requestId, 'not_found', 'Unknown agent');
     if (!(this.options.isRuntimeAvailable?.(model.runtime) ?? true))
       return fail(requestId, 'runtime_unavailable', `${model.runtime} is not available on this computer`);
     if (parentId !== undefined && (await repositories.sessions.get(parentId)) === undefined) return fail(requestId, 'not_found', 'Unknown parent session');
+    // A repeat of a create that went through (CR-2): said so before any folder is made for it.
+    if ((await repositories.sessions.get(sessionId)) !== undefined) return fail(requestId, 'already_exists', 'A session with this ID already exists');
+    if (this.closing) return closingFailure(requestId);
+    let cwd = command.cwd;
+    let made: string | undefined;
+    if (cwd === undefined) {
+      const allocated = await this.allocateWorkFolder(sessionId);
+      if (!allocated.ok) return fail(requestId, allocated.taken === true ? 'already_exists' : 'invalid_request', allocated.message);
+      cwd = made = allocated.path;
+    }
     const root = this.options.resolveRealPath(cwd);
-    if (root === null) return fail(requestId, 'invalid_request', 'The working folder cannot be resolved');
+    if (root === null) {
+      if (made !== undefined) await this.releaseWorkFolder(sessionId, made);
+      return fail(requestId, 'invalid_request', 'The working folder cannot be resolved');
+    }
     const at = this.options.now();
     const session: LogicalSession = {
       id: sessionId,
       revision: 0,
       kind: 'ordinary',
-      title: agent.name,
-      agent: { id: agent.id, revision: agent.revision },
+      // Named by its first message (T048, like Claude), with or without an Agent.
+      title: DEFAULT_SESSION_TITLE,
+      autoTitle: true,
+      ...(agent !== undefined && { agent: { id: agent.id, revision: agent.revision } }),
       requestedModel: model,
       observedModel: { source: 'unknown' },
       activity: 'closed',
@@ -922,8 +967,24 @@ export class SessionService {
       createdAt: at,
       updatedAt: at,
     };
-    if (this.closing) return closingFailure(requestId);
-    if ((await repositories.sessions.create(session)) === 'exists') return fail(requestId, 'already_exists', 'A session with this ID already exists');
+    if (this.closing) {
+      if (made !== undefined) await this.releaseWorkFolder(sessionId, made);
+      return closingFailure(requestId);
+    }
+    let stored: 'created' | 'exists';
+    try {
+      stored = await repositories.sessions.create(session);
+    } catch (error) {
+      // No half-made session (T048): the claim of a folder made for a session that was not stored goes, also when the
+      // write was refused (read-only data, r1 P1-3); the folder itself stays (r2). Only when it is not known whether the
+      // session was stored does the claim stay; the next start's check settles it.
+      if (made !== undefined && !(error instanceof CommitUncertainError) && (await this.storedOrUnknown(sessionId)) === 'absent') await this.releaseWorkFolder(sessionId, made);
+      throw error;
+    }
+    if (stored === 'exists') {
+      if (made !== undefined && (await repositories.sessions.get(sessionId))?.cwd !== made) await this.releaseWorkFolder(sessionId, made);
+      return fail(requestId, 'already_exists', 'A session with this ID already exists');
+    }
     this.options.publish({ type: 'session.updated', session });
     // The runtime session is created in the background; a send waits for it.
     void this.serial(sessionKey(sessionId), () => (this.closing ? Promise.resolve(undefined) : this.ensureProvisioned(session))).catch((error: unknown) =>
@@ -933,6 +994,80 @@ export class SessionService {
       revision: session.revision,
       created: [{ kind: 'session', id: sessionId }],
     });
+  }
+
+  /**
+   * A new work folder for a session (an ordinary one, or the root session of `instanceId`'s run) started without one
+   * (T048): the same one when the session asks again. Nothing is made without `options.workFolders`.
+   */
+  async allocateWorkFolder(sessionId: SessionId, instanceId?: InstanceId): Promise<Allocated> {
+    if (this.workFolders === undefined) return { ok: false, message: 'A working folder must be given' };
+    return this.workFolders.allocate(sessionId, instanceId);
+  }
+
+  /** Takes back the folder made for a session that was not created: its claim only; the folder stays (T048 r2). */
+  async releaseWorkFolder(sessionId: SessionId, path: string): Promise<void> {
+    try {
+      await this.workFolders?.release(sessionId, path);
+    } catch (error) {
+      // Left for the next start's check (reconcileWorkFolders).
+      this.log(`taking back the work folder of ${sessionId} failed (${errorName(error)})`);
+    }
+  }
+
+  /**
+   * At start, before any command (T048): work folders claimed for a session that was never stored are removed while
+   * empty. `inUse` adds what else still counts on a claim (a run's start that has not made its root session yet).
+   */
+  async reconcileWorkFolders(inUse: (claim: WorkFolderClaim) => Promise<boolean> = () => Promise.resolve(false)): Promise<void> {
+    await this.workFolders?.reconcile(async (claim) => (await this.repos.sessions.get(claim.sessionId)) !== undefined || (await inUse(claim)));
+  }
+
+  private async storedOrUnknown(sessionId: SessionId): Promise<'stored' | 'absent' | 'unknown'> {
+    try {
+      return (await this.repos.sessions.get(sessionId)) === undefined ? 'absent' : 'stored';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private async rename(command: CommandOf<'session.rename'>): Promise<CommandResult> {
+    const { requestId, sessionId, expectedRevision } = command;
+    const title = command.title.trim();
+    if (title.length === 0 || Array.from(title).length > SESSION_TITLE_MAX_LENGTH)
+      return fail(requestId, 'invalid_request', `A title has 1 to ${SESSION_TITLE_MAX_LENGTH} characters`);
+    // The user's title stays: the first message no longer names the session.
+    return this.updateFromCommand(requestId, sessionId, expectedRevision, (s) => withoutAutoTitle({ ...s, title }));
+  }
+
+  /** A first user message names a session still waiting for its title (T048); the session's revision after it. */
+  private async nameFromFirstMessage(sessionId: SessionId, text: string): Promise<number | undefined> {
+    const saved = await this.updateSession(sessionId, (s) => (s.autoTitle === true ? withoutAutoTitle({ ...s, title: titleFromMessage(text) }) : undefined));
+    return saved === undefined || saved === 'stale' ? undefined : saved.revision;
+  }
+
+  private async setPreferences(command: CommandOf<'preferences.set'>): Promise<CommandResult> {
+    const refused = await this.checkWorkFolderRoot(command.preferences.workFolderRoot);
+    if (refused !== undefined) return fail(command.requestId, 'invalid_request', refused);
+    const preferences = await this.repos.preferences.set(command.preferences);
+    this.options.publish({
+      type: 'preferences.updated',
+      preferences,
+      at: this.options.now(),
+    });
+    return ok(command.requestId);
+  }
+
+  /**
+   * A new work folder location (Q-1): a full path whose links resolve (T042). The one already saved is not checked
+   * again. Undefined when it may be saved; otherwise why not.
+   */
+  private async checkWorkFolderRoot(root: string | undefined): Promise<string | undefined> {
+    if (root === undefined || root === (await this.repos.preferences.get()).workFolderRoot) return undefined;
+    // Checked, never made here (r1 P1-4): a save the storage refuses leaves nothing behind. The first folder made in
+    // it makes the location too.
+    if (this.options.resolveRealPath(root) === null) return 'The work folder location must be a full path that can be resolved';
+    return undefined;
   }
 
   private async send(command: CommandOf<'session.send'>): Promise<CommandResult> {
@@ -1002,9 +1137,12 @@ export class SessionService {
       call,
     });
     const created = [{ kind: 'message' as const, id: messageId }];
+    // Sent (or perhaps sent), so the session is named by it (T048), also on a repeat whose first try stopped before
+    // that. Not while it only waits (the runtime not usable now): a repeat of the same message keeps its revision.
+    const named = outcome === 'sent' || outcome === 'unknown' ? await this.nameFromFirstMessage(sessionId, text) : undefined;
     switch (outcome) {
       case 'sent':
-        return ok(requestId, { revision: session.revision, created });
+        return ok(requestId, { revision: named ?? session.revision, created });
       case 'unknown':
         await this.setActivity(sessionId, 'reconciling');
         return fail(requestId, 'unknown_outcome', 'It is not known whether the message reached the session; it is not sent again', {
@@ -1075,9 +1213,16 @@ export class SessionService {
     const session = await this.repos.sessions.get(sessionId);
     if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
     if (session.kind !== 'ordinary') return fail(requestId, 'invalid_transition', 'A workflow session keeps its agent');
+    // The new instructions (or none, T048) take effect when the runtime session is next started or resumed.
+    if (agentId === null)
+      return this.updateFromCommand(requestId, sessionId, expectedRevision, (s) => {
+        if (s.kind !== 'ordinary') return s;
+        const next = { ...s };
+        delete next.agent;
+        return next;
+      });
     const agent = await this.repos.agents.get(agentId);
     if (agent === undefined) return fail(requestId, 'not_found', 'Unknown agent');
-    // The new instructions take effect when the runtime session is next started or resumed.
     return this.updateFromCommand(requestId, sessionId, expectedRevision, (s) => ({ ...s, agent: { id: agent.id, revision: agent.revision } }));
   }
 
@@ -1134,7 +1279,7 @@ export class SessionService {
     const { requestId, agentId, expectedRevision } = command;
     const repositories = this.repos;
     const inUse =
-      (await repositories.sessions.list()).some((s) => s.agent.id === agentId) ||
+      (await repositories.sessions.list()).some((s) => s.agent?.id === agentId) ||
       (await repositories.workflows.list()).some((w) => w.nodes.some((n) => n.kind === 'agent' && n.agentId === agentId));
     // C-01: an agent a session or a workflow template uses stays.
     if (inUse) return fail(requestId, 'invalid_transition', 'The agent is used by a session or a workflow');
@@ -1547,8 +1692,13 @@ export class SessionService {
      * (`task-worktree`), so it is not same-folder work (R-07 locks). Absent: `session-cwd`, as before.
      */
     worktree?: boolean;
+    /**
+     * The run's other folder (Q-8, T048): readable, and writable when `write` and the node writes. Added to the folder
+     * scope beside the cwd.
+     */
+    extraRoots?: { path: string; write: boolean }[];
   }): Promise<'created' | 'exists' | 'taken' | 'unresolvable' | 'closing'> {
-    const { sessionId, instance, nodeId, taskId, cwd, parentId, worktree } = input;
+    const { sessionId, instance, nodeId, taskId, cwd, parentId, worktree, extraRoots = [] } = input;
     const node = instance.template.nodes.find((n) => n.id === nodeId);
     if (node?.kind !== 'agent') return 'taken';
     // An existing session is this one only when everything the node gives it is the same (T024 r2-P1-4):
@@ -1567,6 +1717,11 @@ export class SessionService {
     if (existing !== undefined) return same(existing) ? 'exists' : 'taken';
     const root = this.options.resolveRealPath(cwd);
     if (root === null) return 'unresolvable';
+    const extra = extraRoots.map((r) => ({ real: this.options.resolveRealPath(r.path), write: r.write && node.writePolicy === 'write' }));
+    if (extra.some((r) => r.real === null)) return 'unresolvable';
+    const writes = node.writePolicy === 'write';
+    const writableRoots = writes ? [root, ...extra.filter((r) => r.write).map((r) => r.real as string)] : [];
+    const readableRoots = extra.filter((r) => !r.write).map((r) => r.real as string);
     const agent = await this.repos.agents.get(node.agentId);
     const at = this.options.now();
     const session: WorkflowSession = {
@@ -1580,7 +1735,7 @@ export class SessionService {
       observedModel: { source: 'unknown' },
       activity: 'closed',
       cwd,
-      folderScope: { source: worktree === true ? 'task-worktree' : 'session-cwd', workspaceRoot: root, writableRoots: node.writePolicy === 'write' ? [root] : [], readableRoots: [] },
+      folderScope: { source: worktree === true ? 'task-worktree' : 'session-cwd', workspaceRoot: root, writableRoots, readableRoots },
       ...(parentId !== undefined && { parentId }),
       createdAt: at,
       updatedAt: at,
@@ -1874,7 +2029,7 @@ export class SessionService {
 
   /** The session's runtime settings: its model and its agent's instructions (no MCP mount, C-07). */
   private async settingsOf(session: LogicalSession): Promise<SessionSettings> {
-    const agent: AgentDefinition | undefined = await this.repos.agents.get(session.agent.id);
+    const agent: AgentDefinition | undefined = session.agent === undefined ? undefined : await this.repos.agents.get(session.agent.id);
     // A workflow node that may not write (read-only, exec-only) gets no writable root (T024, R-04).
     if (session.kind === 'workflow') {
       const briefing = await this.workflow?.briefing(session);
@@ -1885,10 +2040,11 @@ export class SessionService {
         ...(instructions.length > 0 && { instructions }),
       };
     }
+    // Without an Agent (or with empty instructions) nothing is added: the runtime's and model's own behaviour (U-01).
     return {
       model: session.requestedModel,
       readOnly: false,
-      ...(agent !== undefined && { instructions: agent.instructions }),
+      ...(agent !== undefined && agent.instructions.length > 0 && { instructions: agent.instructions }),
     };
   }
 

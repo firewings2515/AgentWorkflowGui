@@ -59,3 +59,11 @@ Cursor 綁定 repository 實例與 session，每個 session 各自保留最近 8
 故障實作只在 `testing/storage-faults.ts`。`new InjectedStorageFaults(db)` 可注入既有連線；
 啟動測試可將未綁定的實例經 `openStorage(path, { hooks: faults })` 傳入。
 慢磁碟以同步等待模擬同步 SQLite I/O；正式程式不建立故障實例。
+
+## v0.8（T048）
+
+migration v11 把 agent／workflow／project 與 instance 內 template 的 `schemaVersion` 從 0.7.0 改為 0.8.0；
+session、preferences、instance 的新欄位都是選填（沒有 Agent、`autoTitle`、`workFolderRoot`、run 的
+`workFolder`／`projectFolder`），所以舊的 body 不改。新表 `work_folder_claim` 記錄 GUI 自動建立的工作資料夾
+屬於哪個 session（一個 session 一筆、一個路徑一筆，路徑不分大小寫比對）。claim 先寫、資料夾後建；啟動時
+沒有對應 session（也沒有對應 run 的開始紀錄）的 claim 會刪掉，資料夾是空的才以非遞迴 rmdir 刪除。

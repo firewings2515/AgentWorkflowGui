@@ -40,12 +40,13 @@ import {
 } from '../../contracts';
 import type { DeliveryService } from '../delivery';
 import { type GuiHandoff, isResolverSession, resolverBriefing, TaskPipeline, type TaskPipelineOptions } from '../pipeline';
-import type { AppRepositories, DeliveryStore, HandoffMeta, PayloadContext, StoredDelivery } from '../ports';
+import { type AppRepositories, CommitUncertainError, type DeliveryStore, type HandoffMeta, type PayloadContext, type StoredDelivery, type WorkFolderClaim } from '../ports';
 import type { CommandOf, SessionService, WorkflowHooks, WorkflowSession } from '../sessions';
 import { type AgentNode, agentNodes, briefing, handoffCounts, handoffText, hasEdge, isRework, nodeOf, reportText, reworkKey, rootNode, runtimesOf, sameTarget, taskProgress } from './graph';
 import {
   firstMessageIdOf,
   firstMessageOperationOf,
+  isPre08StartRef,
   startInstanceOf,
   startRefOf,
   handoffConfirmationId,
@@ -129,6 +130,17 @@ const RESOLVER_ONLY = rejected('invalid-input', 'this session resolves a merge c
 const REPORT = 'report-';
 const REPORT_ASKING = 'report-c-';
 const asksConfirmation = (operationId: OperationId) => operationId.startsWith(REPORT_ASKING);
+
+/**
+ * The run's other folder for a session working in `cwd` (Q-8, T048): root may read the project folder (never write it
+ * directly: worktrees or the other nodes do); a node in the project folder may also use the work folder (writing
+ * there only when the node writes). Nothing for runs started before 0.8, or when both are one folder.
+ */
+const extraRootsOf = (instance: WorkflowInstance, cwd: string, isRoot: boolean): { extraRoots?: { path: string; write: boolean }[] } => {
+  const other = isRoot ? instance.projectFolder : instance.workFolder;
+  if (other === undefined || other === cwd) return {};
+  return { extraRoots: [{ path: other, write: !isRoot }] };
+};
 
 const sameModel = (a: ModelSelection, b: ModelSelection) => a.runtime === b.runtime && a.model === b.model && a.effort === b.effort;
 
@@ -246,7 +258,7 @@ export class WorkflowEngine implements WorkflowHooks {
   }
 
   private async startNow(command: CommandOf<'workflow.start'>): Promise<CommandResult> {
-    const { requestId, instanceId, rootSessionId, workflowId, workflowRevision, title, cwd, firstMessage, crossToolConsent } = command;
+    const { requestId, instanceId, rootSessionId, workflowId, workflowRevision, title, workFolder, projectFolder, firstMessage, crossToolConsent } = command;
     const sessions = this.options.sessions;
     const repos = this.repos;
     const messageId = firstMessageIdOf(instanceId);
@@ -274,7 +286,24 @@ export class WorkflowEngine implements WorkflowHooks {
     const root = rootNode(template);
     const settings = { model: root.model, readOnly: root.writePolicy !== 'write' };
     // Which workflow, root node and limit, also while no instance exists yet (r3-P1-1).
-    const startRef = startRefOf({ instanceId, workflowId, rootNodeId: root.id, reworkLimit: template.reworkLimit, title, crossToolConsent });
+    // A start written before 0.8 (r1 P1-5): one folder for root and the repository, as such runs had. Its repeat may name
+    // that folder as either, or neither; it goes on as it was started, without a project folder of its own.
+    const stored = intent?.kind === 'user-message' ? intent : undefined;
+    const pre08 = stored !== undefined && isPre08StartRef(stored.sourceCallRef);
+    if (pre08 && [workFolder, projectFolder].some((f) => f !== undefined && f !== stored.context.cwd)) return taken();
+    const project = pre08 ? undefined : projectFolder;
+    const startRef = startRefOf({
+      instanceId,
+      workflowId,
+      rootNodeId: root.id,
+      reworkLimit: template.reworkLimit,
+      title,
+      crossToolConsent,
+      ...(!pre08 && { folders: { ...(project !== undefined && { projectFolder: project }) } }),
+    });
+    // Root works in the work folder (Q-4, T048): the one given, else the one the first attempt chose and wrote into its
+    // first message, else a new one made below. A repeat that names another folder is not this run.
+    let cwd = (pre08 ? undefined : workFolder) ?? stored?.context.cwd;
     if (intent !== undefined) {
       const same =
         intent.kind === 'user-message' &&
@@ -287,7 +316,12 @@ export class WorkflowEngine implements WorkflowHooks {
         intent.context.runtime === root.model.runtime &&
         sameModel(intent.context.session.model, root.model) &&
         intent.context.session.readOnly === settings.readOnly &&
-        (instance === undefined || (instance.workflowId === workflowId && instance.workflowRevision === workflowRevision && instance.rootSessionId === rootSessionId && instance.title === title));
+        (instance === undefined ||
+          (instance.workflowId === workflowId &&
+            instance.workflowRevision === workflowRevision &&
+            instance.rootSessionId === rootSessionId &&
+            instance.title === title &&
+            instance.projectFolder === project));
       if (!same) return taken();
     }
     if (instance === undefined) {
@@ -297,14 +331,39 @@ export class WorkflowEngine implements WorkflowHooks {
       }
       // Starting is the consent to cross-tool handoffs between the run's nodes (R-11); without it nothing starts.
       if (runtimesOf(template).size > 1 && !crossToolConsent) return fail(requestId, 'invalid_request', 'This workflow hands off between tools; starting it needs that consent');
-      if (!sessions.canResolve(cwd)) return fail(requestId, 'invalid_request', 'The working folder cannot be resolved');
+      // Task worktrees come from the project folder: a run with worktrees cannot start without one (Q-8).
+      if (template.isolation === 'worktree' && project === undefined && !pre08)
+        return fail(requestId, 'invalid_request', 'This workflow works in task worktrees; starting it needs a project folder');
+      if (cwd !== undefined && !sessions.canResolve(cwd)) return fail(requestId, 'invalid_request', 'The working folder cannot be resolved');
+      if (project !== undefined && !sessions.canResolve(project)) return fail(requestId, 'invalid_request', 'The project folder cannot be resolved');
     }
+    let made: string | undefined;
     if (intent === undefined) {
       if ((await repos.sessions.get(rootSessionId)) !== undefined) return taken('A session with this ID already exists');
       // The root ID may be held by another run's start that stopped before creating the session (r3-P1-2).
       if (await this.rootClaimed(rootSessionId, operationId)) return taken('A session with this ID already exists');
       if (sessions.isClosing()) return fail(requestId, 'runtime_unavailable', 'The application is closing');
-      const accepted = await this.delivery.accept({
+      // No work folder given: one is made now, the last step before the start is written (T048). The same root
+      // session asking again gets the same folder; one whose start never got written is removed at the next start.
+      if (cwd === undefined) {
+        const allocated = await sessions.allocateWorkFolder(rootSessionId, instanceId);
+        if (!allocated.ok) return allocated.taken === true ? taken('A session with this ID already exists') : fail(requestId, 'invalid_request', allocated.message);
+        cwd = made = allocated.path;
+        if (!sessions.canResolve(cwd)) {
+          await sessions.releaseWorkFolder(rootSessionId, made);
+          return fail(requestId, 'invalid_request', 'The working folder cannot be resolved');
+        }
+      }
+    }
+    // Set above: given, read from the stored start, or made just now.
+    if (cwd === undefined) return fail(requestId, 'internal_error', 'The run has no work folder');
+    if (intent === undefined) {
+      const release = async () => {
+        if (made !== undefined) await sessions.releaseWorkFolder(rootSessionId, made);
+      };
+      let accepted: Awaited<ReturnType<DeliveryService['accept']>>;
+      try {
+        accepted = await this.delivery.accept({
         kind: 'user-message',
         operationId,
         sourceCallRef: startRef,
@@ -315,10 +374,23 @@ export class WorkflowEngine implements WorkflowHooks {
         target: { sessionId: rootSessionId, provision: sessions.provisionFor(rootSessionId) },
         at: this.options.now(),
         context: { runtime: root.model.runtime, cwd, entry: { kind: 'new-turn' }, session: settings, origin: { kind: 'user' } },
-      });
-      if (accepted.status === 'conflict') return taken();
+        });
+      } catch (error) {
+        // Refused (read-only data, r1 P1-3), not possibly written: the claim of the folder made for it goes, the folder
+        // stays (r2). When the commit is in doubt the claim stays too, for the repeat or the next start's check.
+        if (!(error instanceof CommitUncertainError)) await release();
+        throw error;
+      }
+      if (accepted.status === 'conflict') {
+        await release();
+        return taken();
+      }
+      // Possibly written: the folder stays with its claim, for the repeat or the next start's check.
       if (accepted.status === 'commit-uncertain') return fail(requestId, 'storage_failed', 'Starting the run could not be saved for certain', { retryable: true, mayHaveSideEffects: true });
-      if (accepted.status !== 'accepted' && accepted.status !== 'duplicate') return fail(requestId, 'internal_error', 'The run could not be started');
+      if (accepted.status !== 'accepted' && accepted.status !== 'duplicate') {
+        await release();
+        return fail(requestId, 'internal_error', 'The run could not be started');
+      }
       wrote = true;
     }
     const at = this.options.now();
@@ -342,6 +414,9 @@ export class WorkflowEngine implements WorkflowHooks {
       rounds: [],
       mergeQueue: [],
       taskPlans: [],
+      // A start written before 0.8 records neither, like the runs of its time.
+      ...(!pre08 && { workFolder: cwd }),
+      ...(project !== undefined && { projectFolder: project }),
       createdAt: at,
     };
     if (sessions.isClosing()) return fail(requestId, 'runtime_unavailable', 'The application is closing', { mayHaveSideEffects: wrote });
@@ -352,11 +427,12 @@ export class WorkflowEngine implements WorkflowHooks {
       const bound = existingRoot.kind === 'workflow' && existingRoot.workflow.instanceId === instanceId && existingRoot.workflow.nodeId === root.id && existingRoot.workflow.taskId === undefined;
       if (!bound) return taken('A session with this ID already exists');
     } else {
-      const made = await sessions.createWorkflowSession({ sessionId: rootSessionId, instance: created, nodeId: root.id, cwd });
-      if (made === 'taken') return taken('A session with this ID already exists');
-      if (made === 'unresolvable') return fail(requestId, 'invalid_request', 'The working folder cannot be resolved', { mayHaveSideEffects: wrote });
-      if (made === 'closing') return fail(requestId, 'runtime_unavailable', 'The application is closing', { mayHaveSideEffects: wrote });
-      wrote ||= made === 'created';
+      // Root plans from the project's code: it may read the project folder, never write it directly (Q-8, T048).
+      const rootMade = await sessions.createWorkflowSession({ sessionId: rootSessionId, instance: created, nodeId: root.id, cwd, ...extraRootsOf(created, cwd, true) });
+      if (rootMade === 'taken') return taken('A session with this ID already exists');
+      if (rootMade === 'unresolvable') return fail(requestId, 'invalid_request', 'The working folder cannot be resolved', { mayHaveSideEffects: wrote });
+      if (rootMade === 'closing') return fail(requestId, 'runtime_unavailable', 'The application is closing', { mayHaveSideEffects: wrote });
+      wrote ||= rootMade === 'created';
     }
     if ((await sessions.recordUserMessage(rootSessionId, messageId, firstMessage)) === 'taken') return taken();
     if (instance === undefined) {
@@ -878,8 +954,20 @@ export class WorkflowEngine implements WorkflowHooks {
     // The task's worktree with worktree isolation (T032), else root's folder; the source that created it is its parent (WB-01).
     const current = this.pipeline === undefined ? undefined : await repos.instances.get(instance.id);
     const worktree = current === undefined ? undefined : this.pipeline?.cwdOf(current, taskId);
-    const cwd = worktree ?? root.cwd;
-    const made = await this.options.sessions.createWorkflowSession({ sessionId, instance, nodeId: node.id, taskId, cwd, parentId: caller.id, ...(worktree !== undefined && { worktree: true }) });
+    // A same-folder run with a project folder: the other nodes change its code in place and may also use the work
+    // folder for reports (Q-8, T048). Without one, everything is in root's folder, as before.
+    const inProject = worktree === undefined && instance.template.isolation !== 'worktree' && instance.projectFolder !== undefined;
+    const cwd = worktree ?? (inProject ? instance.projectFolder : undefined) ?? root.cwd;
+    const made = await this.options.sessions.createWorkflowSession({
+      sessionId,
+      instance,
+      nodeId: node.id,
+      taskId,
+      cwd,
+      parentId: caller.id,
+      ...(worktree !== undefined && { worktree: true }),
+      ...(inProject && extraRootsOf(instance, cwd, false)),
+    });
     return made === 'created' || made === 'exists' ? sessionId : undefined;
   }
 
@@ -1527,6 +1615,16 @@ export class WorkflowEngine implements WorkflowHooks {
     const pipelined = this.pipeline !== undefined && (instance.template.isolation === 'worktree' || rootNode(instance.template).outputRules.some((r) => r.target.kind === 'tasks'));
     if (pipelined) return briefing(instance, node, session.workflow.taskId, true);
     return briefing(instance, node, session.workflow.taskId ?? instance.tasks[0]?.id);
+  }
+
+  /**
+   * Whether a run still counts on the work folder claimed for its root session (T048): its instance exists, or its
+   * start was written (the first message), so a repeat or recovery goes on in that folder.
+   */
+  async workFolderInUse(claim: WorkFolderClaim): Promise<boolean> {
+    if (claim.instanceId === undefined) return false;
+    if ((await this.repos.instances.get(claim.instanceId)) !== undefined) return true;
+    return (await this.store.get(firstMessageOperationOf(firstMessageIdOf(claim.instanceId)))) !== undefined;
   }
 
   /**

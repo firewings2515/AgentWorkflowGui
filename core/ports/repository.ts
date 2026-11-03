@@ -36,6 +36,7 @@ import type {
   WorkflowInstance,
   WorkflowTemplate,
 } from '../../contracts';
+import type { WorkFolderClaimRepository } from './work-folders';
 
 /** Result of a compare-and-set save: `stale` returns what is stored now so the caller can show both. */
 export type SaveResult<T> = { status: 'saved'; record: T } | { status: 'stale'; current: T | undefined };
@@ -220,5 +221,7 @@ export interface AppRepositories {
   peerMessages: PeerMessageRepository;
   transfers: TransferRepository;
   projects: ProjectRepository;
+  /** Which GUI-made work folder belongs to which session (T048). */
+  workFolders: WorkFolderClaimRepository;
   readSnapshotData(options?: SnapshotOptions): Promise<SnapshotData>;
 }

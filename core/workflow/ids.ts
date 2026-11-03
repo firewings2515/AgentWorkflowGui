@@ -19,9 +19,33 @@ export interface StartIdentity {
   reworkLimit: number;
   title: string;
   crossToolConsent: boolean;
+  /**
+   * The run's folders (T048): set by every 0.8 start, the project folder in it when given. Absent: the identity a start
+   * written before 0.8 had (six parts), so such a start is still recognised when it is sent again (r1 P1-5).
+   */
+  folders?: { projectFolder?: string };
 }
 const START = 'workflow.start:';
-export const startRefOf = (s: StartIdentity): string => `${START}${JSON.stringify([s.instanceId, s.workflowId, s.rootNodeId, s.reworkLimit, s.title, s.crossToolConsent])}`;
+export const startRefOf = (s: StartIdentity): string =>
+  `${START}${JSON.stringify([
+    s.instanceId,
+    s.workflowId,
+    s.rootNodeId,
+    s.reworkLimit,
+    s.title,
+    s.crossToolConsent,
+    ...(s.folders !== undefined ? [s.folders.projectFolder !== undefined ? { projectFolder: s.folders.projectFolder } : {}] : []),
+  ])}`;
+/** A start written before 0.8 (T048 r1 P1-5): its identity has no folders part. */
+export const isPre08StartRef = (sourceCallRef: string | undefined): boolean => {
+  if (sourceCallRef?.startsWith(START) !== true) return false;
+  try {
+    const parsed: unknown = JSON.parse(sourceCallRef.slice(START.length));
+    return Array.isArray(parsed) && parsed.length === 6;
+  } catch {
+    return false;
+  }
+};
 /** The instance a first message's delivery was accepted for; undefined for any other delivery. */
 export const startInstanceOf = (sourceCallRef: string | undefined): InstanceId | undefined => {
   if (sourceCallRef?.startsWith(START) !== true) return undefined;

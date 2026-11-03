@@ -174,7 +174,7 @@ describe('T024 review r1', () => {
     const original = startCommand();
     await expect(w.run(original)).rejects.toThrow('crash');
     const after = await w.restart();
-    for (const changed of [{ cwd: 'E:\\work\\other' }, { firstMessage: 'Something else.' }]) {
+    for (const changed of [{ workFolder: 'E:\\work\\other' }, { firstMessage: 'Something else.' }]) {
       expect(await after.run({ ...original, requestId: rid(), ...changed })).toMatchObject({ ok: false, code: 'already_exists' });
     }
     // Consent is first stored with the instance; this mixed-tool workflow is refused without it anyway.
@@ -203,7 +203,7 @@ describe('T024 review r1', () => {
     await expect(w.run(original)).rejects.toThrow('crash');
     expect(await instanceOf(w)).toBeDefined();
     const after = await w.restart();
-    for (const changed of [{ cwd: 'E:\\work\\other' }, { firstMessage: 'Something else.' }, { crossToolConsent: false }]) {
+    for (const changed of [{ workFolder: 'E:\\work\\other' }, { firstMessage: 'Something else.' }, { crossToolConsent: false }]) {
       expect(await after.run({ ...original, requestId: rid(), ...changed })).toMatchObject({ ok: false, code: 'already_exists' });
     }
     expect(await after.run({ ...original, requestId: rid() })).toMatchObject({ ok: true });

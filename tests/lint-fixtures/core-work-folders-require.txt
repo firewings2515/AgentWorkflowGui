@@ -1,0 +1,4 @@
+// virtual-path: core/sessions/work-folders.ts
+// expect: error
+// T048 r3: nor through require.
+export const remove = (path: string) => require('fs').rmSync(path);

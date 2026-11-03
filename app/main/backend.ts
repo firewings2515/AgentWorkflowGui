@@ -23,6 +23,7 @@ import {
   type SessionId,
   type Snapshot,
   type StorageInfo,
+  type Timestamp,
   type UiPreferences,
 } from '../../contracts';
 import { ClaudeAdapter, claudeAgentSdk } from '../../adapters/claude';
@@ -47,6 +48,7 @@ import type {
   RuntimeLocator,
   StartSessionOptions,
   StorageHealth,
+  WorkFolderFs,
 } from '../../core/ports';
 import { StorageReadOnlyError, StorageWriteError } from '../../core/ports';
 import { Redactor, SessionService } from '../../core/sessions';
@@ -61,6 +63,7 @@ import { type MissedRecords, withMissed } from './missed-records';
 import type { FolderState } from './real-path';
 import { GitIgnoreRules } from './git-ignore';
 import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
+import { defaultWorkFolderRoot, nodeWorkFolderFs } from './work-folders';
 import { WorkspaceWatchers, type WatchFn } from './workspace-watch';
 
 /** What the main process needs from its process host: the port plus the spawn the adapters use (T013). */
@@ -110,6 +113,12 @@ export interface BackendOptions {
   storageHooks?: StorageHooks;
   /** Turns of each session's history in the Snapshot (C-26); older ones are read with `session.history`. Default 50. */
   snapshotTurns?: number;
+  /**
+   * Work folders for sessions and runs started without one (T048, U-02): `defaultRoot` is used while the user set no
+   * `workFolderRoot` (the app: `%USERPROFILE%\AgentWorkflowGui`), `fs` replaces node:fs (tests). Absent: no folder is
+   * ever made, a folder must be given, and the Snapshot names the default location for display only.
+   */
+  workFolders?: { defaultRoot: string; fs?: WorkFolderFs; day?: (at: Timestamp) => string };
 }
 
 /** Turns per session in the Snapshot by default: the renderer reads older history 50 turns a page (T041). */
@@ -178,10 +187,11 @@ const describe = (error: unknown): string => {
  * The facade while the stored data is damaged (C-06): a Snapshot that says so, with the fixed reason code
  * and the database location and nothing else, and every command refused.
  */
-export const damagedFacade = (reason: string, location: string): AppFacade => ({
+export const damagedFacade = (reason: string, location: string, workFolderRoot: string = defaultWorkFolderRoot()): AppFacade => ({
   snapshot: (): Snapshot => ({
     schemaVersion: CONTRACTS_VERSION,
     app: { status: 'damaged', reason, location },
+    defaultWorkFolderRoot: workFolderRoot,
     seq: 0,
     agents: [],
     workflows: [],
@@ -257,7 +267,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     } catch {
       // Already unusable.
     }
-    return { status: 'damaged', facade: damagedFacade(reason, options.dbPath), dbPath: options.dbPath, reason, shutdown: () => Promise.resolve() };
+    return { status: 'damaged', facade: damagedFacade(reason, options.dbPath, options.workFolders?.defaultRoot), dbPath: options.dbPath, reason, shutdown: () => Promise.resolve() };
   };
   try {
     // T038: a pending restore, migrations after their backup, the day's backup and pruning, in that order; data that
@@ -565,6 +575,9 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     hashPayload: sha256,
     resolveRealPath: (path) => options.resolveRealPath(path),
     ...(options.folderState !== undefined && { folderState: options.folderState }),
+    ...(options.workFolders !== undefined && {
+      workFolders: { fs: options.workFolders.fs ?? nodeWorkFolderFs, defaultRoot: options.workFolders.defaultRoot, ...(options.workFolders.day !== undefined && { day: options.workFolders.day }) },
+    }),
     // The router's hooks: each opening's requests know whether that opening still serves the session (T036 r3 P1-2).
     createAdapter: (runtime, sessionId, sessionHooks) => createAdapter(runtime, sessionId, sessionHooks),
     mountMcp: (sessionId) => {
@@ -656,6 +669,9 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     await workflow.recover();
     // Each confirmed transfer goes on from the step it stopped at; a cancelled one sends nothing (T023).
     await transfer.recover();
+    // Work folders claimed for a session that never came (the app stopped between the claim and the session, T048):
+    // removed while empty, before any command can ask for one.
+    await service.reconcileWorkFolders((claim) => workflow.workFolderInUse(claim));
   } catch (error) {
     await service.shutdown(closeTimeoutMs).catch(() => undefined);
     await mcp.close().catch(() => undefined);
@@ -713,6 +729,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       void bus.publish({ type: 'storage.updated', storage: await storageInfo(), at: now() });
       return { ok: true, requestId: command.requestId, created: [] };
     });
+  /** Where new work folders go unless the user chose another place (Q-1, T048). */
+  const workFolderRootShown = options.workFolders?.defaultRoot ?? defaultWorkFolderRoot();
   const facade: AppFacade = {
     async snapshot(missed?: MissedRecords): Promise<Snapshot> {
       // The seq first: anything published after it is applied again by the renderer, never skipped.
@@ -746,6 +764,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
         // File locks (R-07) live in memory only: the lock table's list now.
         locks: service.locks?.list() ?? [],
         preferences: data.preferences,
+        defaultWorkFolderRoot: workFolderRootShown,
         historyPages: data.historyPages,
         storage,
         runtimes: RUNTIMES.flatMap((runtime) => statuses.get(runtime) ?? []),

@@ -72,7 +72,7 @@ describe('fixtures', () => {
       if (x.nativeTaskId) expect(nativeTaskIds.has(x.nativeTaskId)).toBe(true);
     };
     for (const x of s.sessions) {
-      expect(agentIds.has(x.agent.id)).toBe(true);
+      if (x.agent) expect(agentIds.has(x.agent.id)).toBe(true);
       if (x.parentId) expect(sessionIds.has(x.parentId)).toBe(true);
       if (x.derivedFromSessionId) expect(sessionIds.has(x.derivedFromSessionId)).toBe(true);
       if (x.kind === 'workflow') expect(nodeIds.has(x.workflow.nodeId)).toBe(true);
@@ -132,7 +132,7 @@ describe('contract rules', () => {
     const create = { type: 'session.create', requestId: 'r1', sessionId: 's-new', kind: 'ordinary', agentId: 'a', model: { runtime: 'claude', model: 'claude-opus-5-5' }, cwd: 'E:/w' };
     expect(ok(Command, create)).toBe(true);
     expect(ok(Command, { ...create, sessionId: undefined })).toBe(false);
-    const start = { type: 'workflow.start', requestId: 'r2', instanceId: 'i1', rootSessionId: 's-root', workflowId: 'w', workflowRevision: 1, title: 't', cwd: 'E:/w', firstMessage: 'go', crossToolConsent: true };
+    const start = { type: 'workflow.start', requestId: 'r2', instanceId: 'i1', rootSessionId: 's-root', workflowId: 'w', workflowRevision: 1, title: 't', workFolder: 'E:/w', firstMessage: 'go', crossToolConsent: true };
     expect(ok(Command, start)).toBe(true);
     expect(ok(Command, { ...start, rootSessionId: undefined })).toBe(false);
     const prepare = { type: 'transfer.prepare', requestId: 'r3', sourceSessionId: 's1', target: { runtime: 'codex', model: 'gpt-6-astra' }, noteSource: 'gui-digest' };

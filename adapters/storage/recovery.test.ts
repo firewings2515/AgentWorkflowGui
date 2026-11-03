@@ -418,12 +418,12 @@ describe('read-only and injected faults', () => {
   it('reports the failing migration version after earlier migrations in the same transaction roll back', async () => {
     const file = path(); const first = await open(file); first.close();
     const migrations = [...MIGRATIONS,
-      { version: 11, name: 'first', sql: 'CREATE TABLE temporary_upgrade (id INTEGER);' },
-      { version: 12, name: 'second', sql: 'CREATE TABLE other_upgrade (id INTEGER); SELECT * FROM secret_missing_table;' },
+      { version: latestVersion() + 1, name: 'first', sql: 'CREATE TABLE temporary_upgrade (id INTEGER);' },
+      { version: latestVersion() + 2, name: 'second', sql: 'CREATE TABLE other_upgrade (id INTEGER); SELECT * FROM secret_missing_table;' },
     ];
     const s = await open(file, at(1), { migrations });
-    expect(s.report.failedMigrationVersion).toBe(12);
-    expect(schemaVersion(s.db)).toBe(10);
+    expect(s.report.failedMigrationVersion).toBe(latestVersion() + 2);
+    expect(schemaVersion(s.db)).toBe(latestVersion());
     expect(s.db.prepare("SELECT name FROM sqlite_schema WHERE name IN ('temporary_upgrade', 'other_upgrade')").all()).toEqual([]);
     expect(JSON.stringify(s.report)).not.toContain('secret_missing_table');
   });

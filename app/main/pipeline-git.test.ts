@@ -57,7 +57,7 @@ it('V-19, V-20, V-21 on a real repository: parallel tasks, a dependency, a confl
     return { exitCode: 0, outputTail: 'ok' };
   };
   await w.repositories.projects.save({ ...project(), rootPath: repo }, null);
-  expect(await started(w, { cwd: repo })).toMatchObject({ ok: true });
+  expect(await started(w, { workFolder: repo, projectFolder: repo })).toMatchObject({ ok: true });
   const created = await w.engine.createTasks(
     {
       ruleId: 'split',
@@ -157,7 +157,7 @@ it('r2 P1-4 on a real repository: a file the setup adds and stages (`git add`) n
     return { exitCode: 0, outputTail: 'ok' };
   };
   await w.repositories.projects.save({ ...project(), rootPath: repo }, null);
-  expect(await started(w, { cwd: repo })).toMatchObject({ ok: true });
+  expect(await started(w, { workFolder: repo, projectFolder: repo })).toMatchObject({ ok: true });
   const created = await w.engine.createTasks({ ruleId: 'split', tasks: [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }] }, { caller: ROOT, sourceCallRef: 'call-staged' });
   if (created.status !== 'created') throw new Error(JSON.stringify(created));
   const a = created.tasks[0]!.taskId;

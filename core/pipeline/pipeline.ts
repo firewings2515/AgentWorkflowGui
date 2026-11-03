@@ -212,19 +212,25 @@ export class TaskPipeline {
 
   // ---- the instance's repository ------------------------------------------------------------------
 
-  /** The project of the run (O-06): the one named, else the one whose folder holds root's cwd. */
+  /**
+   * The project of the run (O-06): the one named, else the one whose folder holds the run's project folder (T048),
+   * or root's cwd for runs started before 0.8.
+   */
   private async projectOf(instance: WorkflowInstance): Promise<ProjectSettings | undefined> {
     if (instance.projectId !== undefined) return this.repos.projects.get(instance.projectId);
-    const root = await this.repos.sessions.get(instance.rootSessionId);
-    if (root === undefined) return undefined;
-    return (await this.repos.projects.list()).filter((p) => inside(root.cwd, p.rootPath)).sort((a, b) => b.rootPath.length - a.rootPath.length)[0];
+    const folder = instance.projectFolder ?? (await this.repos.sessions.get(instance.rootSessionId))?.cwd;
+    if (folder === undefined) return undefined;
+    return (await this.repos.projects.list()).filter((p) => inside(folder, p.rootPath)).sort((a, b) => b.rootPath.length - a.rootPath.length)[0];
   }
 
-  /** The repository's top folder: the project's, or root's cwd (GitPort has no top-level query). */
+  /**
+   * The repository's top folder: the project's, else the run's project folder (T048), else root's cwd for runs started
+   * before 0.8 (GitPort has no top-level query).
+   */
   private async repoOf(instance: WorkflowInstance): Promise<string | undefined> {
     const project = await this.projectOf(instance);
     if (project !== undefined) return project.rootPath;
-    return (await this.repos.sessions.get(instance.rootSessionId))?.cwd;
+    return instance.projectFolder ?? (await this.repos.sessions.get(instance.rootSessionId))?.cwd;
   }
 
   /** Setup and test commands: the workflow's override, else the project's (O-06). */

@@ -14,3 +14,4 @@ export {
   type WorkflowSession,
 } from './service';
 export { absolutePath, isAbsolutePath, WrittenPaths, type WrittenPathsOptions } from './written-paths';
+export { type Allocated, joinFolder, localDay, seqOf, workFolderName, WorkFolders, type WorkFolderOptions } from './work-folders';

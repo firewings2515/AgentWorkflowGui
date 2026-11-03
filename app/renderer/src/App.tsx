@@ -85,7 +85,7 @@ function AppContent({ snapshot, store, serviceStore, ipcState }: { snapshot: Sna
     ? { repository: createIpcWorkflowRepository(store), controls: undefined } : createWorkflowDemo(snapshot.workflows));
   const [{ repository: agentRepository, controls: agentDemo }] = useState(() => store
     ? { repository: createIpcAgentRepository(store), controls: undefined }
-    : createAgentDemo(snapshot.agents, id => snapshot.sessions.some(session => session.agent.id === id) || workflowRepository.getSnapshot().some(workflow => workflow.nodes.some(node => node.kind === 'agent' && node.agentId === id))));
+    : createAgentDemo(snapshot.agents, id => snapshot.sessions.some(session => session.agent?.id === id) || workflowRepository.getSnapshot().some(workflow => workflow.nodes.some(node => node.kind === 'agent' && node.agentId === id))));
   const agentOptions = useSyncExternalStore(agentRepository.subscribe, agentRepository.getSnapshot);
   const [workspace, dispatch] = useReducer(workspaceReducer, snapshot.sessions, initialWorkspace);
   const [route, setRoute] = useState(currentRoute);
@@ -144,7 +144,7 @@ function AppContent({ snapshot, store, serviceStore, ipcState }: { snapshot: Sna
   const changeSelection = (sessionId: SessionId, patch: Partial<Selection>) => {
     const session = snapshot.sessions.find(candidate => candidate.id === sessionId);
     if (!session) return;
-    setSelections(previous => ({ ...previous, [sessionId]: { ...(previous[sessionId] ?? { agentId: session.agent.id, model: session.requestedModel }), ...patch } }));
+    setSelections(previous => ({ ...previous, [sessionId]: { ...(previous[sessionId] ?? { agentId: session.agent?.id, model: session.requestedModel }), ...patch } }));
   };
   const changeAgent = (sessionId: SessionId, agentId: AgentId) => {
     const session = snapshot.sessions.find(item => item.id === sessionId);

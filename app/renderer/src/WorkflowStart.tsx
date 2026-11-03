@@ -38,7 +38,7 @@ export function WorkflowStart({ snapshot, store, ipcState, onOpen }: {
       const requestId = RequestId.parse(crypto.randomUUID());
       setPending(true);
       void store.send({ type: 'workflow.start', requestId, instanceId, rootSessionId,
-        workflowId: template.id, workflowRevision: template.revision, title, cwd, firstMessage, crossToolConsent: consent,
+        workflowId: template.id, workflowRevision: template.revision, title, workFolder: cwd, projectFolder: cwd, firstMessage, crossToolConsent: consent,
       }).then(result => { setReceipt({ result, requestId, instanceId, rootSessionId }); setPending(false); });
     }}>
       <fieldset {...readOnlyProps(snapshot.app.status === 'read-only')} disabled={disabled}>

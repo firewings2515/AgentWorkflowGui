@@ -22,6 +22,14 @@ describe('startSession', () => {
     await expect(h.adapter.startSession(startOptions())).rejects.toThrow(/already open/);
   });
 
+  it('T048: a session without an Agent gets no instructions of ours: Claude Code\'s own system prompt as it is', async () => {
+    const h = setup();
+    await h.adapter.start();
+    await h.adapter.startSession(startOptions());
+    expect(h.sdk.last.options).toMatchObject({ sessionId: REF, model: 'haiku' });
+    expect(h.sdk.last.options).not.toHaveProperty('systemPrompt');
+  });
+
   it('chooses a UUID when none is pre-allocated and refuses a malformed one', async () => {
     const h = setup();
     await h.adapter.start();

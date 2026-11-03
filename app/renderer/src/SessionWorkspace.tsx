@@ -14,7 +14,7 @@ import { EscalationPanel, openEscalations } from './EscalationPanel';
 import { LockWaits } from './LockWaits';
 import { VirtualMessages } from './VirtualMessages';
 
-export interface Selection { agentId: AgentId; model: ModelSelection }
+export interface Selection { agentId: AgentId | undefined; model: ModelSelection }
 export interface WorkspaceProps {
   snapshot: Snapshot;
   store?: RendererStore | undefined;
@@ -78,7 +78,7 @@ export function SessionWorkspace(props: WorkspaceProps) {
   if (!session) return <section className="workspace"><Empty>找不到 session：{view.sessionId}</Empty><button onClick={onClose}>關閉工作區</button></section>;
   const context = contextFor(view);
   const pendingCount = openEscalations(snapshot, session.id).length;
-  const chosen = selection ?? { agentId: session.agent.id, model: session.requestedModel };
+  const chosen = selection ?? { agentId: session.agent?.id, model: session.requestedModel };
   const instance = session.kind === 'workflow' ? snapshot.instances.find(candidate => candidate.id === session.workflow.instanceId) : undefined;
   const activeTurn = sessionBlocksSend(snapshot, session.id);
   const canInterrupt = sessionCanInterrupt(snapshot, session.id);
@@ -122,7 +122,7 @@ export function SessionWorkspace(props: WorkspaceProps) {
           });
         }}>
           <div className="selectors">
-            <label>{session.kind === 'workflow' ? 'Agent · 已鎖定' : 'Agent'}<select aria-label="Agent" aria-describedby={readOnly ? 'read-only-reason' : session.kind === 'workflow' ? `${view.id}-agent-lock` : undefined} value={chosen.agentId} {...readOnlyProps(readOnly)} disabled={readOnly || session.kind === 'workflow' || props.store?.isBlocked('session.setAgent', `session:${session.id}`)} onChange={event => {
+            <label>{session.kind === 'workflow' ? 'Agent · 已鎖定' : 'Agent'}<select aria-label="Agent" aria-describedby={readOnly ? 'read-only-reason' : session.kind === 'workflow' ? `${view.id}-agent-lock` : undefined} value={chosen.agentId ?? ''} {...readOnlyProps(readOnly)} disabled={readOnly || session.kind === 'workflow' || props.store?.isBlocked('session.setAgent', `session:${session.id}`)} onChange={event => {
               const agent = props.agentOptions.find(candidate => candidate.id === event.target.value);
               if (agent) onAgent(agent.id);
             }}>{(session.kind === 'workflow' ? snapshot.agents : props.agentOptions).map(agent => <option key={`${agent.id}:${agent.revision}`} value={agent.id}>{agent.name}</option>)}</select></label>

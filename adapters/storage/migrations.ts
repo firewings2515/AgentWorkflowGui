@@ -370,6 +370,34 @@ ALTER TABLE ${table} ADD COLUMN history_open INTEGER GENERATED ALWAYS AS
 CREATE INDEX ${table}_history_open ON ${table} (session_id, history_open, at_ms);
 `).join('\n') + '\nCREATE INDEX artifact_history_time ON artifact (session_id, at_ms);\n';
 
+/**
+ * v11: records written under contracts 0.7 read under 0.8 (T048). Agents, workflow templates, projects and the
+ * template pinned in each instance carry the contracts version; everything new in 0.8 is optional (a session without
+ * an Agent, `autoTitle`, `workFolderRoot`, a run's two folders), so sessions, preferences and instances keep their
+ * bodies. The work folder claims (core/ports/work-folders.ts): one per session, a path claimed once without case;
+ * `made` (with the real path then) only once this program's make created the folder; `released` once taken back
+ * while the claim could not be removed.
+ */
+const contracts08V11 = `
+UPDATE agent SET body = json_set(body, '$.schemaVersion', '0.8.0') WHERE json_extract(body, '$.schemaVersion') = '0.7.0';
+UPDATE workflow SET body = json_set(body, '$.schemaVersion', '0.8.0') WHERE json_extract(body, '$.schemaVersion') = '0.7.0';
+UPDATE project SET body = json_set(body, '$.schemaVersion', '0.8.0') WHERE json_extract(body, '$.schemaVersion') = '0.7.0';
+UPDATE workflow_instance SET body = json_set(body, '$.template.schemaVersion', '0.8.0') WHERE json_extract(body, '$.template.schemaVersion') = '0.7.0';
+CREATE TABLE work_folder_claim (
+  session_id TEXT PRIMARY KEY,
+  instance_id TEXT,
+  path TEXT NOT NULL,
+  path_key TEXT NOT NULL UNIQUE,
+  day TEXT NOT NULL,
+  seq INTEGER NOT NULL CHECK (seq >= 1),
+  state TEXT NOT NULL CHECK (state IN ('claimed', 'made', 'released')),
+  made_real TEXT CHECK ((state = 'made') = (made_real IS NOT NULL)),
+  created_at TEXT NOT NULL,
+  created_ms INTEGER NOT NULL
+) STRICT;
+CREATE INDEX work_folder_claim_by_day ON work_folder_claim (day, seq);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
@@ -381,6 +409,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 8, name: 'contracts-0.7', sql: contracts07V8 },
   { version: 9, name: 'storage-0.7-delivery', sql: storage07V9 },
   { version: 10, name: 'storage-0.7-history', sql: pagingV10 },
+  { version: 11, name: 'contracts-0.8', sql: contracts08V11 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;

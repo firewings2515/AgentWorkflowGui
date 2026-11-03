@@ -240,7 +240,7 @@ describe('T045 runtime detection in the backend', () => {
     const codex = { model: { runtime: 'codex' as const, model: 'codex-m' } };
     await s.run({ type: 'workflow.save', requestId: rid(), workflow: template({}, { plan: codex, impl: codex, review: codex }), expectedRevision: null });
     const started = await Promise.race([
-      s.run({ type: 'workflow.start', requestId: rid(), instanceId: InstanceId.parse('run-codex'), rootSessionId: SessionId.parse('root-codex'), workflowId: WORKFLOW, workflowRevision: 0, title: 'Codex only', cwd: dir, firstMessage: 'Go.', crossToolConsent: true }),
+      s.run({ type: 'workflow.start', requestId: rid(), instanceId: InstanceId.parse('run-codex'), rootSessionId: SessionId.parse('root-codex'), workflowId: WORKFLOW, workflowRevision: 0, title: 'Codex only', workFolder: dir, projectFolder: dir, firstMessage: 'Go.', crossToolConsent: true }),
       new Promise<'waited'>((resolve) => setTimeout(() => resolve('waited'), 3000)),
     ]);
     expect(started).toMatchObject({ ok: true });
@@ -256,7 +256,7 @@ describe('T045 runtime detection in the backend', () => {
     await s.run({ type: 'workflow.save', requestId: rid(), workflow: template({}), expectedRevision: null });
     loc.answers.claude = available('claude');
     const before = loc.calls.filter((c) => c === 'claude').length;
-    await s.run({ type: 'workflow.start', requestId: rid(), instanceId: InstanceId.parse('run-mixed'), rootSessionId: SessionId.parse('root-mixed'), workflowId: WORKFLOW, workflowRevision: 0, title: 'Mixed', cwd: dir, firstMessage: 'Go.', crossToolConsent: true });
+    await s.run({ type: 'workflow.start', requestId: rid(), instanceId: InstanceId.parse('run-mixed'), rootSessionId: SessionId.parse('root-mixed'), workflowId: WORKFLOW, workflowRevision: 0, title: 'Mixed', workFolder: dir, projectFolder: dir, firstMessage: 'Go.', crossToolConsent: true });
     expect(loc.calls.filter((c) => c === 'claude').length).toBe(before + 1);
     await s.backend.shutdown();
   });

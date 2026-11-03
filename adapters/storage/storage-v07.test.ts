@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { CONTRACTS_VERSION } from '../../contracts';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { fixtureSnapshotInput } from '../../contracts/fixtures/snapshot';
 import { openDatabase } from './database';
@@ -37,10 +38,10 @@ describe('v8: data stored under contracts 0.6', () => {
     const db = openDatabase(path);
     try {
       const data = await createRepositories(db).readSnapshotData();
-      expect(data.agents.map((a) => a.schemaVersion)).toEqual(['0.7.0']);
-      expect(data.workflows.map((w) => w.schemaVersion)).toEqual(['0.7.0']);
-      expect(data.projects.map((p) => p.schemaVersion)).toEqual(['0.7.0']);
-      expect(data.instances.map((i) => i.template.schemaVersion)).toEqual(['0.7.0']);
+      expect(data.agents.map((a) => a.schemaVersion)).toEqual([CONTRACTS_VERSION]);
+      expect(data.workflows.map((w) => w.schemaVersion)).toEqual([CONTRACTS_VERSION]);
+      expect(data.projects.map((p) => p.schemaVersion)).toEqual([CONTRACTS_VERSION]);
+      expect(data.instances.map((i) => i.template.schemaVersion)).toEqual([CONTRACTS_VERSION]);
       expect(data.preferences).toEqual({ theme: 'light', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 } });
     } finally {
       db.close();

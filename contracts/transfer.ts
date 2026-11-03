@@ -85,8 +85,16 @@ export const SupervisorSettings = z.strictObject({
 });
 export type SupervisorSettings = z.infer<typeof SupervisorSettings>;
 
-/** Preferences saved before 0.7 have no `supervisor` and read with its defaults. */
-export const UiPreferences = z.strictObject({ theme: Theme.default('dark'), supervisor: SupervisorSettings.default({ idleCloseMinutes: 15, maxOpenRuntimes: 6 }) });
+/**
+ * Preferences saved before 0.7 have no `supervisor` and read with its defaults. `workFolderRoot` (T048, Q-1): where
+ * new work folders are made, as the user wrote it; absent, the default location (`Snapshot.defaultWorkFolderRoot`).
+ * `preferences.set` replaces the whole record, so a sender keeps the fields it does not change.
+ */
+export const UiPreferences = z.strictObject({
+  theme: Theme.default('dark'),
+  supervisor: SupervisorSettings.default({ idleCloseMinutes: 15, maxOpenRuntimes: 6 }),
+  workFolderRoot: z.string().min(1).optional(),
+});
 export type UiPreferences = z.infer<typeof UiPreferences>;
 
 // Inferred types for schemas that are not typed next to their definition.

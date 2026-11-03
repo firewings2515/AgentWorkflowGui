@@ -12,6 +12,7 @@ import { agentRepository, projectRepository, workflowRepository } from './defini
 import { SqliteSessionRepository } from './session-repository';
 import { SqliteEscalationRepository, SqliteOwnedProcessRepository, SqlitePreferencesRepository } from './small-repositories';
 import { readTransaction } from './transaction';
+import { SqliteWorkFolderClaimRepository } from './work-folder-repository';
 
 export interface RepositoryOptions {
   /** Message text, command output and diffs over this many UTF-8 bytes are stored apart; default 64 KiB. */
@@ -47,6 +48,7 @@ export const createRepositories = (db: DatabaseSync, options: RepositoryOptions 
     peerMessages,
     transfers,
     projects,
+    workFolders: new SqliteWorkFolderClaimRepository(ctx),
     readSnapshotData: (options = {}) =>
       run(() =>
         readTransaction(db, (): SnapshotData => {
