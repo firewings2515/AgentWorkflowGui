@@ -29,6 +29,7 @@ import { SessionCreate } from './SessionCreate';
 import { SettingsPage } from './SettingsPage';
 import type { SessionCreateDraft } from './SessionCreate';
 import { AppMenu } from './AppMenu';
+import { ShellV4 } from './shell-v4/ShellV4';
 import './styles.css';
 
 export const APP_NAME = 'AgentWorkflowGui';
@@ -57,7 +58,10 @@ const currentRoute = () => window.location.hash.slice(1) || '/workbench';
 const focusView = (viewId: string) => requestAnimationFrame(() => document.getElementById(`${viewId}-heading`)?.focus());
 
 export function App({ snapshot }: { snapshot?: Snapshot }) {
-  const demo = new URLSearchParams(window.location.search).get('demo');
+  const params = new URLSearchParams(window.location.search);
+  const demo = params.get('demo');
+  // T047 (U0): the v0.4 shell is a demo-mode preview only; the connected app keeps the current screens.
+  if (!window.awg && params.get('shell') === 'v4') return <ShellV4 {...(snapshot ? { snapshot } : {})} />;
   return window.awg ? <ConnectedApp store={rendererStore(window.awg)} /> : <DemoApp snapshot={snapshot ?? (demo === 'long' ? performanceSnapshot() : demo === 'read-only' ? fixtureReadOnlySnapshot : fixtureSnapshot)} />;
 }
 
