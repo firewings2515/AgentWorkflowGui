@@ -39,13 +39,26 @@ const cmd = <T extends string, S extends z.ZodRawShape>(type: T, shape: S) =>
   z.strictObject({ type: z.literal(type), requestId: RequestId, ...shape });
 
 export const Command = z.discriminatedUnion('type', [
-  cmd('session.create', { sessionId: SessionId, kind: z.literal('ordinary'), agentId: AgentId, model: ModelSelection, cwd: z.string().min(1), parentId: SessionId.optional() }),
+  /**
+   * No `agentId`: a session without an Agent (U-01). No `cwd`: the main process makes a new `YYYY-MM-DD-NNN` folder in
+   * the default work folder location (U-02, T048), once per session ID, also when the command is sent again.
+   */
+  cmd('session.create', {
+    sessionId: SessionId,
+    kind: z.literal('ordinary'),
+    agentId: AgentId.optional(),
+    model: ModelSelection,
+    cwd: z.string().min(1).optional(),
+    parentId: SessionId.optional(),
+  }),
   cmd('session.send', { sessionId: SessionId, messageId: MessageId, expectedRevision: Revision, text: z.string().min(1), attachments: z.array(Attachment).default([]) }),
   cmd('session.interrupt', { sessionId: SessionId }),
   /** Same-runtime model change only; changing runtime goes through transfer (R-02, R-12). */
   cmd('session.setModel', { sessionId: SessionId, expectedRevision: Revision, model: ModelSelection }),
-  /** Rejected for workflow sessions (WB-02). */
-  cmd('session.setAgent', { sessionId: SessionId, expectedRevision: Revision, agentId: AgentId }),
+  /** Rejected for workflow sessions (WB-02). `null` leaves an ordinary session without an Agent (T048). */
+  cmd('session.setAgent', { sessionId: SessionId, expectedRevision: Revision, agentId: AgentId.nullable() }),
+  /** The title the user gives (T048); trimmed, 1 to SESSION_TITLE_MAX_LENGTH characters. The first message no longer renames it. */
+  cmd('session.rename', { sessionId: SessionId, expectedRevision: Revision, title: z.string() }),
   cmd('session.reparent', { sessionId: SessionId, expectedRevision: Revision, parentId: SessionId.nullable() }),
   cmd('nativeTask.stop', { sessionId: SessionId, nativeTaskId: NativeTaskId }),
   cmd('agent.save', { agent: AgentDefinition, expectedRevision: Revision.nullable() }),
@@ -58,7 +71,16 @@ export const Command = z.discriminatedUnion('type', [
     workflowId: WorkflowId,
     workflowRevision: Revision,
     title: z.string().min(1),
-    cwd: z.string().min(1),
+    /**
+     * Where the run's reports and plans go and root works (Q-4, T048). Absent: a new `YYYY-MM-DD-NNN` folder in the
+     * default location, made once per run, also when the command is sent again.
+     */
+    workFolder: z.string().min(1).optional(),
+    /**
+     * The repository whose code the run changes (Q-8): task worktrees are made from it. Required with worktree
+     * isolation; in a same-folder run the non-root nodes work in it directly. Absent: they work in the work folder.
+     */
+    projectFolder: z.string().min(1).optional(),
     firstMessage: z.string().min(1),
     crossToolConsent: z.boolean(),
   }),
@@ -324,6 +346,11 @@ export const Snapshot = z.strictObject({
   /** Held in memory only (R-07): empty after a restart. */
   locks: z.array(FileLock).default([]),
   preferences: UiPreferences,
+  /**
+   * Where new work folders go when `preferences.workFolderRoot` is not set (Q-1, T048): `%USERPROFILE%\AgentWorkflowGui`,
+   * as the main process found it.
+   */
+  defaultWorkFolderRoot: z.string().min(1),
   historyPages: z.array(HistoryPageInfo).default([]),
   storage: StorageInfo.default({}),
   /** What was found of each runtime (C-33); empty before the first detection. */

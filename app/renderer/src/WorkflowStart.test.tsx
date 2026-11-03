@@ -75,7 +75,7 @@ describe('T025 workflow start', () => {
     await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(1));
     const command = Command.parse(fake.bridge.send.mock.calls[0]![0]);
     expect(command).toMatchObject({ type: 'workflow.start', workflowId: fixtureSnapshot.workflows[0]!.id,
-      workflowRevision: fixtureSnapshot.workflows[0]!.revision, title: '新的工作', cwd: 'E:\\work', firstMessage: '請完成實作', crossToolConsent: true });
+      workflowRevision: fixtureSnapshot.workflows[0]!.revision, title: '新的工作', workFolder: 'E:\\work', projectFolder: 'E:\\work', firstMessage: '請完成實作', crossToolConsent: true });
     if (command.type !== 'workflow.start') throw new Error('wrong command');
     expect(new Set([command.requestId, command.instanceId, command.rootSessionId]).size).toBe(3);
     await screen.findByText(/unsupported/);

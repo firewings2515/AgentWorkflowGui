@@ -344,6 +344,13 @@ export const WorkflowInstance = z
     template: WorkflowTemplate,
     /** The project whose setup script and test command the tasks use (O-06), when the cwd is one. */
     projectId: ProjectId.optional(),
+    /**
+     * The run's two folders (Q-4, Q-8, T048), as `workflow.start` gave or made them. `workFolder`: root works here and
+     * reports and plans go here. `projectFolder`: the repository task worktrees come from; in a same-folder run the
+     * non-root nodes work in it. Both absent on runs started before 0.8: root's cwd is both, as it was.
+     */
+    workFolder: z.string().min(1).optional(),
+    projectFolder: z.string().min(1).optional(),
     /** The branch merges go to (R-06); the pipeline sets it before its first merge (absent before 0.6). */
     targetBranch: z.string().min(1).optional(),
     /** Global limit of tasks in progress at once (O-05). */

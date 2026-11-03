@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { CONTRACTS_VERSION } from '../../contracts';
 import { afterEach, describe, expect, it } from 'vitest';
 import { PeerMessageId, SessionId, TransferProposal, WorkflowInstance } from '../../contracts';
 import { fixtureSnapshot as fx } from '../../contracts/fixtures/snapshot';
@@ -64,7 +65,7 @@ describe('v5 → v6 → v7 compatibility', () => {
             })),
           };
           write.run(id, instance.revision, expected.length, JSON.stringify(instance));
-          expected.push(WorkflowInstance.parse({ ...instance, template: { ...template, schemaVersion: '0.7.0' } }));
+          expected.push(WorkflowInstance.parse({ ...instance, template: { ...template, schemaVersion: CONTRACTS_VERSION } }));
         }
       }
     }
@@ -164,7 +165,7 @@ describe('v7 migration rollback', () => {
     expect(db.prepare('SELECT * FROM schema_migration').all()).toEqual(before.versions);
     db.exec('DROP TRIGGER fail_v7');
     expect(migrate(db)).toBe(latestVersion());
-    expect((await createRepositories(db).agents.get(agent.id))?.schemaVersion).toBe('0.7.0');
+    expect((await createRepositories(db).agents.get(agent.id))?.schemaVersion).toBe(CONTRACTS_VERSION);
   });
 
   it('fails closed on damaged v5 JSON during v6, leaving v7 unapplied and original bytes intact', () => {

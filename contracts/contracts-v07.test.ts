@@ -38,8 +38,8 @@ const envelope = (seq: number, event: unknown) => ({ schemaVersion: CONTRACTS_VE
 const delta = (text: string) => ({ type: 'message.delta', sessionId: 's-1', messageId: 'm-1', delta: text });
 
 describe('contracts 0.7', () => {
-  it('C-32: is version 0.7.0; the fixtures show a paged history, backups, a pending restore and read-only data', () => {
-    expect(CONTRACTS_VERSION).toBe('0.7.0');
+  // The version itself is 0.8.0 since T048 (contracts-v08.test.ts).
+  it('C-32: the fixtures show a paged history, backups, a pending restore and read-only data', () => {
     expect(fixtureSnapshot.historyPages).toEqual([{ sessionId: 's-plan-notes', olderCursor: 'cursor-plan-notes-1' }]);
     expect(fixtureSnapshot.storage.lastBackupAt).toBeDefined();
     expect(fixtureReadOnlySnapshot.app).toMatchObject({ status: 'read-only', reason: 'disk-full' });

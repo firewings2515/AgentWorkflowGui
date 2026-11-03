@@ -8,3 +8,4 @@ export * from './git';
 export * from './locks';
 export * from './storage';
 export * from './runtime-status';
+export * from './work-folders';

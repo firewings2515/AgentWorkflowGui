@@ -3,7 +3,7 @@
 import { z } from 'zod';
 
 /** Bump on any breaking change; contract changes go through the main session. */
-export const CONTRACTS_VERSION = '0.7.0';
+export const CONTRACTS_VERSION = '0.8.0';
 
 /**
  * Carried by every serialized boundary (Snapshot, event envelope, saved definitions) so stored data

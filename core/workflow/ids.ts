@@ -19,9 +19,12 @@ export interface StartIdentity {
   reworkLimit: number;
   title: string;
   crossToolConsent: boolean;
+  /** The run's project folder (T048); absent, the identity is what it was before 0.8, so earlier starts still match. */
+  projectFolder?: string;
 }
 const START = 'workflow.start:';
-export const startRefOf = (s: StartIdentity): string => `${START}${JSON.stringify([s.instanceId, s.workflowId, s.rootNodeId, s.reworkLimit, s.title, s.crossToolConsent])}`;
+export const startRefOf = (s: StartIdentity): string =>
+  `${START}${JSON.stringify([s.instanceId, s.workflowId, s.rootNodeId, s.reworkLimit, s.title, s.crossToolConsent, ...(s.projectFolder !== undefined ? [s.projectFolder] : [])])}`;
 /** The instance a first message's delivery was accepted for; undefined for any other delivery. */
 export const startInstanceOf = (sourceCallRef: string | undefined): InstanceId | undefined => {
   if (sourceCallRef?.startsWith(START) !== true) return undefined;

@@ -79,7 +79,7 @@ describe('workflow.start (R-11, R-06)', () => {
     const w = await world();
     expect(await w.run(startCommand({ workflowRevision: 3 }))).toMatchObject({ ok: false, code: 'stale_revision' });
     expect(await w.run(startCommand({ crossToolConsent: false }))).toMatchObject({ ok: false, code: 'invalid_request' });
-    expect(await w.run(startCommand({ cwd: 'Z:\\nowhere' }))).toMatchObject({ ok: false, code: 'invalid_request' });
+    expect(await w.run(startCommand({ workFolder: 'Z:\\nowhere' }))).toMatchObject({ ok: false, code: 'invalid_request' });
     expect(await w.repositories.instances.list()).toEqual([]);
     expect(await w.repositories.sessions.list()).toEqual([]);
   });

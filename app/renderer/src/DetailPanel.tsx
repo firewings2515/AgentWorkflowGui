@@ -86,10 +86,10 @@ function Files({ snapshot, session }: Pick<DetailProps, 'snapshot' | 'session'>)
 }
 
 function SessionInfo({ snapshot, session }: Pick<DetailProps, 'snapshot' | 'session'>) {
-  const agent = snapshot.agents.find(candidate => candidate.id === session.agent.id && candidate.revision === session.agent.revision);
+  const agent = session.agent && snapshot.agents.find(candidate => candidate.id === session.agent?.id && candidate.revision === session.agent.revision);
   return <section><h3>Session 資訊</h3><dl className="session-info">
     <dt>GUI session</dt><dd className="mono">{session.id}</dd>
-    <dt>Agent</dt><dd>{agent?.name ?? session.agent.id} · revision {session.agent.revision}</dd>
+    <dt>Agent</dt><dd>{session.agent ? `${agent?.name ?? session.agent.id} · revision ${session.agent.revision}` : '無'}</dd>
     <dt>要求的 Model</dt><dd>{session.requestedModel.model} · {session.requestedModel.effort ?? '未指定 effort'}</dd>
     <dt>模型觀察</dt><dd>{observedModelText(session)}</dd>
     <dt>Runtime</dt><dd>{session.requestedModel.runtime}</dd>

@@ -93,11 +93,34 @@ export const FolderScope = z
   .refine((s) => s.writableRoots.length === 0 || s.writableRoots.includes(s.workspaceRoot), ruleIssue('scope.writable-includes-workspace'));
 export type FolderScope = z.infer<typeof FolderScope>;
 
+/** The Agent a session runs with, at the revision it was given. */
+export const SessionAgent = z.strictObject({ id: AgentId, revision: Revision });
+export type SessionAgent = z.infer<typeof SessionAgent>;
+
+/** The title of a new session until its first user message names it (T048, like Claude). */
+export const DEFAULT_SESSION_TITLE = '新對話';
+/** How long a title taken from a message may be, in characters (code points). */
+export const AUTO_TITLE_MAX_LENGTH = 40;
+/** Longest title `session.rename` accepts, in characters (code points). */
+export const SESSION_TITLE_MAX_LENGTH = 200;
+
+/** The first non-blank line of a message, trimmed and cut to AUTO_TITLE_MAX_LENGTH; the placeholder when there is none. */
+export const titleFromMessage = (text: string): string => {
+  const line = text.split(/\r\n|\r|\n/).map((l) => l.trim()).find((l) => l.length > 0);
+  if (line === undefined) return DEFAULT_SESSION_TITLE;
+  const chars = Array.from(line);
+  return chars.length <= AUTO_TITLE_MAX_LENGTH ? line : chars.slice(0, AUTO_TITLE_MAX_LENGTH).join('').trimEnd();
+};
+
 const sessionShape = {
   id: SessionId,
   revision: Revision,
   title: z.string(),
-  agent: z.strictObject({ id: AgentId, revision: Revision }),
+  /**
+   * The title is still the placeholder and becomes the first line of the first user message once that is
+   * accepted (T048); renaming clears it. Absent on sessions stored before 0.8 and on workflow sessions.
+   */
+  autoTitle: z.literal(true).optional(),
   requestedModel: ModelSelection,
   /** Latest observation for the header; per-reply models live on each Message (R-12). */
   observedModel: ObservedModel,
@@ -125,8 +148,10 @@ const sessionShape = {
  * has a workflow binding and an ordinary one never does (WB-02), so the two cannot contradict.
  */
 export const LogicalSession = z.discriminatedUnion('kind', [
-  z.strictObject({ ...sessionShape, kind: z.literal('ordinary') }),
-  z.strictObject({ ...sessionShape, kind: z.literal('workflow'), workflow: WorkflowBinding }),
+  /** An ordinary session needs no Agent (U-01, T048): without one the runtime gets no extra instructions. */
+  z.strictObject({ ...sessionShape, kind: z.literal('ordinary'), agent: SessionAgent.optional() }),
+  /** A workflow session always has its node's Agent (WB-02). */
+  z.strictObject({ ...sessionShape, kind: z.literal('workflow'), agent: SessionAgent, workflow: WorkflowBinding }),
 ]);
 export type LogicalSession = z.infer<typeof LogicalSession>;
 

@@ -15,6 +15,7 @@ import { type PerfLog, startPerfLog } from './perf-log';
 import { perfLoadFrom, startPerfLoad } from './perf-load';
 import { createTrustedUrlMatcher, type TrustedSender } from './ipc-guard';
 import { folderState, resolveRealPath } from './real-path';
+import { defaultWorkFolderRoot } from './work-folders';
 import { createRuntimeLocator } from './runtime-locator';
 import { supervisorSettings } from './supervisor-settings';
 import { hiddenMenuTemplate, themeOf, WINDOW_BACKGROUND } from './window-chrome';
@@ -144,6 +145,8 @@ void app.whenReady().then(async () => {
     // back to the Agent SDK's copy; a development run may.
     runtimes: createRuntimeLocator({ ...(!app.isPackaged && { sdkBundledClaude: () => sdkBundledClaude(app.getAppPath()) }), log }),
     resolveRealPath,
+    // New sessions and runs without a folder get one in %USERPROFILE%\AgentWorkflowGui unless the user chose another (T048).
+    workFolders: { defaultRoot: defaultWorkFolderRoot() },
     // A closed session whose folder the file system says is gone is refused as such (C-30 `folder-missing`).
     folderState,
     // The idle supervisor follows the user's preferences (C-30); the environment overrides them in development runs only

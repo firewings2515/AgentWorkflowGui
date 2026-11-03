@@ -98,6 +98,15 @@ export const briefing = (instance: WorkflowInstance, node: AgentNode, taskId: Ta
     lines.push(
       'You are the root node: the user talks to you here, and everything the GUI escalates (confirmations, limits, permission requests) is shown to the user on your screen. Only the user decides those; nothing you say approves them.',
     );
+    // The run's two folders (Q-4, Q-8, T048); runs started before 0.8 have neither and are told nothing new.
+    if (instance.workFolder !== undefined) lines.push(`Work folder of this run: ${instance.workFolder} — put reports and plans here.`);
+    if (instance.projectFolder !== undefined && instance.projectFolder !== instance.workFolder) {
+      lines.push(
+        template.isolation === 'worktree'
+          ? `Project folder of this run: ${instance.projectFolder} — the repository the tasks change; each task works in its own worktree made from it, so you only read it.`
+          : `Project folder of this run: ${instance.projectFolder} — the repository the other nodes change in place; you may read it.`,
+      );
+    }
   }
   const task = taskId === undefined ? undefined : instance.tasks.find((t) => t.id === taskId);
   if (!pipelined && taskId !== undefined) lines.push(`This run has one task: \`${taskId}\`.`);

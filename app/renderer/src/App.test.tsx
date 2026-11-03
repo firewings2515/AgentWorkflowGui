@@ -104,7 +104,7 @@ describe('T004 工作台外殼', () => {
     expect(pane().getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).value).toBe('claude:claude-sonnet-5-5');
     expect(draft().value).toBe('A');
     expect(draft('view-2').value).toBe('B');
-    expect(fixtureSnapshot.sessions[0]?.agent.id).toBe('agent-planner');
+    expect(fixtureSnapshot.sessions[0]?.agent?.id).toBe('agent-planner');
   });
 
   it('preserves session draft and scroll across selection and page navigation', () => {

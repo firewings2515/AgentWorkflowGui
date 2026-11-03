@@ -30,7 +30,7 @@ function fillCreate() {
 const createButton = () => screen.getByRole<HTMLButtonElement>('button', { name: '建立 session' });
 function newSession(command: Extract<Command, { type: 'session.create' }>, revision: number): LogicalSession {
   const base = fixtureSnapshot.sessions.find(item => item.kind === 'ordinary')!;
-  return { ...base, id: command.sessionId, title: '新建對話', revision, agent: { id: command.agentId, revision: 1 }, requestedModel: command.model, activity: 'idle', cwd: command.cwd };
+  return { ...base, id: command.sessionId, title: '新建對話', revision, ...(command.agentId !== undefined && { agent: { id: command.agentId, revision: 1 } }), requestedModel: command.model, activity: 'idle', cwd: command.cwd ?? 'E:/work/auto' };
 }
 
 describe('T027 app menu', () => {

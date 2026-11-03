@@ -26,7 +26,7 @@ import { hashOf } from '../../delivery/testing/fixtures';
 import { MemoryDeliveryStore } from '../../delivery/testing/memory-store';
 import type { WorktreeFiles } from '../../pipeline';
 import type { AppRepositories, DeliveryStore, DispatchRequest, GitPort, McpMount, PermissionPolicy, PolicyDecision, StoredDelivery } from '../../ports';
-import { SessionService } from '../../sessions';
+import { SessionService, type SessionServiceOptions } from '../../sessions';
 import { FakeAdapter, type RuntimeDisk } from '../../sessions/testing/fake-adapter';
 import { MemoryRepositories } from '../../sessions/testing/memory-repositories';
 import { FakeCommands, FakeFiles } from '../../pipeline/testing/fakes';
@@ -166,7 +166,7 @@ const peerOf = (r: StoredDelivery): PeerMessage | undefined => {
 const all = async (store: DeliveryStore) => [...(await store.listByState('pending')), ...(await store.listByState('unknown')), ...(await store.listByState('sent'))];
 
 /** Memory repositories whose handoffs and peer messages are the delivery store's records (C-12). */
-class WorkflowRepositories extends MemoryRepositories {
+export class WorkflowRepositories extends MemoryRepositories {
   constructor(private readonly store: MemoryDeliveryStore) {
     super();
   }
@@ -289,7 +289,12 @@ export interface RealFolders {
 /** The storage of the next start: a new connection to the same database, read back from its file (T039 r1-P1-2). */
 export type Reopen = () => { repositories: AppRepositories; store: DeliveryStore };
 
-const build = (repositories: AppRepositories, store: DeliveryStore, previous?: World, real?: RealFolders, reopen?: Reopen): World => {
+/** What else a world may be given (T048): work folders for runs started without one. */
+export interface HarnessExtra {
+  workFolders?: SessionServiceOptions['workFolders'];
+}
+
+const build = (repositories: AppRepositories, store: DeliveryStore, previous?: World, real?: RealFolders, reopen?: Reopen, extra: HarnessExtra = {}): World => {
   const world = {
     repositories,
     store,
@@ -355,6 +360,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     listModels: () => Promise.resolve([]),
     log: (message) => world.logs.push(message),
     sleep: () => new Promise<void>(() => undefined),
+    ...(extra.workFolders !== undefined && { workFolders: extra.workFolders }),
   });
   world.engine = new WorkflowEngine({
     sessions: world.service,
@@ -394,7 +400,7 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
   world.run = (command) => world.service.execute(command);
   world.restart = async () => {
     const fresh = reopen?.();
-    const next = build(fresh?.repositories ?? repositories, fresh?.store ?? store, world, real, reopen);
+    const next = build(fresh?.repositories ?? repositories, fresh?.store ?? store, world, real, reopen, extra);
     await next.service.start();
     await next.engine.recover();
     return next;
@@ -408,8 +414,15 @@ export const world = async (workflow: WorkflowTemplate = template()): Promise<Wo
 };
 
 /** The same world on other storage (the SQLite repositories and store in app/main's tests, r2). */
-export const worldOn = async (repositories: AppRepositories, store: DeliveryStore, workflow: WorkflowTemplate = template(), real?: RealFolders, reopen?: Reopen): Promise<World> => {
-  const w = build(repositories, store, undefined, real, reopen);
+export const worldOn = async (
+  repositories: AppRepositories,
+  store: DeliveryStore,
+  workflow: WorkflowTemplate = template(),
+  real?: RealFolders,
+  reopen?: Reopen,
+  extra?: HarnessExtra,
+): Promise<World> => {
+  const w = build(repositories, store, undefined, real, reopen, extra);
   for (const a of agents()) await w.repositories.agents.save(a, null);
   await w.repositories.workflows.save(workflow, null);
   return w;
@@ -431,7 +444,9 @@ export const startCommand = (extra: Partial<Extract<Command, { type: 'workflow.s
   workflowId: WORKFLOW,
   workflowRevision: 0,
   title: 'Add a login page',
-  cwd: CWD,
+  // One folder for both, as a run was before 0.8 (T048): root and the repository in CWD.
+  workFolder: CWD,
+  projectFolder: CWD,
   firstMessage: 'Plan a login page.',
   crossToolConsent: true,
   ...extra,
