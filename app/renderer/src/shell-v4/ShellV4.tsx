@@ -67,7 +67,7 @@ export function ShellV4({ snapshot = v4DemoSnapshot }: { snapshot?: Snapshot }) 
   const [choices, setChoices] = useState<Record<string, ComposerChoice>>({});
   const [editTitle, setEditTitle] = useState<{ sessionId: string; nonce: number }>({ sessionId: '', nonce: 0 });
   const [notice, setNotice] = useState('');
-  const [{ repository: agentRepository, controls: agentDemo }] = useState(() => createAgentDemo(snapshot.agents, id => snapshot.sessions.some(session => session.agent.id === id)));
+  const [{ repository: agentRepository, controls: agentDemo }] = useState(() => createAgentDemo(snapshot.agents, id => snapshot.sessions.some(session => session.agent?.id === id)));
   const [{ repository: workflowRepository, controls: workflowDemo }] = useState(() => createWorkflowDemo(snapshot.workflows));
   const agents = useSyncExternalStore(agentRepository.subscribe, agentRepository.getSnapshot);
   const autoFolder = nextAutoFolder(new Date());
@@ -83,7 +83,7 @@ export function ShellV4({ snapshot = v4DemoSnapshot }: { snapshot?: Snapshot }) 
   const active = panes.find(pane => pane.id === activePane) ?? panes[0];
   // An existing session starts from its own Agent and Model; a new chat starts with no Agent and the default Model.
   const choiceFor = (key: string, session?: Snapshot['sessions'][number]): ComposerChoice => choices[key] ?? (session
-    ? { folder: { kind: 'picked', path: session.cwd }, agentId: session.agent.id, modelKey: `${session.requestedModel.runtime}:${session.requestedModel.model}` }
+    ? { folder: { kind: 'picked', path: session.cwd }, agentId: session.agent?.id ?? '', modelKey: `${session.requestedModel.runtime}:${session.requestedModel.model}` }
     : { folder: { kind: 'auto' }, agentId: '', modelKey: defaultModelKey(snapshot.modelOptions) });
   const go = (next: V4Page) => { setPage(next); const nextMode = pageModes[next]; if (nextMode) setMode(nextMode); if (narrow) setNarrowOpen(false); };
   const patchPane = (id: string, patch: Partial<V4Pane>) => setPanes(previous => previous.map(pane => pane.id === id ? { ...pane, ...patch } : pane));

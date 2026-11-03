@@ -97,7 +97,7 @@ export function Conversation(props: ConversationProps) {
   const escalations = snapshot.escalations.filter(item => item.state === 'open' && (item.fromSessionId === session.id || item.rootSessionId === session.id));
   const entries = timeline(snapshot, session, escalations);
   const tasks = snapshot.nativeTasks.filter(task => task.sessionId === session.id).sort((a, b) => a.startedAt.localeCompare(b.startedAt));
-  const agent = snapshot.agents.find(item => item.id === session.agent.id);
+  const agent = snapshot.agents.find(item => item.id === session.agent?.id);
   const finish = (save: boolean) => {
     setEditing(false);
     if (save && name.trim() && name.trim() !== title) props.onRename(name.trim());
