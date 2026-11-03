@@ -159,11 +159,13 @@ describe('snapshot', () => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const asked: unknown[] = [];
     let fail = true;
+    const sent: EventBatch[] = [];
     const target: EventTarget = {
       isDestroyed: () => false,
       getURL: () => 'http://localhost:5173/',
-      send: () => {
-        throw new Error('render frame disposed');
+      send: (_channel, batch) => {
+        if (fail) throw new Error('render frame disposed');
+        sent.push(batch);
       },
     };
     const { call, bus } = setup({
@@ -182,11 +184,17 @@ describe('snapshot', () => {
     await expect(call(SNAPSHOT_CHANNEL, trustedEvent)).rejects.toThrow(SNAPSHOT_UNAVAILABLE);
     fail = false;
     await call(SNAPSHOT_CHANNEL, trustedEvent);
-    const owed = (m: unknown) => (m as Map<string, { turns: Set<string> }>).get('s-wf-build-b')?.turns.has('turn-b1');
-    expect(asked.map(owed)).toEqual([true, true]);
-    // Brought back once: the read after it is owed nothing.
+    // Answered, but no batch since it was taken: the window may not hold it, so the next read brings it back too (r2).
     await call(SNAPSHOT_CHANNEL, trustedEvent);
-    expect((asked[2] as Map<string, unknown>).size).toBe(0);
+    const owed = (m: unknown) => (m as Map<string, { turns: Set<string> }>).get('s-wf-build-b')?.turns.has('turn-b1');
+    expect(asked.map(owed)).toEqual([true, true, true]);
+    // A batch sent after that answer, acknowledged by the window: it holds that Snapshot, and nothing is owed.
+    bus.publish({ type: 'usage.limits', at: '2026-11-03T10:00:00.000Z' });
+    await tick();
+    const ack = electron.listeners.get(BATCH_ACK_CHANNEL)!;
+    ack(trustedEvent, sent.at(-1)!.toSeq);
+    await call(SNAPSHOT_CHANNEL, trustedEvent);
+    expect((asked[3] as Map<string, unknown>).size).toBe(0);
   });
 });
 

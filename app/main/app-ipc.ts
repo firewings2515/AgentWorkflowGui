@@ -107,7 +107,10 @@ export interface EventTarget {
   send(channel: string, batch: EventBatch): void;
 }
 
-export type ForwardingOptions = Pick<BatcherOptions, 'batchMs' | 'maxBatch' | 'maxInFlight' | 'maxPending' | 'maxPendingBytes' | 'stallMs' | 'log'>;
+export type ForwardingOptions = Pick<
+  BatcherOptions,
+  'batchMs' | 'maxBatch' | 'maxInFlight' | 'maxPending' | 'maxPendingBytes' | 'stallMs' | 'answerWithinMs' | 'log' | 'now' | 'setTimer' | 'clearTimer'
+>;
 
 /**
  * Pushes the bus's envelopes to the window as event batches (C-27), but only while it is alive and still showing one
@@ -156,6 +159,22 @@ export interface AppIpcOptions {
 }
 
 /**
+ * One Snapshot read of the window (the SNAPSHOT handler; the T040 recovery tests drive it as the renderer does). The cut
+ * comes first, in the same synchronous step as the seq the facade reads (C-27). What is owed comes back with this read
+ * and stays owed until the window is known to hold it (event-batcher.ts): the answer is marked last, right before it
+ * goes to the window, and a read that fails leaves it owed to the next one.
+ */
+export function readForWindow(batcher: WindowBatcher, facade: AppFacade, onSnapshot?: (snapshot: Snapshot, ms: number) => void): Promise<Snapshot> {
+  const owed = batcher.cut();
+  const began = performance.now();
+  return readSnapshot(facade, console.error, owed).then((snapshot) => {
+    onSnapshot?.(snapshot, performance.now() - began);
+    batcher.answered(owed);
+    return snapshot;
+  });
+}
+
+/**
  * Registers the snapshot, command and query handlers and the batch acknowledgement, and starts forwarding events.
  * Returns the function that stops forwarding.
  */
@@ -165,17 +184,7 @@ export function registerAppIpc(options: AppIpcOptions): () => void {
   options.onBatcher?.(batcher);
   // Everything queued goes out before the Snapshot's seq is read, in the same synchronous step (facade.snapshot reads
   // the seq before its first await), so the next batch starts right after that seq (C-27).
-  handleTrusted(SNAPSHOT_CHANNEL, getTrustedSender, () => {
-    const missed = batcher.cut();
-    const began = performance.now();
-    // What the window was not sent comes back with this read; a read that fails owes it to the next one.
-    const read = readSnapshot(facade, console.error, missed).catch((error: unknown) => {
-      batcher.keepMissed(missed);
-      throw error;
-    });
-    const { onSnapshot } = options;
-    return onSnapshot === undefined ? read : read.then((snapshot) => (onSnapshot(snapshot, performance.now() - began), snapshot));
-  });
+  handleTrusted(SNAPSHOT_CHANNEL, getTrustedSender, () => readForWindow(batcher, facade, options.onSnapshot));
   handleTrusted(COMMAND_CHANNEL, getTrustedSender, (raw: unknown) => runCommand(facade, raw));
   handleTrusted(QUERY_CHANNEL, getTrustedSender, (raw: unknown) => runQuery(facade, raw));
   const onAck = (event: IpcSenderEvent, toSeq: unknown) => {

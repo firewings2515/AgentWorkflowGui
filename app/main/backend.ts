@@ -57,7 +57,7 @@ import type { EventBus } from './event-bus';
 import { type AppFacade, failure } from './facade';
 import { type FaultPoint, faultApplies, withFaultPoint } from './fault-points';
 import { hashFile, setTimer } from './file-hash';
-import { addMissed, type MissedRecords, sessionsToRead } from './missed-records';
+import { type MissedRecords, withMissed } from './missed-records';
 import type { FolderState } from './real-path';
 import { GitIgnoreRules } from './git-ignore';
 import { gitWorktreeFiles, isPipelineFolder, jobCommandRunner } from './pipeline-host';
@@ -721,15 +721,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       const data = await repositories.readSnapshotData({ recentTurns: options.snapshotTurns ?? SNAPSHOT_TURNS });
       // And what the window was not sent (T040 r1 P1-1), read after the rest, so never older than the seq: a far-back
       // turn that ended meanwhile, an answered request. Only sessions of which something is not held yet are read.
-      let conversations = data.conversations;
-      if (missed !== undefined && missed.size > 0) {
-        const known = new Set(data.sessions.map((s) => s.id));
-        for (const sessionId of sessionsToRead(conversations, missed)) {
-          const session = missed.get(sessionId);
-          if (session === undefined || !known.has(sessionId)) continue;
-          conversations = addMissed(conversations, await repositories.conversations.get(sessionId), session);
-        }
-      }
+      const conversations = await withMissed(data.conversations, data.sessions, missed, (sessionId) => repositories.conversations.get(sessionId));
       const storage = await storageInfo();
       return {
         schemaVersion: CONTRACTS_VERSION,

@@ -12,9 +12,21 @@
 // A batch that could not be sent is handled the same way (r1 P1-2): the window is told to read again, never handed a
 // later batch that would pass the gap off as merged deltas.
 //
+// The records owed (T040 r2): a record whose event the window did not take in a batch right after the one before is
+// kept until the window is known to hold a Snapshot that brought it back. The renderer (renderer-store.ts) takes a
+// batch it was sent without applying it whenever it reads: a batch after a gap is held and then dropped under the
+// Snapshot's seq, a batch arriving in the error state is dropped, a Snapshot older than an invalidation it saw is
+// dropped. So from a gap (a batch not sent, the window let go, any `snapshot.invalidated`) until the window holds a
+// Snapshot again, every envelope is written down, sent or not, and so is everything `cut` sends. A Snapshot read hands
+// over all that is owed and the batcher keeps it: it is let go only once that read was answered (in time, before the
+// renderer would give up on it), a batch sent after the answer was acknowledged, and no gap came in between. Batches
+// and the answer go to the window over the same IPC channel in order, so that batch was taken after the Snapshot.
+// Anything else (a read that failed or came late, a gap during the read, a renderer that reads for a reason of its
+// own) leaves it owed to the next read.
+//
 // Electron-free: the IPC layer (app-ipc.ts) gives it the window and the timers.
 import { CONTRACTS_VERSION, type AppEvent, type EventBatch, type EventEnvelope, type SessionId } from '../../contracts';
-import { mergeMissed, type MissedRecords, noteMissed } from './missed-records';
+import { copyMissed, mergeMissed, type MissedRecords, type MissedSession, noteMissed } from './missed-records';
 
 /** The window batches go to. */
 export interface BatchTarget {
@@ -41,6 +53,11 @@ export interface BatcherOptions {
   maxPendingBytes?: number;
   /** No acknowledgement for this long while batches wait: the window is let go (default 30 s). */
   stallMs?: number;
+  /**
+   * A Snapshot read answered later than this after its cut may have been given up on by the renderer (it waits 15 s):
+   * what it brought back stays owed to the next read (default 10 s).
+   */
+  answerWithinMs?: number;
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
@@ -117,6 +134,19 @@ const sizeOf = (event: AppEvent): number =>
 interface InFlight {
   toSeq: number;
   sentAt: number;
+  /** The how-manyth batch sent. */
+  index: number;
+}
+
+/** The last Snapshot read (`cut`) while it is not known that the window holds it. */
+interface Reading {
+  /** Everything owed, handed to that read. */
+  owed: MissedRecords;
+  cutAt: number;
+  /** Batches sent when it was answered; a batch sent after that and acknowledged shows the window took it. */
+  answeredAfter?: number;
+  /** A gap since the cut, or an answer that came late: the window may not hold it. */
+  spoiled: boolean;
 }
 
 export class WindowBatcher {
@@ -145,8 +175,13 @@ export class WindowBatcher {
   private overflowed = false;
   /** While let go: whether `snapshot.invalidated` reached the window; `failed` sends each later envelope as a gap. */
   private told: 'awaited' | 'sent' | 'failed' = 'awaited';
-  /** The records of the envelopes not sent since the last Snapshot read. */
+  /** The records owed since the last Snapshot read (`cut`); what was owed before it went with that read. */
   private missed: MissedRecords = new Map();
+  /** Whether the window is known to hold a Snapshot and every batch since. Not yet when it starts. */
+  private holds = false;
+  private reading: Reading | undefined;
+  private sends = 0;
+  private readonly answerWithinMs: number;
   private timer: unknown;
   readonly stats: BatcherStats = { batches: 0, envelopesIn: 0, envelopesSent: 0, merged: 0, overflows: 0, maxPending: 0, maxInFlight: 0, bytesSent: 0 };
 
@@ -157,6 +192,7 @@ export class WindowBatcher {
     this.maxPending = options.maxPending ?? 5000;
     this.maxPendingBytes = options.maxPendingBytes ?? 16 * 1024 * 1024;
     this.stallMs = options.stallMs ?? 30_000;
+    this.answerWithinMs = options.answerWithinMs ?? 10_000;
     this.now = options.now ?? (() => Date.now());
     this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
@@ -170,7 +206,8 @@ export class WindowBatcher {
     this.stats.envelopesIn++;
     if (this.overflowed) {
       // Let go: only the invalidation reaches it, alone, after the gap it marks. Should that not have reached it, the
-      // next envelope goes alone instead: its gap tells the renderer to read again just the same.
+      // next envelope goes alone instead: its gap tells the renderer to read again just the same. Sent or not, it is
+      // owed (r2): the renderer holds it until the Snapshot comes and then drops it under the Snapshot's seq.
       if (envelope.event.type === 'snapshot.invalidated' || this.told === 'failed') {
         if (this.sendNow([envelope], envelope.seq)) this.told = 'sent';
         else if (envelope.event.type === 'snapshot.invalidated') this.told = 'failed';
@@ -178,6 +215,8 @@ export class WindowBatcher {
       return;
     }
     const { event } = envelope;
+    // Whatever invalidated it (a restore, an event not written), the renderer reads again once it sees this.
+    if (event.type === 'snapshot.invalidated') this.gap();
     const sessions = sessionsOf(event);
     const key = deltaKey(event);
     if (key !== undefined && sessions !== 'all' && sessions[0] !== undefined) {
@@ -208,16 +247,26 @@ export class WindowBatcher {
   ack(toSeq: number): void {
     const index = this.inFlight.findIndex((b) => b.toSeq === toSeq);
     if (index < 0) return;
+    const acknowledged = this.inFlight[index]!;
     // Batches are applied in order: one acknowledged means those before it were too.
     this.inFlight = this.inFlight.slice(index + 1);
     this.lastAckAt = this.now();
+    // Taken after the answer to the read, with no gap since the cut: the window holds that Snapshot and every batch
+    // since, so what the read brought back, and what was written down since, is no longer owed.
+    const reading = this.reading;
+    if (reading !== undefined && !reading.spoiled && reading.answeredAfter !== undefined && acknowledged.index > reading.answeredAfter) {
+      this.reading = undefined;
+      this.missed = new Map();
+      this.holds = true;
+    }
     if (this.pending.size > 0) this.drain();
   }
 
   /**
    * Right before the Snapshot's seq is read, in the same synchronous step: everything queued is sent now (so the next
    * batch starts after the Snapshot's seq and no merge spans it), and a let-go window is fed again from here on.
-   * Returns the records of what the window was not sent, for that Snapshot to bring back.
+   * Returns every record owed, for that Snapshot to bring back; they stay owed until the window is known to hold it
+   * (`answered`, then an acknowledgement).
    */
   cut(): MissedRecords {
     this.cancelTimer();
@@ -237,14 +286,26 @@ export class WindowBatcher {
     // A reading renderer starts over: what was waited for before no longer holds it back.
     this.inFlight = [];
     this.lastAckAt = this.now();
-    const missed = this.missed;
+    // What an earlier read was handed and the window is not known to hold goes with this one too (r2): the renderer
+    // drops a Snapshot older than an invalidation it saw, and one it gave up waiting for.
+    const owed = this.reading === undefined ? new Map<SessionId, MissedSession>() : copyMissed(this.reading.owed);
+    mergeMissed(owed, this.missed);
     this.missed = new Map();
-    return missed;
+    // Until the window is known to hold this one, everything it is sent is written down as well.
+    this.holds = false;
+    this.reading = { owed, cutAt: this.now(), spoiled: false };
+    return owed;
   }
 
-  /** A Snapshot read that failed: what it was to bring back is still owed to the next one. */
-  keepMissed(missed: MissedRecords): void {
-    mergeMissed(this.missed, missed);
+  /**
+   * The read `cut` returned `owed` to was answered: once a batch sent from now on is acknowledged, the window holds it.
+   * A read that failed is never answered, so what it was to bring back stays owed to the next one.
+   */
+  answered(owed: MissedRecords): void {
+    const reading = this.reading;
+    if (reading?.owed !== owed) return;
+    if (this.now() - reading.cutAt > this.answerWithinMs) reading.spoiled = true;
+    else reading.answeredAfter = this.sends;
   }
 
   /** Sends what is queued now, as far as the in-flight limit lets it (tests and shutdown). */
@@ -256,6 +317,7 @@ export class WindowBatcher {
     this.cancelTimer();
     this.dropPending();
     this.missed = new Map();
+    this.reading = undefined;
   }
 
   get pendingCount(): number {
@@ -319,15 +381,20 @@ export class WindowBatcher {
     }
     const first = envelopes[0];
     if (first === undefined) return;
-    this.sendNow(envelopes, this.lastSent === undefined ? first.seq : this.lastSent + 1, untracked);
+    this.sendNow(envelopes, this.lastSent === undefined ? first.seq : this.lastSent + 1, !untracked);
   }
 
-  /** Whether the batch reached the window. One that did not leaves a gap the renderer sees, and its records are owed. */
-  private sendNow(envelopes: EventEnvelope[], fromSeq: number, untracked = true): boolean {
+  /**
+   * Whether the batch reached the window. One that did not leaves a gap the renderer sees, and its records are owed.
+   * Untracked batches (sent by `cut`, or while let go) and every batch while the window is not known to hold a Snapshot
+   * are owed even when sent: the renderer may drop them under the Snapshot's seq (r2).
+   */
+  private sendNow(envelopes: EventEnvelope[], fromSeq: number, tracked = false): boolean {
     const toSeq = envelopes[envelopes.length - 1]!.seq;
     const notSent = () => {
       // The next batch shows the gap (never passed off as merged deltas), so the window reads again.
       this.lastSent = undefined;
+      this.gap();
       for (const e of envelopes) noteMissed(this.missed, e.event);
     };
     const batch: EventBatch = { schemaVersion: CONTRACTS_VERSION, fromSeq, toSeq, envelopes };
@@ -352,14 +419,22 @@ export class WindowBatcher {
       return false;
     }
     this.lastSent = toSeq;
+    this.sends++;
     this.stats.batches++;
     this.stats.envelopesSent += envelopes.length;
     for (const e of envelopes) this.stats.bytesSent += sizeOf(e.event);
-    if (!untracked) {
-      this.inFlight.push({ toSeq, sentAt: this.now() });
+    if (!tracked || !this.holds) for (const e of envelopes) noteMissed(this.missed, e.event);
+    if (tracked) {
+      this.inFlight.push({ toSeq, sentAt: this.now(), index: this.sends });
       this.stats.maxInFlight = Math.max(this.stats.maxInFlight, this.inFlight.length);
     }
     return true;
+  }
+
+  /** The window will read again, or might: it is no longer known to hold a Snapshot, nor the read under way. */
+  private gap(): void {
+    this.holds = false;
+    if (this.reading !== undefined) this.reading.spoiled = true;
   }
 
   private dropPending(): void {
@@ -375,6 +450,7 @@ export class WindowBatcher {
     this.cancelTimer();
     this.overflowed = true;
     this.told = 'awaited';
+    this.gap();
     this.stats.overflows++;
     // What is let go is owed to the next Snapshot.
     for (const e of this.pending.values()) noteMissed(this.missed, e.event);

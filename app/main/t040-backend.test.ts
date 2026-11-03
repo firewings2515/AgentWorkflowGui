@@ -30,7 +30,7 @@ import { InjectedStorageFaults } from '../../adapters/storage/testing/storage-fa
 import type { PermissionHandle, PolicyDecision } from '../../core/ports';
 import { FakeAdapter, permissionRequest } from '../../core/sessions/testing/fake-adapter';
 import { agent } from '../../core/sessions/testing/harness';
-import { forwardEvents } from './app-ipc';
+import { forwardEvents, readForWindow } from './app-ipc';
 import { type Backend, type BackendProcessHost, startBackend, STORAGE_READ_ONLY, STORAGE_TURNED_READ_ONLY } from './backend';
 import { EventBus } from './event-bus';
 import { type FolderState, folderState, resolveRealPath } from './real-path';
@@ -568,13 +568,19 @@ describe('C-27 with C-26: a far-back record that changed while the renderer was 
     // Without what was missed the Snapshot would not have it at all (the review's repro): neither running nor completed.
     expect((await snapshot(s)).turns.some((t) => t.id === oldest)).toBe(false);
     // The read as the IPC handler does it: the cut hands over what the window missed.
-    const snap = Snapshot.parse(await s.backend.facade.snapshot(batcher.cut()));
+    const snap = await readForWindow(batcher, s.backend.facade);
     expect(snap.turns).toContainEqual(expect.objectContaining({ id: oldest, state: 'completed' }));
     // The streamed message is there completed, so the renderer drops its stream (renderer-store keeps one otherwise).
     expect(snap.messages).toContainEqual(expect.objectContaining({ id: 'm-old', text: 'x'.repeat(40) }));
     expect(snap.turns.filter((t) => t.sessionId === sessionId)).toHaveLength(51);
-    // Owed once: the next read is the plain Snapshot again.
-    expect(Snapshot.parse(await s.backend.facade.snapshot(batcher.cut())).turns.some((t) => t.id === oldest)).toBe(false);
+    // Owed until the window is known to hold that Snapshot (r2): a read now brings it back again.
+    expect((await readForWindow(batcher, s.backend.facade)).turns.some((t) => t.id === oldest)).toBe(true);
+    // A batch sent after the answer, acknowledged: the window holds it, and the next read is the plain Snapshot again.
+    adapter.emit({ type: 'session.activity', sessionId, activity: 'idle', at });
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    batcher.ack(sent.at(-1)!.toSeq);
+    expect((await readForWindow(batcher, s.backend.facade)).turns.some((t) => t.id === oldest)).toBe(false);
     stop();
     await s.backend.shutdown();
   });

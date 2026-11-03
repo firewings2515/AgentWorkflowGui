@@ -66,7 +66,11 @@ export const noteMissed = (missed: MissedRecords, event: AppEvent): void => {
   }
 };
 
-/** `from`'s entries added to `into` (the batcher keeps what a Snapshot that failed did not bring back). */
+/** A copy that shares nothing with `missed` (a read may still be going through what it was handed). */
+export const copyMissed = (missed: MissedRecords): MissedRecords =>
+  new Map([...missed].map(([sessionId, s]) => [sessionId, { turns: new Set(s.turns), records: new Set(s.records), whole: s.whole }]));
+
+/** `from`'s entries added to `into` (the batcher hands a read what an earlier one brought back, should that be lost). */
 export const mergeMissed = (into: MissedRecords, from: MissedRecords): void => {
   for (const [sessionId, session] of from) {
     const kept = into.get(sessionId);
@@ -86,6 +90,28 @@ export const mergeMissed = (into: MissedRecords, from: MissedRecords): void => {
 };
 
 const key = (r: { sessionId: string; id: string }) => JSON.stringify([r.sessionId, r.id]);
+
+/**
+ * The Snapshot's conversations (`held`, read with the rest) with what `missed` names added, each session read in full
+ * after them (backend.ts; the T040 recovery tests on the memory repositories and on SQLite). Sessions not in
+ * `sessions` (deleted meanwhile) are left out.
+ */
+export const withMissed = async (
+  held: Conversation,
+  sessions: readonly { id: SessionId }[],
+  missed: MissedRecords | undefined,
+  read: (sessionId: SessionId) => Promise<Conversation>,
+): Promise<Conversation> => {
+  if (missed === undefined || missed.size === 0) return held;
+  const known = new Set(sessions.map((s) => s.id));
+  let conversations = held;
+  for (const sessionId of sessionsToRead(held, missed)) {
+    const session = missed.get(sessionId);
+    if (session === undefined || !known.has(sessionId)) continue;
+    conversations = addMissed(conversations, await read(sessionId), session);
+  }
+  return conversations;
+};
 
 /**
  * The sessions of `missed` whose records `held` (the Snapshot's part of the conversations) does not all hold, with what
