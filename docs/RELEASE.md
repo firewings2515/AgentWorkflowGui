@@ -42,7 +42,8 @@ npm run pack     # 只產生 release\win-unpacked（不做安裝檔），用來�
 
 ## 3. 安裝、解除安裝與使用者資料
 
-- **per-user**：預設安裝到 `%LOCALAPPDATA%\Programs\AgentWorkflowGui`（electron-builder 的 per-user 預設值，`oneClick`，不會要求系統管理員權限；這個預設位置**沒有實測**，實測都是用 `/D=` 指定資料夾）。會在開始功能表建立捷徑，並在 `HKCU` 的解除安裝清單登記；不建桌面捷徑。
+- **per-user**：預設安裝到 `%LOCALAPPDATA%\Programs\agent-workflow-gui`（electron-builder 的 per-user 預設值，資料夾名取自 `package.json` 的 `name`；2026-11-04 使用者實際安裝確認），不會要求系統管理員權限。會在開始功能表建立捷徑，並在 `HKCU` 的解除安裝清單登記；不建桌面捷徑。
+- **安裝畫面**（T049）：一般的安裝精靈，不是 one-click。執行後不問問題，直接安裝；裝完停在完成頁，顯示安裝到哪個資料夾，以及「執行 AgentWorkflowGui」的勾選框（預設打勾），按「完成」關閉。整個安裝程式是繁體中文。完成頁文字在 `installer/installer.nsh`。
 - 靜默安裝到指定資料夾：`AgentWorkflowGui-Setup-0.1.0-x64.exe /S /D=<資料夾>`（`/D` 必須放在最後、不加引號）。靜默解除安裝：`"<資料夾>\Uninstall AgentWorkflowGui.exe" /S`。
 - **解除安裝保留使用者資料**（`deleteAppDataOnUninstall: false`）：`%APPDATA%\AgentWorkflowGui` 不會被刪。要徹底移除要自己刪這個資料夾。
 - 程式還在執行時，安裝或解除安裝程式會要求先關閉它。
