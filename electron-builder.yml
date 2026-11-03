@@ -50,10 +50,17 @@ win:
   artifactName: '${productName}-Setup-${version}-${arch}.${ext}'
 
 nsis:
-  oneClick: true
+  # Assisted, not one-click (T049): it installs at once with no questions, then stops on a finish page that shows the
+  # folder and a ticked "run now" box (installer/installer.nsh). Still per-user only, no administrator rights.
+  oneClick: false
   perMachine: false
   allowElevation: false
-  runAfterFinish: false
+  allowToChangeInstallationDirectory: false
+  runAfterFinish: true
+  include: installer/installer.nsh
+  # The finish page text is Chinese, so the whole installer is too.
+  multiLanguageInstaller: false
+  language: '1028'
   createDesktopShortcut: false
   createStartMenuShortcut: true
   # Uninstalling keeps %APPDATA%\AgentWorkflowGui (the database and backups).
