@@ -22,7 +22,9 @@
 // at all (let go, a batch that could not be sent) is written down as before. What a read was handed is kept until the
 // renderer says it took that very read; until then each newer read is handed it again. A renderer that says nothing
 // only makes the batcher owe more: batches piling up unsaid are folded into the written-down records, which stay
-// bounded per session (`missed-records.ts`).
+// bounded per session (`missed-records.ts`). A report lets go only of what it can prove (T040 r4): `applied` names a
+// batch the batcher sent and is still keeping, `adopted` the read under way, at a seq from that Snapshot's to the last
+// sent. Any other report (a seq never sent, a read that does not exist or was taken already) is ignored and logged.
 //
 // Electron-free: the IPC layer (app-ipc.ts) gives it the window and the timers.
 import { CONTRACTS_VERSION, type AppEvent, type EventBatch, type EventEnvelope, type SessionId } from '../../contracts';
@@ -140,6 +142,11 @@ export interface SnapshotCut {
 /** Batches sent whose records wait for the renderer to say it applied them, at most; older ones are owed. */
 const AWAITED = 64;
 
+/** The read under way: its Snapshot holds everything up to `seq` (the bus's seq at the cut). */
+interface Reading extends SnapshotCut {
+  seq: number;
+}
+
 export class WindowBatcher {
   private readonly batchMs: number;
   private readonly maxBatch: number;
@@ -171,8 +178,10 @@ export class WindowBatcher {
   /** Batches sent, oldest first, with the records of their events, until the renderer says it applied them. */
   private awaiting: { toSeq: number; records: MissedRecords }[] = [];
   /** The last read and what it was handed, until the renderer says it took it. */
-  private reading: SnapshotCut | undefined;
+  private reading: Reading | undefined;
   private reads = 0;
+  /** The highest seq a batch that reached the window ended at. */
+  private highestSent = 0;
   private timer: unknown;
   readonly stats: BatcherStats = { batches: 0, envelopesIn: 0, envelopesSent: 0, merged: 0, overflows: 0, maxPending: 0, maxInFlight: 0, bytesSent: 0 };
 
@@ -274,8 +283,8 @@ export class WindowBatcher {
     const owed = this.reading === undefined ? new Map<SessionId, MissedSession>() : copyMissed(this.reading.owed);
     mergeMissed(owed, this.missed);
     this.missed = new Map();
-    this.reading = { read: ++this.reads, owed };
-    return this.reading;
+    this.reading = { read: ++this.reads, owed, seq: this.lastSeen };
+    return { read: this.reading.read, owed };
   }
 
   /**
@@ -283,16 +292,25 @@ export class WindowBatcher {
    * before it, reached it. It applies a batch only right after the seq it holds, so none before it was dropped.
    */
   applied(toSeq: number): void {
-    this.awaiting = this.awaiting.filter((sent) => sent.toSeq > toSeq);
+    // Only a batch it was sent and that is still kept for it: anything else proves nothing (r4).
+    const index = this.awaiting.findIndex((sent) => sent.toSeq === toSeq);
+    if (index < 0) return this.options.log?.(`[events] the window said it applied a batch it was not sent or already said so (to ${String(toSeq)}); ignored`);
+    this.awaiting = this.awaiting.slice(index + 1);
   }
 
   /**
    * The renderer took the Snapshot of read `read` and applied what it held back after it, up to `seq` (its report):
-   * what that read was handed reached it. A read that is not the last one is no proof for what the last was handed.
+   * what that read was handed reached it. Only the read under way counts, at a seq from its Snapshot's to the last one
+   * sent; any other report is ignored as a whole (r4): a read that is not the last one, or one taken already, is no
+   * proof for what the last was handed.
    */
   adopted(read: number, seq: number): void {
-    if (this.reading?.read === read) this.reading = undefined;
-    this.applied(seq);
+    const reading = this.reading;
+    if (reading?.read !== read || seq < reading.seq || seq > Math.max(reading.seq, this.highestSent)) {
+      return this.options.log?.(`[events] the window said it took a read it was not answered, or at a seq it does not hold (read ${String(read)}, seq ${String(seq)}); ignored`);
+    }
+    this.reading = undefined;
+    this.awaiting = this.awaiting.filter((sent) => sent.toSeq > seq);
   }
 
   /** Sends what is queued now, as far as the in-flight limit lets it (tests and shutdown). */
@@ -410,16 +428,16 @@ export class WindowBatcher {
       return false;
     }
     this.lastSent = toSeq;
+    this.highestSent = Math.max(this.highestSent, toSeq);
     this.stats.batches++;
     this.stats.envelopesSent += envelopes.length;
     for (const e of envelopes) this.stats.bytesSent += sizeOf(e.event);
+    // Kept with its records (if any) until the renderer says it applied it; a report must name one of these.
     const records: MissedRecords = new Map();
     for (const e of envelopes) noteMissed(records, e.event);
-    if (records.size > 0) {
-      this.awaiting.push({ toSeq, records });
-      // A renderer that says nothing: what piles up is owed as if it had not been sent.
-      if (this.awaiting.length > AWAITED) mergeMissed(this.missed, this.awaiting.shift()!.records);
-    }
+    this.awaiting.push({ toSeq, records });
+    // A renderer that says nothing: what piles up is owed as if it had not been sent.
+    if (this.awaiting.length > AWAITED) mergeMissed(this.missed, this.awaiting.shift()!.records);
     if (tracked) {
       this.inFlight.push({ toSeq, sentAt: this.now() });
       this.stats.maxInFlight = Math.max(this.stats.maxInFlight, this.inFlight.length);

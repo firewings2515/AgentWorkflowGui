@@ -158,6 +158,8 @@ void app.whenReady().then(async () => {
     getTrustedSender,
     getEventTarget: () => (mainWindow === null || mainWindow.isDestroyed() ? null : mainWindow.webContents),
     isTrustedUrl,
+    // The batcher's notes (a window let go, a report that proves nothing) in the main process log.
+    forwarding: { log },
     ...(perf !== undefined && {
       onBatcher: (batcher) => {
         batcherStats = () => ({ ...batcher.stats });

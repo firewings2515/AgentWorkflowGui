@@ -1,7 +1,8 @@
-// T040 r2, r3: what the window is owed, end to end. The batcher (event-batcher.ts), the Snapshot read and the window's
-// reports as the IPC handlers take them (`readForWindow`, `windowReport`), the Snapshot's records read as backend.ts
-// reads them (`readSnapshotData` and `withMissed`), on the memory repositories and on SQLite, the same cases; into the
-// real renderer store (T041), whose reports say what it applied and which read it took.
+// T040 r2, r3, r4: what the window is owed, end to end. The main process through its real IPC entry (`registerAppIpc`,
+// Electron's ipcMain stood in for): the batcher (event-batcher.ts), the numbered Snapshot read, the window's reports and
+// acknowledgements, each from the trusted window; the Snapshot's records read as backend.ts reads them
+// (`readSnapshotData` and `withMissed`), on the memory repositories and on SQLite, the same cases; into the real
+// renderer store (T041), whose reports say what it applied and which read it took.
 //
 // IPC as Electron has it: the answers to reads and the batches reach the renderer on two pipes, each in order but not
 // in order with each other; what the renderer sends (the read itself, reports, acknowledgements) goes on one pipe in
@@ -32,12 +33,37 @@ import { fixtureSnapshot } from '../../contracts/fixtures/snapshot';
 import { createRepositories, openDatabase } from '../../adapters/storage';
 import type { AppRepositories } from '../../core/ports';
 import { MemoryRepositories } from '../../core/sessions/testing/memory-repositories';
-import { forwardEvents, readForWindow, windowReport } from '../../app/main/app-ipc';
+import { registerAppIpc } from '../../app/main/app-ipc';
+import type { WindowBatcher } from '../../app/main/event-batcher';
 import { EventBus } from '../../app/main/event-bus';
+import type { IpcSenderEvent, TrustedSender } from '../../app/main/ipc-guard';
+import { BATCH_ACK_CHANNEL, SNAPSHOT_READ_CHANNEL, WINDOW_REPORT_CHANNEL } from '../../app/preload/channels';
 import type { AppFacade } from '../../app/main/facade';
 import { type MissedRecords, withMissed } from '../../app/main/missed-records';
 import { seeded } from '../../app/main/testing/event-stream';
 import type { AppBridge, SnapshotRead, WindowReport } from '../../app/preload/bridge-types';
+
+// Electron's ipcMain, as registerAppIpc uses it: the handlers and listeners it registers, called as IPC would.
+const electron = vi.hoisted(() => ({
+  handlers: new Map<string, (event: unknown, ...args: unknown[]) => unknown>(),
+  listeners: new Map<string, (event: unknown, ...args: unknown[]) => void>(),
+}));
+vi.mock('electron', () => ({
+  ipcMain: {
+    handle: (channel: string, handler: (event: unknown, ...args: unknown[]) => unknown) => electron.handlers.set(channel, handler),
+    on: (channel: string, listener: (event: unknown, ...args: unknown[]) => void) => electron.listeners.set(channel, listener),
+    removeListener: (channel: string) => electron.listeners.delete(channel),
+  },
+}));
+const page = { url: 'app://renderer' };
+const trusted: TrustedSender = { webContentsId: 7, isTrustedUrl: (url) => url === page.url };
+/** What reaches the main process from our own window. */
+const fromWindow: IpcSenderEvent = { sender: { id: 7, mainFrame: page }, senderFrame: page };
+const listener = (channel: string) => {
+  const found = electron.listeners.get(channel);
+  if (found === undefined) throw new Error(`no listener on ${channel}`);
+  return found;
+};
 
 // The renderer store is compiled with the DOM's types (tsconfig.web); this file is not, so it is loaded by name and
 // typed here as far as the test uses it (as renderer-batches.test.ts does).
@@ -273,11 +299,18 @@ async function world(repos: AppRepositories) {
 
   // The window: what the preload does with batches (each acknowledged once the listener returned), over IPC.
   const listeners = new Set<(batch: EventBatch) => void>();
-  const { batcher, stop } = forwardEvents(
+  const logs: string[] = [];
+  let batcher!: WindowBatcher;
+  const stop = registerAppIpc({
+    facade,
     bus,
-    () => ({
+    getTrustedSender: () => trusted,
+    isTrustedUrl: (url) => trusted.isTrustedUrl(url),
+    onBatcher: (b) => (batcher = b),
+    forwarding: { batchMs: 0, maxPending: QUEUE, maxInFlight: 2, now: () => loop.t, setTimer: loop.set, clearTimer: loop.clear, log: (m) => logs.push(m) },
+    getEventTarget: () => ({
       isDestroyed: () => false,
-      getURL: () => 'app://renderer',
+      getURL: () => page.url,
       send: (_channel, batch) => {
         if (faults.sends > 0) {
           faults.sends--;
@@ -291,21 +324,20 @@ async function world(repos: AppRepositories) {
         }
         sent.push(batch);
         loop.send('batches', () => {
-          for (const listener of [...listeners]) {
-            listener(structuredClone(batch));
-            loop.send('up', () => batcher.ack(batch.toSeq));
+          for (const take of [...listeners]) {
+            take(structuredClone(batch));
+            loop.send('up', () => listener(BATCH_ACK_CHANNEL)(fromWindow, batch.toSeq));
           }
         });
       },
     }),
-    () => true,
-    { batchMs: 0, maxPending: QUEUE, maxInFlight: 2, now: () => loop.t, setTimer: loop.set, clearTimer: loop.clear, log: () => undefined },
-  );
-  // As the preload has them, over the pipes; the main process side as the IPC handlers take them.
+  });
+  // As the preload has them, over the pipes, into the handlers registerAppIpc registered.
   const readSnapshot = () =>
     new Promise<SnapshotRead>((resolve, reject) => {
       loop.send('up', () => {
-        readForWindow(batcher, facade).then(
+        const handler = electron.handlers.get(SNAPSHOT_READ_CHANNEL)!;
+        (handler(fromWindow) as Promise<SnapshotRead>).then(
           (answer) => {
             answered.push(answer.read);
             loop.send('answers', () => resolve(structuredClone(answer)));
@@ -321,11 +353,7 @@ async function world(repos: AppRepositories) {
     report: (report: WindowReport) => {
       reports.push(report);
       const copy: unknown = structuredClone(report);
-      loop.send('up', () => {
-        const checked = windowReport(copy);
-        if (checked?.kind === 'applied') batcher.applied(checked.toSeq);
-        else if (checked?.kind === 'adopted') batcher.adopted(checked.read, checked.seq);
-      });
+      loop.send('up', () => listener(WINDOW_REPORT_CHANNEL)(fromWindow, copy));
     },
     send: () => Promise.reject(new Error('no commands')),
     onEvent: () => () => undefined,
@@ -405,7 +433,9 @@ async function world(repos: AppRepositories) {
   };
 
   return {
-    repos, bus, loop, faults, batcher, store, op, old, older, sent, answered, reports, settle, check,
+    repos, bus, loop, faults, batcher, store, op, old, older, sent, answered, reports, logs, settle, check,
+    /** A report from the trusted window that no renderer would make (r4), straight into the IPC entry. */
+    forge: (report: unknown) => listener(WINDOW_REPORT_CHANNEL)(fromWindow, report),
     /** The reads the renderer said it took. */
     adopted: () => reports.flatMap((r) => (r.kind === 'adopted' ? [r.read] : [])),
     dispose: () => {
@@ -558,6 +588,45 @@ describe.each(backends)('the records owed to the window, into the real renderer 
     w.dispose();
   });
 
+  // r4: a report that proves nothing lets go of nothing. Straight into the IPC entry from the trusted window: the far-back
+  // turn's end is sent but held up on its pipe, then the window reads, gives up, and is reloaded; each report comes
+  // once before the read (when the batch is kept) and once while it is under way (when the read was handed it).
+  it.each([
+    ['applied, past anything sent', () => ({ kind: 'applied', toSeq: Number.MAX_SAFE_INTEGER })],
+    ['adopted, a read that does not exist', () => ({ kind: 'adopted', read: 999_999, seq: Number.MAX_SAFE_INTEGER })],
+    ['adopted, the read under way at seq 0', (read: number) => ({ kind: 'adopted', read, seq: 0 })],
+    ['adopted, the read under way past what was sent', (read: number, sent: number) => ({ kind: 'adopted', read, seq: sent + 1 })],
+  ] as const)('a report the main process cannot hold true (%s): ignored and logged; the reload brings the record back', async (_case, forged) => {
+    const w = await world(make());
+    const lastSent = () => Math.max(...w.sent.map((b) => b.toSeq));
+    w.loop.held.add('batches');
+    await w.op.complete(w.old);
+    await w.loop.run();
+    expect(w.batcher.awaitingCount).toBeGreaterThan(0);
+    w.forge(forged(w.answered.at(-1)!, lastSent()));
+    expect(w.batcher.awaitingCount).toBeGreaterThan(0);
+    // The window reads; the answer is held up, and the forged report comes again while the read is under way.
+    w.loop.held.add('answers');
+    const reading = w.store.reconnect();
+    await w.loop.run();
+    w.forge(forged(w.answered.at(-1)!, lastSent()));
+    expect(w.logs.filter((l) => l.includes('ignored'))).toHaveLength(2);
+    // It gives up; what was held up arrives late and is dropped; the user reloads.
+    w.loop.advance(GIVE_UP);
+    await w.loop.run();
+    await reading;
+    expect(w.store.getSnapshot().connection).toBe('error');
+    w.loop.held.clear();
+    await w.loop.run();
+    const reloading = w.store.reconnect();
+    await w.loop.run();
+    await reloading;
+    await w.check();
+    expect(w.store.getSnapshot().snapshot!.turns).toContainEqual(expect.objectContaining({ id: w.old, state: 'completed' }));
+    expect(Object.values(w.store.getSnapshot().messageStreams)).toEqual([]);
+    w.dispose();
+  });
+
   // r3 P2: what the renderer held while the answer was on its way, it applies with the Snapshot and says so.
   it('batches after the cut, held until the answer comes, are applied with the Snapshot: nothing is kept or owed for them', async () => {
     const w = await world(make());
@@ -653,6 +722,8 @@ describe.each(backends)('the records owed to the window, into the real renderer 
     await w.check();
     // The faults took effect, each kind (the seeds are chosen so).
     expect(w.batcher.stats.overflows).toBeGreaterThan(0);
+    // The real renderer never says anything the main process cannot hold true (r4).
+    expect(w.logs.filter((l) => l.includes('ignored'))).toEqual([]);
     for (const [kind, n] of Object.entries(w.faults.fired)) expect(n, kind).toBeGreaterThan(0);
     w.dispose();
   });

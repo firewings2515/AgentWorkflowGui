@@ -575,3 +575,77 @@ describe('B-10 a record is owed until the renderer says it reached it (r2, r3)',
     expect(r.batcher.cut().owed.get('s1' as SessionId)?.turns.size).toBe(300);
   });
 });
+
+describe('B-11 a report lets go only of what it can prove (r4)', () => {
+  const turn = (id: string): AppEvent => ({
+    type: 'turn.updated',
+    turn: { id: id as never, sessionId: 's1' as SessionId, state: 'completed', startedAt: '2026-11-03T10:00:00.000Z', endedAt: '2026-11-03T10:00:01.000Z' },
+  });
+  const owes = (cut: ReturnType<WindowBatcher['cut']>, id: string) => cut.owed.get('s1' as SessionId)?.turns.has(id) === true;
+  /** Turn `t-kept` sent and kept; a read under way that was handed `t-handed`; logs written down. */
+  const setup = () => {
+    const logs: string[] = [];
+    const r = rig({ batcher: { log: (m) => logs.push(m) } });
+    r.batcher.adopted(r.batcher.cut().read, r.bus.seq);
+    r.bus.publish(turn('t-handed'));
+    r.clock.advance(100);
+    const reading = r.batcher.cut();
+    r.bus.publish(turn('t-kept'));
+    r.clock.advance(100);
+    const kept = r.ledger.batches.at(-1)!.toSeq;
+    return { r, logs, reading, kept, ignored: () => logs.filter((l) => l.includes('ignored')).length };
+  };
+
+  it.each([
+    ['applied past anything sent', (_read: number, kept: number) => ({ kind: 'applied' as const, toSeq: Number.MAX_SAFE_INTEGER, kept })],
+    ['applied between batches (no batch ends there)', (_read: number, kept: number) => ({ kind: 'applied' as const, toSeq: kept - 1, kept })],
+  ])('%s: ignored, logged, the batch still kept', (_name, make) => {
+    const { r, reading, kept, ignored } = setup();
+    const report = make(reading.read, kept);
+    r.batcher.applied(report.toSeq);
+    expect(ignored()).toBe(1);
+    expect(r.batcher.awaitingCount).toBe(1);
+    // Said for the batch it was sent: let go, and said again: ignored.
+    r.batcher.applied(kept);
+    expect(r.batcher.awaitingCount).toBe(0);
+    r.batcher.applied(kept);
+    expect(ignored()).toBe(2);
+  });
+
+  it.each([
+    ['a read that does not exist', (read: number, sent: number) => [read + 1000, sent]],
+    ['the read under way at seq 0', (read: number) => [read, 0]],
+    ['the read under way below its Snapshot', (read: number, sent: number) => [read, sent - 2]],
+    ['the read under way past what was sent', (read: number, sent: number) => [read, sent + 1]],
+    ['the read under way at MAX_SAFE_INTEGER', (read: number) => [read, Number.MAX_SAFE_INTEGER]],
+  ])('adopted, %s: ignored as a whole, logged; nothing it was handed or kept is let go', (_name, make) => {
+    const { r, reading, kept, ignored } = setup();
+    const [read, seq] = make(reading.read, kept);
+    r.batcher.adopted(read!, seq!);
+    expect(ignored()).toBe(1);
+    expect(r.batcher.awaitingCount).toBe(1);
+    const next = r.batcher.cut();
+    expect([owes(next, 't-handed'), owes(next, 't-kept')]).toEqual([true, true]);
+  });
+
+  it('applied for a batch that held no record (usage, invalidations): it was sent, so the report is taken, not logged', () => {
+    const { r, kept, ignored } = setup();
+    r.bus.publish({ type: 'usage.limits', at: '2026-11-03T10:00:00.000Z' });
+    r.clock.advance(100);
+    const noRecord = r.ledger.batches.at(-1)!.toSeq;
+    expect(noRecord).toBeGreaterThan(kept);
+    r.batcher.applied(noRecord);
+    expect(ignored()).toBe(0);
+    expect(r.batcher.awaitingCount).toBe(0);
+  });
+
+  it('adopted at its Snapshot seq, or at a batch sent after it: let go; said again: ignored', () => {
+    const { r, reading, kept, ignored } = setup();
+    r.batcher.adopted(reading.read, kept);
+    expect(ignored()).toBe(0);
+    expect(r.batcher.awaitingCount).toBe(0);
+    r.batcher.adopted(reading.read, kept);
+    expect(ignored()).toBe(1);
+    expect(r.batcher.cut().owed.size).toBe(0);
+  });
+});
