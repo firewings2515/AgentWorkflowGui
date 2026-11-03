@@ -292,6 +292,8 @@ export type Reopen = () => { repositories: AppRepositories; store: DeliveryStore
 /** What else a world may be given (T048): work folders for runs started without one. */
 export interface HarnessExtra {
   workFolders?: SessionServiceOptions['workFolders'];
+  /** Replaces the link resolution (real work folders beside the memory git's E:\\work, T048 r2). */
+  realPath?: (path: string) => string | null;
 }
 
 const build = (repositories: AppRepositories, store: DeliveryStore, previous?: World, real?: RealFolders, reopen?: Reopen, extra: HarnessExtra = {}): World => {
@@ -328,7 +330,8 @@ const build = (repositories: AppRepositories, store: DeliveryStore, previous?: W
     }
   };
   const policy: PermissionPolicy = { evaluate: () => world.decide() };
-  const resolveReal = (path: string) => (real !== undefined ? path : path.startsWith('E:\\work') ? path.replace('E:\\work', 'E:\\real') : null);
+  const resolveReal = (path: string) =>
+    extra.realPath !== undefined ? extra.realPath(path) : real !== undefined ? path : path.startsWith('E:\\work') ? path.replace('E:\\work', 'E:\\real') : null;
   let mounts = 0;
   world.claude = withTurns(new FakeAdapter('claude', (handle) => world.service.onPermissionRequest(handle)), world);
   world.claude.diskOf = () => world.disk;

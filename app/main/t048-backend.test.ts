@@ -1,7 +1,7 @@
 // T048 on the assembled backend with a real SQLite file and real folders in a temporary directory: a session without
 // an Agent or a folder through the facade, the Snapshot's default location, read-only data making no folder (C-29),
 // and the start taking back the folders claimed for a session that never came.
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -126,7 +126,7 @@ describe('T048 on the backend', () => {
     expect(await s.backend.repositories.sessions.get(SessionId.parse('s-1'))).toBeUndefined();
   });
 
-  it('the start takes back claims whose session never came: an empty folder goes, one with something in it stays', async () => {
+  it('the start drops the claims whose session never came and removes no folder, empty or not (r2)', async () => {
     const first = await start();
     expect(await createBare(first, 's-kept')).toMatchObject({ ok: true });
     await settle();
@@ -151,22 +151,29 @@ describe('T048 on the backend', () => {
 
     const s = await start();
     expect((await s.backend.repositories.workFolders.list()).map((c) => c.sessionId)).toEqual(['s-kept']);
-    expect(readdirSync(location).sort()).toEqual([`${DAY}-001`, `${DAY}-003`, `${DAY}-005`]);
+    expect(readdirSync(location).sort()).toEqual([`${DAY}-001`, `${DAY}-002`, `${DAY}-003`, `${DAY}-005`]);
     expect(readdirSync(folder('003'))).toEqual(['notes.txt']);
-    expect(s.logs.some((l) => l.includes('kept work folder'))).toBe(true);
+    expect(s.logs.some((l) => l.includes('is left as it is'))).toBe(true);
   });
 
-  it('r1 P1-3: the data turning read-only on the session write, after the folder was made: no folder is left', async () => {
+  it('r1 P1-3: the data turning read-only on the session write, after the folder was made: no session; the folder stays, its claim is never reused', async () => {
     const faults = new InjectedStorageFaults();
     const s = await start({ faults });
     // The claim, its mark as made, then the session: the third write fills the disk.
     faults.failNextWrite('disk-full', 3);
     expect(await createBare(s, 's-1')).toMatchObject({ ok: false, code: 'storage_read_only', message: STORAGE_TURNED_READ_ONLY });
-    expect(existsSync(folder('001'))).toBe(false);
+    expect(existsSync(folder('001'))).toBe(true);
     expect(await s.backend.repositories.sessions.get(SessionId.parse('s-1'))).toBeUndefined();
+    // The next start drops the claim; the same ID then gets a new folder, never the one left.
+    await s.backend.shutdown();
+    running = [];
+    const next = await start();
+    expect(await next.backend.repositories.workFolders.list()).toEqual([]);
+    expect(await createBare(next, 's-1')).toMatchObject({ ok: true });
+    expect((await next.backend.repositories.sessions.get(SessionId.parse('s-1')))?.cwd).toBe(folder('002'));
   });
 
-  it('r1 P1-3: the data turning read-only on a run\'s start, after its work folder was made: no folder is left', async () => {
+  it('r1 P1-3: the data turning read-only on a run\'s start, after its work folder was made: no run; the folder stays', async () => {
     const faults = new InjectedStorageFaults();
     const s = await start({ faults });
     for (const a of agents()) expect(await s.run({ type: 'agent.save', requestId: rid(), agent: a, expectedRevision: null })).toMatchObject({ ok: true });
@@ -178,7 +185,8 @@ describe('T048 on the backend', () => {
         workflowRevision: 0, title: 'Report', firstMessage: 'Go.', crossToolConsent: true,
       }),
     ).toMatchObject({ ok: false, code: 'storage_read_only' });
-    expect(existsSync(folder('001'))).toBe(false);
+    expect(existsSync(folder('001'))).toBe(true);
+    expect(await s.backend.repositories.instances.get(InstanceId.parse('run-1'))).toBeUndefined();
   });
 
   it('r1 P1-4: a preferences save that turns the data read-only makes no folder', async () => {
@@ -190,6 +198,13 @@ describe('T048 on the backend', () => {
       await s.run({ type: 'preferences.set', requestId: rid(), preferences: { theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 }, workFolderRoot: other } }),
     ).toMatchObject({ ok: false, code: 'storage_read_only' });
     expect(existsSync(join(dir, 'elsewhere'))).toBe(false);
+  });
+
+  it('r2: the work folder code removes nothing: no remove call in the port, the allocator or the node:fs side', () => {
+    for (const file of ['core/ports/work-folders.ts', 'core/sessions/work-folders.ts', 'app/main/work-folders.ts']) {
+      const code = readFileSync(join(process.cwd(), file), 'utf8').replace(/\/\/.*$|\/\*[\s\S]*?\*\//gm, '');
+      expect(code).not.toMatch(/rmdir|rmSync|unlink|removeEmpty|\brm\(/);
+    }
   });
 
   it('without work folders: the Snapshot names %USERPROFILE%\\AgentWorkflowGui for display, and a session needs a folder', async () => {

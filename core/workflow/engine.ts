@@ -376,8 +376,8 @@ export class WorkflowEngine implements WorkflowHooks {
         context: { runtime: root.model.runtime, cwd, entry: { kind: 'new-turn' }, session: settings, origin: { kind: 'user' } },
         });
       } catch (error) {
-        // Refused (read-only data, r1 P1-3), not possibly written: the folder made for it goes. When the commit is in
-        // doubt it stays with its claim, for the repeat or the next start's check.
+        // Refused (read-only data, r1 P1-3), not possibly written: the claim of the folder made for it goes, the folder
+        // stays (r2). When the commit is in doubt the claim stays too, for the repeat or the next start's check.
         if (!(error instanceof CommitUncertainError)) await release();
         throw error;
       }

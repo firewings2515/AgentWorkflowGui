@@ -80,6 +80,10 @@ describe('v11: data stored under contracts 0.7', () => {
       expect((await claims.get(SessionId.parse('s-1')))?.madeReal).toBeUndefined();
       await claims.markMade(SessionId.parse('s-1'), 'D:\\Real\\2026-11-04-001');
       expect(await claims.get(SessionId.parse('s-1'))).toMatchObject({ state: 'made', madeReal: 'D:\\Real\\2026-11-04-001' });
+      await claims.markReleased(SessionId.parse('s-1'));
+      expect(await claims.get(SessionId.parse('s-1'))).toMatchObject({ state: 'released' });
+      expect((await claims.get(SessionId.parse('s-1')))?.madeReal).toBeUndefined();
+      await claims.markMade(SessionId.parse('s-1'), 'D:\\Real\\2026-11-04-001');
       // `made` always with its real path, and only then (r1 P1-1).
       expect(() => db.prepare("UPDATE work_folder_claim SET made_real = NULL WHERE session_id = 's-1'").run()).toThrow();
       expect(await claim('s-2', 'c:\\w\\2026-11-04-001', 1)).toBe('taken');

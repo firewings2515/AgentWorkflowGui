@@ -49,7 +49,6 @@ const setup = async (storage: T048Storage): Promise<Env> => {
       hooks.onMake?.(folder);
       return folders.fs.make(folder);
     },
-    removeEmpty: (folder) => folders.fs.removeEmpty(folder),
   };
   const w = await worldOn(repositories, store, { workFolders: { fs, defaultRoot: folders.location, day: () => day.value }, realPath: (p) => folders.realPath(p) });
   const env: Env = {
@@ -231,7 +230,7 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       expect((await w.repositories.workFolders.get(SessionId.parse('s-1')))?.path).toBe(folderOf(env, '002'));
     });
 
-    it('storing the session fails: no session, no claim and no folder are left; the same ID then succeeds', async () => {
+    it('storing the session fails: no session and no claim are left, the folder stays (r2); the same ID then gets the next one', async () => {
       const env = await setup(storage);
       const { w } = env;
       const sessions: Pick<AppRepositories['sessions'], 'create' | 'get'> = w.repositories.sessions;
@@ -245,12 +244,12 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       await expect(create(w, 's-1')).rejects.toThrow('disk');
       expect(await sessions.get(SessionId.parse('s-1'))).toBeUndefined();
       expect(await w.repositories.workFolders.get(SessionId.parse('s-1'))).toBeUndefined();
-      expect(env.folders.exists(folderOf(env, '001'))).toBe(false);
+      expect(env.folders.exists(folderOf(env, '001'))).toBe(true);
       expect(await create(w, 's-1')).toMatchObject({ ok: true });
-      expect((await get(w, 's-1')).cwd).toBe(folderOf(env, '001'));
+      expect((await get(w, 's-1')).cwd).toBe(folderOf(env, '002'));
     });
 
-    it('stopped after the folder was made and before the session was stored: the next start removes the claim, and the folder only while empty', async () => {
+    it('stopped after the folder was made and before the session was stored: the next start removes the claim and leaves the folder', async () => {
       const env = await setup(storage);
       const { w, folders } = env;
       // The app stops while the session is being written: nothing after the folder runs.
@@ -268,14 +267,14 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       sessions.create = original;
       const next = await env.restart();
       expect(await next.repositories.workFolders.list()).toEqual([]);
-      expect(folders.exists(folderOf(env, '001'))).toBe(false);
-      // Something is in it: kept, never emptied.
+      // Nothing removed: the empty one and the one with something in it are both there.
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
       expect(folders.fs.list(folderOf(env, '002'))).toEqual(['notes.txt']);
-      expect(next.logs.some((l) => l.includes('kept work folder'))).toBe(true);
-      // The same ID sent again after the start: one folder for it.
+      expect(next.logs.some((l) => l.includes('its folder') && l.includes('is left as it is'))).toBe(true);
+      // The same ID sent again after the start: a new folder for it, never the one left.
       expect(await create(next, 's-1')).toMatchObject({ ok: true });
       expect((await get(next, 's-1')).cwd).toBe(folderOf(env, '003'));
-      expect(madeOn(env)).toEqual([`${DAY}-002`, `${DAY}-003`]);
+      expect(madeOn(env)).toEqual([`${DAY}-001`, `${DAY}-002`, `${DAY}-003`]);
     });
 
     it('a claim written before its folder was made: the next start removes it; a stored session keeps its claim and folder', async () => {
@@ -375,10 +374,26 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       expect(await next.repositories.workFolders.list()).toEqual([]);
       expect(folders.exists(folderOf(env, '001'))).toBe(true);
       expect(folders.exists(target)).toBe(true);
-      expect(next.logs.some((l) => l.includes('not the folder this program made'))).toBe(true);
+      expect(next.logs.some((l) => l.includes('is left as it is'))).toBe(true);
     });
 
-    it('r1 P1-2: taking back a folder another session uses meanwhile keeps the folder (on a failed write and at the next start)', async () => {
+    it('r1 P1-1: a link put in place of a folder we made is not reused when the same session asks again', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const id = SessionId.parse('s-x');
+      const path = folderOf(env, '001');
+      // As our make left it (made, with its real path), its session not stored yet.
+      expect(await w.repositories.workFolders.claim({ sessionId: id, path, day: DAY, seq: 1, state: 'claimed', createdAt: '2026-11-04T01:00:00.000Z' })).toBe('claimed');
+      folders.makeForeign(path);
+      await w.repositories.workFolders.markMade(id, folders.realPath(path)!);
+      folders.relink(path, joinFolder(folders.elsewhere, 'target'));
+      expect(await create(w, 's-x')).toMatchObject({ ok: true });
+      expect((await get(w, 's-x')).cwd).toBe(folderOf(env, '002'));
+      expect(folders.exists(path)).toBe(true);
+      expect(w.logs.some((l) => l.includes('was not made by this program'))).toBe(true);
+    });
+
+    it('r1 P1-2: a folder another session uses is never removed when its claim is taken back (a failed write, the next start)', async () => {
       const env = await setup(storage);
       const { w, folders } = env;
       const sessions: Pick<AppRepositories['sessions'], 'create'> = w.repositories.sessions;
@@ -394,7 +409,6 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       await expect(first).rejects.toThrow('disk');
       expect(folders.exists(folderOf(env, '001'))).toBe(true);
       expect(await w.repositories.workFolders.get(SessionId.parse('s-1'))).toBeUndefined();
-      expect(w.logs.some((l) => l.includes('a session or run uses it'))).toBe(true);
       // The same at the next start: s-3 stopped before its session was stored; s-4 uses its folder.
       sessions.create = (session) => (session.id === 's-3' ? new Promise<'created' | 'exists'>(() => undefined) : original(session));
       void create(w, 's-3');
@@ -406,7 +420,7 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       expect(folders.exists(folderOf(env, '002'))).toBe(true);
     });
 
-    it('r1 P1-3: the session write refused after the folder was made: the folder goes first, a claim that cannot go is settled at the next start', async () => {
+    it('r1 P1-3: the session write refused after the folder was made: the claim is released, the folder stays; the next start drops the claim', async () => {
       const env = await setup(storage);
       const { w, folders } = env;
       const sessions: Pick<AppRepositories['sessions'], 'create'> = w.repositories.sessions;
@@ -416,26 +430,100 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       sessions.create = () => Promise.reject(new StorageReadOnlyError('disk-full'));
       claims.remove = () => Promise.reject(new StorageReadOnlyError('disk-full'));
       await expect(create(w, 's-1')).rejects.toBeInstanceOf(StorageReadOnlyError);
-      expect(folders.exists(folderOf(env, '001'))).toBe(false);
-      expect(await w.repositories.workFolders.get(SessionId.parse('s-1'))).toMatchObject({ state: 'made' });
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+      // Its removal refused, the claim is released: never to be reused.
+      expect(await w.repositories.workFolders.get(SessionId.parse('s-1'))).toMatchObject({ state: 'released' });
       [sessions.create, claims.remove] = [create0, remove0];
       const next = await env.restart();
       expect(await next.repositories.workFolders.list()).toEqual([]);
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
     });
 
-    it('r1 P1-3: refused right after the make (marking the claim made): the folder and the location it made go', async () => {
+    it('r1 P1-3: refused right after the make (marking the claim made): the folder and the location stay, the claim never becomes ours', async () => {
       const env = await setup(storage);
       const { w, folders } = env;
       const claims: Pick<AppRepositories['workFolders'], 'markMade'> = w.repositories.workFolders;
       const markMade = claims.markMade;
       claims.markMade = () => Promise.reject(new StorageReadOnlyError('disk-full'));
       await expect(create(w, 's-1')).rejects.toBeInstanceOf(StorageReadOnlyError);
-      expect(folders.exists(folderOf(env, '001'))).toBe(false);
-      expect(folders.exists(folders.location)).toBe(false);
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+      expect(folders.exists(folders.location)).toBe(true);
+      expect(await w.repositories.workFolders.get(SessionId.parse('s-1'))).toMatchObject({ state: 'claimed' });
       claims.markMade = markMade;
-      // Claimed only: the next start drops the claim and touches no folder.
+      // Asked again: claimed only, so the folder there is not taken as ours; a new one.
+      expect(await create(w, 's-1')).toMatchObject({ ok: true });
+      expect((await get(w, 's-1')).cwd).toBe(folderOf(env, '002'));
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+    });
+
+    // ---- review r2: taking back never removes a folder -----------------------------------------------------------
+
+    it('r2 ①: a session given the folder while its claim is being taken back keeps it', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const sessions: Pick<AppRepositories['sessions'], 'create'> = w.repositories.sessions;
+      const claims: Pick<AppRepositories['workFolders'], 'remove'> = w.repositories.workFolders;
+      const [create0, remove0] = [sessions.create.bind(sessions), claims.remove.bind(claims)];
+      sessions.create = (session) => (session.id === 's-1' ? Promise.reject(new Error('disk')) : create0(session));
+      // The take-back pauses at its claim's removal: the window in which s-2 is given the folder.
+      let resume: (() => void) | undefined;
+      claims.remove = (sessionId) => new Promise<void>((resolve) => (resume = () => resolve(remove0(sessionId))));
+      const first = create(w, 's-1');
+      for (let i = 0; i < 20 && resume === undefined; i++) await settle();
+      claims.remove = remove0;
+      expect(await create(w, 's-2', { cwd: folderOf(env, '001') })).toMatchObject({ ok: true });
+      resume!();
+      await expect(first).rejects.toThrow('disk');
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+      expect(await get(w, 's-2')).toMatchObject({ cwd: folderOf(env, '001') });
+      expect(await w.repositories.workFolders.get(SessionId.parse('s-1'))).toBeUndefined();
+    });
+
+    it('r2 ②: marking the claim made refused while another session was given the folder: the folder and the location stay', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const claims: Pick<AppRepositories['workFolders'], 'markMade'> = w.repositories.workFolders;
+      const markMade = claims.markMade;
+      let refuse: (() => void) | undefined;
+      claims.markMade = () => new Promise<void>((_resolve, reject) => (refuse = () => reject(new StorageReadOnlyError('disk-full'))));
+      const first = create(w, 's-1');
+      for (let i = 0; i < 20 && refuse === undefined; i++) await settle();
+      claims.markMade = markMade;
+      expect(await create(w, 's-2', { cwd: folderOf(env, '001') })).toMatchObject({ ok: true });
+      refuse!();
+      await expect(first).rejects.toBeInstanceOf(StorageReadOnlyError);
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+      expect(folders.exists(folders.location)).toBe(true);
+      expect(await get(w, 's-2')).toMatchObject({ cwd: folderOf(env, '001') });
+    });
+
+    it('r2 ③: a claim taken back but not removable is never reused, also when storage still says made; the next start drops it', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const sessions: Pick<AppRepositories['sessions'], 'create'> = w.repositories.sessions;
+      const claims: Pick<AppRepositories['workFolders'], 'remove' | 'markReleased'> = w.repositories.workFolders;
+      const [create0, remove0, released0] = [sessions.create.bind(sessions), claims.remove.bind(claims), claims.markReleased.bind(claims)];
+      let refusing = true;
+      sessions.create = (session) => (refusing ? Promise.reject(new StorageReadOnlyError('disk-full')) : create0(session));
+      claims.remove = (sessionId) => (refusing ? Promise.reject(new StorageReadOnlyError('disk-full')) : remove0(sessionId));
+      claims.markReleased = (sessionId) => (refusing ? Promise.reject(new StorageReadOnlyError('disk-full')) : released0(sessionId));
+      await expect(create(w, 's-1')).rejects.toBeInstanceOf(StorageReadOnlyError);
+      // Storage still says made (its release was refused too), and the folder is still there.
+      expect(await w.repositories.workFolders.get(SessionId.parse('s-1'))).toMatchObject({ state: 'made', path: folderOf(env, '001') });
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+      // Writable again: the same ID asked again does not get that folder back.
+      refusing = false;
+      expect(await create(w, 's-1')).toMatchObject({ ok: true });
+      expect((await get(w, 's-1')).cwd).toBe(folderOf(env, '002'));
+      // And a stopped one: storage says made, its session never came; the next start drops it, the folder stays.
+      refusing = true;
+      await expect(create(w, 's-3')).rejects.toBeInstanceOf(StorageReadOnlyError);
+      refusing = false;
       const next = await env.restart();
-      expect(await next.repositories.workFolders.list()).toEqual([]);
+      expect((await next.repositories.workFolders.list()).map((c) => c.sessionId)).toEqual(['s-1']);
+      expect(folders.exists(folderOf(env, '003'))).toBe(true);
+      expect(await create(next, 's-3')).toMatchObject({ ok: true });
+      expect((await get(next, 's-3')).cwd).toBe(folderOf(env, '004'));
     });
 
     it('r1 P1-4: a preferences save refused (read-only data) makes no folder', async () => {

@@ -375,7 +375,8 @@ CREATE INDEX ${table}_history_open ON ${table} (session_id, history_open, at_ms)
  * template pinned in each instance carry the contracts version; everything new in 0.8 is optional (a session without
  * an Agent, `autoTitle`, `workFolderRoot`, a run's two folders), so sessions, preferences and instances keep their
  * bodies. The work folder claims (core/ports/work-folders.ts): one per session, a path claimed once without case;
- * `made` (with the real path then) only once this program's make created the folder.
+ * `made` (with the real path then) only once this program's make created the folder; `released` once taken back
+ * while the claim could not be removed.
  */
 const contracts08V11 = `
 UPDATE agent SET body = json_set(body, '$.schemaVersion', '0.8.0') WHERE json_extract(body, '$.schemaVersion') = '0.7.0';
@@ -389,7 +390,7 @@ CREATE TABLE work_folder_claim (
   path_key TEXT NOT NULL UNIQUE,
   day TEXT NOT NULL,
   seq INTEGER NOT NULL CHECK (seq >= 1),
-  state TEXT NOT NULL CHECK (state IN ('claimed', 'made')),
+  state TEXT NOT NULL CHECK (state IN ('claimed', 'made', 'released')),
   made_real TEXT CHECK ((state = 'made') = (made_real IS NOT NULL)),
   created_at TEXT NOT NULL,
   created_ms INTEGER NOT NULL

@@ -6,8 +6,9 @@
 //
 // Only what our own make created is ours (T048 r1 P1-1): the claim says `made`, with the real path the folder had
 // then. A folder at a claimed name that our make did not create, or one whose real path changed since (a link put in
-// its place), is never reused or removed. A folder is removed only while empty, while no session or run uses it
-// (r1 P1-2), and before its claim goes, so a claim left by a refused write points at nothing (r1 P1-3).
+// its place), is never reused. Nothing is ever removed (T048 r2): taking a folder back drops its claim and leaves the
+// folder, so no check that could go stale stands between a session using a folder and its removal. A folder left so
+// is at most a number used up; a claim that could not be dropped is `released` and never reused.
 import type { InstanceId, SessionId, Timestamp } from '../../contracts';
 import type { WorkFolderClaim, WorkFolderClaimRepository, WorkFolderFs } from '../ports';
 
@@ -21,8 +22,6 @@ export interface WorkFolderOptions {
   day?: (at: Timestamp) => string;
   /** Link resolution as the policy sees it (T042); null when it cannot be confirmed. */
   resolveRealPath(path: string): string | null;
-  /** Whether any session or run uses the folder (its path as written, or its real path). */
-  inUse(path: string, real: string | null): Promise<boolean>;
   log?(message: string): void;
 }
 
@@ -65,42 +64,45 @@ type Made = { made: true } | { made: false; exists: true } | { made: false; exis
 
 export class WorkFolders {
   private queue: Promise<unknown> = Promise.resolve();
+  /** Claims taken back in this process whose removal failed: never reused, whatever storage still says (r2 ③). */
+  private readonly released = new Set<SessionId>();
 
   constructor(private readonly options: WorkFolderOptions) {}
 
   /**
    * The folder of `sessionId`: the one our make created for it before (made again when it went missing), or a new one.
-   * Nothing on disk is touched before its claim is written, so a write refused (read-only data) makes no folder; a
-   * refusal after the folder was made takes the folder back before it throws.
+   * Nothing on disk is touched before its claim is written, so a write refused (read-only data) makes no folder.
    */
   allocate(sessionId: SessionId, instanceId?: InstanceId): Promise<Allocated> {
     return this.serial(() => this.allocateNow(sessionId, instanceId));
   }
 
   /**
-   * Takes back a folder whose session was not created: the folder first (only ours, empty, used by nothing), then the
-   * claim. A claim that cannot be removed (the data turned read-only) is left for the next start's check.
+   * Takes back the folder of a session that was not created: its claim goes, the folder stays (r2). A claim that cannot
+   * be removed (the data turned read-only) is marked released when it can be, and in any case never reused; the next
+   * start removes it.
    */
   release(sessionId: SessionId, path: string): Promise<void> {
     return this.serial(async () => {
       const claim = await this.options.claims.get(sessionId);
       if (claim === undefined || claim.path !== path) return;
-      await this.takeBack(claim);
+      await this.drop(claim);
     });
   }
 
   /**
-   * At start (T048): a claim whose session and run never came (the app stopped between the claim and the session) is
-   * taken back like a release. A folder with anything in it, one not ours, or one in use stays and is logged.
+   * At start (T048): a claim whose session and run never came (the app stopped between the claim and the session), or
+   * one released, is removed. Its folder stays.
    */
   reconcile(ownerInUse: (claim: WorkFolderClaim) => Promise<boolean>): Promise<void> {
     return this.serial(async () => {
       for (const claim of await this.options.claims.list()) {
-        if (await ownerInUse(claim)) continue;
+        if (claim.state !== 'released' && (await ownerInUse(claim))) continue;
         try {
-          await this.takeBack(claim);
+          await this.options.claims.remove(claim.sessionId);
+          this.log(`dropped the claim of ${claim.sessionId}; its folder ${claim.path} is left as it is`);
         } catch (error) {
-          this.log(`taking back the claim of ${claim.sessionId} failed (${nameOf(error)})`);
+          this.log(`dropping the claim of ${claim.sessionId} failed (${nameOf(error)})`);
         }
       }
     });
@@ -109,14 +111,15 @@ export class WorkFolders {
   private async allocateNow(sessionId: SessionId, instanceId: InstanceId | undefined): Promise<Allocated> {
     const { claims } = this.options;
     const previous = await claims.get(sessionId);
-    // Another run's root (or an ordinary session) under this ID: never its folder, so neither can take back the other's.
+    // Another run's root (or an ordinary session) under this ID: never its folder.
     if (previous !== undefined && previous.instanceId !== instanceId) return { ok: false, message: 'This session ID already has a work folder for something else', taken: true };
     if (previous !== undefined) {
-      // Asked again for the same session: its folder when our make created it, never a second one.
+      // Asked again for the same session: its folder when our make created it and it was never taken back.
       const own = await this.ownAgain(previous);
       if (own !== undefined) return own;
-      // Not ours (made by someone else, or a link in its place): only the claim goes, then a new name.
+      // Not ours (made by someone else, a link in its place, or taken back): only the claim goes, then a new name.
       await claims.remove(sessionId);
+      this.released.delete(sessionId);
     }
     const location = await this.options.location();
     const at = this.options.now();
@@ -139,13 +142,14 @@ export class WorkFolders {
       if (made.made) return { ok: true, path };
       await claims.remove(sessionId);
       if (!made.exists) return this.failed('the work folder could not be made', made.error);
-      // Someone else's folder (the user's, another program's): not ours, the next number.
+      // Someone else's folder (the user's, another program's, or one we left): not ours, the next number.
     }
     return { ok: false, message: 'No free work folder name was found' };
   }
 
-  /** The claimed folder again when it is ours: made by our make (and still where it was), or made by it now. */
+  /** The claimed folder again when it is ours: made by our make, never taken back and still where it was, or made by it now. */
   private async ownAgain(claim: WorkFolderClaim): Promise<Allocated | undefined> {
+    if (claim.state === 'released' || this.released.has(claim.sessionId)) return undefined;
     // Gone (or never made): ours when our make creates it now.
     const made = await this.makeOwn(claim.sessionId, claim.path);
     if (made.made) return { ok: true, path: claim.path };
@@ -161,64 +165,32 @@ export class WorkFolders {
   }
 
   /**
-   * Makes the claimed folder (and the location when missing) and marks the claim `made` with its real path. A mark the
-   * storage refuses takes back what was just made before it throws.
+   * Makes the claimed folder (and the location when missing) and marks the claim `made` with its real path. When the
+   * storage refuses the mark, the folder stays and the claim stays `claimed`, which never makes it ours (r2 ②).
    */
   private async makeOwn(sessionId: SessionId, path: string): Promise<Made> {
     const { fs } = this.options;
-    let tree: string[] = [];
     try {
-      tree = fs.makeTree(parentOf(path));
-      if (fs.make(path) === 'exists') {
-        this.undo(tree);
-        return { made: false, exists: true };
-      }
+      fs.makeTree(parentOf(path));
+      if (fs.make(path) === 'exists') return { made: false, exists: true };
     } catch (error) {
-      this.undo(tree);
       return { made: false, exists: false, error };
     }
     const real = this.options.resolveRealPath(path);
-    try {
-      if (real === null) throw new Error('unresolvable');
-      await this.options.claims.markMade(sessionId, real);
-    } catch (error) {
-      this.undo([...tree, path]);
-      if (real === null) return { made: false, exists: false, error };
-      throw error;
-    }
+    if (real === null) return { made: false, exists: false, error: new Error('unresolvable') };
+    await this.options.claims.markMade(sessionId, real);
     return { made: true };
   }
 
-  /** Folder first, claim second (r1 P1-3). */
-  private async takeBack(claim: WorkFolderClaim): Promise<void> {
-    if (claim.state === 'made' && (await this.mayRemove(claim))) this.removeIfEmpty(claim.path);
-    await this.options.claims.remove(claim.sessionId);
-  }
-
-  /** Ours (the real path it was made with), and no session or run uses it. */
-  private async mayRemove(claim: WorkFolderClaim): Promise<boolean> {
-    const real = this.options.resolveRealPath(claim.path);
-    if (real === null || claim.madeReal === undefined || folderKey(real) !== folderKey(claim.madeReal)) {
-      this.log(`kept work folder ${claim.path}: it is not the folder this program made`);
-      return false;
-    }
-    if (await this.options.inUse(claim.path, real)) {
-      this.log(`kept work folder ${claim.path}: a session or run uses it`);
-      return false;
-    }
-    return true;
-  }
-
-  /** Removes folders this call just made, innermost first, while empty. */
-  private undo(made: readonly string[]): void {
-    for (const folder of [...made].reverse()) this.removeIfEmpty(folder);
-  }
-
-  private removeIfEmpty(path: string): void {
+  /** The claim goes; when it cannot, it is released (in storage when that works, here in any case). */
+  private async drop(claim: WorkFolderClaim): Promise<void> {
     try {
-      if (this.options.fs.removeEmpty(path) === 'not-empty') this.log(`kept work folder ${path}: it is not empty`);
+      await this.options.claims.remove(claim.sessionId);
+      this.released.delete(claim.sessionId);
     } catch (error) {
-      this.log(`removing work folder ${path} failed (${nameOf(error)})`);
+      this.released.add(claim.sessionId);
+      await this.options.claims.markReleased(claim.sessionId).catch(() => undefined);
+      throw error;
     }
   }
 

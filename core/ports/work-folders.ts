@@ -2,7 +2,9 @@
 // new `YYYY-MM-DD-NNN` folder in the default location. The claim (which folder belongs to which session) is
 // written before the folder is made, so sending the same create again, also after a restart, never makes a second
 // one; a claim whose session never came is cleaned up at the next start. Only a folder this program's own make
-// created (`made`, with the real path it had then) is ever reused as ours or removed (T048 r1 P1-1).
+// created (`made`, with the real path it had then, never released since) is ever reused as ours (T048 r1 P1-1).
+// Nothing here removes a folder (T048 r2): taking a folder back drops its claim only, and a folder left so is at most
+// a number used up.
 import type { InstanceId, SessionId, Timestamp } from '../../contracts';
 
 /** One folder the GUI chose for a session (an ordinary session, or the root session of a run). */
@@ -19,8 +21,9 @@ export interface WorkFolderClaim {
   /**
    * `claimed`: the name is taken, the folder not (yet) made by us; whatever is at the path is not ours. `made`: our
    * make created it, and `madeReal` is its real path then (a link changed since means it is not ours any more).
+   * `released`: taken back while its claim could not be removed; never reused, removed at the next start.
    */
-  state: 'claimed' | 'made';
+  state: 'claimed' | 'made' | 'released';
   madeReal?: string;
   createdAt: Timestamp;
 }
@@ -35,17 +38,17 @@ export interface WorkFolderClaimRepository {
   claim(claim: WorkFolderClaim): Promise<'claimed' | 'taken'>;
   /** Our make created the claimed folder; `real` is its real path now. */
   markMade(sessionId: SessionId, real: string): Promise<void>;
+  /** Taken back, its claim not removed (yet): never to be reused (T048 r2). */
+  markReleased(sessionId: SessionId): Promise<void>;
   remove(sessionId: SessionId): Promise<void>;
 }
 
-/** The file system as making work folders needs it (main: node:fs). Paths are absolute; failures throw. */
+/** The file system as making work folders needs it (main: node:fs): it lists and makes, never removes. Paths are absolute; failures throw. */
 export interface WorkFolderFs {
   /** Names of the entries directly in `folder`; empty when it does not exist. */
   list(folder: string): string[];
-  /** Makes `folder` and whatever of its parents is missing (the location); returns the folders it made, outermost first. */
-  makeTree(folder: string): string[];
+  /** Makes `folder` and whatever of its parents is missing (the location). */
+  makeTree(folder: string): void;
   /** Makes one folder, not its parents: `exists` when something is already there (another session's, the user's). */
   make(folder: string): 'created' | 'exists';
-  /** Removes `folder` only when it is an empty folder; never anything in it. */
-  removeEmpty(folder: string): 'removed' | 'not-empty' | 'missing';
 }

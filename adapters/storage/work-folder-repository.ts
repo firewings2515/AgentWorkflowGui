@@ -20,7 +20,7 @@ const COLUMNS = 'session_id, instance_id, path, day, seq, state, made_real, crea
 
 const claimOf = (row: Row): WorkFolderClaim => {
   if (!Number.isSafeInteger(row.seq) || row.seq < 1 || row.path.length === 0) throw new StoredDataError('work_folder_claim', ['claim:invalid']);
-  if (row.state !== 'claimed' && row.state !== 'made') throw new StoredDataError('work_folder_claim', ['state:invalid']);
+  if (row.state !== 'claimed' && row.state !== 'made' && row.state !== 'released') throw new StoredDataError('work_folder_claim', ['state:invalid']);
   return {
     sessionId: row.session_id as SessionId,
     ...(row.instance_id !== null && { instanceId: row.instance_id as InstanceId }),
@@ -68,6 +68,15 @@ export class SqliteWorkFolderClaimRepository implements WorkFolderClaimRepositor
     return run(() => {
       writeTransaction(this.ctx.db, () => {
         const result = this.ctx.db.prepare("UPDATE work_folder_claim SET state = 'made', made_real = ? WHERE session_id = ?").run(real, sessionId);
+        return Number(result.changes) > 0 ? committed(undefined) : unchanged(undefined);
+      });
+    });
+  }
+
+  markReleased(sessionId: SessionId): Promise<void> {
+    return run(() => {
+      writeTransaction(this.ctx.db, () => {
+        const result = this.ctx.db.prepare("UPDATE work_folder_claim SET state = 'released', made_real = NULL WHERE session_id = ?").run(sessionId);
         return Number(result.changes) > 0 ? committed(undefined) : unchanged(undefined);
       });
     });

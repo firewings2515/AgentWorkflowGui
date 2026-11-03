@@ -34,18 +34,15 @@ export class MemoryWorkFolderFs implements WorkFolderFs {
     return [...names, ...files];
   }
 
-  makeTree(folder: string): string[] {
+  makeTree(folder: string): void {
     const parts = folder.replace(/[\\/]+$/, '').split(/[\\/]/);
-    const created: string[] = [];
     for (let i = 1; i <= parts.length; i++) {
       const path = parts.slice(0, i).join('\\');
       if (i === 1 || this.exists(path)) continue;
       if (this.files.has(key(path))) throw Object.assign(new Error('EEXIST'), { code: 'EEXIST' });
       this.folders.set(key(path), path);
       this.made.push(path);
-      created.push(path);
     }
-    return created;
   }
 
   make(folder: string): 'created' | 'exists' {
@@ -58,10 +55,10 @@ export class MemoryWorkFolderFs implements WorkFolderFs {
     return 'created';
   }
 
-  removeEmpty(folder: string): 'removed' | 'not-empty' | 'missing' {
-    if (!this.exists(folder)) return 'missing';
-    if (this.list(folder).length > 0) return 'not-empty';
-    this.folders.delete(key(folder));
-    return 'removed';
+  /** The user removes a folder (and what is in it) outside the GUI. */
+  removeByUser(folder: string): void {
+    const prefix = key(folder);
+    for (const k of [...this.folders.keys()]) if (k === prefix || k.startsWith(`${prefix}\\`)) this.folders.delete(k);
+    for (const k of [...this.files]) if (k.startsWith(`${prefix}\\`)) this.files.delete(k);
   }
 }

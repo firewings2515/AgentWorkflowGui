@@ -205,6 +205,15 @@ export class MemoryRepositories implements AppRepositories {
       if (claim !== undefined) this.claimRecords.set(sessionId, { ...claim, state: 'made', madeReal: real });
       return Promise.resolve();
     },
+    markReleased: (sessionId) => {
+      const claim = this.claimRecords.get(sessionId);
+      if (claim !== undefined) {
+        const released: WorkFolderClaim = { ...claim, state: 'released' };
+        delete released.madeReal;
+        this.claimRecords.set(sessionId, released);
+      }
+      return Promise.resolve();
+    },
     remove: (sessionId) => {
       this.claimRecords.delete(sessionId);
       return Promise.resolve();
