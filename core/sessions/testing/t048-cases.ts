@@ -21,6 +21,8 @@ export interface FolderHost {
   /** Makes a folder outside the GUI (the user's own, another program's). */
   makeForeign(path: string): void;
   realPath(path: string): string | null;
+  /** Puts a link (a junction) to `target`, a folder made for it, where the folder `path` was. */
+  relink(path: string, target: string): void;
   /** A location elsewhere that does not exist yet (preferences). */
   elsewhere: string;
 }
@@ -281,7 +283,7 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       const { w } = env;
       expect(await create(w, 's-kept')).toMatchObject({ ok: true });
       const kept = (await get(w, 's-kept')).cwd;
-      expect(await w.repositories.workFolders.claim({ sessionId: SessionId.parse('s-lost'), path: folderOf(env, '002'), day: DAY, seq: 2, createdAt: '2026-11-04T01:00:00.000Z' })).toBe('claimed');
+      expect(await w.repositories.workFolders.claim({ sessionId: SessionId.parse('s-lost'), path: folderOf(env, '002'), day: DAY, seq: 2, state: 'claimed', createdAt: '2026-11-04T01:00:00.000Z' })).toBe('claimed');
       const next = await env.restart();
       expect((await next.repositories.workFolders.list()).map((c) => c.sessionId)).toEqual(['s-kept']);
       expect(env.folders.exists(kept)).toBe(true);
@@ -314,7 +316,7 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       expect(await get(w, 's-old')).toMatchObject({ title: 'Reviewer', agent: { id: AGENT } });
     });
 
-    it('Q-1: preferences name another location: made when missing, used from then on; one that is not a full path is refused', async () => {
+    it('Q-1: preferences name another location: checked, not made (r1 P1-4); its first folder makes it; one that is not a full path is refused', async () => {
       const env = await setup(storage);
       const { w, folders } = env;
       const prefs = await w.repositories.preferences.get();
@@ -322,15 +324,148 @@ export const t048SessionCases = (name: string, storage: T048Storage) =>
       expect(await w.run({ type: 'preferences.set', requestId: rid(), preferences: { ...prefs, workFolderRoot: 'relative\\folder' } })).toMatchObject({ ok: false, code: 'invalid_request' });
       expect((await w.repositories.preferences.get()).workFolderRoot).toBeUndefined();
       expect(await w.run({ type: 'preferences.set', requestId: rid(), preferences: { ...prefs, workFolderRoot: other } })).toMatchObject({ ok: true });
-      expect(folders.exists(other)).toBe(true);
+      expect(folders.exists(other)).toBe(false);
       expect(w.events.some((e) => e.type === 'preferences.updated' && e.preferences.workFolderRoot === other)).toBe(true);
       expect(await create(w, 's-1')).toMatchObject({ ok: true });
       expect((await get(w, 's-1')).cwd).toBe(joinFolder(other, `${DAY}-001`));
+      expect(folders.exists(joinFolder(other, `${DAY}-001`))).toBe(true);
       // Saving the same location again (the theme changed) does not check or make it again.
       expect(await w.run({ type: 'preferences.set', requestId: rid(), preferences: { ...prefs, theme: 'light', workFolderRoot: other } })).toMatchObject({ ok: true });
       // Back to the default location.
       expect(await w.run({ type: 'preferences.set', requestId: rid(), preferences: { ...prefs } })).toMatchObject({ ok: true });
       expect(await create(w, 's-2')).toMatchObject({ ok: true });
       expect((await get(w, 's-2')).cwd).toBe(folderOf(env, '001'));
+    });
+    // ---- review r1 ----------------------------------------------------------------------------------------------
+
+    it('r1 P1-1: a claim whose folder our make never created: a folder someone made at that name is neither reused nor removed', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const lost = SessionId.parse('s-lost');
+      // Claimed, then the app stopped before its make; the user made an empty folder of that name.
+      expect(await w.repositories.workFolders.claim({ sessionId: lost, path: folderOf(env, '001'), day: DAY, seq: 1, state: 'claimed', createdAt: '2026-11-04T01:00:00.000Z' })).toBe('claimed');
+      folders.makeForeign(folderOf(env, '001'));
+      // The same session asking again: not that folder, a new one.
+      expect(await create(w, 's-lost')).toMatchObject({ ok: true });
+      expect((await get(w, 's-lost')).cwd).toBe(folderOf(env, '002'));
+      expect(await w.repositories.workFolders.get(lost)).toMatchObject({ path: folderOf(env, '002'), state: 'made' });
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+      // And at the next start, a claim left so is dropped without touching the folder.
+      expect(await w.repositories.workFolders.claim({ sessionId: SessionId.parse('s-other'), path: folderOf(env, '003'), day: DAY, seq: 3, state: 'claimed', createdAt: '2026-11-04T01:00:00.000Z' })).toBe('claimed');
+      folders.makeForeign(folderOf(env, '003'));
+      const next = await env.restart();
+      expect((await next.repositories.workFolders.list()).map((c) => c.sessionId)).toEqual(['s-lost']);
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+      expect(folders.exists(folderOf(env, '003'))).toBe(true);
+    });
+
+    it('r1 P1-1: a link put in place of a folder we made: not reused, not removed, the claim only', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const sessions: Pick<AppRepositories['sessions'], 'create'> = w.repositories.sessions;
+      const original = sessions.create;
+      sessions.create = () => new Promise<'created' | 'exists'>(() => undefined);
+      void create(w, 's-1');
+      for (let i = 0; i < 20 && !folders.exists(folderOf(env, '001')); i++) await settle();
+      // While the app is down, the folder becomes a link to another (empty) folder.
+      const target = joinFolder(folders.elsewhere, 'target');
+      folders.relink(folderOf(env, '001'), target);
+      sessions.create = original;
+      const next = await env.restart();
+      expect(await next.repositories.workFolders.list()).toEqual([]);
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+      expect(folders.exists(target)).toBe(true);
+      expect(next.logs.some((l) => l.includes('not the folder this program made'))).toBe(true);
+    });
+
+    it('r1 P1-2: taking back a folder another session uses meanwhile keeps the folder (on a failed write and at the next start)', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const sessions: Pick<AppRepositories['sessions'], 'create'> = w.repositories.sessions;
+      const original = sessions.create.bind(sessions);
+      let fail: (() => void) | undefined;
+      sessions.create = (session) =>
+        session.id === 's-1' ? new Promise<'created' | 'exists'>((_resolve, reject) => (fail = () => reject(new Error('disk')))) : original(session);
+      const first = create(w, 's-1');
+      for (let i = 0; i < 20 && fail === undefined; i++) await settle();
+      // s-2 is given s-1's folder while s-1 is being written.
+      expect(await create(w, 's-2', { cwd: folderOf(env, '001') })).toMatchObject({ ok: true });
+      fail!();
+      await expect(first).rejects.toThrow('disk');
+      expect(folders.exists(folderOf(env, '001'))).toBe(true);
+      expect(await w.repositories.workFolders.get(SessionId.parse('s-1'))).toBeUndefined();
+      expect(w.logs.some((l) => l.includes('a session or run uses it'))).toBe(true);
+      // The same at the next start: s-3 stopped before its session was stored; s-4 uses its folder.
+      sessions.create = (session) => (session.id === 's-3' ? new Promise<'created' | 'exists'>(() => undefined) : original(session));
+      void create(w, 's-3');
+      for (let i = 0; i < 20 && !folders.exists(folderOf(env, '002')); i++) await settle();
+      expect(await create(w, 's-4', { cwd: folderOf(env, '002') })).toMatchObject({ ok: true });
+      sessions.create = original;
+      const next = await env.restart();
+      expect(await next.repositories.workFolders.get(SessionId.parse('s-3'))).toBeUndefined();
+      expect(folders.exists(folderOf(env, '002'))).toBe(true);
+    });
+
+    it('r1 P1-3: the session write refused after the folder was made: the folder goes first, a claim that cannot go is settled at the next start', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const sessions: Pick<AppRepositories['sessions'], 'create'> = w.repositories.sessions;
+      const claims: Pick<AppRepositories['workFolders'], 'remove'> = w.repositories.workFolders;
+      const [create0, remove0] = [sessions.create, claims.remove];
+      // The data turned read-only: this write and every later one are refused.
+      sessions.create = () => Promise.reject(new StorageReadOnlyError('disk-full'));
+      claims.remove = () => Promise.reject(new StorageReadOnlyError('disk-full'));
+      await expect(create(w, 's-1')).rejects.toBeInstanceOf(StorageReadOnlyError);
+      expect(folders.exists(folderOf(env, '001'))).toBe(false);
+      expect(await w.repositories.workFolders.get(SessionId.parse('s-1'))).toMatchObject({ state: 'made' });
+      [sessions.create, claims.remove] = [create0, remove0];
+      const next = await env.restart();
+      expect(await next.repositories.workFolders.list()).toEqual([]);
+    });
+
+    it('r1 P1-3: refused right after the make (marking the claim made): the folder and the location it made go', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const claims: Pick<AppRepositories['workFolders'], 'markMade'> = w.repositories.workFolders;
+      const markMade = claims.markMade;
+      claims.markMade = () => Promise.reject(new StorageReadOnlyError('disk-full'));
+      await expect(create(w, 's-1')).rejects.toBeInstanceOf(StorageReadOnlyError);
+      expect(folders.exists(folderOf(env, '001'))).toBe(false);
+      expect(folders.exists(folders.location)).toBe(false);
+      claims.markMade = markMade;
+      // Claimed only: the next start drops the claim and touches no folder.
+      const next = await env.restart();
+      expect(await next.repositories.workFolders.list()).toEqual([]);
+    });
+
+    it('r1 P1-4: a preferences save refused (read-only data) makes no folder', async () => {
+      const env = await setup(storage);
+      const { w, folders } = env;
+      const other = joinFolder(folders.elsewhere, 'Refused');
+      const preferences: Pick<AppRepositories['preferences'], 'set'> = w.repositories.preferences;
+      preferences.set = () => Promise.reject(new StorageReadOnlyError('disk-full'));
+      const prefs = await w.repositories.preferences.get();
+      await expect(w.run({ type: 'preferences.set', requestId: rid(), preferences: { ...prefs, workFolderRoot: other } })).rejects.toBeInstanceOf(StorageReadOnlyError);
+      expect(folders.exists(other)).toBe(false);
+      expect(folders.exists(folders.elsewhere)).toBe(false);
+    });
+
+    it('the first message names the session only once it went: one saved and waiting for its runtime keeps the placeholder', async () => {
+      const env = await setup(storage);
+      const { w } = env;
+      await create(w, 's-1');
+      await settle();
+      // Its runtime closed while idle; resuming it fails for now (the runtime cannot be used): the message waits.
+      expect(await w.service.closeIdle(SessionId.parse('s-1'), () => Promise.resolve(true), 1000)).toBe('closed');
+      w.unavailable.add('codex');
+      const resend = async () =>
+        w.run({ type: 'session.send', requestId: rid(), sessionId: SessionId.parse('s-1'), messageId: 'm-1' as never, expectedRevision: (await get(w, 's-1')).revision, text: 'Plan the page', attachments: [] });
+      expect(await resend()).toMatchObject({ ok: false, code: 'runtime_unavailable' });
+      // Saved and waiting, not sent: not named yet.
+      expect(await get(w, 's-1')).toMatchObject({ title: DEFAULT_SESSION_TITLE, autoTitle: true });
+      w.unavailable.delete('codex');
+      // Sent now: named.
+      expect(await resend()).toMatchObject({ ok: true });
+      expect((await get(w, 's-1')).title).toBe('Plan the page');
     });
   });

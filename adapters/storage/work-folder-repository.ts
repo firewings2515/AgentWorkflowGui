@@ -11,19 +11,24 @@ interface Row {
   path: string;
   day: string;
   seq: number;
+  state: string;
+  made_real: string | null;
   created_at: string;
 }
 
-const COLUMNS = 'session_id, instance_id, path, day, seq, created_at';
+const COLUMNS = 'session_id, instance_id, path, day, seq, state, made_real, created_at';
 
 const claimOf = (row: Row): WorkFolderClaim => {
   if (!Number.isSafeInteger(row.seq) || row.seq < 1 || row.path.length === 0) throw new StoredDataError('work_folder_claim', ['claim:invalid']);
+  if (row.state !== 'claimed' && row.state !== 'made') throw new StoredDataError('work_folder_claim', ['state:invalid']);
   return {
     sessionId: row.session_id as SessionId,
     ...(row.instance_id !== null && { instanceId: row.instance_id as InstanceId }),
     path: row.path,
     day: row.day,
     seq: row.seq,
+    state: row.state,
+    ...(row.made_real !== null && { madeReal: row.made_real }),
     createdAt: row.created_at,
   };
 };
@@ -52,11 +57,20 @@ export class SqliteWorkFolderClaimRepository implements WorkFolderClaimRepositor
         const taken = this.ctx.db.prepare('SELECT 1 AS taken FROM work_folder_claim WHERE session_id = ? OR path_key = ?').get(claim.sessionId, claim.path.toLowerCase());
         if (taken !== undefined) return unchanged('taken');
         this.ctx.db
-          .prepare('INSERT INTO work_folder_claim (session_id, instance_id, path, path_key, day, seq, created_at, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(claim.sessionId, claim.instanceId ?? null, claim.path, claim.path.toLowerCase(), claim.day, claim.seq, claim.createdAt, epochMs(claim.createdAt));
+          .prepare('INSERT INTO work_folder_claim (session_id, instance_id, path, path_key, day, seq, state, made_real, created_at, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(claim.sessionId, claim.instanceId ?? null, claim.path, claim.path.toLowerCase(), claim.day, claim.seq, claim.state, claim.madeReal ?? null, claim.createdAt, epochMs(claim.createdAt));
         return committed('claimed');
       }),
     );
+  }
+
+  markMade(sessionId: SessionId, real: string): Promise<void> {
+    return run(() => {
+      writeTransaction(this.ctx.db, () => {
+        const result = this.ctx.db.prepare("UPDATE work_folder_claim SET state = 'made', made_real = ? WHERE session_id = ?").run(real, sessionId);
+        return Number(result.changes) > 0 ? committed(undefined) : unchanged(undefined);
+      });
+    });
   }
 
   remove(sessionId: SessionId): Promise<void> {

@@ -67,10 +67,11 @@ import type {
   WorkFolderClaim,
   WorkFolderFs,
 } from '../ports';
+import { CommitUncertainError } from '../ports/delivery';
 import type { IdleFacts } from '../supervisor/idle';
 import { PermissionGate } from './permissions';
 import { SessionRuntimes } from './runtimes';
-import { type Allocated, WorkFolders } from './work-folders';
+import { type Allocated, folderKey, WorkFolders } from './work-folders';
 import { WrittenPaths, type WrittenPathsOptions } from './written-paths';
 import { gated, ServiceClosedError } from './write-gate';
 
@@ -436,6 +437,8 @@ export class SessionService {
         location: async () => (await this.repos.preferences.get()).workFolderRoot ?? defaultRoot,
         now: () => options.now(),
         ...(day !== undefined && { day }),
+        resolveRealPath: (path) => options.resolveRealPath(path),
+        inUse: (path, real) => this.folderUsed(path, real),
         log: (message) => options.log?.(message),
       });
     }
@@ -973,9 +976,10 @@ export class SessionService {
     try {
       stored = await repositories.sessions.create(session);
     } catch (error) {
-      // No half-made session (T048): a folder made for a session that was not stored is taken back. When it is not
-      // known whether the session was stored, the folder stays; the next start's check settles it.
-      if (made !== undefined && (await this.storedOrUnknown(sessionId)) === 'absent') await this.releaseWorkFolder(sessionId, made);
+      // No half-made session (T048): a folder made for a session that was not stored is taken back, also when the write
+      // was refused (read-only data, r1 P1-3). Only when it is not known whether the session was stored does the folder
+      // stay; the next start's check settles it.
+      if (made !== undefined && !(error instanceof CommitUncertainError) && (await this.storedOrUnknown(sessionId)) === 'absent') await this.releaseWorkFolder(sessionId, made);
       throw error;
     }
     if (stored === 'exists') {
@@ -1061,14 +1065,33 @@ export class SessionService {
    */
   private async checkWorkFolderRoot(root: string | undefined): Promise<string | undefined> {
     if (root === undefined || root === (await this.repos.preferences.get()).workFolderRoot) return undefined;
+    // Checked, never made here (r1 P1-4): a save the storage refuses leaves nothing behind. The first folder made in
+    // it makes the location too.
     if (this.options.resolveRealPath(root) === null) return 'The work folder location must be a full path that can be resolved';
-    try {
-      this.options.workFolders?.fs.makeTree(root);
-    } catch (error) {
-      this.log(`making the work folder location failed (${errorName(error)})`);
-      return 'The work folder location could not be made';
-    }
     return undefined;
+  }
+
+  /**
+   * Whether a session or a run uses the folder (r1 P1-2): its cwd, folder scope, work or project folder, or the folder
+   * of a start still waiting for its root session, compared as Windows compares paths and by real path.
+   */
+  private async folderUsed(path: string, real: string | null): Promise<boolean> {
+    const keys = new Set([folderKey(path), ...(real !== null ? [folderKey(real)] : [])]);
+    const hit = (candidate: string | undefined) => {
+      if (candidate === undefined) return false;
+      if (keys.has(folderKey(candidate))) return true;
+      const resolved = this.options.resolveRealPath(candidate);
+      return resolved !== null && keys.has(folderKey(resolved));
+    };
+    for (const s of await this.repos.sessions.list()) {
+      const { workspaceRoot, writableRoots, readableRoots } = s.folderScope;
+      if ([s.cwd, workspaceRoot, ...writableRoots, ...readableRoots].some(hit)) return true;
+    }
+    for (const i of await this.repos.instances.list()) if ([i.workFolder, i.projectFolder].some(hit)) return true;
+    for (const state of ['pending', 'unknown'] as const) {
+      for (const record of await this.store.listByState(state)) if (record.kind === 'user-message' && hit(record.context.cwd)) return true;
+    }
+    return false;
   }
 
   private async send(command: CommandOf<'session.send'>): Promise<CommandResult> {

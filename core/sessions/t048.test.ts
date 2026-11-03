@@ -11,7 +11,13 @@ import { joinFolder, seqOf, workFolderName } from './work-folders';
 
 t048SessionCases('memory', () => {
   const fs = new MemoryWorkFolderFs(['E:\\work']);
-  const link = (path: string) => (path.toLowerCase().startsWith('e:\\work') ? `E:\\real${path.slice('E:\\work'.length)}` : null);
+  // E:\work is a junction to E:\real; `relink` adds junctions of its own below it.
+  const links = new Map<string, string>();
+  const link = (path: string): string | null => {
+    const lower = path.toLowerCase();
+    for (const [from, to] of links) if (lower === from || lower.startsWith(`${from}\\`)) return link(`${to}${path.slice(from.length)}`);
+    return lower.startsWith('e:\\work') ? `E:\\real${path.slice('E:\\work'.length)}` : null;
+  };
   return {
     repositories: new MemoryRepositories(),
     store: new MemoryDeliveryStore(),
@@ -21,8 +27,12 @@ t048SessionCases('memory', () => {
       elsewhere: 'E:\\work\\elsewhere',
       exists: (path) => fs.exists(path),
       putFile: (folder, name) => fs.putFile(joinFolder(folder, name)),
-      makeForeign: (path) => fs.makeTree(path),
+      makeForeign: (path) => void fs.makeTree(path),
       realPath: link,
+      relink: (path, target) => {
+        fs.makeTree(target);
+        links.set(path.toLowerCase(), target);
+      },
     },
   };
 });

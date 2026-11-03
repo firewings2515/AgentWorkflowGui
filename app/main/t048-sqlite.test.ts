@@ -1,6 +1,6 @@
 // T048 on the real SQLite repositories and delivery store, with real folders in a temporary directory and the main
 // process's own folder code (work-folders.ts, real-path.ts): the same cases as the memory run in core/sessions/t048.test.ts.
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
@@ -32,8 +32,13 @@ t048SessionCases('SQLite and real folders', () => {
       elsewhere: join(dir, 'elsewhere'),
       exists: (path) => existsSync(path),
       putFile: (folder, name) => writeFileSync(join(folder, name), 'x'),
-      makeForeign: (path) => mkdirSync(path, { recursive: true }),
+      makeForeign: (path) => void mkdirSync(path, { recursive: true }),
       realPath: (path) => resolveRealPath(path),
+      relink: (path, target) => {
+        rmdirSync(path);
+        mkdirSync(target, { recursive: true });
+        symlinkSync(target, path, 'junction');
+      },
     },
   };
 });

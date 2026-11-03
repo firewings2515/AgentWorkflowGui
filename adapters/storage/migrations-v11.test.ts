@@ -74,8 +74,14 @@ describe('v11: data stored under contracts 0.7', () => {
     try {
       const claims = createRepositories(db).workFolders;
       const at = '2026-11-04T01:00:00.000Z' as Timestamp;
-      const claim = (id: string, folder: string, seq: number) => claims.claim({ sessionId: SessionId.parse(id), path: folder, day: '2026-11-04', seq, createdAt: at });
+      const claim = (id: string, folder: string, seq: number) => claims.claim({ sessionId: SessionId.parse(id), path: folder, day: '2026-11-04', seq, state: 'claimed', createdAt: at });
       expect(await claim('s-1', 'C:\\W\\2026-11-04-001', 1)).toBe('claimed');
+      expect(await claims.get(SessionId.parse('s-1'))).toMatchObject({ state: 'claimed' });
+      expect((await claims.get(SessionId.parse('s-1')))?.madeReal).toBeUndefined();
+      await claims.markMade(SessionId.parse('s-1'), 'D:\\Real\\2026-11-04-001');
+      expect(await claims.get(SessionId.parse('s-1'))).toMatchObject({ state: 'made', madeReal: 'D:\\Real\\2026-11-04-001' });
+      // `made` always with its real path, and only then (r1 P1-1).
+      expect(() => db.prepare("UPDATE work_folder_claim SET made_real = NULL WHERE session_id = 's-1'").run()).toThrow();
       expect(await claim('s-2', 'c:\\w\\2026-11-04-001', 1)).toBe('taken');
       expect(await claim('s-1', 'C:\\W\\2026-11-04-002', 2)).toBe('taken');
       expect(await claims.listDay('2026-11-04')).toHaveLength(1);

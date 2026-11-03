@@ -21,7 +21,14 @@ export const nodeWorkFolderFs: WorkFolderFs = {
     }
   },
   makeTree(folder) {
-    mkdirSync(folder, { recursive: true });
+    // The first folder it made, or undefined when all of them were there: the made ones are that one and below it.
+    const first = mkdirSync(folder, { recursive: true });
+    if (first === undefined) return [];
+    const created = [first];
+    const rest = win32.relative(first, folder);
+    if (rest === '') return created;
+    for (const part of rest.split(win32.sep)) created.push(win32.join(created.at(-1)!, part));
+    return created;
   },
   make(folder) {
     try {

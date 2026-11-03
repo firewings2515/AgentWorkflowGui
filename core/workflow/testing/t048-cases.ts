@@ -5,6 +5,7 @@
 // (app/main/workflow-t048.test.ts), with a memory file system for the folders in both.
 import { describe, expect, it } from 'vitest';
 import { SessionId, type WorkflowTemplate } from '../../../contracts';
+import { StorageReadOnlyError } from '../../ports';
 import { hashOf } from '../../delivery/testing/fixtures';
 import { taskWorktreeRef } from '../../pipeline/naming';
 import { createTasks, pipelineTemplate } from '../../pipeline/testing/t032-cases';
@@ -97,9 +98,14 @@ export const t048WorkflowCases = (backend: string, make: MakeWorld) =>
 
     it('stopped after the work folder was made and before the start was written: the next start takes it back; the start then makes one', async () => {
       const t = await begin(make, template());
-      crashOnce(t.w.store, 'accept');
-      await expect(start(t.w)).rejects.toThrow('crash');
+      // The app stops while the start is being written.
+      const store: Pick<typeof t.w.store, 'accept'> = t.w.store;
+      const accept = store.accept;
+      store.accept = () => new Promise(() => undefined);
+      void start(t.w);
+      for (let i = 0; i < 20 && !t.fs.exists(auto('001')); i++) await settle();
       expect(t.fs.exists(auto('001'))).toBe(true);
+      store.accept = accept;
       const next = await t.restart();
       expect(await next.repositories.workFolders.list()).toEqual([]);
       expect(t.fs.exists(auto('001'))).toBe(false);
@@ -186,6 +192,52 @@ export const t048WorkflowCases = (backend: string, make: MakeWorld) =>
       // An ordinary session under that ID is refused too, and leaves the run's folder alone.
       expect(await t.w.run({ type: 'session.create', requestId: rid(), sessionId: ROOT, kind: 'ordinary', model: { runtime: 'claude', model: 'haiku' } })).toMatchObject({ ok: false, code: 'already_exists' });
       expect(t.fs.exists(auto('001'))).toBe(true);
+    });
+
+    it('r1 P1-3: the start write refused (read-only data) after the work folder was made: the folder goes', async () => {
+      const t = await begin(make, template());
+      const store: Pick<typeof t.w.store, 'accept'> = t.w.store;
+      const accept = store.accept;
+      store.accept = () => Promise.reject(new StorageReadOnlyError('disk-full'));
+      await expect(start(t.w)).rejects.toBeInstanceOf(StorageReadOnlyError);
+      expect(t.fs.exists(auto('001'))).toBe(false);
+      expect(await t.w.repositories.workFolders.list()).toEqual([]);
+      store.accept = accept;
+      expect(await start(t.w)).toMatchObject({ ok: true });
+      expect((await sessionAt(t.w, ROOT)).cwd).toBe(auto('001'));
+    });
+
+    it('r1 P1-5: a worktree start written before 0.8 (one folder) is finished by its repeat, with or without that folder named', async () => {
+      const t = await begin(make, pipelineTemplate());
+      // As 0.7 wrote it: the identity without its folders part, root's folder the repository; then the app stopped.
+      const store: Pick<typeof t.w.store, 'accept'> = t.w.store;
+      const accept = store.accept.bind(t.w.store);
+      store.accept = (input) => {
+        const ref = input.sourceCallRef;
+        if (ref === undefined) return accept(input);
+        const prefix = 'workflow.start:';
+        return accept({ ...input, sourceCallRef: `${prefix}${JSON.stringify((JSON.parse(ref.slice(prefix.length)) as unknown[]).slice(0, 6))}` });
+      };
+      crashOnce(t.w.repositories.sessions, 'create');
+      await expect(start(t.w, { workFolder: PROJECT, projectFolder: PROJECT })).rejects.toThrow('crash');
+      store.accept = accept;
+      const next = await t.restart();
+      // Another project folder is another run; none, or the one folder, is this one.
+      expect(await start(next, { projectFolder: 'E:\\work\\other' })).toMatchObject({ ok: false, code: 'already_exists' });
+      expect(await start(next)).toMatchObject({ ok: true });
+      expect(await start(next, { workFolder: PROJECT, projectFolder: PROJECT })).toMatchObject({ ok: true });
+      expect((await sessionAt(next, ROOT)).cwd).toBe(PROJECT);
+      const run = await instanceOf(next);
+      expect(run.workFolder).toBeUndefined();
+      expect(run.projectFolder).toBeUndefined();
+      // Its tasks come from root's folder, as before 0.8.
+      const tasks = await createTasks(next, [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }]);
+      if (tasks.status !== 'created') throw new Error('no tasks');
+      const taskId = tasks.tasks[0]!.taskId;
+      expect(await handoff(next, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId })).toMatchObject({ status: 'accepted' });
+      for (let i = 0; i < 20; i++) await settle();
+      expect((await instanceOf(next)).tasks[0]?.worktree?.path).toBe((await taskWorktreeRef(hashOf, PROJECT, INSTANCE, taskId)).path);
+      expect(madeOn(t.fs)).toEqual([]);
     });
 
     it('a workflow session keeps its Agent: setAgent to none is refused', async () => {

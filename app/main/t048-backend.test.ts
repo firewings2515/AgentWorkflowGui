@@ -9,6 +9,7 @@ import { type Command, type CommandResult, InstanceId, type OwnedProcess, Reques
 import { InjectedStorageFaults } from '../../adapters/storage/testing/storage-faults';
 import type { PermissionHandle } from '../../core/ports';
 import { FakeAdapter } from '../../core/sessions/testing/fake-adapter';
+import { agents, template, WORKFLOW } from '../../core/workflow/testing/harness';
 import { type Backend, type BackendProcessHost, startBackend, STORAGE_READ_ONLY, STORAGE_TURNED_READ_ONLY } from './backend';
 import { EventBus } from './event-bus';
 import { resolveRealPath } from './real-path';
@@ -130,22 +131,65 @@ describe('T048 on the backend', () => {
     expect(await createBare(first, 's-kept')).toMatchObject({ ok: true });
     await settle();
     const claims = first.backend.repositories.workFolders;
-    const claim = (id: string, seq: number) =>
-      claims.claim({ sessionId: SessionId.parse(id), path: folder(String(seq).padStart(3, '0')), day: DAY, seq, createdAt: '2026-11-04T01:00:00.000Z' });
-    expect(await claim('s-empty', 2)).toBe('claimed');
-    expect(await claim('s-full', 3)).toBe('claimed');
-    expect(await claim('s-never-made', 4)).toBe('claimed');
-    mkdirSync(folder('002'));
-    mkdirSync(folder('003'));
+    const claim = async (id: string, seq: number, made: boolean) => {
+      const path = folder(String(seq).padStart(3, '0'));
+      expect(await claims.claim({ sessionId: SessionId.parse(id), path, day: DAY, seq, state: 'claimed', createdAt: '2026-11-04T01:00:00.000Z' })).toBe('claimed');
+      if (!made) return;
+      // As our make left it: made, with its real path then.
+      mkdirSync(path);
+      await claims.markMade(SessionId.parse(id), resolveRealPath(path)!);
+    };
+    await claim('s-empty', 2, true);
+    await claim('s-full', 3, true);
     writeFileSync(join(folder('003'), 'notes.txt'), 'mine');
+    await claim('s-never-made', 4, false);
+    // Claimed only, and someone else made a folder there: never ours to remove (r1 P1-1).
+    await claim('s-not-ours', 5, false);
+    mkdirSync(folder('005'));
     await first.backend.shutdown();
     running = [];
 
     const s = await start();
     expect((await s.backend.repositories.workFolders.list()).map((c) => c.sessionId)).toEqual(['s-kept']);
-    expect(readdirSync(location).sort()).toEqual([`${DAY}-001`, `${DAY}-003`]);
+    expect(readdirSync(location).sort()).toEqual([`${DAY}-001`, `${DAY}-003`, `${DAY}-005`]);
     expect(readdirSync(folder('003'))).toEqual(['notes.txt']);
     expect(s.logs.some((l) => l.includes('kept work folder'))).toBe(true);
+  });
+
+  it('r1 P1-3: the data turning read-only on the session write, after the folder was made: no folder is left', async () => {
+    const faults = new InjectedStorageFaults();
+    const s = await start({ faults });
+    // The claim, its mark as made, then the session: the third write fills the disk.
+    faults.failNextWrite('disk-full', 3);
+    expect(await createBare(s, 's-1')).toMatchObject({ ok: false, code: 'storage_read_only', message: STORAGE_TURNED_READ_ONLY });
+    expect(existsSync(folder('001'))).toBe(false);
+    expect(await s.backend.repositories.sessions.get(SessionId.parse('s-1'))).toBeUndefined();
+  });
+
+  it('r1 P1-3: the data turning read-only on a run\'s start, after its work folder was made: no folder is left', async () => {
+    const faults = new InjectedStorageFaults();
+    const s = await start({ faults });
+    for (const a of agents()) expect(await s.run({ type: 'agent.save', requestId: rid(), agent: a, expectedRevision: null })).toMatchObject({ ok: true });
+    expect(await s.run({ type: 'workflow.save', requestId: rid(), workflow: template(), expectedRevision: null })).toMatchObject({ ok: true });
+    faults.failNextWrite('disk-full', 3);
+    expect(
+      await s.run({
+        type: 'workflow.start', requestId: rid(), instanceId: InstanceId.parse('run-1'), rootSessionId: SessionId.parse('root-1'), workflowId: WORKFLOW,
+        workflowRevision: 0, title: 'Report', firstMessage: 'Go.', crossToolConsent: true,
+      }),
+    ).toMatchObject({ ok: false, code: 'storage_read_only' });
+    expect(existsSync(folder('001'))).toBe(false);
+  });
+
+  it('r1 P1-4: a preferences save that turns the data read-only makes no folder', async () => {
+    const faults = new InjectedStorageFaults();
+    const s = await start({ faults });
+    const other = join(dir, 'elsewhere', 'Nested');
+    faults.failNextWrite('disk-full');
+    expect(
+      await s.run({ type: 'preferences.set', requestId: rid(), preferences: { theme: 'dark', supervisor: { idleCloseMinutes: 15, maxOpenRuntimes: 6 }, workFolderRoot: other } }),
+    ).toMatchObject({ ok: false, code: 'storage_read_only' });
+    expect(existsSync(join(dir, 'elsewhere'))).toBe(false);
   });
 
   it('without work folders: the Snapshot names %USERPROFILE%\\AgentWorkflowGui for display, and a session needs a folder', async () => {

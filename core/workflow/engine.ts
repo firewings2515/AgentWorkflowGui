@@ -40,12 +40,13 @@ import {
 } from '../../contracts';
 import type { DeliveryService } from '../delivery';
 import { type GuiHandoff, isResolverSession, resolverBriefing, TaskPipeline, type TaskPipelineOptions } from '../pipeline';
-import type { AppRepositories, DeliveryStore, HandoffMeta, PayloadContext, StoredDelivery, WorkFolderClaim } from '../ports';
+import { type AppRepositories, CommitUncertainError, type DeliveryStore, type HandoffMeta, type PayloadContext, type StoredDelivery, type WorkFolderClaim } from '../ports';
 import type { CommandOf, SessionService, WorkflowHooks, WorkflowSession } from '../sessions';
 import { type AgentNode, agentNodes, briefing, handoffCounts, handoffText, hasEdge, isRework, nodeOf, reportText, reworkKey, rootNode, runtimesOf, sameTarget, taskProgress } from './graph';
 import {
   firstMessageIdOf,
   firstMessageOperationOf,
+  isPre08StartRef,
   startInstanceOf,
   startRefOf,
   handoffConfirmationId,
@@ -285,10 +286,24 @@ export class WorkflowEngine implements WorkflowHooks {
     const root = rootNode(template);
     const settings = { model: root.model, readOnly: root.writePolicy !== 'write' };
     // Which workflow, root node and limit, also while no instance exists yet (r3-P1-1).
-    const startRef = startRefOf({ instanceId, workflowId, rootNodeId: root.id, reworkLimit: template.reworkLimit, title, crossToolConsent, ...(projectFolder !== undefined && { projectFolder }) });
+    // A start written before 0.8 (r1 P1-5): one folder for root and the repository, as such runs had. Its repeat may name
+    // that folder as either, or neither; it goes on as it was started, without a project folder of its own.
+    const stored = intent?.kind === 'user-message' ? intent : undefined;
+    const pre08 = stored !== undefined && isPre08StartRef(stored.sourceCallRef);
+    if (pre08 && [workFolder, projectFolder].some((f) => f !== undefined && f !== stored.context.cwd)) return taken();
+    const project = pre08 ? undefined : projectFolder;
+    const startRef = startRefOf({
+      instanceId,
+      workflowId,
+      rootNodeId: root.id,
+      reworkLimit: template.reworkLimit,
+      title,
+      crossToolConsent,
+      ...(!pre08 && { folders: { ...(project !== undefined && { projectFolder: project }) } }),
+    });
     // Root works in the work folder (Q-4, T048): the one given, else the one the first attempt chose and wrote into its
     // first message, else a new one made below. A repeat that names another folder is not this run.
-    let cwd = workFolder ?? (intent?.kind === 'user-message' ? intent.context.cwd : undefined);
+    let cwd = (pre08 ? undefined : workFolder) ?? stored?.context.cwd;
     if (intent !== undefined) {
       const same =
         intent.kind === 'user-message' &&
@@ -306,7 +321,7 @@ export class WorkflowEngine implements WorkflowHooks {
             instance.workflowRevision === workflowRevision &&
             instance.rootSessionId === rootSessionId &&
             instance.title === title &&
-            instance.projectFolder === projectFolder));
+            instance.projectFolder === project));
       if (!same) return taken();
     }
     if (instance === undefined) {
@@ -317,10 +332,10 @@ export class WorkflowEngine implements WorkflowHooks {
       // Starting is the consent to cross-tool handoffs between the run's nodes (R-11); without it nothing starts.
       if (runtimesOf(template).size > 1 && !crossToolConsent) return fail(requestId, 'invalid_request', 'This workflow hands off between tools; starting it needs that consent');
       // Task worktrees come from the project folder: a run with worktrees cannot start without one (Q-8).
-      if (template.isolation === 'worktree' && projectFolder === undefined)
+      if (template.isolation === 'worktree' && project === undefined && !pre08)
         return fail(requestId, 'invalid_request', 'This workflow works in task worktrees; starting it needs a project folder');
       if (cwd !== undefined && !sessions.canResolve(cwd)) return fail(requestId, 'invalid_request', 'The working folder cannot be resolved');
-      if (projectFolder !== undefined && !sessions.canResolve(projectFolder)) return fail(requestId, 'invalid_request', 'The project folder cannot be resolved');
+      if (project !== undefined && !sessions.canResolve(project)) return fail(requestId, 'invalid_request', 'The project folder cannot be resolved');
     }
     let made: string | undefined;
     if (intent === undefined) {
@@ -346,7 +361,9 @@ export class WorkflowEngine implements WorkflowHooks {
       const release = async () => {
         if (made !== undefined) await sessions.releaseWorkFolder(rootSessionId, made);
       };
-      const accepted = await this.delivery.accept({
+      let accepted: Awaited<ReturnType<DeliveryService['accept']>>;
+      try {
+        accepted = await this.delivery.accept({
         kind: 'user-message',
         operationId,
         sourceCallRef: startRef,
@@ -357,7 +374,13 @@ export class WorkflowEngine implements WorkflowHooks {
         target: { sessionId: rootSessionId, provision: sessions.provisionFor(rootSessionId) },
         at: this.options.now(),
         context: { runtime: root.model.runtime, cwd, entry: { kind: 'new-turn' }, session: settings, origin: { kind: 'user' } },
-      });
+        });
+      } catch (error) {
+        // Refused (read-only data, r1 P1-3), not possibly written: the folder made for it goes. When the commit is in
+        // doubt it stays with its claim, for the repeat or the next start's check.
+        if (!(error instanceof CommitUncertainError)) await release();
+        throw error;
+      }
       if (accepted.status === 'conflict') {
         await release();
         return taken();
@@ -391,8 +414,9 @@ export class WorkflowEngine implements WorkflowHooks {
       rounds: [],
       mergeQueue: [],
       taskPlans: [],
-      workFolder: cwd,
-      ...(projectFolder !== undefined && { projectFolder }),
+      // A start written before 0.8 records neither, like the runs of its time.
+      ...(!pre08 && { workFolder: cwd }),
+      ...(project !== undefined && { projectFolder: project }),
       createdAt: at,
     };
     if (sessions.isClosing()) return fail(requestId, 'runtime_unavailable', 'The application is closing', { mayHaveSideEffects: wrote });

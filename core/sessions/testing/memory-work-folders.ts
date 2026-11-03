@@ -34,14 +34,18 @@ export class MemoryWorkFolderFs implements WorkFolderFs {
     return [...names, ...files];
   }
 
-  makeTree(folder: string): void {
+  makeTree(folder: string): string[] {
     const parts = folder.replace(/[\\/]+$/, '').split(/[\\/]/);
+    const created: string[] = [];
     for (let i = 1; i <= parts.length; i++) {
       const path = parts.slice(0, i).join('\\');
       if (i === 1 || this.exists(path)) continue;
+      if (this.files.has(key(path))) throw Object.assign(new Error('EEXIST'), { code: 'EEXIST' });
       this.folders.set(key(path), path);
       this.made.push(path);
+      created.push(path);
     }
+    return created;
   }
 
   make(folder: string): 'created' | 'exists' {

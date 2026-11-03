@@ -48,6 +48,8 @@ export interface World {
   configure: (adapter: FakeAdapter) => void;
   /** The exit deadline (SessionServiceOptions.sleep); by default it never passes. */
   sleeper: (ms: number) => Promise<void>;
+  /** Runtimes that cannot be used now: no adapter is made for them, as the main process refuses (T045). Kept across a restart. */
+  unavailable: Set<Runtime>;
   service: SessionService;
   logs: string[];
   /** With `locks`: the files the lock table hashes (folded path → state; absent means missing) and its clock. */
@@ -88,6 +90,7 @@ const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, pre
     logs: [] as string[],
     configure: previous?.configure ?? (() => undefined),
     sleeper: (): Promise<void> => new Promise<void>(() => undefined),
+    unavailable: previous?.unavailable ?? new Set<Runtime>(),
   } as unknown as World;
   const policy: PermissionPolicy = {
     evaluate: (_request, context) => {
@@ -109,6 +112,7 @@ const build = (repositories: MemoryRepositories, store: MemoryDeliveryStore, pre
     resolveRealPath: (path) => world.realPath(path),
     folderState: (path) => world.folderState?.(path) ?? (world.realPath(path) === null ? 'missing' : 'exists'),
     createAdapter: (runtime: Runtime, sessionId: SessionId) => {
+      if (world.unavailable.has(runtime)) throw new Error(`${runtime} is not available on this computer`);
       if (runtime === 'claude') return world.claude;
       const adapter = new FakeAdapter('codex', (handle) => world.service.onPermissionRequest(handle));
       world.configure(adapter);
