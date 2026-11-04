@@ -3,7 +3,7 @@
 // option fails here and not only in the installed app. A packaged app never falls back to the SDK's claude.exe.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const hoisted = vi.hoisted(() => ({ startBackend: vi.fn(), createRuntimeLocator: vi.fn(), isPackaged: { value: true } }));
+const hoisted = vi.hoisted(() => ({ startBackend: vi.fn(), createRuntimeLocator: vi.fn(), isPackaged: { value: true }, setAppUserModelId: vi.fn(), setToastActivatorCLSID: vi.fn() }));
 
 vi.mock('electron', () => {
   class FakeWindow {
@@ -22,7 +22,8 @@ vi.mock('electron', () => {
         return hoisted.isPackaged.value;
       },
       setName: vi.fn(),
-      setAppUserModelId: vi.fn(),
+      setAppUserModelId: hoisted.setAppUserModelId,
+      setToastActivatorCLSID: hoisted.setToastActivatorCLSID,
       getVersion: () => '0.0.0',
       getPath: () => 'C:\\userData',
       getAppPath: () => 'C:\\project',
@@ -31,6 +32,7 @@ vi.mock('electron', () => {
       quit: vi.fn(),
     },
     BrowserWindow: FakeWindow,
+    Notification: class { static isSupported = () => true; static handleActivation = vi.fn(); },
     Menu: { setApplicationMenu: vi.fn(), buildFromTemplate: vi.fn() },
     dialog: { showMessageBox: vi.fn(), showOpenDialog: vi.fn() },
     nativeTheme: { themeSource: 'dark' },
@@ -42,6 +44,25 @@ vi.mock('./backend', () => ({ startBackend: hoisted.startBackend }));
 vi.mock('./app-ipc', () => ({ registerAppIpc: vi.fn() }));
 vi.mock('./ipc', () => ({ handleTrusted: vi.fn() }));
 vi.mock('./runtime-locator', () => ({ createRuntimeLocator: hoisted.createRuntimeLocator }));
+
+describe('T057 the installed app and a development run have their own Windows ID and notification class', () => {
+  it.runIf(process.platform === 'win32')('packaged: the installer’s; development: the .dev ones', async () => {
+    const ids = await import('./app-id');
+    for (const packaged of [true, false]) {
+      vi.resetModules();
+      hoisted.setAppUserModelId.mockClear();
+      hoisted.setToastActivatorCLSID.mockClear();
+      hoisted.startBackend.mockReset();
+      hoisted.createRuntimeLocator.mockReturnValue({ detect: vi.fn(), current: vi.fn() });
+      hoisted.startBackend.mockResolvedValue({ status: 'ready', facade: { snapshot: () => ({ preferences: { theme: 'dark' } }) }, unfinishedWork: () => Promise.resolve({}), shutdown: () => Promise.resolve() });
+      hoisted.isPackaged.value = packaged;
+      await import('./index');
+      await vi.waitFor(() => expect(hoisted.startBackend).toHaveBeenCalledTimes(1));
+      expect(hoisted.setAppUserModelId.mock.calls).toEqual([[packaged ? ids.APP_USER_MODEL_ID : ids.DEV_APP_USER_MODEL_ID]]);
+      expect(hoisted.setToastActivatorCLSID.mock.calls).toEqual([[packaged ? ids.TOAST_ACTIVATOR_CLSID : ids.DEV_TOAST_ACTIVATOR_CLSID]]);
+    }
+  });
+});
 
 describe('T045 index.ts gives the backend the runtime locator', () => {
   beforeEach(() => {

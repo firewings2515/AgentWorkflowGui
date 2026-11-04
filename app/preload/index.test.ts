@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { type EventBatch, type EventEnvelope, FolderRequest, QueryRequest } from '../../contracts';
 import type { AppBridge } from './bridge-types';
-import { APP_INFO_CHANNEL, BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, EVENT_CHANNEL, FOCUS_WINDOW_CHANNEL, FOLDER_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL, SNAPSHOT_READ_CHANNEL, WINDOW_REPORT_CHANNEL } from './channels';
+import { APP_INFO_CHANNEL, BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, ESCALATION_ACTIVATED_CHANNEL, ESCALATION_NOTICE_CHANNEL, EVENT_CHANNEL, FOLDER_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL, SNAPSHOT_READ_CHANNEL, WINDOW_REPORT_CHANNEL } from './channels';
 
 type Listener = (event: unknown, batch: EventBatch) => void;
 
@@ -9,6 +9,7 @@ const electron = vi.hoisted(() => ({
   exposed: new Map<string, unknown>(),
   listeners: new Set<Listener>(),
   channels: [] as string[],
+  registered: [] as [string, Listener][],
   invoke: vi.fn(),
   send: vi.fn(),
 }));
@@ -20,6 +21,7 @@ vi.mock('electron', () => ({
     send: electron.send,
     on: (channel: string, listener: Listener) => {
       electron.channels.push(channel);
+      electron.registered.push([channel, listener]);
       electron.listeners.add(listener);
     },
     removeListener: (_channel: string, listener: Listener) => electron.listeners.delete(listener),
@@ -40,6 +42,7 @@ beforeEach(() => {
   electron.exposed.clear();
   electron.listeners.clear();
   electron.channels.length = 0;
+  electron.registered.length = 0;
   electron.invoke.mockReset();
   electron.send.mockReset();
 });
@@ -47,7 +50,7 @@ beforeEach(() => {
 describe('preload bridge', () => {
   it('exposes exactly the typed API and no ipcRenderer', async () => {
     const bridge = await loadBridge();
-    expect(Object.keys(bridge).sort()).toEqual(['focusWindow', 'folders', 'getAppInfo', 'onBatch', 'onEvent', 'query', 'readSnapshot', 'report', 'send', 'snapshot']);
+    expect(Object.keys(bridge).sort()).toEqual(['folders', 'getAppInfo', 'onBatch', 'onEscalationActivated', 'onEvent', 'query', 'readSnapshot', 'report', 'send', 'showEscalationNotice', 'snapshot']);
     expect(Object.keys(bridge.folders ?? {})).toEqual(['request']);
     expect(electron.exposed.size).toBe(1);
   });
@@ -77,15 +80,31 @@ describe('preload bridge', () => {
     ]);
   });
 
-  it('focusWindow sends only its channel: whatever the page passes never reaches the main process (T055)', async () => {
+  it('showEscalationNotice passes one string, the escalation ID, and nothing else (T057)', async () => {
     const bridge = await loadBridge();
     electron.invoke.mockResolvedValue('anything the main process answers');
     // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the extra arguments on purpose
-    const call = bridge.focusWindow as unknown as (...args: unknown[]) => Promise<unknown>;
-    await expect(call('E:\\other\\window', { id: 7 }, () => undefined)).resolves.toBeUndefined();
-    await bridge.focusWindow?.();
-    expect(electron.invoke.mock.calls).toEqual([[FOCUS_WINDOW_CHANNEL], [FOCUS_WINDOW_CHANNEL]]);
+    const call = bridge.showEscalationNotice as unknown as (...args: unknown[]) => Promise<unknown>;
+    await expect(call('esc-1', '<b>title</b>', { body: 'text' }, () => undefined)).resolves.toBeUndefined();
+    await expect(bridge.showEscalationNotice?.('esc-2')).resolves.toBeUndefined();
+    for (const bad of [undefined, 7, { escalationId: 'esc-3' }, ['esc-4'], null]) await expect(call(bad)).resolves.toBeUndefined();
+    expect(electron.invoke.mock.calls).toEqual([[ESCALATION_NOTICE_CHANNEL, 'esc-1'], [ESCALATION_NOTICE_CHANNEL, 'esc-2']]);
     expect(electron.send).not.toHaveBeenCalled();
+  });
+
+  it('onEscalationActivated hands the listener a well-formed ID alone, and stops when cancelled (T057)', async () => {
+    const bridge = await loadBridge();
+    const got: unknown[] = [];
+    const cancel = bridge.onEscalationActivated!((...args: unknown[]) => got.push(args));
+    const entry = electron.registered.find(([channel]) => channel === ESCALATION_ACTIVATED_CHANNEL);
+    expect(entry).toBeDefined();
+    const deliver = entry![1] as unknown as (event: unknown, payload: unknown) => void;
+    deliver({ sender: 'main' }, { escalationId: 'esc-1', extra: '<img>' });
+    for (const bad of [undefined, null, 'esc-2', { escalationId: 3 }, { escalationId: '' }, { escalationId: 'x'.repeat(257) }, { id: 'esc-3' }]) deliver({}, bad);
+    deliver({}, { escalationId: 'x'.repeat(256) });
+    expect(got).toEqual([['esc-1'], ['x'.repeat(256)]]);
+    cancel();
+    expect(electron.listeners.has(entry![1])).toBe(false);
   });
 
   it('routes folder requests to their own channel (C-24)', async () => {

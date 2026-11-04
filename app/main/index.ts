@@ -1,16 +1,16 @@
 import { join } from 'node:path';
-import { app, BrowserWindow, dialog, Menu, nativeTheme, session, shell } from 'electron';
+import { app, BrowserWindow, dialog, Menu, nativeTheme, Notification, session, shell } from 'electron';
 import { WindowsProcessHost } from '../../adapters/process';
 import type { Theme } from '../../contracts';
-import { APP_INFO_CHANNEL, FOCUS_WINDOW_CHANNEL, FOLDER_CHANNEL } from '../preload/channels';
-import { APP_USER_MODEL_ID } from './app-id';
+import { APP_INFO_CHANNEL, ESCALATION_NOTICE_CHANNEL, FOLDER_CHANNEL } from '../preload/channels';
+import { appIdentity } from './app-id';
 import { registerAppIpc } from './app-ipc';
 import { type Backend, type DamagedBackend, startBackend } from './backend';
 import { sdkBundledClaude } from './claude-exe';
+import { createEscalationNotices } from './escalation-notice';
 import { EventBus } from './event-bus';
 import { realFolder } from './exe-search';
 import { faultPointFrom } from './fault-points';
-import { focusWindow } from './focus-window';
 import { handleFolderRequest } from './folders';
 import { handleTrusted } from './ipc';
 import { type PerfLog, startPerfLog } from './perf-log';
@@ -120,18 +120,50 @@ async function confirmExit(ready: Backend): Promise<boolean> {
   return response === 0;
 }
 
+/**
+ * The system notifications of escalations (T057): the page names the escalation, this process shows it and handles its
+ * click, from the banner or the Windows Action Center.
+ */
+const notices = createEscalationNotices({
+  snapshot: () => (backend?.status === 'ready' ? backend.facade.snapshot() : undefined),
+  getWindow: () => mainWindow,
+  createNotification: (options) => new Notification(options),
+  useToastXml: process.platform === 'win32',
+  log,
+});
+
 app.setName(APP_NAME);
-// Windows shows system notifications under this ID (T055).
-if (process.platform === 'win32') app.setAppUserModelId(APP_USER_MODEL_ID);
+if (process.platform === 'win32') {
+  // Windows shows system notifications under this ID (T055), and calls this class when one is clicked (T057). The
+  // installed app and a development run each have their own (app-id.ts).
+  const identity = appIdentity(app.isPackaged);
+  app.setAppUserModelId(identity.appUserModelId);
+  try {
+    app.setToastActivatorCLSID(identity.toastActivatorClsid);
+  } catch (error: unknown) {
+    log(`[main] toast activator not set (${error instanceof Error ? error.name : 'unknown'})`);
+  }
+  // Every click Windows reports, also from the Action Center and after the toast object is gone. Registered before the
+  // app is ready: a click that started the app is delivered as soon as this is set, and only brings the window forward
+  // (there is none yet, so nothing happens and the app opens as usual).
+  if (typeof Notification.handleActivation === 'function') Notification.handleActivation((details) => void notices.activate(details));
+}
 // The renderer is a single local page showing untrusted text (T042): before any window exists.
 app.on('web-contents-created', (_event, contents) => guardWebContents(contents, isTrustedUrl));
 
 void app.whenReady().then(async () => {
   perf?.mark('app-ready');
-  guardSession(session.defaultSession, isTrustedUrl);
+  // Electron registers the notification class with Windows only when its notification service starts. Started now, a
+  // click on a toast left from an earlier run reaches this app instead of starting a second one (T057).
+  try {
+    Notification.isSupported();
+  } catch {
+    /* No notifications on this system. */
+  }
+  guardSession(session.defaultSession);
   handleTrusted(APP_INFO_CHANNEL, getTrustedSender, () => ({ name: APP_NAME, version: app.getVersion() }));
-  // A clicked notification brings the window forward. The handler takes no argument: nothing the page sends is used (T055).
-  handleTrusted(FOCUS_WINDOW_CHANNEL, getTrustedSender, () => focusWindow(mainWindow));
+  // The page asks for the notification of one escalation: its ID is the one value used, and it is checked (T057).
+  handleTrusted(ESCALATION_NOTICE_CHANNEL, getTrustedSender, (escalationId: unknown) => notices.show(escalationId));
   Menu.setApplicationMenu(Menu.buildFromTemplate(hiddenMenuTemplate(devUrl !== undefined)));
   applyTheme(theme);
   const bus = new EventBus();
@@ -212,6 +244,7 @@ app.on('before-quit', (event) => {
   void (async () => {
     if (current.status === 'ready' && !(await confirmExit(current).catch(() => true))) return;
     quitting = true;
+    notices.stop();
     await current.shutdown().catch((error: unknown) => log(`[main] shutdown failed (${error instanceof Error ? error.name : 'unknown'})`));
     app.quit();
   })();

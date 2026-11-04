@@ -1,13 +1,13 @@
-// System notification for an escalation that needs the user (U3 Q-15, T055). Shown only when a *new* open escalation
-// appears while the window is not in front and the setting is on. The text is plain text: the title and the body are
-// handed to the `Notification` API as strings, and the body is cleaned of control characters first.
+// System notification for an escalation that needs the user (U3 Q-15, T055, T057). The page decides when: a *new* open
+// escalation appears while the window is not in front and the setting is on. Then it asks the main process, by the
+// escalation's ID alone, to show it; the main process looks the escalation up and writes the text. A click (from the
+// banner or the Windows Action Center) comes back from the main process as the ID of the escalation to open.
 import { useEffect, useRef, useState } from 'react';
 import type { SessionId, Snapshot } from '../../../contracts';
+import type { AwgBridge } from '../../preload/bridge-types';
 import type { RendererState } from './renderer-store';
 
 export const NOTIFY_KEY = 'awg.notify.v1';
-export const NOTIFY_TITLE = '需要你處理';
-export const NOTIFY_BODY_LIMIT = 100;
 
 // When saving fails, the last choice made on this page is kept here, so what the checkbox shows is what the notifier does.
 let unsaved: boolean | undefined;
@@ -41,32 +41,8 @@ export function forgetUnsavedNotifySetting(): void {
   unsaved = undefined;
 }
 
-// Line breaks and tabs become one space; every other control character and the bidi controls are dropped.
-const isBreak = (cp: number) => cp === 0x0a || cp === 0x0d || cp === 0x09 || cp === 0x85 || cp === 0x2028 || cp === 0x2029;
-const isDropped = (cp: number) => cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f) || (cp >= 0x200b && cp <= 0x200f) || (cp >= 0x202a && cp <= 0x202e)
-  || (cp >= 0x2066 && cp <= 0x2069) || cp === 0xfeff;
-const clean = (text: string) => Array.from(text).map(letter => {
-  const cp = letter.codePointAt(0) ?? 0;
-  return isBreak(cp) ? ' ' : isDropped(cp) ? '' : letter;
-}).join('').replace(/[ ]{2,}/g, ' ').trim();
-
-/** "<session title>：<escalation title>", cleaned and cut to 100 characters (code points). No `detail`. */
-export function notificationBody(sessionTitle: string | undefined, escalationTitle: string): string {
-  const title = clean(sessionTitle ?? '');
-  const text = title ? `${title}：${clean(escalationTitle)}` : clean(escalationTitle);
-  const letters = Array.from(text);
-  return letters.length > NOTIFY_BODY_LIMIT ? `${letters.slice(0, NOTIFY_BODY_LIMIT - 1).join('')}…` : text;
-}
-
-/** The part of the `Notification` API used (a stand-in in tests). */
-export interface NotificationLike {
-  onclick: ((event?: unknown) => void) | null;
-  close(): void;
-}
-export interface NotificationApi {
-  new (title: string, options?: { body?: string; tag?: string }): NotificationLike;
-  readonly permission: string;
-}
+/** The part of the bridge the notifier uses (T057). */
+export type NoticeBridge = Pick<AwgBridge, 'showEscalationNotice' | 'onEscalationActivated'>;
 
 export interface NotifierOptions {
   store: { subscribe: (listener: () => void) => () => void; getSnapshot: () => Pick<RendererState, 'connection' | 'snapshot'> };
@@ -74,18 +50,11 @@ export interface NotifierOptions {
   onActivate: (sessionId: SessionId, escalationId: string) => void;
   hasFocus?: () => boolean;
   enabled?: () => boolean;
-  notification?: () => NotificationApi | undefined;
-  focusWindow?: () => void;
+  /** The preload bridge (`window.awg` unless given). */
+  bridge?: () => NoticeBridge | undefined;
 }
 
-const defaultApi = (): NotificationApi | undefined => (typeof Notification === 'undefined' ? undefined : (Notification as unknown as NotificationApi));
-const defaultFocusWindow = () => {
-  try {
-    void window.awg?.focusWindow?.()?.catch(() => undefined);
-  } catch {
-    /* No bridge, or it failed: the session still opens. */
-  }
-};
+const defaultBridge = (): NoticeBridge | undefined => (typeof window === 'undefined' ? undefined : window.awg);
 
 /**
  * Watches the store. A notification needs an escalation that is `open` now and was never seen `open` before, so a repeated
@@ -97,9 +66,9 @@ export function startEscalationNotifier(options: NotifierOptions): () => void {
   const { store, onActivate } = options;
   const seen = new Set<string>();
   let needsBaseline = true;
-  // Notifications still on screen: once the notifier is stopped (the shell is gone) a click on one must do nothing (r2 P2).
+  // Once the notifier is stopped (the shell is gone) a click must do nothing (T055 r2 P2).
   let stopped = false;
-  const live = new Set<NotificationLike>();
+  const bridge = (options.bridge ?? defaultBridge)();
   const evaluate = () => {
     const state = store.getSnapshot();
     const snapshot: Snapshot | null = state.snapshot;
@@ -111,33 +80,32 @@ export function startEscalationNotifier(options: NotifierOptions): () => void {
       const hasFocus = options.hasFocus ?? (() => document.hasFocus());
       if (hasFocus() || !(options.enabled ?? readNotifyEnabled)()) continue;
       try {
-        const api = (options.notification ?? defaultApi)();
-        if (!api || api.permission !== 'granted') continue;
-        const sessionTitle = snapshot.sessions.find(session => session.id === item.fromSessionId)?.title;
-        const shown = new api(NOTIFY_TITLE, { body: notificationBody(sessionTitle, item.title), tag: item.id });
-        live.add(shown);
-        shown.onclick = () => {
-          if (stopped) return;
-          live.delete(shown);
-          try { (options.focusWindow ?? defaultFocusWindow)(); } catch { /* The session still opens. */ }
-          onActivate(item.fromSessionId, item.id);
-          try { shown.close(); } catch { /* Already closed. */ }
-        };
+        // The ID alone: the main process checks the escalation and writes the text itself.
+        void bridge?.showEscalationNotice?.(item.id)?.catch(() => undefined);
       } catch {
-        /* A notification that cannot be shown is skipped; the escalation card is still in the app. */
+        /* No notification then; the escalation card is still in the app. */
       }
     }
   };
+  // A clicked notification: the main process brought the window forward and names the escalation to open. The page
+  // finds its session in its own data; an escalation it does not know (yet) opens nothing.
+  const activated = (escalationId: string) => {
+    if (stopped) return;
+    const item = store.getSnapshot().snapshot?.escalations.find(escalation => escalation.id === escalationId);
+    if (item) onActivate(item.fromSessionId, item.id);
+  };
+  let stopActivated: (() => void) | undefined;
+  try {
+    stopActivated = bridge?.onEscalationActivated?.(activated);
+  } catch {
+    /* An older preload: clicks bring the window forward only. */
+  }
   evaluate();
   const unsubscribe = store.subscribe(evaluate);
   return () => {
     stopped = true;
     unsubscribe();
-    for (const shown of live) {
-      shown.onclick = null;
-      try { shown.close(); } catch { /* Already closed. */ }
-    }
-    live.clear();
+    try { stopActivated?.(); } catch { /* Already gone. */ }
   };
 }
 

@@ -30,5 +30,11 @@ export const QUERY_CHANNEL = 'app:query';
 /** Renderer -> main: one FolderRequest (C-24), answered with a FolderResult (invoke). */
 export const FOLDER_CHANNEL = 'app:folder';
 
-/** Renderer -> main: bring the window to the front (invoke). Carries nothing: the main process picks its own window. */
-export const FOCUS_WINDOW_CHANNEL = 'app:focus-window';
+/**
+ * Renderer -> main: show the system notification of one escalation (invoke, T057). Carries its ID and nothing else:
+ * the main process looks the escalation up and writes the text itself.
+ */
+export const ESCALATION_NOTICE_CHANNEL = 'app:escalation-notice';
+
+/** Main -> renderer: a notification was clicked, open this escalation, `{ escalationId }` (send, T057). */
+export const ESCALATION_ACTIVATED_CHANNEL = 'app:escalation-activated';
