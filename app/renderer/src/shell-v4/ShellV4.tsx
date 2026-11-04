@@ -3,7 +3,7 @@
 // `serviceStore` serves fixture data (history pages, preferences, backups) and controls say what they would send.
 import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from 'react';
 import type { LogicalSession, ModelOption, SessionId, Snapshot } from '../../../../contracts';
-import { AgentId, MessageId, RequestId } from '../../../../contracts';
+import { AgentId, MessageId, PINNED_LIMIT, pinnedOf, RequestId } from '../../../../contracts';
 import { AgentCatalog } from '../AgentCatalog';
 import { createAgentDemo } from '../agent-demo';
 import { createIpcAgentRepository } from '../agent-repository';
@@ -25,7 +25,6 @@ import { defaultModelKey, modelKey } from './Composer';
 import type { ComposerChoice } from './Composer';
 import { Conversation } from './Conversation';
 import { useCreateFlow } from './create-flow';
-import { demoPinned } from './demo-data';
 import type { SidebarMode, V4Page } from './demo-data';
 import { recentFolders, requestFolder } from './folders';
 import { NewChat, SettingsV4 } from './Pages';
@@ -84,7 +83,6 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const [narrowOpen, setNarrowOpen] = useState(false);
   // Demo only: renames and pins stay in this preview.
   const [titles, setTitles] = useState<Record<string, string>>({});
-  const [demoPins, setDemoPins] = useState<Record<SidebarMode, ReadonlySet<string>>>(() => ({ chat: new Set(demoPinned.chat), workflow: new Set(demoPinned.workflow) }));
   // Demo only: Agent／Model choices of existing sessions (connected: those are commands).
   const [choices, setChoices] = useState<Record<string, ComposerChoice>>({});
   const [newDraft, setNewDraft] = useState('');
@@ -249,6 +247,37 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
       if (!result.ok) setNotice(`沒有改名：${result.code === 'stale_revision' ? '標題剛被更新，請再改一次。' : commandFeedback(result, 'session.rename')}`);
     });
   };
+  /**
+   * Pins or unpins in the mode the item belongs to (WB-11: a run or a node session in Workflow mode). preferences.set
+   * replaces the whole record (T050 ★F), so it is built from the latest Snapshot at the moment of sending. IDs that name
+   * nothing loaded any more are dropped from the list being changed, so they do not hold places of the 50.
+   */
+  const togglePin = (id: string) => {
+    const current = preferenceStore.getSnapshot().snapshot;
+    if (!current || pinBlocked) return;
+    const lists = pinnedOf(current.preferences);
+    const key = modeOf(current, id);
+    const loaded = (item: string) => current.sessions.some(session => session.id === item) || (key === 'workflow' && current.instances.some(instance => instance.id === item));
+    const kept = lists[key].filter(loaded);
+    // The IDs come from the Snapshot (sessions and instances), so they already are session or instance IDs.
+    const target = id as (typeof kept)[number];
+    let next: typeof kept;
+    if (kept.includes(target)) next = kept.filter(item => item !== target);
+    else if (kept.length >= PINNED_LIMIT) { setNotice(`釘選已滿（${PINNED_LIMIT}），請先取消一些釘選。`); return; }
+    else next = [...kept, target];
+    void preferenceStore.send({ type: 'preferences.set', requestId: newId(), preferences: { ...current.preferences, pinned: key === 'chat' ? { ...lists, chat: next as typeof lists.chat } : { ...lists, workflow: next } } }).then(result => {
+      if (!result.ok) setNotice(`釘選沒有儲存：${commandFeedback(result)}`);
+    });
+  };
+  /** Renames a run with workflow.rename (T050) and the run's latest revision; the demo keeps the name in this preview. */
+  const renameRun = (instanceId: string, title: string) => {
+    if (!store) { setTitles(previous => ({ ...previous, [instanceId]: title })); return; }
+    const instance = store.getSnapshot().snapshot?.instances.find(item => item.id === instanceId);
+    if (!instance || readOnly) return;
+    void store.send({ type: 'workflow.rename', requestId: newId(), instanceId: instance.id, expectedRevision: instance.revision, title }).then(result => {
+      if (!result.ok) setNotice(`沒有改名：${result.code === 'stale_revision' ? '這次執行剛被更新，請再改一次。' : commandFeedback(result, 'workflow.rename')}`);
+    });
+  };
   const closeTransfer = () => {
     const viewId = transfer?.viewId;
     setTransfer(null);
@@ -276,7 +305,11 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
     : ipcState?.connection === 'error' ? '資料同步失敗，保留上次資料' : '正在同步資料…';
   const connection = <><span className="v4-dot" data-state={store ? ipcState?.connection : 'demo'} aria-hidden="true" /><span role="status">{connectionText}</span>
     {store && <button type="button" className="v4-icon" aria-label="重新讀取資料" title="重新讀取資料（F5）" disabled={ipcState?.connection === 'loading'} onClick={reload}>↻</button>}</>;
-  const pinned = store ? { chat: new Set<string>(), workflow: new Set<string>() } : demoPins;
+  const pinnedLists = pinnedOf(snapshot.preferences);
+  const pinned = { chat: new Set<string>(pinnedLists.chat), workflow: new Set<string>(pinnedLists.workflow) };
+  // The demo's own service stores preferences too, so pins work the same way there.
+  const preferenceStore = store ?? serviceStore;
+  const pinBlocked = readOnly || commandDisabled || preferenceStore.isBlocked('preferences.set', 'preferences');
 
   let main;
   if (page === 'chat' && panes.panes.length) main = <div className={`v4-panes ${panes.panes.length > 1 ? 'v4-split' : ''}`}>{panes.panes.map(pane => {
@@ -313,17 +346,12 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const selectedSession = page === 'chat' ? active?.sessionId : undefined;
   return <div className={`v4-shell ${collapsed ? 'v4-collapsed' : ''} ${narrow ? 'v4-narrow' : ''}`} data-testid="shell-v4">
     <Sidebar snapshot={snapshot} titles={titles} pinned={pinned} mode={mode} selectedId={selectedSession} page={page === 'missing' ? 'chat' : page} collapsed={collapsed} overlay={narrow} theme={theme}
-      readOnly={readOnly} canPin={!store} canRenameRun={!store} connection={connection}
+      readOnly={readOnly} pinBlocked={pinBlocked} connection={connection}
       onCollapse={value => { if (narrow) setNarrowOpen(!value); else setSidebarOpen(!value); }}
       onMode={value => { setMode(value); if (page === 'new' && value === 'workflow') go('workflow-start'); else if (page === 'workflow-start' && value === 'chat') go('new'); }}
       onNewChat={() => go('new')} onStartWorkflow={() => go('workflow-start')} onOpen={id => open(id)} onSplit={split}
       onTheme={changeTheme} onPage={next => go(next, next === 'templates' ? snapshot.workflows[0]?.id ?? '' : '')}
-      onPin={id => setDemoPins(previous => {
-        const key = modeOf(snapshot, id); const next = new Set(previous[key]);
-        if (next.has(id)) next.delete(id); else next.add(id);
-        return { ...previous, [key]: next };
-      })}
-      onRenameRun={(id, name) => setTitles(previous => ({ ...previous, [id]: name }))}
+      onPin={togglePin} onRenameRun={renameRun}
       onRename={id => { open(id); setEditTitle(previous => ({ sessionId: id, nonce: previous.nonce + 1 })); }} />
     {narrow && narrowOpen && <div className="v4-scrim" aria-hidden="true" onClick={() => setNarrowOpen(false)} />}
     <main className="v4-main">

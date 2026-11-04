@@ -35,8 +35,8 @@ export interface SidebarProps {
   onRenameRun: (id: string, title: string) => void; onPage: (page: V4Page) => void; onTheme: (theme: Theme) => void;
   /** Read-only data (T040): pinning and renaming are shown but disabled, with the reason. */
   readOnly: boolean;
-  /** Whether pinning and renaming a run can be saved (they need contracts 0.9, T050). */
-  canPin: boolean; canRenameRun: boolean;
+  /** Pinning cannot be saved now (read-only, not synchronised, or a preferences change in flight). */
+  pinBlocked: boolean;
   /** The connection line at the bottom: the IPC state, or the demo note. */
   connection: ReactNode;
 }
@@ -201,8 +201,8 @@ export function Sidebar(props: SidebarProps) {
       items={[
         { label: '開啟', onSelect: () => props.onOpen(menuOpenId) },
         { label: '在分割畫面開啟', disabled: menuOpenId === selectedId, onSelect: () => props.onSplit(menuOpenId) },
-        ...(props.canPin ? [{ label: props.pinned[modeOf(snapshot, menu.id)].has(menu.id) ? '取消釘選' : '釘選', disabled: props.readOnly, ...readOnly, onSelect: () => props.onPin(menu.id) }] : []),
-        ...(!menuRun || props.canRenameRun ? [{ label: '重新命名', disabled: props.readOnly, ...readOnly, onSelect: () => { if (menuRun) setRenaming(menuRun.id); else props.onRename(menuOpenId); } }] : []),
+        { label: props.pinned[modeOf(snapshot, menu.id)].has(menu.id) ? '取消釘選' : '釘選', disabled: props.pinBlocked, ...readOnly, onSelect: () => props.onPin(menu.id) },
+        { label: '重新命名', disabled: props.readOnly, ...readOnly, onSelect: () => { if (menuRun) setRenaming(menuRun.id); else props.onRename(menuOpenId); } },
       ]} />}
   </aside>;
 }

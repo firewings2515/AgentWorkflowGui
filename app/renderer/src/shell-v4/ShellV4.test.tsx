@@ -171,11 +171,13 @@ describe('T047 sidebar', () => {
     fireEvent.click(pane('規劃想法').getByRole('button', { name: '關閉分割畫面：規劃想法' }));
     expect(screen.queryByRole('region', { name: '對話：規劃想法' })).toBeNull();
   });
-  it('pins a session from the context menu (demo: kept in this preview)', () => {
+  it('pins a session from the context menu (demo: through the demo service\'s preferences)', async () => {
     open('/new');
+    await waitFor(() => expect(sidebar().getByText('示意模式 · 未連接 runtime')).toBeTruthy());
     fireEvent.contextMenu(row('參考資料整理'));
+    await waitFor(() => expect(screen.getByRole<HTMLButtonElement>('menuitem', { name: '釘選' }).disabled).toBe(false));
     fireEvent.click(screen.getByRole('menuitem', { name: '釘選' }));
-    expect(within(sidebar().getByRole('region', { name: '釘選' })).getByRole('button', { name: '參考資料整理' })).toBeTruthy();
+    expect(await within(sidebar().getByRole('region', { name: '釘選' })).findByRole('button', { name: '參考資料整理' })).toBeTruthy();
   });
   it('shows the connection and reloads from the bottom of the sidebar when connected', async () => {
     const fake = fakeBridge(); window.awg = fake.bridge;
@@ -244,16 +246,18 @@ describe('T047 sidebar modes', () => {
     expect(pane('Review：表單驗證')).toBeTruthy();
     expect(mode(/^Workflow$/).getAttribute('aria-pressed')).toBe('true');
   });
-  it('keeps one pinned list per mode', () => {
+  it('keeps one pinned list per mode', async () => {
     open('/new');
     fireEvent.contextMenu(row('參考資料整理'));
+    await waitFor(() => expect(screen.getByRole<HTMLButtonElement>('menuitem', { name: '釘選' }).disabled).toBe(false));
     fireEvent.click(screen.getByRole('menuitem', { name: '釘選' }));
+    await within(sidebar().getByRole('region', { name: '釘選' })).findByRole('button', { name: '參考資料整理' });
     fireEvent.click(mode(/^Workflow/));
     const pins = within(sidebar().getByRole('region', { name: '釘選' }));
     expect(pins.queryByRole('button', { name: '參考資料整理' })).toBeNull();
     fireEvent.contextMenu(pins.getByRole('button', { name: /^新人文件整理/ }));
     fireEvent.click(screen.getByRole('menuitem', { name: '取消釘選' }));
-    expect(sidebar().queryByRole('region', { name: '釘選' })).toBeNull();
+    await waitFor(() => expect(sidebar().queryByRole('region', { name: '釘選' })).toBeNull());
     fireEvent.click(mode(/^對話/));
     expect(within(sidebar().getByRole('region', { name: '釘選' })).getByRole('button', { name: '參考資料整理' })).toBeTruthy();
   });

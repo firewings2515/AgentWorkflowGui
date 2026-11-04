@@ -3,8 +3,8 @@
 // session (now: the new chat creates it on send, REVISION_V0_4 §3.4), first and later sends, stale revisions, interrupt.
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Command, CONTRACTS_VERSION, RequestId } from '../../../../contracts';
-import type { AppEvent, CommandResult, LogicalSession, Snapshot } from '../../../../contracts';
+import { Command, CONTRACTS_VERSION, LogicalSession, PinnedLists, RequestId } from '../../../../contracts';
+import type { AppEvent, CommandResult, Snapshot } from '../../../../contracts';
 import { fixtureSnapshot } from '../../../../contracts/fixtures/snapshot';
 import { App } from '../App';
 import { INTERRUPT_WAIT_MS, rendererStore } from '../renderer-store';
@@ -405,6 +405,96 @@ describe('T027 send in the v0.4 conversation', () => {
     fireEvent.click(screen.getByRole('menuitemradio', { name: same.displayName }));
     await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(2));
     expect(fake.bridge.send.mock.calls[1]![0]).toMatchObject({ type: 'session.setModel', sessionId: original.id, model: { runtime: same.runtime, model: same.model } });
+  });
+});
+
+describe('T051 pins and run names (contracts 0.9, T050)', () => {
+  /** The service applies preferences.set and workflow.rename and says so with events, like the real one. */
+  function serviceSaves() {
+    fake.bridge.send.mockImplementation(async input => {
+      await Promise.resolve();
+      const command = Command.parse(input);
+      if (command.type === 'preferences.set') fake.emit({ schemaVersion: CONTRACTS_VERSION, seq: ++seq, event: { type: 'preferences.updated', preferences: command.preferences, at: original.updatedAt } });
+      if (command.type === 'workflow.rename') {
+        const instance = rendererStore(fake.bridge).getSnapshot().snapshot!.instances.find(item => item.id === command.instanceId)!;
+        fake.emit({ schemaVersion: CONTRACTS_VERSION, seq: ++seq, event: { type: 'instance.updated', instance: { ...instance, title: command.title, revision: instance.revision + 1 } } });
+      }
+      return { ok: true, requestId: command.requestId, created: [] };
+    });
+  }
+  const pinnedRow = (name: string | RegExp) => waitFor(() => expect(within(sidebar().getByRole('region', { name: '釘選' })).getByRole('button', { name })).toBeTruthy());
+  const pin = (name: string | RegExp, label = '釘選') => { fireEvent.contextMenu(sidebar().getByRole('button', { name })); fireEvent.click(screen.getByRole('menuitem', { name: label })); };
+  const sentPreferences = () => fake.bridge.send.mock.calls.map(([input]) => Command.parse(input)).filter(command => command.type === 'preferences.set').map(command => command.type === 'preferences.set' ? command.preferences : undefined);
+
+  it('pins with preferences.set built from the latest preferences, keeping theme, folder and the other list', async () => {
+    fake.data.snapshot.preferences = { ...fake.data.snapshot.preferences, theme: 'light', workFolderRoot: 'D:\\work', pinned: PinnedLists.parse({ chat: [], workflow: ['inst-login'] }) };
+    serviceSaves();
+    await setup();
+    // A newer preferences event arrives after the screen was drawn: the next write must carry it.
+    emit({ type: 'preferences.updated', preferences: { ...fake.data.snapshot.preferences, supervisor: { idleCloseMinutes: 30, maxOpenRuntimes: 4 } }, at: original.updatedAt });
+    pin('參考資料整理');
+    await pinnedRow('參考資料整理');
+    expect(sentPreferences()[0]).toEqual({ theme: 'light', workFolderRoot: 'D:\\work', supervisor: { idleCloseMinutes: 30, maxOpenRuntimes: 4 }, pinned: { chat: ['s-research'], workflow: ['inst-login'] } });
+    pin('參考資料整理', '取消釘選');
+    await waitFor(() => expect(sidebar().queryByRole('region', { name: '釘選' })).toBeNull());
+    expect(sentPreferences()[1]).toMatchObject({ pinned: { chat: [], workflow: ['inst-login'] } });
+  });
+
+  it('pins a run and a node session into the Workflow list (WB-11), and skips IDs that name nothing', async () => {
+    fake.data.snapshot.preferences = { ...fake.data.snapshot.preferences, pinned: PinnedLists.parse({ chat: ['gone-session'], workflow: ['gone-run'] }) };
+    serviceSaves();
+    await setup();
+    expect(sidebar().queryByRole('region', { name: '釘選' })).toBeNull();
+    fireEvent.click(sidebar().getByRole('button', { name: /^Workflow/ }));
+    pin(/^登入功能/);
+    await pinnedRow(/^登入功能/);
+    fireEvent.click(sidebar().getByRole('button', { name: '展開 登入功能' }));
+    pin('Review：表單驗證');
+    await pinnedRow('Review：表單驗證');
+    // The changed list loses the ID that names nothing; the other list is left as it was.
+    expect(sentPreferences()[0]!.pinned).toEqual({ chat: ['gone-session'], workflow: ['inst-login'] });
+    expect(sentPreferences()[1]!.pinned).toEqual({ chat: ['gone-session'], workflow: ['inst-login', 's-wf-review-a'] });
+  });
+
+  it('refuses a 51st pin without sending (PINNED_LIMIT)', async () => {
+    // Fifty loaded sessions already pinned (the first fixture session has no parent).
+    const many = Array.from({ length: 50 }, (_, index) => LogicalSession.parse({ ...fake.data.snapshot.sessions[0]!, id: `s-many-${index}`, title: `多 ${index}` }));
+    fake.data.snapshot.sessions = [...fake.data.snapshot.sessions, ...many];
+    fake.data.snapshot.preferences = { ...fake.data.snapshot.preferences, pinned: PinnedLists.parse({ chat: many.map(session => session.id), workflow: [] }) };
+    serviceSaves();
+    await setup();
+    pin('參考資料整理');
+    expect(document.querySelector('.v4-notice')?.textContent).toContain('釘選已滿（50）');
+    expect(fake.bridge.send).not.toHaveBeenCalled();
+  });
+
+  it('renames a run with workflow.rename and its latest revision; the title bar badge follows', async () => {
+    serviceSaves();
+    window.history.replaceState(null, '', '/#/sessions/s-wf-build-b');
+    await setup();
+    const run = rendererStore(fake.bridge).getSnapshot().snapshot!.instances.find(item => item.id === 'inst-login')!;
+    emit({ type: 'instance.updated', instance: { ...run, revision: run.revision + 3 } });
+    fireEvent.contextMenu(sidebar().getByRole('button', { name: /^登入功能/ }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '重新命名' }));
+    const input = screen.getByRole<HTMLInputElement>('textbox', { name: '執行名稱' });
+    fireEvent.change(input, { target: { value: ' 新登入流程 ' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    fireEvent.blur(input);
+    await waitFor(() => expect(sidebar().getByRole('button', { name: /^新登入流程/ })).toBeTruthy());
+    expect(fake.bridge.send.mock.calls[0]![0]).toMatchObject({ type: 'workflow.rename', instanceId: 'inst-login', expectedRevision: run.revision + 3, title: '新登入流程' });
+    expect(screen.getByRole('button', { name: /Workflow：新登入流程/ })).toBeTruthy();
+  });
+
+  it('says why a run was not renamed, and keeps the old name', async () => {
+    fake.bridge.send.mockImplementation(input => Promise.resolve({ ok: false, requestId: RequestId.parse(input.requestId), code: 'stale_revision', message: 'done', retryable: true, mayHaveSideEffects: false }));
+    await setup('/workflows/start');
+    fireEvent.contextMenu(sidebar().getByRole('button', { name: /^登入功能/ }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '重新命名' }));
+    const input = screen.getByRole<HTMLInputElement>('textbox', { name: '執行名稱' });
+    fireEvent.change(input, { target: { value: '別的名字' } });
+    fireEvent.blur(input);
+    await waitFor(() => expect(document.querySelector('.v4-notice')?.textContent).toContain('這次執行剛被更新'));
+    expect(sidebar().getByRole('button', { name: /^登入功能/ })).toBeTruthy();
   });
 });
 

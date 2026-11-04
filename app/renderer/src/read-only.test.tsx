@@ -82,9 +82,11 @@ it('T051: disables replying, renaming, Agent／Model changes and settings writes
   for (const item of screen.getAllByRole<HTMLButtonElement>('menuitemradio')) { expect(item.disabled).toBe(true); expect(item.title).toContain('唯讀'); }
   fireEvent.keyDown(document, { key: 'Escape' });
   fireEvent.contextMenu(within(screen.getByRole('complementary', { name: '側欄' })).getByRole('button', { name: '規劃想法' }));
-  const rename = screen.getByRole<HTMLButtonElement>('menuitem', { name: '重新命名' });
-  expect(rename.disabled).toBe(true);
-  expect(rename.title).toContain('唯讀');
+  for (const name of ['重新命名', '釘選']) {
+    const item = screen.getByRole<HTMLButtonElement>('menuitem', { name });
+    expect(item.disabled).toBe(true);
+    expect(item.title).toContain('唯讀');
+  }
   fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
   fireEvent.click(screen.getByRole('button', { name: '設定' }));
   blocked('還原預設');

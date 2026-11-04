@@ -18,6 +18,8 @@ const pastRuns = [pastRun('inst-onboard', '新人文件整理', 'completed', '09
 /** The fixture plus a conversation for 「實作：Session 儲存」 with tool calls, a held push and sub-tasks, two earlier runs and a chat escalation. */
 export const v4DemoSnapshot = Snapshot.parse({
   ...fixtureSnapshotInput,
+  // One pinned chat and one pinned run, saved like the app saves them (contracts 0.9, T050).
+  preferences: { ...fixtureSnapshotInput.preferences, pinned: { chat: ['s-handoff-codex'], workflow: ['inst-onboard'] } },
   sessions: [...fixtureSnapshotInput.sessions, ...pastRuns.map(run => run.session)],
   instances: [...fixtureSnapshotInput.instances, ...pastRuns.map(run => run.instance)],
   escalations: [
@@ -51,8 +53,6 @@ export const v4DemoSnapshot = Snapshot.parse({
 });
 
 export type SidebarMode = 'chat' | 'workflow';
-/** The demo's pinned items, one list per sidebar mode (REVISION_V0_4 §3.1). Connected, they come from the preferences (T050). */
-export const demoPinned: Record<SidebarMode, readonly string[]> = { chat: ['s-handoff-codex'], workflow: ['inst-onboard'] };
 
 /** Sessions with the most recent activity first (Q-6: no folder grouping). */
 export const byRecent = (a: LogicalSession, b: LogicalSession) => b.updatedAt.localeCompare(a.updatedAt);
