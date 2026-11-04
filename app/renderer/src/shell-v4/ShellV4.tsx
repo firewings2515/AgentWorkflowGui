@@ -1,7 +1,7 @@
 // The v0.4 shell (REVISION_V0_4 §3, U2_PLAN §3 T051): a simple, Claude-like layout for the connected app and the demo.
 // Connected: `store` is the IPC renderer store and every control sends a real command. Demo: `store` is undefined,
 // `serviceStore` serves fixture data (history pages, preferences, backups) and controls say what they would send.
-import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from 'react';
 import type { LogicalSession, ModelOption, SessionId, Snapshot } from '../../../../contracts';
 import { AgentId, MessageId, PINNED_LIMIT, pinnedOf, RequestId } from '../../../../contracts';
 import { AgentCatalog } from '../AgentCatalog';
@@ -29,9 +29,13 @@ import { Conversation } from './Conversation';
 import { useCreateFlow } from './create-flow';
 import type { SidebarMode, V4Page } from './demo-data';
 import { recentFolders, requestFolder } from './folders';
+import { useMessageTimes } from './last-message';
+import { createThrottledWriter, readJson } from './local-store';
 import { canMove } from './move-targets';
 import { NewChat, SettingsV4 } from './Pages';
-import { initialPanes, openTarget, paneReducer } from './pane-state';
+import { PANES_KEY, restoreLayout, serializeLayout, startPanes } from './pane-memory';
+import { openTarget, paneReducer } from './pane-state';
+import { baselineSeen, initialSeen, markSeen, SEEN_KEY, serializeSeen, unreadOf } from './seen';
 import { modeOf, Sidebar } from './Sidebar';
 import '../styles.css';
 import './styles.css';
@@ -41,13 +45,24 @@ export const SAVING_PREFERENCES = '正在儲存設定，完成後就能再改。
 /** WB-04 (T053): the tree changed since the Snapshot the user chose from; never sent again on its own. */
 export const STALE_MOVE = '這個對話剛被改過，請再試一次。';
 
-// Below this width the sidebar collapses by itself and opens as an overlay.
-const narrowQuery = '(max-width: 900px)';
-const isNarrow = () => window.matchMedia?.(narrowQuery).matches ?? false;
+// Below this width the sidebar collapses by itself and opens as an overlay, and a split shows only its active pane
+// (styles.css `@media (max-width: 900px)`; layout.test checks the two match).
+export const NARROW_MAX_WIDTH = 900;
+const narrowQuery = `(max-width: ${NARROW_MAX_WIDTH}px)`;
+/** r2 P2-1: matchMedia when there is one, else the window width; undefined when neither can tell. */
+const widthIsNarrow = (): boolean | undefined => typeof window.matchMedia === 'function' ? window.matchMedia(narrowQuery).matches
+  : typeof window.innerWidth === 'number' ? window.innerWidth <= NARROW_MAX_WIDTH : undefined;
+const isNarrow = () => widthIsNarrow() ?? false;
+/** For "seen": when the width is unknown, assume a split may show only its active pane. */
+const mayHideSplit = () => widthIsNarrow() ?? true;
 const subscribeWidth = (onChange: () => void) => {
-  const query = window.matchMedia?.(narrowQuery);
-  query?.addEventListener('change', onChange);
-  return () => query?.removeEventListener('change', onChange);
+  if (typeof window.matchMedia !== 'function') {
+    window.addEventListener('resize', onChange);
+    return () => window.removeEventListener('resize', onChange);
+  }
+  const query = window.matchMedia(narrowQuery);
+  query.addEventListener('change', onChange);
+  return () => query.removeEventListener('change', onChange);
 };
 // Pages that belong to one sidebar mode; going there switches the sidebar too. Settings keeps the current mode.
 const pageModes: Partial<Record<V4Page, SidebarMode>> = { new: 'chat', 'workflow-start': 'workflow', agents: 'workflow', templates: 'workflow', progress: 'workflow' };
@@ -78,13 +93,32 @@ const newId = () => RequestId.parse(crypto.randomUUID());
 
 export interface ShellProps { snapshot: Snapshot; store?: RendererStore | undefined; serviceStore: RendererStore; ipcState?: RendererState | undefined }
 
-export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps) {
-  const [route, setRoute] = useState(currentRoute);
+/**
+ * Q-16 (T054): the address and panes to start with. The shell mounts only once the first Snapshot is there, so the stored
+ * layout is checked against it here. An empty address (how Electron opens the page) goes to the restored active pane.
+ */
+function startLayout(snapshot: Snapshot, persist: boolean) {
   const known = (id: string) => snapshot.sessions.some(session => session.id === id);
-  const [panes, dispatch] = useReducer(paneReducer, route, start => initialPanes(start.page === 'chat' && known(start.id) ? start.id as SessionId : undefined));
+  const restored = persist ? restoreLayout(readJson(PANES_KEY), known) : undefined;
+  const opened = currentRoute();
+  const activeSession = restored?.panes.find(pane => pane.id === restored.active)?.sessionId;
+  const replace = !!activeSession && window.location.hash.replace(/^#/, '') === '';
+  const route = replace ? parseRoute(routePath('chat', activeSession)) : opened;
+  return { route, replace, panes: startPanes(restored, route.page === 'chat' && known(route.id) ? route.id as SessionId : undefined) };
+}
+
+export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps) {
+  // r1 P1-2: the demo (no app service) never reads or writes the stored layout and seen times; they belong to the
+  // connected app's sessions, and demo data would replace them.
+  const [persist] = useState(() => !!store);
+  const [boot] = useState(() => startLayout(snapshot, persist));
+  const [route, setRoute] = useState(boot.route);
+  const known = (id: string) => snapshot.sessions.some(session => session.id === id);
+  const [panes, dispatch] = useReducer(paneReducer, boot.panes);
   const [mode, setMode] = useState<SidebarMode>(() => route.page === 'chat' && known(route.id) ? modeOf(snapshot, route.id) : route.page !== 'missing' ? pageModes[route.page] ?? 'chat' : 'chat');
   const [demoTheme, setDemoTheme] = useState<Theme>();
   const narrow = useSyncExternalStore(subscribeWidth, isNarrow);
+  const splitMayHide = useSyncExternalStore(subscribeWidth, mayHideSplit);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [narrowOpen, setNarrowOpen] = useState(false);
   // Demo only: renames and pins stay in this preview.
@@ -115,6 +149,34 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const page: V4Page | 'missing' = route.page === 'chat' && !known(route.id) ? 'missing' : route.page;
   // Discard the preview as soon as damaged data is observed, before recovery can render it again.
   if (damaged && transfer) setTransfer(null);
+
+  // Q-17 / Q-14 (T054): last-message and last-reply times keep their identity through message.delta, so the order and
+  // the unread marks are worked out again only when a message is added or replaced.
+  const times = useMessageTimes(snapshot.messages);
+  const [seen, setSeen] = useState(() => persist
+    ? initialSeen(readJson(SEEN_KEY), snapshot.sessions, times.replies, times.last)
+    : baselineSeen(snapshot.sessions, times.replies, times.last));
+  // A session shown in a visible pane is seen. The panes are hidden on every other page, and when narrow a split shows
+  // only its active pane (r1 P1-1).
+  const shownPanes = page !== 'chat' ? [] : splitMayHide ? (active ? [active] : []) : panes.panes;
+  const visibleKey = shownPanes.map(pane => pane.sessionId).join('\n');
+  const visible = useMemo(() => visibleKey ? visibleKey.split('\n') : [], [visibleKey]);
+  // Moved up while rendering (not in an effect), so a reply in a shown session never lights up, not even for a frame.
+  const marked = markSeen(seen, times.replies, visible);
+  if (marked !== seen) setSeen(marked);
+  const unread = useMemo(() => unreadOf(times.replies, marked, visible), [times.replies, marked, visible]);
+  // Q-16 / Q-14: both are written at most every 500 ms, and on page hide or unmount; a failed write is ignored.
+  const [writers] = useState(() => ({ seen: createThrottledWriter(SEEN_KEY), panes: createThrottledWriter(PANES_KEY) }));
+  useEffect(() => { if (persist) writers.seen.schedule(serializeSeen(seen)); }, [persist, seen, writers]);
+  // Drafts and reading positions are not kept, so typing or scrolling does not write.
+  const layoutText = useMemo(() => JSON.stringify(serializeLayout(panes)), [panes]);
+  useEffect(() => { if (persist) writers.panes.schedule(layoutText); }, [persist, layoutText, writers]);
+  useEffect(() => {
+    const flush = () => { writers.seen.flush(); writers.panes.flush(); };
+    window.addEventListener('pagehide', flush);
+    return () => { window.removeEventListener('pagehide', flush); flush(); };
+  }, [writers]);
+  useEffect(() => { if (boot.replace) window.history.replaceState(null, '', `#${boot.route.path}`); }, [boot]);
 
   const navigate = useCallback((path: string, replace = false) => {
     if (replace) window.history.replaceState(null, '', `#${path}`); else window.history.pushState(null, '', `#${path}`);
@@ -411,7 +473,7 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const selectedSession = page === 'chat' ? active?.sessionId : undefined;
   return <div className={`v4-shell ${collapsed ? 'v4-collapsed' : ''} ${narrow ? 'v4-narrow' : ''}`} data-testid="shell-v4">
     <Sidebar snapshot={snapshot} titles={titles} pinned={pinned} mode={mode} selectedId={selectedSession} page={page === 'missing' ? 'chat' : page} collapsed={collapsed} overlay={narrow} theme={theme}
-      readOnly={readOnly} pinBlocked={pinBlocked} pinReason={pinReason} themeReason={themeReason} connection={connection}
+      readOnly={readOnly} pinBlocked={pinBlocked} pinReason={pinReason} themeReason={themeReason} connection={connection} times={times.last} unread={unread}
       onCollapse={value => { if (narrow) setNarrowOpen(!value); else setSidebarOpen(!value); }}
       onMode={value => { setMode(value); if (page === 'new' && value === 'workflow') go('workflow-start'); else if (page === 'workflow-start' && value === 'chat') go('new'); }}
       onNewChat={() => go('new')} onStartWorkflow={() => go('workflow-start')} onOpen={id => open(id)} onSplit={split}

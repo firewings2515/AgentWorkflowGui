@@ -1,7 +1,6 @@
 // Demo data for the v0.4 shell: the fixture plus a conversation with tool calls, earlier runs and a chat escalation.
 // The demo (no app service) and the T051 screenshots of the connected app use it.
 import { Snapshot } from '../../../../contracts';
-import type { LogicalSession } from '../../../../contracts';
 import { fixtureSnapshotInput } from '../../../../contracts/fixtures/snapshot';
 
 const t = (time: string) => `2026-10-24T${time}:00+08:00`;
@@ -52,9 +51,7 @@ export const v4DemoSnapshot = Snapshot.parse({
   ],
 });
 
+/** Q-6, U3 Q-17: the sidebar lists are not grouped by folder and are ordered by last message (`last-message.ts`). */
 export type SidebarMode = 'chat' | 'workflow';
-
-/** Sessions with the most recent activity first (Q-6: no folder grouping). */
-export const byRecent = (a: LogicalSession, b: LogicalSession) => b.updatedAt.localeCompare(a.updatedAt);
 
 export type V4Page = 'new' | 'chat' | 'settings' | 'workflow-start' | 'agents' | 'templates' | 'progress';
