@@ -4,7 +4,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Command, CONTRACTS_VERSION, LogicalSession, PinnedLists, RequestId } from '../../../../contracts';
-import type { AppEvent, CommandResult, Snapshot } from '../../../../contracts';
+import type { AppEvent, CommandResult, EventBatch, EventEnvelope, Snapshot } from '../../../../contracts';
 import { fixtureSnapshot } from '../../../../contracts/fixtures/snapshot';
 import { App } from '../App';
 import { INTERRUPT_WAIT_MS, rendererStore } from '../renderer-store';
@@ -489,7 +489,7 @@ describe('T027 send in the v0.4 conversation', () => {
   });
 });
 
-describe('r1 P1-1: a whole-record preferences write keeps an accepted write whose event has not arrived', () => {
+describe('r1 P1-1 / r2: a preferences write waits until the Snapshot shows the previous one', () => {
   /** preferences.set is accepted at once; its preferences.updated events wait until released. */
   function lateEvents() {
     const held: AppEvent[] = [];
@@ -502,50 +502,107 @@ describe('r1 P1-1: a whole-record preferences write keeps an accepted write whos
     return { release: () => act(() => { held.splice(0).forEach(event => fake.emit({ schemaVersion: CONTRACTS_VERSION, seq: ++seq, event })); }) };
   }
   const sent = () => fake.bridge.send.mock.calls.map(([input]) => Command.parse(input)).flatMap(command => command.type === 'preferences.set' ? [command.preferences] : []);
-  const pinMenu = (name: string) => { fireEvent.contextMenu(sidebar().getByRole('button', { name })); fireEvent.click(screen.getByRole('menuitem', { name: '釘選' })); };
+  const menuItem = (row: string | RegExp, label: string) => { fireEvent.contextMenu(sidebar().getByRole('button', { name: row })); return screen.getByRole<HTMLButtonElement>('menuitem', { name: label }); };
+  const pinMenu = (row: string | RegExp) => fireEvent.click(menuItem(row, '釘選'));
   const accepted = (count: number) => waitFor(() => expect(Object.values(rendererStore(fake.bridge).getSnapshot().commands).filter(item => item.command.type === 'preferences.set' && item.result?.ok)).toHaveLength(count));
+  const closeMenu = () => fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
 
-  it('two pins in a row: the second carries the first', async () => {
+  it('two pins in a row: the second waits for the first to show, then carries it', async () => {
     const events = lateEvents();
     await setup();
     pinMenu('參考資料整理');
     await accepted(1);
+    const waiting = menuItem('規劃想法', '釘選');
+    expect(waiting.disabled).toBe(true);
+    expect(waiting.title).toBe('正在儲存設定，完成後就能再改。');
+    closeMenu();
+    events.release();
     pinMenu('規劃想法');
     await accepted(2);
     expect(sent()[1]!.pinned).toEqual({ chat: ['s-research', 's-plan-notes'], workflow: [] });
-    events.release();
-    expect(within(sidebar().getByRole('region', { name: '釘選' })).getAllByRole('button').map(button => button.textContent)).toEqual(expect.arrayContaining([expect.stringContaining('參考資料整理'), expect.stringContaining('規劃想法')]));
-    // Once the events are in, the Snapshot is the base again.
-    fireEvent.contextMenu(sidebar().getByRole('button', { name: /^規劃想法（轉交 Codex）/ })); fireEvent.click(screen.getByRole('menuitem', { name: '釘選' }));
-    await accepted(3);
-    expect(sent()[2]!.pinned).toEqual({ chat: ['s-research', 's-plan-notes', 's-handoff-codex'], workflow: [] });
   });
 
-  it('a pin then the theme: the theme write keeps the pin', async () => {
+  it('a pin then the theme: the theme waits, then keeps the pin', async () => {
     const events = lateEvents();
     await setup();
     pinMenu('參考資料整理');
     await accepted(1);
+    const toggle = sidebar().getByRole<HTMLButtonElement>('button', { name: '切換成淺色' });
+    expect(toggle.disabled).toBe(true);
+    expect(toggle.title).toBe('正在儲存設定，完成後就能再改。');
+    events.release();
     fireEvent.click(sidebar().getByRole('button', { name: '切換成淺色' }));
     await accepted(2);
     expect(sent()[1]).toMatchObject({ theme: 'light', pinned: { chat: ['s-research'], workflow: [] } });
-    events.release();
-    expect(rendererStore(fake.bridge).getSnapshot().snapshot!.preferences).toMatchObject({ theme: 'light', pinned: { chat: ['s-research'] } });
   });
 
-  it('a pin then the default work folder: the folder write keeps the pin, and the pin write keeps the folder', async () => {
-    lateEvents();
+  it('a pin then the default work folder: saving waits with a note, then keeps the pin', async () => {
+    const events = lateEvents();
     await setup();
     pinMenu('參考資料整理');
     await accepted(1);
     click('設定');
     fireEvent.change(screen.getByRole('textbox', { name: '預設工作資料夾位置' }), { target: { value: 'D:\\agents' } });
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '儲存' }).disabled).toBe(true);
+    expect(screen.getAllByText('正在儲存設定，完成後就能再改。').length).toBeGreaterThan(0);
+    events.release();
     click('儲存');
     await accepted(2);
     expect(sent()[1]).toMatchObject({ workFolderRoot: 'D:\\agents', pinned: { chat: ['s-research'], workflow: [] } });
+  });
+
+  it('r2 P1-a: a late success of a timed-out pin does not bring it back over a later pin', async () => {
+    const late = deferred<CommandResult>();
+    fake.bridge.send.mockReturnValueOnce(late.promise);
+    await setup();
+    vi.useFakeTimers();
+    pinMenu('參考資料整理');
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+    vi.useRealTimers();
+    // The service did save the first pin: the user reads again and checks the result (settings page).
+    const first = sent()[0]!;
+    fake.data.snapshot = { ...fake.data.snapshot, seq: ++seq, preferences: first };
+    click('設定');
+    fireEvent.click(sidebar().getByRole('button', { name: '重新讀取資料' }));
+    await waitFor(() => expect(rendererStore(fake.bridge).getSnapshot().snapshot!.preferences).toEqual(first));
+    fireEvent.click(await screen.findByText('待核對操作（1）'));
+    click('已核對結果');
+    fake.bridge.send.mockImplementation(async input => {
+      await Promise.resolve();
+      const command = Command.parse(input);
+      if (command.type === 'preferences.set') fake.emit({ schemaVersion: CONTRACTS_VERSION, seq: ++seq, event: { type: 'preferences.updated', preferences: command.preferences, at: original.updatedAt } });
+      return { ok: true, requestId: command.requestId, created: [] };
+    });
     pinMenu('規劃想法');
-    await accepted(3);
-    expect(sent()[2]).toMatchObject({ workFolderRoot: 'D:\\agents', pinned: { chat: ['s-research', 's-plan-notes'] } });
+    await waitFor(() => expect(rendererStore(fake.bridge).getSnapshot().snapshot!.preferences.pinned?.chat).toEqual(['s-research', 's-plan-notes']));
+    const firstId = Command.parse(fake.bridge.send.mock.calls[0]![0]).requestId;
+    await act(async () => { late.resolve({ ok: true, requestId: firstId, created: [] }); await Promise.resolve(); });
+    const toggle = sidebar().getByRole<HTMLButtonElement>('button', { name: '切換成淺色' });
+    expect(toggle.disabled).toBe(false);
+    fireEvent.click(toggle);
+    await waitFor(() => expect(sent()).toHaveLength(3));
+    expect(sent()[2]).toMatchObject({ theme: 'light', pinned: { chat: ['s-research', 's-plan-notes'], workflow: [] } });
+  });
+
+  it('r2 P1-b: the own event and another window\'s later write in one batch: the next write builds on the later one', async () => {
+    const batches = new Set<(batch: EventBatch) => void>();
+    const bridge = { ...fake.bridge, onBatch: (listener: (batch: EventBatch) => void) => { batches.add(listener); return () => { batches.delete(listener); }; } };
+    window.awg = bridge;
+    try {
+      fake.bridge.send.mockImplementation(input => Promise.resolve({ ok: true, requestId: RequestId.parse(input.requestId), created: [] }));
+      await setup();
+      pinMenu('參考資料整理');
+      await waitFor(() => expect(Object.values(rendererStore(bridge).getSnapshot().commands).some(item => item.command.type === 'preferences.set' && item.result?.ok)).toBe(true));
+      const own = sent()[0]!;
+      const other = { ...own, pinned: PinnedLists.parse({ chat: ['s-research', 's-handoff-codex'], workflow: ['inst-login'] }) };
+      const envelopes = [own, other].map((preferences): EventEnvelope => ({ schemaVersion: CONTRACTS_VERSION, seq: ++seq, event: { type: 'preferences.updated' as const, preferences, at: original.updatedAt } }));
+      act(() => batches.forEach(listener => listener({ schemaVersion: CONTRACTS_VERSION, fromSeq: envelopes[0]!.seq, toSeq: envelopes[1]!.seq, envelopes })));
+      const toggle = sidebar().getByRole<HTMLButtonElement>('button', { name: '切換成淺色' });
+      expect(toggle.disabled).toBe(false);
+      fireEvent.click(toggle);
+      await waitFor(() => expect(sent()).toHaveLength(2));
+      expect(sent()[1]).toMatchObject({ theme: 'light', pinned: { chat: ['s-research', 's-handoff-codex'], workflow: ['inst-login'] } });
+    } finally { cleanup(); rendererStore(bridge).dispose(); }
   });
 });
 

@@ -37,6 +37,10 @@ export interface SidebarProps {
   readOnly: boolean;
   /** Pinning cannot be saved now (read-only, not synchronised, or a preferences change in flight). */
   pinBlocked: boolean;
+  /** Why pinning is disabled, shown on the menu item (read-only, saving, not synchronised). */
+  pinReason?: string | undefined;
+  /** Why the theme cannot change now; undefined when it can. */
+  themeReason?: string | undefined;
   /** The connection line at the bottom: the IPC state, or the demo note. */
   connection: ReactNode;
 }
@@ -193,7 +197,7 @@ export function Sidebar(props: SidebarProps) {
     <div className="v4-sidebar-foot">
       <button type="button" className="v4-foot-link" aria-current={props.page === 'settings' ? 'page' : undefined} onClick={() => props.onPage('settings')}><span aria-hidden="true">⚙</span> 設定</button>
       <div className="v4-connection">{props.connection}
-        <button type="button" className="v4-icon v4-theme" aria-label={props.theme === 'dark' ? '切換成淺色' : '切換成深色'} title="切換外觀" onClick={() => props.onTheme(props.theme === 'dark' ? 'light' : 'dark')}>{props.theme === 'dark' ? '☾' : '☀'}</button></div>
+        <button type="button" className="v4-icon v4-theme" aria-label={props.theme === 'dark' ? '切換成淺色' : '切換成深色'} title={props.themeReason ?? '切換外觀'} disabled={!!props.themeReason} onClick={() => props.onTheme(props.theme === 'dark' ? 'light' : 'dark')}>{props.theme === 'dark' ? '☾' : '☀'}</button></div>
     </div>
     {menu && menuOpenId && <MenuList label={`${menuTitle} 的選單`} className="v4-context-menu"
       style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 180) }}
@@ -201,7 +205,7 @@ export function Sidebar(props: SidebarProps) {
       items={[
         { label: '開啟', onSelect: () => props.onOpen(menuOpenId) },
         { label: '在分割畫面開啟', disabled: menuOpenId === selectedId, onSelect: () => props.onSplit(menuOpenId) },
-        { label: props.pinned[modeOf(snapshot, menu.id)].has(menu.id) ? '取消釘選' : '釘選', disabled: props.pinBlocked, ...readOnly, onSelect: () => props.onPin(menu.id) },
+        { label: props.pinned[modeOf(snapshot, menu.id)].has(menu.id) ? '取消釘選' : '釘選', disabled: props.pinBlocked, title: props.pinBlocked ? props.pinReason : undefined, onSelect: () => props.onPin(menu.id) },
         { label: '重新命名', disabled: props.readOnly, ...readOnly, onSelect: () => { if (menuRun) setRenaming(menuRun.id); else props.onRename(menuOpenId); } },
       ]} />}
   </aside>;

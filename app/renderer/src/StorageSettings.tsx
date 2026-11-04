@@ -136,9 +136,10 @@ export function SupervisorSection({ store, demo }: { store: RendererStore; demo:
   const disabled = state.connection !== 'ready' || state.snapshot?.app.status !== 'ready' || store.isBlocked('preferences.set', 'preferences');
   return <section className="v4-card" aria-labelledby="settings-supervisor-heading"><h2 id="settings-supervisor-heading">Runtime 程序</h2><p>閒置程序釋放後，會在需要時恢復；超過上限時先釋放最久未使用的閒置程序。</p>{demo && <p>示意模式：設定僅保留在這次預覽。</p>}
     {state.snapshot?.app.status === 'read-only' && <p>唯讀模式，設定無法儲存。</p>}
+    {store.savingPreferences() && <p role="status">正在儲存設定，完成後就能再改。</p>}
     <form onSubmit={event => {
       event.preventDefault(); if (disabled || !parsed.success) return;
-      const latest = store.preferences();
+      const latest = store.getSnapshot().snapshot?.preferences;
       if (!latest) return;
       void store.send({ type: 'preferences.set', requestId: RequestId.parse(crypto.randomUUID()), preferences: { ...latest, supervisor: parsed.data } }).then(result => setFeedback(result.ok ? '設定已接受。' : commandFeedback(result)));
     }}><label>閒置分鐘數（1～1440）<input type="number" min={1} max={1440} step={1} required value={idle} onChange={e => setIdle(e.target.value)} /></label>

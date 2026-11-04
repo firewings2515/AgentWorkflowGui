@@ -12,6 +12,7 @@ import { FolderButton } from '../FolderButton';
 import type { RendererState, RendererStore } from '../renderer-store';
 import { sessionBlocksSend } from '../renderer-store';
 import { StorageBanner } from '../StorageSettings';
+import { readOnlyProps } from '../read-only';
 import { readTheme, THEME_KEY } from '../theme';
 import type { Theme } from '../theme';
 import { TransferDialog } from '../TransferDialog';
@@ -34,6 +35,7 @@ import '../styles.css';
 import './styles.css';
 
 export const APP_NAME = 'AgentWorkflowGui';
+export const SAVING_PREFERENCES = '正在儲存設定，完成後就能再改。';
 
 // Below this width the sidebar collapses by itself and opens as an overlay.
 const narrowQuery = '(max-width: 900px)';
@@ -258,7 +260,7 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
    */
   const togglePin = (id: string) => {
     const current = preferenceStore.getSnapshot().snapshot;
-    const base = preferenceStore.preferences();
+    const base = current?.preferences;
     if (!current || !base || pinBlocked) return;
     const lists = pinnedOf(base);
     const key = modeOf(current, id);
@@ -290,7 +292,7 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   };
   const changeTheme = (next: Theme) => {
     if (themeDisabled || next === theme) return;
-    const latest = store?.preferences();
+    const latest = store?.getSnapshot().snapshot?.preferences;
     if (store && !readOnly) { if (latest) void store.send({ type: 'preferences.set', requestId: newId(), preferences: { ...latest, theme: next } }); }
     else setDemoTheme(next);
   };
@@ -312,10 +314,13 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
     {store && <button type="button" className="v4-icon" aria-label="重新讀取資料" title="重新讀取資料（F5）" disabled={ipcState?.connection === 'loading'} onClick={reload}>↻</button>}</>;
   // The demo's own service stores preferences too, so pins work the same way there.
   const preferenceStore = store ?? serviceStore;
-  // An accepted pin shows at once, before its preferences event (r1 P1-1).
-  const pinnedLists = pinnedOf(preferenceStore.preferences() ?? snapshot.preferences);
+  const pinnedLists = pinnedOf(snapshot.preferences);
   const pinned = { chat: new Set<string>(pinnedLists.chat), workflow: new Set<string>(pinnedLists.workflow) };
   const pinBlocked = readOnly || commandDisabled || preferenceStore.isBlocked('preferences.set', 'preferences');
+  // r2: a preferences write waits until the Snapshot shows the previous one; normally that is a few milliseconds.
+  const savingReason = preferenceStore.savingPreferences() ? SAVING_PREFERENCES : undefined;
+  const pinReason = readOnly ? readOnlyProps(true).title : savingReason ?? (pinBlocked ? '資料尚未同步完成，或上次設定的結果還待核對。' : undefined);
+  const themeReason = themeDisabled ? (store?.savingPreferences() ? SAVING_PREFERENCES : '資料尚未同步完成，或上次設定的結果還待核對。') : undefined;
 
   let main;
   if (page === 'chat' && panes.panes.length) main = <div className={`v4-panes ${panes.panes.length > 1 ? 'v4-split' : ''}`}>{panes.panes.map(pane => {
@@ -352,7 +357,7 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const selectedSession = page === 'chat' ? active?.sessionId : undefined;
   return <div className={`v4-shell ${collapsed ? 'v4-collapsed' : ''} ${narrow ? 'v4-narrow' : ''}`} data-testid="shell-v4">
     <Sidebar snapshot={snapshot} titles={titles} pinned={pinned} mode={mode} selectedId={selectedSession} page={page === 'missing' ? 'chat' : page} collapsed={collapsed} overlay={narrow} theme={theme}
-      readOnly={readOnly} pinBlocked={pinBlocked} connection={connection}
+      readOnly={readOnly} pinBlocked={pinBlocked} pinReason={pinReason} themeReason={themeReason} connection={connection}
       onCollapse={value => { if (narrow) setNarrowOpen(!value); else setSidebarOpen(!value); }}
       onMode={value => { setMode(value); if (page === 'new' && value === 'workflow') go('workflow-start'); else if (page === 'workflow-start' && value === 'chat') go('new'); }}
       onNewChat={() => go('new')} onStartWorkflow={() => go('workflow-start')} onOpen={id => open(id)} onSplit={split}

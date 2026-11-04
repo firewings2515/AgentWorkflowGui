@@ -75,7 +75,7 @@ function WorkFolderSetting({ snapshot, store, demo }: { snapshot: Snapshot; stor
   const disabled = readOnly || snapshot.app.status !== 'ready' || store.getSnapshot().connection !== 'ready' || store.isBlocked('preferences.set', 'preferences');
   // preferences.set replaces the whole object: build it from the latest Snapshot at the moment of sending.
   const save = (value: string | undefined) => {
-    const latest = store.preferences();
+    const latest = store.getSnapshot().snapshot?.preferences;
     if (!latest || disabled) return;
     const rest = { ...latest };
     delete rest.workFolderRoot;
@@ -122,6 +122,7 @@ export function SettingsV4({ snapshot, store, serviceStore, ipcState, theme, the
       <h1 id="v4-settings-heading" tabIndex={-1}>設定</h1>
       <section className="v4-card" aria-label="一般">
         <h2>一般</h2>
+        {serviceStore.savingPreferences() && <p role="status" className="v4-muted">正在儲存設定，完成後就能再改。</p>}
         <Field label="外觀"><div className="v4-segmented" role="radiogroup" aria-label="外觀">
           {(['dark', 'light'] as const).map(value => <button key={value} type="button" role="radio" aria-checked={theme === value} disabled={themeDisabled} onClick={() => onTheme(value)}>{value === 'dark' ? '深色' : '淺色'}</button>)}
         </div></Field>
