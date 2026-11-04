@@ -33,6 +33,8 @@ export const t050WorkflowCases = (backend: string, make: MakeWorld) =>
 
     it('renames the run: trimmed, revision + 1, announced once with the new title; nothing else changes', async () => {
       const { w, before } = await running();
+      const rootBefore = await w.repositories.sessions.get(ROOT);
+      expect(rootBefore).toBeDefined();
       const events = instanceEvents(w).length;
       expect(await w.run(renameOf(before, '  Release notes  '))).toMatchObject({ ok: true, revision: before.revision + 1 });
       const after = await instanceOf(w);
@@ -42,7 +44,12 @@ export const t050WorkflowCases = (backend: string, make: MakeWorld) =>
       expect(announced).toHaveLength(1);
       expect(announced[0]?.instance).toEqual(after);
       // Only the run: the root session and the task keep the title they started with.
-      expect((await w.repositories.sessions.get(ROOT))?.title).toBe((await w.repositories.sessions.get(ROOT))?.title);
+      // Read before the rename and after it (r1 P2): the root session's title and revision are as they were.
+      const rootAfter = await w.repositories.sessions.get(ROOT);
+      expect(rootAfter?.title).toBe(rootBefore?.title);
+      expect(rootAfter?.title).not.toBe('Release notes');
+      expect(rootAfter?.revision).toBe(rootBefore?.revision);
+      expect(w.events.some((e) => e.type === 'session.updated' && e.session.title === 'Release notes')).toBe(false);
       expect(after.tasks[0]?.title).toBe(before.tasks[0]?.title);
     });
 
