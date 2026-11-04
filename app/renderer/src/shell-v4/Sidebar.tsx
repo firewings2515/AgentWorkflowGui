@@ -9,7 +9,9 @@ import { byLastMessage, runLastMessageAt } from './last-message';
 import type { LastMessageTimes } from './last-message';
 import { MenuList } from './MenuList';
 import type { MenuItem } from './MenuList';
+import { moveTargets } from './move-targets';
 import { MovePicker } from './MovePicker';
+import { useSessionDrag } from './session-drag';
 
 // REVISION_V0_4 §3.1 / Q-9: one sidebar with a 對話｜Workflow switch on top. Both modes share the same parts and
 // behaviour (＋, search, pinned, list, context menu, keys, rail, overlay); only the ＋ action and the list differ.
@@ -87,6 +89,22 @@ export function Sidebar(props: SidebarProps) {
   const readOnly = props.readOnly ? { title: readOnlyProps(true).title } : {};
   const title = (session: LogicalSession) => titles[session.id] ?? session.title;
   const runTitle = (instance: WorkflowInstance) => titles[instance.id] ?? instance.title;
+  // T056: only rows of the chat tree drag (not pinned, not search, not Workflow mode), and only while they can move.
+  const inChatTree = (id: SessionId) => {
+    const session = snapshot.sessions.find(item => item.id === id);
+    return mode === 'chat' && !query.trim() && session?.kind === 'ordinary' && !props.pinned.chat.has(id);
+  };
+  const canDrag = (id: SessionId) => !props.readOnly && !props.moveReason(id);
+  const drag = useSessionDrag({
+    canDrag: id => canDrag(id) && inChatTree(id),
+    start: id => {
+      const session = snapshot.sessions.find(item => item.id === id);
+      if (session?.kind !== 'ordinary') return undefined;
+      return { targets: new Set(moveTargets(snapshot, id, item => item.title, '', times).map(item => item.id)), toTop: session.parentId !== undefined };
+    },
+    live: current => canDrag(current.sessionId) && inChatTree(current.sessionId),
+    onDrop: props.onMove,
+  });
   const chatSelected = props.page === 'chat' ? selectedId : undefined;
   const selectedSession = snapshot.sessions.find(session => session.id === chatSelected);
   const selectedRun = selectedSession?.kind === 'workflow' ? selectedSession.workflow.instanceId : undefined;
@@ -106,10 +124,12 @@ export function Sidebar(props: SidebarProps) {
   const listRow = (row: {
     key: string; data: Record<string, string>; label: string; tooltip: string; dot: string; pending: number; unread: boolean; extra?: ReactNode;
     selected: boolean; current?: boolean; children: ReactNode[]; defaultOpen: boolean; onOpen: () => void; menu: ContextTarget['kind'];
+    /** T056: a row of the chat tree is a drag source and a drop target. */
+    drag?: { source: ReturnType<typeof drag.source>; target: ReturnType<typeof drag.target>; dragging: boolean };
   }) => {
     const expanded = openRows[row.key] ?? row.defaultOpen;
     return <li key={row.key} {...row.data}>
-      <div className={`v4-row ${row.selected ? 'v4-row-selected' : ''} ${row.current ? 'v4-row-current' : ''}`}>
+      <div className={`v4-row ${row.selected ? 'v4-row-selected' : ''} ${row.current ? 'v4-row-current' : ''}`} {...row.drag?.target}>
         {row.children.length > 0 ? <button type="button" className="v4-row-toggle" aria-label={`${expanded ? '收合' : '展開'} ${row.label}`} aria-expanded={expanded}
           onClick={() => setOpenRows(previous => ({ ...previous, [row.key]: !expanded }))}>{expanded ? '▾' : '▸'}</button> : <span className="v4-row-spacer" />}
         {renaming === row.key ? <input className="v4-rename" aria-label="執行名稱" defaultValue={row.label} ref={input => { input?.focus(); input?.select(); }}
@@ -118,6 +138,7 @@ export function Sidebar(props: SidebarProps) {
             if (event.key === 'Enter') event.currentTarget.blur();
             else if (event.key === 'Escape') { event.stopPropagation(); event.currentTarget.value = row.label; event.currentTarget.blur(); }
           }} /> : <button type="button" className="v4-session" aria-current={row.selected ? 'true' : undefined} title={row.tooltip} onClick={row.onOpen}
+          {...row.drag?.source} data-dragging={row.drag?.dragging ? 'true' : undefined}
           onContextMenu={event => { event.preventDefault(); openMenu(row.menu, row.key, event.currentTarget, event.clientX, event.clientY); }}
           onKeyDown={event => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); openMenu(row.menu, row.key, event.currentTarget); } }}>
           <span className="v4-activity" data-state={row.dot} aria-hidden="true" />
@@ -131,14 +152,15 @@ export function Sidebar(props: SidebarProps) {
       {row.children.length > 0 && expanded && <ul>{row.children}</ul>}
     </li>;
   };
-  const sessionRow = (session: LogicalSession, pool: readonly LogicalSession[], tag?: string): ReactNode => listRow({
+  const sessionRow = (session: LogicalSession, pool: readonly LogicalSession[], tag?: string, inTree = false): ReactNode => listRow({
     key: session.id, data: { 'data-session-id': session.id }, label: title(session), tooltip: `${title(session)} · ${statusLabel(session.activity)}`,
     dot: session.activity, pending: pendingFrom(session.id), unread: props.unread.has(session.id), selected: chatSelected === session.id, defaultOpen: true, menu: 'session',
     ...(tag ? { extra: <span className="v4-row-tag">{tag}</span> } : {}),
-    children: pool.filter(child => child.parentId === session.id).map(child => sessionRow(child, pool)), onOpen: () => props.onOpen(session.id),
+    children: pool.filter(child => child.parentId === session.id).map(child => sessionRow(child, pool, undefined, inTree)), onOpen: () => props.onOpen(session.id),
+    ...(inTree ? { drag: { source: drag.source(session.id), target: drag.target(session.id), dragging: drag.dragging === session.id } } : {}),
   });
-  /** Pools come from `sortedSessions`, so roots and children are already newest first. */
-  const tree = (pool: readonly LogicalSession[]) => pool.filter(session => !pool.some(parent => parent.id === session.parentId)).map(session => sessionRow(session, pool));
+  /** Pools come from `sortedSessions`, so roots and children are already newest first. `inTree`: the chat list's tree (T056). */
+  const tree = (pool: readonly LogicalSession[], inTree = false) => pool.filter(session => !pool.some(parent => parent.id === session.parentId)).map(session => sessionRow(session, pool, undefined, inTree));
   const runSessions = (instance: WorkflowInstance) => sortedSessions.filter(session => session.kind === 'workflow' && session.workflow.instanceId === instance.id);
   // A run row stands for its root session; its other node sessions are indented below, folded unless the selection is inside.
   const runRow = (instance: WorkflowInstance): ReactNode => {
@@ -154,8 +176,9 @@ export function Sidebar(props: SidebarProps) {
       onOpen: () => props.onOpen(instance.rootSessionId),
     });
   };
-  const section = (id: Section, label: string, body: ReactNode, count: number) => <section className="v4-section" aria-label={label}>
-    <h2><button type="button" aria-expanded={!closedSections.has(`${mode}:${id}`)} onClick={() => toggleSection(`${mode}:${id}`)}>
+  // T056: the 「移到最上層」 zone covers the list's heading while it shows, so the rows below never shift under the cursor.
+  const section = (id: Section, label: string, body: ReactNode, count: number, overlay?: ReactNode) => <section className="v4-section" aria-label={label}>
+    <h2>{overlay}<button type="button" aria-expanded={!closedSections.has(`${mode}:${id}`)} onClick={() => toggleSection(`${mode}:${id}`)}>
       <span>{label}</span><span className="v4-count">{count}</span><span aria-hidden="true">{closedSections.has(`${mode}:${id}`) ? '▸' : '▾'}</span></button></h2>
     {!closedSections.has(`${mode}:${id}`) && body}
   </section>;
@@ -209,7 +232,7 @@ export function Sidebar(props: SidebarProps) {
       {([['templates', '模板', '⧉'], ['agents', 'Agent', '◎']] as const).map(([page, label, icon]) =>
         <button type="button" key={page} className="v4-foot-link" aria-current={props.page === page ? 'page' : undefined} onClick={() => props.onPage(page)}><span aria-hidden="true">{icon}</span> {label}</button>)}
     </div>}
-    <nav className="v4-sections" ref={nav} aria-label={mode === 'chat' ? '對話清單' : 'Workflow 清單'} onKeyDown={event => {
+    <nav className="v4-sections" ref={nav} aria-label={mode === 'chat' ? '對話清單' : 'Workflow 清單'} {...drag.list} onKeyDown={event => {
       if (!(event.target instanceof HTMLElement) || !event.target.classList.contains('v4-session')) return;
       const item = event.target.closest<HTMLLIElement>('li');
       const toggle = item?.querySelector<HTMLButtonElement>(':scope > .v4-row > .v4-row-toggle');
@@ -232,7 +255,8 @@ export function Sidebar(props: SidebarProps) {
           : <p className="v4-muted v4-section-note">沒有符合的對話或 Workflow。</p>}</section> : <>
         {pinnedRows.length > 0 && section('pinned', '釘選', <ul className="v4-tree">{pinnedRows}</ul>, pinnedRows.length)}
         {mode === 'chat'
-          ? section('list', '對話', chats.length ? <ul className="v4-tree">{tree(chats)}</ul> : <p className="v4-muted v4-section-note">還沒有對話。</p>, chats.length)
+          ? section('list', '對話', chats.length ? <ul className="v4-tree">{tree(chats, true)}</ul> : <p className="v4-muted v4-section-note">還沒有對話。</p>, chats.length,
+            drag.top && <div className="v4-drop-top" aria-hidden="true" {...drag.top}>移到最上層</div>)
           : section('list', '執行', runs.length ? <ul className="v4-tree">{runs.map(runRow)}</ul> : <p className="v4-muted v4-section-note">還沒有執行過 Workflow。</p>, runs.length)}
       </>}
     </nav>
