@@ -62,6 +62,7 @@ describe('fake facade', () => {
     ['an unknown parent', reparent('s-research', 's-missing', 2), 'not_found'],
     ['a stale revision', reparent('s-research', null, 1), 'stale_revision'],
     ['a move below itself', reparent('s-plan-notes', 's-research', 4), 'invalid_request'],
+    ['a workflow session as the parent (U3 Q-18)', reparent('s-research', 's-wf-root', 2), 'invalid_request'],
     ['a workflow session', reparent('s-wf-build-a', null, 3), 'invalid_transition'],
   ])('rejects %s without changing anything', async (_name, command, code) => {
     const { facade, events, bus } = setup();

@@ -28,6 +28,7 @@ import { Conversation } from './Conversation';
 import { useCreateFlow } from './create-flow';
 import type { SidebarMode, V4Page } from './demo-data';
 import { recentFolders, requestFolder } from './folders';
+import { canMove } from './move-targets';
 import { NewChat, SettingsV4 } from './Pages';
 import { initialPanes, openTarget, paneReducer } from './pane-state';
 import { modeOf, Sidebar } from './Sidebar';
@@ -36,6 +37,8 @@ import './styles.css';
 
 export const APP_NAME = 'AgentWorkflowGui';
 export const SAVING_PREFERENCES = '正在儲存設定，完成後就能再改。';
+/** WB-04 (T053): the tree changed since the Snapshot the user chose from; never sent again on its own. */
+export const STALE_MOVE = '這個對話剛被改過，請再試一次。';
 
 // Below this width the sidebar collapses by itself and opens as an overlay.
 const narrowQuery = '(max-width: 900px)';
@@ -285,6 +288,32 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
       if (!result.ok) setNotice(`沒有改名：${result.code === 'stale_revision' ? '這次執行剛被更新，請再改一次。' : commandFeedback(result, 'workflow.rename')}`);
     });
   };
+  /** Why a session cannot move now (read-only, not synchronised, its move in flight or unconfirmed); undefined when it can. */
+  const moveReason = (sessionId: SessionId): string | undefined => {
+    if (readOnly) return readOnlyProps(true).title;
+    if (commandDisabled) return '資料尚未同步完成。';
+    // Read from the store at this moment, so a second choice in the same tick already sees the first send.
+    const activity = store && Object.values(store.getSnapshot().blockedCommands).find(item => item.command.type === 'session.reparent' && item.command.sessionId === sessionId);
+    if (activity) return activity.result ? '上次移動的結果無法確認，請到設定頁「待核對操作」核對後再試。' : '正在移動這個對話…';
+    return undefined;
+  };
+  /**
+   * WB-04: session.reparent with the session's revision in the latest Snapshot, after checking the move there again. A
+   * success changes nothing here: the tree follows session.updated. A refusal that means the tree moved on
+   * (stale_revision, invalid_request, not_found) says so and is never sent again on its own (U3 Q1).
+   */
+  const moveSession = (sessionId: SessionId, parentId: SessionId | null) => {
+    const reason = moveReason(sessionId);
+    if (reason) { setNotice(`沒有移動：${reason}`); return; }
+    if (!store) { setNotice(`示意模式：未連接 runtime。連線時會送 session.reparent（${parentId ? '移到所選對話底下' : '移到最上層'}）。`); return; }
+    const current = store.getSnapshot().snapshot;
+    const latest = current?.sessions.find(session => session.id === sessionId);
+    if (!current || !latest || !canMove(current, sessionId, parentId)) { setNotice(STALE_MOVE); return; }
+    void store.send({ type: 'session.reparent', requestId: newId(), sessionId, expectedRevision: latest.revision, parentId }).then(result => {
+      if (result.ok) return;
+      setNotice(['stale_revision', 'invalid_request', 'not_found'].includes(result.code) ? STALE_MOVE : `沒有移動：${commandFeedback(result, 'session.reparent')}`);
+    });
+  };
   const closeTransfer = () => {
     const viewId = transfer?.viewId;
     setTransfer(null);
@@ -362,7 +391,7 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
       onMode={value => { setMode(value); if (page === 'new' && value === 'workflow') go('workflow-start'); else if (page === 'workflow-start' && value === 'chat') go('new'); }}
       onNewChat={() => go('new')} onStartWorkflow={() => go('workflow-start')} onOpen={id => open(id)} onSplit={split}
       onTheme={changeTheme} onPage={next => go(next, next === 'templates' ? snapshot.workflows[0]?.id ?? '' : '')}
-      onPin={togglePin} onRenameRun={renameRun}
+      onPin={togglePin} onRenameRun={renameRun} onMove={moveSession} moveReason={moveReason}
       onRename={id => { open(id); setEditTitle(previous => ({ sessionId: id, nonce: previous.nonce + 1 })); }} />
     {narrow && narrowOpen && <div className="v4-scrim" aria-hidden="true" onClick={() => setNarrowOpen(false)} />}
     <main className="v4-main">

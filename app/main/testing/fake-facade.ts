@@ -24,7 +24,10 @@ export function createFakeFacade(deps: { bus: Pick<EventBus, 'seq' | 'publish'>;
       return failure(requestId, 'stale_revision', 'The session has changed since it was loaded', { retryable: true });
     }
     if (parentId !== null) {
-      if (!state.sessions.some((s) => s.id === parentId)) return failure(requestId, 'not_found', 'Unknown parent session');
+      const parent = state.sessions.find((s) => s.id === parentId);
+      if (!parent) return failure(requestId, 'not_found', 'Unknown parent session');
+      // U3 Q-18, the same check as the real service: an ordinary session never sits below a workflow session.
+      if (parent.kind !== 'ordinary') return failure(requestId, 'invalid_request', 'The parent must be an ordinary session');
       // Walking up from the new parent must never reach the session itself.
       let cursor: string | undefined = parentId;
       while (cursor !== undefined) {
