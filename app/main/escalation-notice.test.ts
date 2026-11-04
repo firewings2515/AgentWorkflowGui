@@ -7,7 +7,7 @@ import type { Escalation, Snapshot } from '../../contracts';
 import { fixtureSnapshot } from '../../contracts/fixtures/snapshot';
 import { ESCALATION_ACTIVATED_CHANNEL } from '../preload/channels';
 import {
-  activatedEscalationId, createEscalationNotices, type EscalationNoticeDeps, LAUNCH_PREFIX, launchArgument, MAX_PENDING_NOTICES, NOTICE_BODY_LIMIT,
+  activatedEscalationId, createEscalationNotices, type EscalationNoticeDeps, LAUNCH_PREFIX, launchArgument, MAX_ESCALATION_ID, MAX_LAUNCH, NOTICE_BODY_LIMIT,
   NOTICE_TITLE, noticeBody, type NoticeOptions, type NoticeWindow,
 } from './escalation-notice';
 
@@ -132,16 +132,61 @@ describe('T057 when the main process shows a notification', () => {
     expect(none.made.length + failing.made.length + throwing.made.length).toBe(0);
   });
 
-  it(`at most ${String(MAX_PENDING_NOTICES)} requests wait for the backend; more are dropped, later ones work again`, async () => {
+  it('r1 P1: none is dropped while the backend is slow: 40 requests during one read all show, with one more read for them', async () => {
     const waiting: (() => void)[] = [];
-    const escalations = Array.from({ length: MAX_PENDING_NOTICES + 5 }, (_, i) => open(`esc-${String(i)}`));
+    const escalations = Array.from({ length: 41 }, (_, i) => open(`esc-${String(i)}`));
     const snapshot = { ...structuredClone(fixtureSnapshot), escalations };
     const { notices, made } = rig(escalations, { snapshot: () => new Promise<Snapshot>(resolve => waiting.push(() => resolve(snapshot))) });
     const asked = escalations.map(item => notices.show(item.id));
-    expect(waiting).toHaveLength(MAX_PENDING_NOTICES);
-    waiting.forEach(resolve => resolve());
+    // The first is being read; the other 40 wait for one read together.
+    expect(waiting).toHaveLength(1);
+    waiting[0]!();
+    await vi.waitFor(() => expect(waiting).toHaveLength(2));
+    waiting[1]!();
     await Promise.all(asked);
-    expect(made).toHaveLength(MAX_PENDING_NOTICES);
+    expect(waiting).toHaveLength(2);
+    expect(made.map(item => item.options.body)).toEqual(escalations.map(item => `${SESSION.title}：${item.title}`));
+  });
+
+  it('r1 P1: a request made during a read is checked against the next read, so an escalation newer than that read shows', async () => {
+    const reads: ((snapshot: Snapshot) => void)[] = [];
+    const { notices, made } = rig([], { snapshot: () => new Promise<Snapshot>(resolve => reads.push(resolve)) });
+    const first = notices.show('esc-old');
+    const second = notices.show('esc-new');
+    // The first read was taken before esc-new existed; esc-new waits for the second one.
+    reads[0]!({ ...structuredClone(fixtureSnapshot), escalations: [open('esc-old')] });
+    await first;
+    await vi.waitFor(() => expect(reads).toHaveLength(2));
+    reads[1]!({ ...structuredClone(fixtureSnapshot), escalations: [open('esc-old'), open('esc-new')] });
+    await second;
+    expect(made.map(item => item.options.body)).toEqual([`${SESSION.title}：確認 esc-old`, `${SESSION.title}：確認 esc-new`]);
+  });
+
+  it('r1 P1 end to end: 17 new escalations arriving while the backend is slow give 17 notifications', async () => {
+    const reads: (() => void)[] = [];
+    const escalations = Array.from({ length: 17 }, (_, i) => open(`esc-${String(i)}`));
+    const snapshot = { ...structuredClone(fixtureSnapshot), escalations };
+    const { notices, made } = rig(escalations, { snapshot: () => new Promise<Snapshot>(resolve => reads.push(() => resolve(snapshot))) });
+    const asked = escalations.map(item => notices.show(item.id));
+    while (made.length < 17) {
+      reads.shift()?.();
+      await flush();
+    }
+    await Promise.all(asked);
+    expect(made).toHaveLength(17);
+  });
+
+  it('stopped while requests wait: they settle and nothing is shown', async () => {
+    const reads: (() => void)[] = [];
+    const escalations = [open('esc-1'), open('esc-2')];
+    const snapshot = { ...structuredClone(fixtureSnapshot), escalations };
+    const { notices, made } = rig(escalations, { snapshot: () => new Promise<Snapshot>(resolve => reads.push(() => resolve(snapshot))) });
+    const asked = [notices.show('esc-1'), notices.show('esc-2')];
+    notices.stop();
+    reads[0]!();
+    await Promise.all(asked);
+    expect(reads).toHaveLength(1);
+    expect(made).toHaveLength(0);
   });
 
   it('without toastXml (not Windows) the title and body are given as they are', async () => {
@@ -220,6 +265,22 @@ describe('T057 injection', () => {
     await expect(notices.show('esc-\ud800')).resolves.toBeUndefined();
     expect(made).toHaveLength(0);
   });
+
+  // r1 P2: whatever is shown can be clicked; the launch limit follows from the ID limit.
+  it.each([
+    ['112 CJK characters (r1)', '中'.repeat(112)],
+    ['256 CJK characters, the longest ID', '中'.repeat(MAX_ESCALATION_ID)],
+    ['128 emoji (256 UTF-16 units)', '😀'.repeat(MAX_ESCALATION_ID / 2)],
+    ['256 characters encoded as is', 'e'.repeat(MAX_ESCALATION_ID)],
+  ])('an ID of %s is shown, and a click on it opens it', async (_name, id) => {
+    const { notices, made, window } = rig([open(id)]);
+    await notices.show(id);
+    expect(made).toHaveLength(1);
+    const launch = parseXml(made[0]!.options.toastXml!).documentElement.getAttribute('launch')!;
+    expect(launch.length).toBeLessThanOrEqual(MAX_LAUNCH);
+    await notices.activate({ type: 'click', arguments: launch });
+    expect(window.send.mock.calls).toEqual([[ESCALATION_ACTIVATED_CHANNEL, { escalationId: id }]]);
+  });
 });
 
 describe('T057 the arguments of a Windows activation', () => {
@@ -237,7 +298,8 @@ describe('T057 the arguments of a Windows activation', () => {
     ['a second argument', { type: 'click', arguments: `${LAUNCH_PREFIX}esc-1&type=action` }],
     ['a broken escape', { type: 'click', arguments: `${LAUNCH_PREFIX}%E0%A4%A` }],
     ['an ID longer than 256 characters', { type: 'click', arguments: `${LAUNCH_PREFIX}${'e'.repeat(257)}` }],
-    ['arguments longer than 1024', { type: 'click', arguments: `${LAUNCH_PREFIX}${'%41'.repeat(400)}` }],
+    ['an encoded ID that decodes to more than 256 characters', { type: 'click', arguments: `${LAUNCH_PREFIX}${'%41'.repeat(400)}` }],
+    ['arguments longer than the longest launch', { type: 'click', arguments: `${LAUNCH_PREFIX}${'A'.repeat(MAX_LAUNCH)}` }],
   ])('%s is no escalation', (_name, details) => {
     expect(activatedEscalationId(details)).toBeUndefined();
   });

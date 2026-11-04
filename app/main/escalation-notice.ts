@@ -19,10 +19,13 @@ export const NOTICE_BODY_LIMIT = 100;
 export const LAUNCH_PREFIX = 'awg-escalation:';
 /** The longest escalation ID taken from the page or from a click. */
 export const MAX_ESCALATION_ID = 256;
-/** Requests still being looked up; more are dropped, so a page cannot make the backend read its Snapshot without end. */
-export const MAX_PENDING_NOTICES = 16;
-const MAX_ARGUMENTS = 1024;
-const LAUNCH = /^awg-escalation:([A-Za-z0-9\-_.!~*'()%]{1,1000})$/;
+/**
+ * The longest `launch` argument (T057 r1 P2): long enough for every ID that may be shown, so whatever is shown can be
+ * clicked. `encodeURIComponent` writes one UTF-16 unit as at most 9 characters (`%E4%B8%AD`; a surrogate pair is 12 for
+ * two units), so 256 units are at most 2304.
+ */
+export const MAX_LAUNCH = LAUNCH_PREFIX.length + MAX_ESCALATION_ID * 9;
+const LAUNCH = /^awg-escalation:([A-Za-z0-9\-_.!~*'()%]+)$/;
 
 // Line breaks and tabs become one space. Every other control character, the bidi controls, a lone surrogate and the two
 // non-characters XML does not allow are dropped.
@@ -67,7 +70,7 @@ function escalationIdOf(raw: unknown): string | undefined {
 export function activatedEscalationId(details: unknown): string | undefined {
   if (typeof details !== 'object' || details === null) return undefined;
   const { type, arguments: args } = details as { type?: unknown; arguments?: unknown };
-  if (type !== 'click' || typeof args !== 'string' || args.length > MAX_ARGUMENTS) return undefined;
+  if (type !== 'click' || typeof args !== 'string' || args.length > MAX_LAUNCH) return undefined;
   const match = LAUNCH.exec(args);
   if (!match) return undefined;
   try {
@@ -119,7 +122,11 @@ export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationN
   const requested = new Set<string>();
   // Notifications on screen, by escalation: held so they are not collected, and so one click is handled once.
   const live = new Map<string, NoticeLike>();
-  let pending = 0;
+  // Requests waiting for the next Snapshot read, with what settles each (T057 r1 P1). Nothing is dropped: however many
+  // arrive while the backend is read, the next read checks them all, so the backend is read once per batch, never per
+  // request, and the page cannot make it read without end.
+  let waiting = new Map<string, () => void>();
+  let reading = false;
   let stopped = false;
 
   const bringForward = () => {
@@ -151,25 +158,23 @@ export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationN
     }
   };
 
-  const show = async (raw: unknown): Promise<void> => {
-    const escalationId = escalationIdOf(raw);
-    if (stopped || escalationId === undefined || requested.has(escalationId) || pending >= MAX_PENDING_NOTICES) return;
-    // Taken before the wait, so two requests at once show one notification.
-    requested.add(escalationId);
-    pending += 1;
+  /** Shows one escalation as the Snapshot has it; one that is not there or not open is let go, to be asked for again. */
+  const present = (escalationId: string, snapshot: Snapshot | undefined): void => {
     try {
-      const snapshot = await read();
       const escalation = snapshot?.escalations.find(item => item.id === escalationId);
       if (stopped || !snapshot || escalation?.state !== 'open') {
         requested.delete(escalationId);
         return;
       }
+      // Throws for an ID that cannot be encoded (a lone surrogate); never longer than an activation accepts (r1 P2).
+      const launch = launchArgument(escalationId);
+      if (launch.length > MAX_LAUNCH) throw new RangeError('launch argument too long');
       const title = snapshot.sessions.find(item => item.id === escalation.fromSessionId)?.title;
       const body = noticeBody(title, escalation.title);
       const notice = deps.createNotification({
         title: NOTICE_TITLE,
         body,
-        ...(deps.useToastXml && { toastXml: toastXml(launchArgument(escalationId), NOTICE_TITLE, body) }),
+        ...(deps.useToastXml && { toastXml: toastXml(launch, NOTICE_TITLE, body) }),
       });
       const forget = () => {
         if (live.get(escalationId) === notice) live.delete(escalationId);
@@ -189,9 +194,40 @@ export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationN
       requested.delete(escalationId);
       live.delete(escalationId);
       deps.log?.(`[notice] not shown (${error instanceof Error ? error.name : 'unknown'})`);
-    } finally {
-      pending -= 1;
     }
+  };
+
+  /**
+   * Reads the Snapshot for every waiting request, one read at a time. A request that arrives during a read waits for the
+   * next one, so it is checked against data at least as new as the request.
+   */
+  const pump = async (): Promise<void> => {
+    if (reading) return;
+    reading = true;
+    try {
+      while (waiting.size > 0) {
+        const batch = waiting;
+        waiting = new Map();
+        const snapshot = stopped ? undefined : await read();
+        for (const [escalationId, settle] of batch) {
+          present(escalationId, snapshot);
+          settle();
+        }
+      }
+    } finally {
+      reading = false;
+    }
+  };
+
+  const show = (raw: unknown): Promise<void> => {
+    const escalationId = escalationIdOf(raw);
+    if (stopped || escalationId === undefined || requested.has(escalationId)) return Promise.resolve();
+    // Taken before the wait, so two requests at once show one notification.
+    requested.add(escalationId);
+    return new Promise<void>((settle) => {
+      waiting.set(escalationId, settle);
+      void pump();
+    });
   };
 
   const activate = async (details: unknown): Promise<void> => {
