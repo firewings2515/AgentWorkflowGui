@@ -3,6 +3,9 @@ import type { LogicalSession, SessionId, Snapshot } from '../../../../contracts'
 import { lastMessageTimes } from './last-message';
 import { moveTargets } from './move-targets';
 
+/** Closes a modal dialog; without the API (jsdom) the open attribute goes. */
+const shut = (element: HTMLDialogElement) => { if (element.close) element.close(); else element.removeAttribute('open'); };
+
 /**
  * 「移到…底下」 (WB-04, T053): a search box over the ordinary sessions the session can move below, newest last message
  * first. Focus stays in the box; ↑↓ choose, Enter confirms, Esc closes. Titles are text, never markup (T042).
@@ -23,8 +26,11 @@ export function MovePicker({ snapshot, sessionId, titles, onPick, onClose }: {
   const times = useMemo(() => lastMessageTimes({ messages }), [messages]);
   const targets = useMemo(() => moveTargets({ sessions, messages }, sessionId, (session: LogicalSession) => titles[session.id] ?? session.title, query, times),
     [sessions, messages, sessionId, titles, query, times]);
-  const index = Math.max(0, targets.findIndex(session => session.id === activeId));
+  const found = targets.findIndex(session => session.id === activeId);
+  const index = Math.max(0, found);
   const active = targets[index];
+  // r1 P2-2: the default (first) choice is remembered by ID too, so a later reorder does not move the highlight.
+  if (active && found < 0) setActiveId(active.id);
   const name = (session: LogicalSession) => titles[session.id] ?? session.title;
   const close = useRef(onClose);
   useEffect(() => { close.current = onClose; });
@@ -34,14 +40,22 @@ export function MovePicker({ snapshot, sessionId, titles, onPick, onClose }: {
     if (element?.showModal) element.showModal(); else element?.setAttribute('open', '');
     // autoFocus ran before the dialog was open; the menu item that opened it gave focus back to the row meanwhile.
     search.current?.focus();
+    // Leaving any other way (the sidebar unmounting) closes the modal too, so the page behind it is not left inert.
+    return () => { if (element?.open) shut(element); };
   }, []);
   // The session went away or cannot move any more: nothing to choose for.
   const gone = moving?.kind !== 'ordinary';
-  useEffect(() => { if (gone) close.current(); }, [gone]);
+  useEffect(() => {
+    if (!gone) return;
+    if (dialog.current?.open) shut(dialog.current);
+    close.current();
+  }, [gone]);
 
   const finish = (target?: LogicalSession) => {
     if (done.current) return;
     done.current = true;
+    // r1 P2-1: close the modal first; the sidebar gives focus back to the row once this has unmounted.
+    if (dialog.current?.open) shut(dialog.current);
     onClose();
     if (target) onPick(target.id);
   };

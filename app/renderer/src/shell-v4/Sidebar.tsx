@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { LogicalSession, SessionId, Snapshot, WorkflowInstance } from '../../../../contracts';
 import { statusLabel } from '../ui';
@@ -59,6 +59,14 @@ export function Sidebar(props: SidebarProps) {
   const [menu, setMenu] = useState<ContextTarget | null>(null);
   const [renaming, setRenaming] = useState('');
   const [picker, setPicker] = useState<{ sessionId: SessionId; from: HTMLElement } | null>(null);
+  // r1 P2-1: the row gets focus back only after the modal picker has closed and unmounted; until then it is inert.
+  const restoreFocus = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (picker || !restoreFocus.current) return;
+    const from = restoreFocus.current;
+    restoreFocus.current = null;
+    if (from.isConnected) from.focus();
+  }, [picker]);
   const nav = useRef<HTMLElement>(null);
   const pinned = props.pinned[mode];
   const readOnly = props.readOnly ? { title: readOnlyProps(true).title } : {};
@@ -224,7 +232,7 @@ export function Sidebar(props: SidebarProps) {
         ...moveItems(menuSession, menu.from),
       ]} />}
     {picker && <MovePicker snapshot={snapshot} sessionId={picker.sessionId} titles={titles}
-      onClose={() => { const from = picker.from; setPicker(null); if (from.isConnected) from.focus(); }}
+      onClose={() => { restoreFocus.current = picker.from; setPicker(null); }}
       onPick={parentId => props.onMove(picker.sessionId, parentId)} />}
   </aside>;
 }

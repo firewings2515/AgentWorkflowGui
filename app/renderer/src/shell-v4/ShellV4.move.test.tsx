@@ -4,7 +4,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Command, CONTRACTS_VERSION, RequestId } from '../../../../contracts';
-import type { AppEvent, CommandResult, ErrorCode, LogicalSession } from '../../../../contracts';
+import type { AppEvent, CommandResult, ErrorCode, LogicalSession, Message } from '../../../../contracts';
 import { fixtureSnapshot } from '../../../../contracts/fixtures/snapshot';
 import { App } from '../App';
 import { rendererStore } from '../renderer-store';
@@ -50,6 +50,8 @@ const addSessions = (...items: Array<[id: string, title: string, createdAt: stri
   });
   fake.data.snapshot = { ...fake.data.snapshot, sessions: [...fake.data.snapshot.sessions, ...added] };
 };
+/** Longer than the store's command time-out (15 s), so a delayed resend or local update would have happened. */
+const LONG_WAIT = 20_000;
 const parentRowOf = (id: string) => document.querySelector(`.v4-sidebar [data-session-id="${id}"]`)?.parentElement?.closest('li')?.getAttribute('data-session-id') ?? null;
 
 describe('T053 menu items (WB-04)', () => {
@@ -117,6 +119,23 @@ describe('T053 picker', () => {
     expect(picker().getByText('沒有可以移過去的對話')).toBeTruthy();
   });
 
+  it('r1 P2-2: the default choice is kept by ID when another session gets a newer message and moves first', async () => {
+    addSessions(['s-new-a', '新的 Alpha', '2026-11-04T02:00:00.000Z'], ['s-new-b', '新的 Beta', '2026-11-04T01:00:00.000Z']);
+    fake.bridge.send.mockImplementation(input => Promise.resolve(accepted(input)));
+    await setup();
+    choose(research.id, '移到…底下');
+    const selected = () => picker().getAllByRole('option').find(option => option.getAttribute('aria-selected') === 'true')?.textContent;
+    expect(options()).toEqual(['新的 Alpha', '新的 Beta', handoff.title]);
+    expect(selected()).toBe('新的 Alpha');
+    emit({ type: 'message.completed', message: { ...fixtureSnapshot.messages[0]!, id: 'm-new-b', sessionId: 's-new-b', createdAt: '2026-11-04T03:00:00.000Z' } as Message });
+    expect(options()).toEqual(['新的 Beta', '新的 Alpha', handoff.title]);
+    expect(selected()).toBe('新的 Alpha');
+    expect(searchBox().getAttribute('aria-activedescendant')).toBe(picker().getByRole('option', { name: '新的 Alpha' }).id);
+    fireEvent.keyDown(searchBox(), { key: 'Enter' });
+    await waitFor(() => expect(reparents()).toHaveLength(1));
+    expect(reparents()[0]).toMatchObject({ parentId: 's-new-a' });
+  });
+
   it('works by keyboard: ↓↑ choose, Enter sends the chosen parent with the latest revision', async () => {
     addSessions(['s-new-a', '新的 Alpha', '2026-11-04T01:00:00.000Z'], ['s-new-b', '新的 Beta', '2026-11-04T02:00:00.000Z']);
     fake.bridge.send.mockImplementation(input => Promise.resolve(accepted(input)));
@@ -148,6 +167,41 @@ describe('T053 picker', () => {
     expect(fake.bridge.send).not.toHaveBeenCalled();
   });
 
+  it('r1 P2-1: closes the modal first and gives focus back only after the picker is gone (Esc, cancel, a choice)', async () => {
+    const proto = HTMLDialogElement.prototype as Partial<HTMLDialogElement>;
+    const saved = { showModal: proto.showModal, close: proto.close };
+    const log: string[] = [];
+    // A modal like the browser's: open while shown, and the page behind it does not take focus.
+    proto.showModal = function (this: HTMLDialogElement) { this.setAttribute('open', ''); log.push('showModal'); };
+    proto.close = function (this: HTMLDialogElement) { this.removeAttribute('open'); log.push('close'); };
+    const realFocus = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'focus')!.value as (this: HTMLElement) => void;
+    const focus = vi.spyOn(HTMLElement.prototype, 'focus').mockImplementation(function (this: HTMLElement) {
+      const modal = document.querySelector('dialog[open]');
+      if (modal && !modal.contains(this)) { log.push('focus ignored'); return; }
+      if (this.classList.contains('v4-session')) log.push(`focus row ${document.querySelector('dialog') ? 'with dialog' : 'after dialog'}`);
+      realFocus.call(this);
+    });
+    try {
+      fake.bridge.send.mockImplementation(input => Promise.resolve(accepted(input)));
+      await setup();
+      const leave: Array<() => void> = [
+        () => fireEvent.keyDown(searchBox(), { key: 'Escape' }),
+        () => fireEvent(screen.getByRole('dialog'), new Event('cancel', { cancelable: true })),
+        () => fireEvent.keyDown(searchBox(), { key: 'Enter' }),
+      ];
+      for (const exit of leave) {
+        choose(plan.id, '移到…底下');
+        log.length = 0;
+        exit();
+        expect(screen.queryByRole('dialog')).toBeNull();
+        expect(log).toEqual(['close', 'focus row after dialog']);
+      }
+    } finally {
+      focus.mockRestore();
+      for (const key of ['showModal', 'close'] as const) { if (saved[key]) proto[key] = saved[key]; else delete proto[key]; }
+    }
+  });
+
   it('shows titles as plain text (T042)', async () => {
     addSessions(['s-evil', '<img src=x onerror="alert(1)">\u0007<b>粗</b>', '2026-11-04T01:00:00.000Z']);
     await setup();
@@ -169,10 +223,13 @@ describe('T053 sending session.reparent', () => {
   it.each(['stale_revision', 'not_found', 'invalid_request'] as const)('%s: says the conversation just changed and never sends again (Q1)', async code => {
     answer(code);
     await setup();
+    // r1 P2-3: a fake clock from the send on, moved past any retry delay and the store's 15 s time-out.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     choose(research.id, '移到最上層');
     expect(await screen.findByText(STALE_MOVE)).toBeTruthy();
-    await new Promise(resolve => setTimeout(resolve, 50));
+    await act(async () => { await vi.advanceTimersByTimeAsync(LONG_WAIT); });
     expect(fake.bridge.send).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(STALE_MOVE)).toBeTruthy();
     // Nothing stays blocked: the user can try again by hand.
     expect(moveItems(research.id).every(item => !item.disabled)).toBe(true);
   });
@@ -215,10 +272,12 @@ describe('T053 sending session.reparent', () => {
     fake.bridge.send.mockImplementation(input => Promise.resolve(accepted(input)));
     await setup();
     expect(parentRowOf(research.id)).toBe(plan.id);
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     choose(research.id, '移到最上層');
     await waitFor(() => expect(reparents()).toHaveLength(1));
-    await act(async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(LONG_WAIT); });
     expect(parentRowOf(research.id)).toBe(plan.id);
+    expect(fake.bridge.send).toHaveBeenCalledTimes(1);
     const moved = { ...research, revision: research.revision + 1 };
     delete moved.parentId;
     emit({ type: 'session.updated', session: moved });
