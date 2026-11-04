@@ -18,6 +18,16 @@ const write = (preferences: UiPreferences, id: string = crypto.randomUUID()) => 
 const updated = (seq: number, preferences: UiPreferences): EventEnvelope => ({ schemaVersion: CONTRACTS_VERSION, seq, event: { type: 'preferences.updated', preferences, at: '2026-11-04T10:00:00Z' } });
 const ok = (requestId: string): CommandResult => ({ ok: true, requestId: RequestId.parse(requestId), created: [] });
 
+/** Sends a command whose answer never comes in time: the store's 50 ms timeout passes on fake timers. */
+async function timedOut(store: RendererStore, command: ReturnType<typeof write>) {
+  vi.useFakeTimers();
+  try {
+    const result = store.send(command);
+    await vi.advanceTimersByTimeAsync(50);
+    return await result;
+  } finally { vi.useRealTimers(); }
+}
+
 /** A fake service: commands answer as told; events go out one by one, or as a batch when `batches` is set. */
 async function setup({ batches = false, timeoutMs = 15000 } = {}) {
   const fake = fakeBridge();
@@ -97,7 +107,7 @@ describe('T051 r2: one preferences write at a time, until the Snapshot shows it'
     const a = withPins(['s-research']);
     const late = deferred<CommandResult>();
     fake.bridge.send.mockReturnValueOnce(late.promise);
-    expect(await store.send(write(a, 'pref-a'))).toMatchObject({ ok: false, code: 'unknown_outcome' });
+    expect(await timedOut(store, write(a, 'pref-a'))).toMatchObject({ ok: false, code: 'unknown_outcome' });
     expect(blocked()).toBe(true);
     // The service did save A; a read shows it and the user checks the result.
     fake.data.snapshot = { ...fake.data.snapshot, seq: fake.data.snapshot.seq + 1, preferences: a };
@@ -119,7 +129,7 @@ describe('T051 r2: one preferences write at a time, until the Snapshot shows it'
     const { fake, store, emit, blocked } = await setup({ timeoutMs: 50 });
     const late = deferred<CommandResult>();
     fake.bridge.send.mockReturnValueOnce(late.promise);
-    await store.send(write(withPins(['s-research']), 'pref-a'));
+    await timedOut(store, write(withPins(['s-research']), 'pref-a'));
     await store.reconnect();
     store.acknowledge('preferences.set', 'preferences');
     const b = withPins(['s-plan-notes']);
@@ -168,6 +178,50 @@ describe('T051 r2: one preferences write at a time, until the Snapshot shows it'
     expect(fake.bridge.snapshot).toHaveBeenCalledTimes(2);
     expect(blocked()).toBe(false);
     expect(fake.bridge.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('r3: a late success after a time-out, before any check, changes nothing: writes stay stopped until a read and a check', async () => {
+    const { fake, store, blocked } = await setup({ timeoutMs: 50 });
+    const a = withPins(['s-research']);
+    const late = deferred<CommandResult>();
+    fake.bridge.send.mockReturnValueOnce(late.promise);
+    await timedOut(store, write(a, 'pref-a'));
+    expect(blocked()).toBe(true);
+    late.resolve(ok('pref-a'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(blocked()).toBe(true);
+    expect(store.getSnapshot().commands['pref-a']!.result).toMatchObject({ code: 'unknown_outcome' });
+    // A check without a read is not taken; a read that started after the result is required.
+    expect(store.needsReadBeforeAcknowledge('preferences.set', 'preferences')).toBe(true);
+    store.acknowledge('preferences.set', 'preferences');
+    expect(blocked()).toBe(true);
+    fake.data.snapshot = { ...fake.data.snapshot, seq: fake.data.snapshot.seq + 1, preferences: a };
+    await store.reconnect();
+    expect(store.needsReadBeforeAcknowledge('preferences.set', 'preferences')).toBe(false);
+    store.acknowledge('preferences.set', 'preferences');
+    expect(blocked()).toBe(false);
+    expect(store.getSnapshot().snapshot!.preferences).toEqual(a);
+    expect(fake.bridge.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('r3: a read that was already running at the time-out does not count as the check', async () => {
+    const { fake, store, blocked } = await setup({ timeoutMs: 50 });
+    const late = deferred<CommandResult>();
+    fake.bridge.send.mockReturnValueOnce(late.promise);
+    const slow = deferred<typeof fake.data.snapshot>();
+    vi.useFakeTimers();
+    const sent = store.send(write(withPins(['s-research']), 'pref-a'));
+    await vi.waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(1));
+    fake.bridge.snapshot.mockReturnValueOnce(slow.promise);
+    const reading = store.reconnect();
+    await vi.advanceTimersByTimeAsync(50);
+    await sent;
+    vi.useRealTimers();
+    slow.resolve(structuredClone(fake.data.snapshot));
+    await reading;
+    expect(store.needsReadBeforeAcknowledge('preferences.set', 'preferences')).toBe(true);
+    store.acknowledge('preferences.set', 'preferences');
+    expect(blocked()).toBe(true);
   });
 
   it('a refused write frees writes at once; an uncertain one stays blocked until checked; a no-op write waits for nothing', async () => {

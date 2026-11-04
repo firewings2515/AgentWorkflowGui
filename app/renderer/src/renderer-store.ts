@@ -154,6 +154,10 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
   // command (uncertain) keeps writes stopped until the user has checked, as before.
   let preferencesWrite: { id: string; preferences: UiPreferences; seen: boolean; receivedIn?: number } | null = null;
   let preferencesTimer: ReturnType<typeof setTimeout> | undefined;
+  // r3: an uncertain preferences.set (time-out, possible side effects) is released only after a Snapshot read that
+  // started after its result: request ID -> the read generation at that result. `lastRead` is the latest finished read.
+  const uncertainPreferences = new Map<string, number>();
+  let lastRead = 0;
   const samePreferences = (a: UiPreferences, b: UiPreferences) => JSON.stringify(UiPreferences.parse(a)) === JSON.stringify(UiPreferences.parse(b));
   const endPreferencesWrite = () => { preferencesWrite = null; clearTimeout(preferencesTimer); preferencesTimer = undefined; };
   /** Called for each event that was actually applied (not skipped as old). */
@@ -292,6 +296,7 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
             commands: next.commands[command.requestId] ? { ...next.commands, [command.requestId]: checked } : next.commands };
         }
         buffer = null;
+        lastRead = Math.max(lastRead, current);
         // A read started after the receipt of the write in progress includes that write.
         if (preferencesWrite?.receivedIn !== undefined && current > preferencesWrite.receivedIn) endPreferencesWrite();
         publish(next);
@@ -306,6 +311,13 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
   const readOnlyBlocks = (type: Command['type']) => state.snapshot?.app.status === 'read-only' && type !== 'backup.restore' && type !== 'backup.cancelRestore';
   const isBlocked = (type: Command['type'], target: string) => readOnlyBlocks(type) || !!state.blockedCommands[blockKey(type, target)]
     || (type === 'preferences.set' && !!preferencesWrite);
+  /** An uncertain whole-record preferences write is checked against a read that started after its result (r3). */
+  const needsReadBeforeAcknowledge = (type: Command['type'], target: string) => {
+    const activity = state.blockedCommands[blockKey(type, target)];
+    if (activity?.command.type !== 'preferences.set') return false;
+    const since = uncertainPreferences.get(activity.command.requestId);
+    return since !== undefined && !(state.connection === 'ready' && lastRead > since);
+  };
   const acknowledge = (type: Command['type'], target: string) => {
     const key = blockKey(type, target);
     const activity = state.blockedCommands[key];
@@ -315,6 +327,8 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
     if (activity.command.type === 'session.interrupt' && activity.result.ok) return;
     const command = activity.command;
     if (command.type === 'session.create' && (state.connection !== 'ready' || !activity.createCheck)) return;
+    if (needsReadBeforeAcknowledge(type, target)) return;
+    uncertainPreferences.delete(command.requestId);
     const id = activity.command.requestId;
     publish({ ...state, blockedCommands: without(state.blockedCommands, key),
       commands: state.commands[id] ? { ...state.commands, [id]: { ...state.commands[id], reviewed: true } } : state.commands });
@@ -386,7 +400,12 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
       // Also protect late create receipts: a timed-out screen can already be
       // watching this command, so do not expose success before its fresh read.
       const creating = command.type === 'session.create' && receipt.ok;
-      // Only the write in progress reacts to its own receipt; a late receipt of an earlier write changes nothing.
+      // r3: a receipt of a preferences write that has already ended (timed out, uncertain, replaced) is ignored with
+      // everything it would change, the blocked state included: only checking the result against a read releases it.
+      // (Other commands carry a revision or a create ID, so their late receipts may still settle a time-out, T027.)
+      if (command.type === 'preferences.set' && preferencesWrite?.id !== command.requestId) return;
+      if (command.type === 'preferences.set' && !receipt.ok && blocksResubmit(receipt)) uncertainPreferences.set(command.requestId, generation);
+      // Only the write in progress reacts to its own receipt.
       if (command.type === 'preferences.set' && preferencesWrite?.id === command.requestId) {
         if (receipt.ok && !preferencesWrite.seen && !(state.snapshot && samePreferences(state.snapshot.preferences, command.preferences))) {
           preferencesWrite.receivedIn = generation;
@@ -428,13 +447,15 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
     getSnapshot: () => state,
     /** A preferences.set is on its way or not yet shown by the Snapshot: preferences writes wait. */
     savingPreferences: () => !!preferencesWrite,
+    needsReadBeforeAcknowledge,
     subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     start: () => state.connection === 'idle' ? reconnect() : loading ?? Promise.resolve(),
     reconnect, send, isBlocked, acknowledge, loadHistory,
     query: (request: Parameters<typeof queryBridge>[1]) => queryBridge(bridge, request, timeoutMs),
     dispose: () => {
       interruptTimers.forEach(clearTimeout); interruptTimers.clear();
-      endPreferencesWrite();
+      // The store outlives a remount: an in-flight or uncertain preferences write keeps its state; only the timer goes.
+      clearTimeout(preferencesTimer); preferencesTimer = undefined;
       generation++; unsubscribe?.(); unsubscribe = undefined; loading = undefined; buffer = null;
       notificationPending = false;
       publish({ ...state, connection: 'idle' });

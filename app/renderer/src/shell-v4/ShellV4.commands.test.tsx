@@ -584,6 +584,35 @@ describe('r1 P1-1 / r2: a preferences write waits until the Snapshot shows the p
     expect(sent()[2]).toMatchObject({ theme: 'light', pinned: { chat: ['s-research', 's-plan-notes'], workflow: [] } });
   });
 
+  it('r3: a late success after a time-out, before checking, keeps writes stopped and sends no package without the pin', async () => {
+    const late = deferred<CommandResult>();
+    fake.bridge.send.mockReturnValueOnce(late.promise);
+    await setup();
+    vi.useFakeTimers();
+    pinMenu('參考資料整理');
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+    vi.useRealTimers();
+    const first = sent()[0]!;
+    // The service saved the pin; its receipt arrives now, before any read or check.
+    fake.data.snapshot = { ...fake.data.snapshot, seq: ++seq, preferences: first };
+    await act(async () => { late.resolve({ ok: true, requestId: Command.parse(fake.bridge.send.mock.calls[0]![0]).requestId, created: [] }); await Promise.resolve(); });
+    const toggle = sidebar().getByRole<HTMLButtonElement>('button', { name: '切換成淺色' });
+    expect(toggle.disabled).toBe(true);
+    fireEvent.click(toggle);
+    expect(sent()).toHaveLength(1);
+    click('設定');
+    fireEvent.click(screen.getByText('待核對操作（1）'));
+    expect(screen.getByText('先按「重新讀取資料」，讀到最新的設定後才能核對')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '已核對結果' })).toBeNull();
+    fireEvent.click(sidebar().getByRole('button', { name: '重新讀取資料' }));
+    fireEvent.click(await screen.findByRole('button', { name: '已核對結果' }));
+    fake.bridge.send.mockImplementation(input => Promise.resolve({ ok: true, requestId: RequestId.parse(input.requestId), created: [] }));
+    await waitFor(() => expect(sidebar().getByRole<HTMLButtonElement>('button', { name: '切換成淺色' }).disabled).toBe(false));
+    fireEvent.click(sidebar().getByRole('button', { name: '切換成淺色' }));
+    await waitFor(() => expect(sent()).toHaveLength(2));
+    expect(sent()[1]).toMatchObject({ theme: 'light', pinned: { chat: ['s-research'], workflow: [] } });
+  });
+
   it('r2 P1-b: the own event and another window\'s later write in one batch: the next write builds on the later one', async () => {
     const batches = new Set<(batch: EventBatch) => void>();
     const bridge = { ...fake.bridge, onBatch: (listener: (batch: EventBatch) => void) => { batches.add(listener); return () => { batches.delete(listener); }; } };
