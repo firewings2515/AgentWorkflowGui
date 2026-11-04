@@ -1,9 +1,9 @@
 // Cross-tool transfer proposals and preferences.
 import { z } from 'zod';
 import { ModelSelection } from './agent';
-import { OperationId, PayloadHash, Revision, SessionId, Timestamp, TransferId } from './common';
+import { InstanceId, OperationId, PayloadHash, Revision, SessionId, Timestamp, TransferId } from './common';
 import { DeliveryRecord, ProvisionRecord, deliveryTargetIssues } from './delivery';
-import { addRuleIssue, type ContractRule } from './rules';
+import { addRuleIssue, ruleIssue, type ContractRule } from './rules';
 
 export const TransferState = z.enum(['draft', 'awaiting-confirmation', 'stale', 'approved', 'failed', 'cancelled']);
 
@@ -85,17 +85,39 @@ export const SupervisorSettings = z.strictObject({
 });
 export type SupervisorSettings = z.infer<typeof SupervisorSettings>;
 
+/** Most IDs one pinned list holds (U2, Q-9). */
+export const PINNED_LIMIT = 50;
+const listedOnce = (ids: readonly string[]) => new Set(ids).size === ids.length;
+
+/**
+ * What the user pinned in the sidebar (U2, Q-9), one list per mode, in the order shown: `chat` session IDs; `workflow`
+ * runs (instance IDs) and node sessions (session IDs) mixed (WB-11): nothing here tells or checks which an ID is, the
+ * renderer does. Each ID at most once, at most PINNED_LIMIT per list; a list that breaks either is refused, never cut
+ * or merged. An ID that names nothing loaded is kept and skipped by the renderer (a session may load later): nothing
+ * checks that it exists.
+ */
+export const PinnedLists = z.strictObject({
+  chat: z.array(SessionId).max(PINNED_LIMIT).refine(listedOnce, ruleIssue('preferences.pinned-unique')),
+  workflow: z.array(z.union([InstanceId, SessionId])).max(PINNED_LIMIT).refine(listedOnce, ruleIssue('preferences.pinned-unique')),
+});
+export type PinnedLists = z.infer<typeof PinnedLists>;
+
 /**
  * Preferences saved before 0.7 have no `supervisor` and read with its defaults. `workFolderRoot` (T048, Q-1): where
  * new work folders are made, as the user wrote it; absent, the default location (`Snapshot.defaultWorkFolderRoot`).
+ * `pinned` (U2, 0.9): absent on preferences saved before 0.9 or never pinned, read as both lists empty (`pinnedOf`).
  * `preferences.set` replaces the whole record, so a sender keeps the fields it does not change.
  */
 export const UiPreferences = z.strictObject({
   theme: Theme.default('dark'),
   supervisor: SupervisorSettings.default({ idleCloseMinutes: 15, maxOpenRuntimes: 6 }),
   workFolderRoot: z.string().min(1).optional(),
+  pinned: PinnedLists.optional(),
 });
 export type UiPreferences = z.infer<typeof UiPreferences>;
+
+/** The pinned lists of saved preferences: both empty when none were saved. */
+export const pinnedOf = (preferences: UiPreferences): PinnedLists => preferences.pinned ?? { chat: [], workflow: [] };
 
 // Inferred types for schemas that are not typed next to their definition.
 export type TransferState = z.infer<typeof TransferState>;

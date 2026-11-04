@@ -57,7 +57,10 @@ export const Command = z.discriminatedUnion('type', [
   cmd('session.setModel', { sessionId: SessionId, expectedRevision: Revision, model: ModelSelection }),
   /** Rejected for workflow sessions (WB-02). `null` leaves an ordinary session without an Agent (T048). */
   cmd('session.setAgent', { sessionId: SessionId, expectedRevision: Revision, agentId: AgentId.nullable() }),
-  /** The title the user gives (T048); trimmed, 1 to SESSION_TITLE_MAX_LENGTH characters. The first message no longer renames it. */
+  /**
+   * The title the user gives (T048); trimmed, 1 to SESSION_TITLE_MAX_LENGTH characters. The first message no longer renames
+   * it. A repeat that finds the title already given changes nothing and succeeds (CR-2, 0.9).
+   */
   cmd('session.rename', { sessionId: SessionId, expectedRevision: Revision, title: z.string() }),
   cmd('session.reparent', { sessionId: SessionId, expectedRevision: Revision, parentId: SessionId.nullable() }),
   cmd('nativeTask.stop', { sessionId: SessionId, nativeTaskId: NativeTaskId }),
@@ -103,6 +106,12 @@ export const Command = z.discriminatedUnion('type', [
    * refused with `invalid_transition` while a merge is active or a delivery's outcome is unknown.
    */
   cmd('workflow.complete', { instanceId: InstanceId, expectedRevision: Revision }),
+  /**
+   * Renames a run (U2, 0.9): trimmed, 1 to SESSION_TITLE_MAX_LENGTH characters, as session.rename; in any state, ended
+   * runs too. A repeat that finds the title already given changes nothing and succeeds (CR-2). Only the run's title: its
+   * sessions and tasks keep theirs. Announced with `instance.updated`.
+   */
+  cmd('workflow.rename', { instanceId: InstanceId, expectedRevision: Revision, title: z.string() }),
   cmd('workflow.cancel', { instanceId: InstanceId, expectedRevision: Revision }),
   /** Retry removing a task's or a merge attempt's worktree recorded as `pending-cleanup` (SP-07). */
   cmd('task.retryCleanup', { instanceId: InstanceId, taskId: TaskId }),
