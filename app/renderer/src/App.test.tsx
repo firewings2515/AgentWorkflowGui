@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // T004 workbench behaviour, moved to the v0.4 shell by T051 (demo mode, fixture data). What only the old layout had
 // (top navigation, ＋ 新增 tab, the composer help) is gone; the rest is checked on the new panes and sidebar.
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App, APP_NAME, THEME_KEY } from './App';
 import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
@@ -83,7 +83,7 @@ describe('T004 workbench behaviour on the v0.4 shell', () => {
     expect(sidebar().getByRole('button', { name: '展開 規劃想法' }).getAttribute('aria-expanded')).toBe('false');
   });
 
-  it('isolates pane drafts and details and restores a closed pane (WB-07, WB-08)', () => {
+  it('isolates pane drafts and details and restores a closed pane (WB-07, WB-08)', async () => {
     render(<App />);
     fireEvent.change(draft(), { target: { value: '第一組草稿' } });
     details(); tab('Session 資訊');
@@ -98,6 +98,12 @@ describe('T004 workbench behaviour on the v0.4 shell', () => {
     expect(sidebar().getByRole('button', { name: '參考資料整理' })).toBeTruthy();
     split('參考資料整理');
     expect(draft('pane-2').value).toBe('第二組草稿');
+    // r1 P2: closing a side by keyboard leaves the focus in the remaining conversation, not on the page.
+    const close = pane('pane-2').getByRole('button', { name: '關閉分割畫面：參考資料整理' });
+    close.focus();
+    fireEvent.click(close);
+    await waitFor(() => expect(document.activeElement).toBe(draft()));
+    split('參考資料整理');
     expect(pane('pane-2').getByRole('tab', { name: '任務流程' }).getAttribute('aria-selected')).toBe('true');
     details();
     expect(pane().getByRole('tab', { name: 'Session 資訊' }).getAttribute('aria-selected')).toBe('true');

@@ -251,7 +251,7 @@ describe('T051 new chat: created on send (REVISION_V0_4 §3.4)', () => {
     await waitFor(() => expect(screen.queryByText(/第一句還沒送出/)).toBeNull());
   });
 
-  it('needs a successful Snapshot read and an explicit confirmation before sending again after a missing create, with fresh IDs', async () => {
+  it('needs a successful Snapshot read and an explicit confirmation before sending again after a missing create, with the same session ID (r1 P1-2)', async () => {
     fake.bridge.send.mockResolvedValue({ ok: false, requestId: null, code: 'storage_failed', message: '', retryable: true, mayHaveSideEffects: true });
     await setup('/new');
     fireEvent.change(newChatBox(), { target: { value: '要確認的第一句' } }); click('送出');
@@ -268,9 +268,90 @@ describe('T051 new chat: created on send (REVISION_V0_4 §3.4)', () => {
     fireEvent.click(await screen.findByRole('button', { name: confirm }));
     expect(send().disabled).toBe(false); expect(fake.bridge.send).toHaveBeenCalledTimes(1);
     expect(newChatBox().value).toBe('要確認的第一句');
+    // The folder, Agent and Model stay as sent: the resend repeats the same create.
+    expect(screen.getByRole('button', { name: 'Agent：無' })).toBeTruthy();
+    click('Agent：無');
+    expect(screen.getAllByRole<HTMLButtonElement>('menuitemradio').every(item => item.disabled)).toBe(true);
+    fireEvent.keyDown(document, { key: 'Escape' });
     click('送出'); await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(2));
     const [, second] = createCalls();
-    expect(second!.sessionId).not.toBe(first!.sessionId); expect(second!.requestId).not.toBe(first!.requestId);
+    expect(second!.sessionId).toBe(first!.sessionId); expect(second!.requestId).not.toBe(first!.requestId);
+    expect({ ...second, requestId: first!.requestId }).toEqual(first);
+  });
+
+  describe('r1 P1-2: a missing create sent again never makes two sessions', () => {
+    /** The service makes a session ID once (CR-2): a repeat gets already_exists. The first create can be held. */
+    function backend() {
+      const made = new Set<string>();
+      let release: (() => void) | undefined;
+      const sends: string[] = [];
+      const create = (command: Extract<Command, { type: 'session.create' }>): CommandResult => {
+        if (made.has(command.sessionId)) return { ok: false, requestId: command.requestId, code: 'already_exists', message: 'exists', retryable: false, mayHaveSideEffects: false };
+        made.add(command.sessionId);
+        const session = newSession(command, 1);
+        fake.data.snapshot = { ...fake.data.snapshot, seq: ++seq, sessions: [...fake.data.snapshot.sessions, session] };
+        fake.emit({ schemaVersion: CONTRACTS_VERSION, seq, event: { type: 'session.updated', session } });
+        return { ok: true, requestId: command.requestId, created: [] };
+      };
+      fake.bridge.send.mockImplementation(async input => {
+        const command = Command.parse(input);
+        if (command.type === 'session.create') {
+          if (createCalls().length === 1) return new Promise<CommandResult>(resolve => { release = () => resolve(create(command)); });
+          return create(command);
+        }
+        if (command.type === 'session.send') sends.push(command.text);
+        return { ok: true, requestId: command.requestId, created: [] };
+      });
+      return { made, sends, release: () => act(async () => { release?.(); await Promise.resolve(); }) };
+    }
+    async function timeOutThenConfirmMissing() {
+      await setup('/new');
+      fireEvent.change(newChatBox(), { target: { value: '只能送一次' } });
+      vi.useFakeTimers(); click('送出');
+      await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+      vi.useRealTimers();
+      await screen.findByText(/建立結果待核對/);
+      click('重新讀取資料並核對');
+      fireEvent.click(await screen.findByRole('button', { name: '我已確認沒有建立，可以重新送出' }));
+    }
+    const sessionsMade = () => rendererStore(fake.bridge).getSnapshot().snapshot!.sessions.filter(session => session.title === '新建對話');
+
+    it('held create → time-out → missing → send again → the held create completes: one session, the first message sent once', async () => {
+      const service = backend();
+      await timeOutThenConfirmMissing();
+      click('送出');
+      await screen.findByRole('heading', { name: '新建對話' });
+      await waitFor(() => expect(service.sends).toEqual(['只能送一次']));
+      await service.release();
+      await act(async () => { await rendererStore(fake.bridge).reconnect(); });
+      expect(service.made.size).toBe(1);
+      expect(sessionsMade()).toHaveLength(1);
+      expect(service.sends).toEqual(['只能送一次']);
+    });
+
+    it('the held create completes before the send again: already_exists opens that same session and sends the first message once', async () => {
+      const service = backend();
+      await timeOutThenConfirmMissing();
+      await service.release();
+      click('送出');
+      await screen.findByRole('heading', { name: '新建對話' });
+      await waitFor(() => expect(service.sends).toEqual(['只能送一次']));
+      expect(service.made.size).toBe(1);
+      expect(sessionsMade()).toHaveLength(1);
+      expect(screen.queryByText(/沒有建立對話/)).toBeNull();
+    });
+
+    it('giving up the attempt is the only way to new IDs', async () => {
+      backend();
+      await timeOutThenConfirmMissing();
+      const [first] = createCalls();
+      click('放棄這次建立，改用新的設定');
+      click('Agent：無'); fireEvent.click(screen.getByRole('menuitemradio', { name: fixtureSnapshot.agents[0]!.name }));
+      click('送出');
+      await waitFor(() => expect(createCalls()).toHaveLength(2));
+      expect(createCalls()[1]!.sessionId).not.toBe(first!.sessionId);
+      expect(createCalls()[1]).toMatchObject({ agentId: fixtureSnapshot.agents[0]!.id });
+    });
   });
 
   it.each(['unknown_outcome', 'storage_failed'] as const)('blocks a blind retry of %s after remount and opens only the generated session ID, unsent', async code => {
@@ -405,6 +486,66 @@ describe('T027 send in the v0.4 conversation', () => {
     fireEvent.click(screen.getByRole('menuitemradio', { name: same.displayName }));
     await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(2));
     expect(fake.bridge.send.mock.calls[1]![0]).toMatchObject({ type: 'session.setModel', sessionId: original.id, model: { runtime: same.runtime, model: same.model } });
+  });
+});
+
+describe('r1 P1-1: a whole-record preferences write keeps an accepted write whose event has not arrived', () => {
+  /** preferences.set is accepted at once; its preferences.updated events wait until released. */
+  function lateEvents() {
+    const held: AppEvent[] = [];
+    fake.bridge.send.mockImplementation(async input => {
+      await Promise.resolve();
+      const command = Command.parse(input);
+      if (command.type === 'preferences.set') held.push({ type: 'preferences.updated', preferences: command.preferences, at: original.updatedAt });
+      return { ok: true, requestId: command.requestId, created: [] };
+    });
+    return { release: () => act(() => { held.splice(0).forEach(event => fake.emit({ schemaVersion: CONTRACTS_VERSION, seq: ++seq, event })); }) };
+  }
+  const sent = () => fake.bridge.send.mock.calls.map(([input]) => Command.parse(input)).flatMap(command => command.type === 'preferences.set' ? [command.preferences] : []);
+  const pinMenu = (name: string) => { fireEvent.contextMenu(sidebar().getByRole('button', { name })); fireEvent.click(screen.getByRole('menuitem', { name: '釘選' })); };
+  const accepted = (count: number) => waitFor(() => expect(Object.values(rendererStore(fake.bridge).getSnapshot().commands).filter(item => item.command.type === 'preferences.set' && item.result?.ok)).toHaveLength(count));
+
+  it('two pins in a row: the second carries the first', async () => {
+    const events = lateEvents();
+    await setup();
+    pinMenu('參考資料整理');
+    await accepted(1);
+    pinMenu('規劃想法');
+    await accepted(2);
+    expect(sent()[1]!.pinned).toEqual({ chat: ['s-research', 's-plan-notes'], workflow: [] });
+    events.release();
+    expect(within(sidebar().getByRole('region', { name: '釘選' })).getAllByRole('button').map(button => button.textContent)).toEqual(expect.arrayContaining([expect.stringContaining('參考資料整理'), expect.stringContaining('規劃想法')]));
+    // Once the events are in, the Snapshot is the base again.
+    fireEvent.contextMenu(sidebar().getByRole('button', { name: /^規劃想法（轉交 Codex）/ })); fireEvent.click(screen.getByRole('menuitem', { name: '釘選' }));
+    await accepted(3);
+    expect(sent()[2]!.pinned).toEqual({ chat: ['s-research', 's-plan-notes', 's-handoff-codex'], workflow: [] });
+  });
+
+  it('a pin then the theme: the theme write keeps the pin', async () => {
+    const events = lateEvents();
+    await setup();
+    pinMenu('參考資料整理');
+    await accepted(1);
+    fireEvent.click(sidebar().getByRole('button', { name: '切換成淺色' }));
+    await accepted(2);
+    expect(sent()[1]).toMatchObject({ theme: 'light', pinned: { chat: ['s-research'], workflow: [] } });
+    events.release();
+    expect(rendererStore(fake.bridge).getSnapshot().snapshot!.preferences).toMatchObject({ theme: 'light', pinned: { chat: ['s-research'] } });
+  });
+
+  it('a pin then the default work folder: the folder write keeps the pin, and the pin write keeps the folder', async () => {
+    lateEvents();
+    await setup();
+    pinMenu('參考資料整理');
+    await accepted(1);
+    click('設定');
+    fireEvent.change(screen.getByRole('textbox', { name: '預設工作資料夾位置' }), { target: { value: 'D:\\agents' } });
+    click('儲存');
+    await accepted(2);
+    expect(sent()[1]).toMatchObject({ workFolderRoot: 'D:\\agents', pinned: { chat: ['s-research'], workflow: [] } });
+    pinMenu('規劃想法');
+    await accepted(3);
+    expect(sent()[2]).toMatchObject({ workFolderRoot: 'D:\\agents', pinned: { chat: ['s-research', 's-plan-notes'] } });
   });
 });
 

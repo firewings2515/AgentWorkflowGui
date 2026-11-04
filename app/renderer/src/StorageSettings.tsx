@@ -138,7 +138,7 @@ export function SupervisorSection({ store, demo }: { store: RendererStore; demo:
     {state.snapshot?.app.status === 'read-only' && <p>唯讀模式，設定無法儲存。</p>}
     <form onSubmit={event => {
       event.preventDefault(); if (disabled || !parsed.success) return;
-      const latest = store.getSnapshot().snapshot?.preferences;
+      const latest = store.preferences();
       if (!latest) return;
       void store.send({ type: 'preferences.set', requestId: RequestId.parse(crypto.randomUUID()), preferences: { ...latest, supervisor: parsed.data } }).then(result => setFeedback(result.ok ? '設定已接受。' : commandFeedback(result)));
     }}><label>閒置分鐘數（1～1440）<input type="number" min={1} max={1440} step={1} required value={idle} onChange={e => setIdle(e.target.value)} /></label>

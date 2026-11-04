@@ -28,13 +28,13 @@ export function NewChat({ snapshot, store, ipcState, agents, draft, onDraft, cho
   const agentMissing = !!choice.agentId && !agents.some(item => item.id === choice.agentId);
   const notReady = !!store && ipcState?.connection !== 'ready';
   const { attempt, result, unresolved } = flow;
-  const failed = result && !result.ok && !blocksResubmit(result) ? result : undefined;
+  const failed = result && !result.ok && !blocksResubmit(result) && !flow.accepted ? result : undefined;
   return <section className="v4-new-chat" aria-labelledby="v4-new-heading" data-workspace="new">
     <div className="v4-column">
       <h1 id="v4-new-heading" tabIndex={-1}>今天想做什麼？</h1>
       <Composer draft={draft} onDraft={onDraft} choice={choice} onChoice={onChoice} agents={agents} models={snapshot.modelOptions} autoFocus
         folders={{ recent, onPick: onPickFolder }} readOnly={readOnly} placeholder="輸入訊息，送出後才建立對話…" onNotice={onNotice}
-        inputDisabled={!!attempt && !result} choiceDisabled={flow.busy || notReady}
+        inputDisabled={!!attempt && !result} choiceDisabled={flow.busy || notReady || !!flow.retryOf}
         sendDisabled={flow.busy || notReady || !model || agentMissing || snapshot.app.status !== 'ready'} onSend={onSend}>
         {!model && <p role="status">尚無可用 Model，請到設定 → Runtime 重新偵測。</p>}
         {agentMissing && <p role="status" className="command-warning">選擇的 Agent 已移除，請重新選擇。</p>}
@@ -47,6 +47,10 @@ export function NewChat({ snapshot, store, ipcState, agents, draft, onDraft, cho
           {flow.found ? <button type="button" onClick={flow.openFound}>已找到建立的對話，開啟它</button>
             : <button type="button" disabled={ipcState?.connection === 'loading'} onClick={() => void flow.reconcile()}>重新讀取資料並核對</button>}
           {unresolved?.createCheck === 'missing' && <button type="button" disabled={ipcState?.connection !== 'ready'} onClick={flow.acknowledgeMissing}>我已確認沒有建立，可以重新送出</button>}
+        </div>}
+        {flow.retryOf && !flow.busy && <div role="status" className="v4-retry-note">
+          <p>再送一次會沿用同一個對話（同一個 ID）和原本的資料夾、Agent、Model；原本的請求如果晚到，也只會有一個對話。</p>
+          <button type="button" onClick={flow.abandon}>放棄這次建立，改用新的設定</button>
         </div>}
       </Composer>
       <RuntimeNotice runtimes={snapshot.runtimes} />
@@ -71,7 +75,7 @@ function WorkFolderSetting({ snapshot, store, demo }: { snapshot: Snapshot; stor
   const disabled = readOnly || snapshot.app.status !== 'ready' || store.getSnapshot().connection !== 'ready' || store.isBlocked('preferences.set', 'preferences');
   // preferences.set replaces the whole object: build it from the latest Snapshot at the moment of sending.
   const save = (value: string | undefined) => {
-    const latest = store.getSnapshot().snapshot?.preferences;
+    const latest = store.preferences();
     if (!latest || disabled) return;
     const rest = { ...latest };
     delete rest.workFolderRoot;

@@ -1,4 +1,4 @@
-import { Command, CommandResult, EventBatch, EventEnvelope, MERGEABLE_EVENT_TYPES, Snapshot } from '../../../contracts';
+import { Command, CommandResult, EventBatch, EventEnvelope, MERGEABLE_EVENT_TYPES, Snapshot, UiPreferences } from '../../../contracts';
 import type { AppEvent } from '../../../contracts';
 import type { AwgBridge } from '../../preload/bridge-types';
 import { blocksResubmit, unknownResult } from './command-feedback';
@@ -144,8 +144,14 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
   let invalidatedSeq = 0;
   let notificationPending = false;
   let notificationFrame: number | undefined;
+  // T051 r1 P1-1: preferences.set replaces the whole record. Its receipt can arrive before its preferences.updated
+  // event, so until the Snapshot shows the accepted record (or a read started after the receipt finishes), the next
+  // write must build on the accepted record, not on the Snapshot.
+  let acceptedPreferences: { preferences: UiPreferences; generation: number } | null = null;
+  const samePreferences = (a: UiPreferences, b: UiPreferences) => JSON.stringify(UiPreferences.parse(a)) === JSON.stringify(UiPreferences.parse(b));
   const publish = (next: RendererState, defer = false) => {
     if (next === state) return;
+    if (acceptedPreferences && next.snapshot && samePreferences(next.snapshot.preferences, acceptedPreferences.preferences)) acceptedPreferences = null;
     // These guards survive pane/route changes.
     for (const [key, activity] of Object.entries(next.blockedCommands)) {
       const { command, result } = activity;
@@ -270,6 +276,8 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
             commands: next.commands[command.requestId] ? { ...next.commands, [command.requestId]: checked } : next.commands };
         }
         buffer = null;
+        // A read started after a preferences receipt includes that write: the Snapshot is the newer record again.
+        if (acceptedPreferences && current > acceptedPreferences.generation) acceptedPreferences = null;
         publish(next);
         if (typeof read === 'number') bridge.report?.({ kind: 'adopted', read, seq: next.snapshot!.seq });
         return;
@@ -359,6 +367,8 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
       // Also protect late create receipts: a timed-out screen can already be
       // watching this command, so do not expose success before its fresh read.
       const creating = command.type === 'session.create' && receipt.ok;
+      if (command.type === 'preferences.set' && receipt.ok && !(state.snapshot && samePreferences(state.snapshot.preferences, command.preferences)))
+        acceptedPreferences = { preferences: command.preferences, generation };
       if (!creating) record(receipt);
       await refresh(receipt);
       if (creating) record(receipt);
@@ -387,6 +397,8 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
   };
   return {
     getSnapshot: () => state,
+    /** The preferences a whole-record write must start from: the last accepted write until the Snapshot shows it. */
+    preferences: (): UiPreferences | undefined => acceptedPreferences?.preferences ?? state.snapshot?.preferences,
     subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     start: () => state.connection === 'idle' ? reconnect() : loading ?? Promise.resolve(),
     reconnect, send, isBlocked, acknowledge, loadHistory,

@@ -137,8 +137,12 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const closePane = (paneId: string) => {
     const remaining = panes.panes.filter(pane => pane.id !== paneId);
     dispatch({ type: 'close', paneId });
-    if (remaining[0]) navigate(routePath('chat', (remaining.find(pane => pane.id === panes.active) ?? remaining[0]).sessionId), true);
-    else go('new');
+    const next = remaining.find(pane => pane.id === panes.active) ?? remaining[0];
+    if (next) {
+      navigate(routePath('chat', next.sessionId), true);
+      // The close button goes with its pane (r1 P2): keyboard focus moves to the remaining conversation's input.
+      requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-pane="${next.id}"] .v4-composer textarea`)?.focus());
+    } else go('new');
   };
 
   // A route changed outside the app (back／forward, a typed address) opens its session in the active pane.
@@ -254,8 +258,9 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
    */
   const togglePin = (id: string) => {
     const current = preferenceStore.getSnapshot().snapshot;
-    if (!current || pinBlocked) return;
-    const lists = pinnedOf(current.preferences);
+    const base = preferenceStore.preferences();
+    if (!current || !base || pinBlocked) return;
+    const lists = pinnedOf(base);
     const key = modeOf(current, id);
     const loaded = (item: string) => current.sessions.some(session => session.id === item) || (key === 'workflow' && current.instances.some(instance => instance.id === item));
     const kept = lists[key].filter(loaded);
@@ -265,7 +270,7 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
     if (kept.includes(target)) next = kept.filter(item => item !== target);
     else if (kept.length >= PINNED_LIMIT) { setNotice(`釘選已滿（${PINNED_LIMIT}），請先取消一些釘選。`); return; }
     else next = [...kept, target];
-    void preferenceStore.send({ type: 'preferences.set', requestId: newId(), preferences: { ...current.preferences, pinned: key === 'chat' ? { ...lists, chat: next as typeof lists.chat } : { ...lists, workflow: next } } }).then(result => {
+    void preferenceStore.send({ type: 'preferences.set', requestId: newId(), preferences: { ...base, pinned: key === 'chat' ? { ...lists, chat: next as typeof lists.chat } : { ...lists, workflow: next } } }).then(result => {
       if (!result.ok) setNotice(`釘選沒有儲存：${commandFeedback(result)}`);
     });
   };
@@ -285,7 +290,7 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   };
   const changeTheme = (next: Theme) => {
     if (themeDisabled || next === theme) return;
-    const latest = store?.getSnapshot().snapshot?.preferences;
+    const latest = store?.preferences();
     if (store && !readOnly) { if (latest) void store.send({ type: 'preferences.set', requestId: newId(), preferences: { ...latest, theme: next } }); }
     else setDemoTheme(next);
   };
@@ -305,10 +310,11 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
     : ipcState?.connection === 'error' ? '資料同步失敗，保留上次資料' : '正在同步資料…';
   const connection = <><span className="v4-dot" data-state={store ? ipcState?.connection : 'demo'} aria-hidden="true" /><span role="status">{connectionText}</span>
     {store && <button type="button" className="v4-icon" aria-label="重新讀取資料" title="重新讀取資料（F5）" disabled={ipcState?.connection === 'loading'} onClick={reload}>↻</button>}</>;
-  const pinnedLists = pinnedOf(snapshot.preferences);
-  const pinned = { chat: new Set<string>(pinnedLists.chat), workflow: new Set<string>(pinnedLists.workflow) };
   // The demo's own service stores preferences too, so pins work the same way there.
   const preferenceStore = store ?? serviceStore;
+  // An accepted pin shows at once, before its preferences event (r1 P1-1).
+  const pinnedLists = pinnedOf(preferenceStore.preferences() ?? snapshot.preferences);
+  const pinned = { chat: new Set<string>(pinnedLists.chat), workflow: new Set<string>(pinnedLists.workflow) };
   const pinBlocked = readOnly || commandDisabled || preferenceStore.isBlocked('preferences.set', 'preferences');
 
   let main;
