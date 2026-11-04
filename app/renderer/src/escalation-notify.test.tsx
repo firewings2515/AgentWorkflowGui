@@ -8,7 +8,7 @@ import type { Escalation, EventEnvelope, Snapshot } from '../../../contracts';
 import { fixtureReadOnlySnapshot, fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
 import { App } from './App';
 import {
-  type NotificationApi, type NotifierOptions, NOTIFY_BODY_LIMIT, NOTIFY_KEY, NOTIFY_TITLE, notificationBody, readNotifyEnabled, startEscalationNotifier, writeNotifyEnabled,
+  forgetUnsavedNotifySetting, type NotificationApi, type NotifierOptions, NOTIFY_BODY_LIMIT, NOTIFY_KEY, NOTIFY_TITLE, notificationBody, readNotifyEnabled, startEscalationNotifier, writeNotifyEnabled,
 } from './escalation-notify';
 import { fakeBridge } from './ipc-test-helpers';
 import { createRendererStore, rendererStore } from './renderer-store';
@@ -39,7 +39,7 @@ let focused: boolean;
 beforeEach(() => {
   FakeNotification.shown = []; FakeNotification.permission = 'granted'; FakeNotification.failing = false;
   focused = false; next = fixtureSnapshot.seq;
-  localStorage.clear();
+  localStorage.clear(); forgetUnsavedNotifySetting();
 });
 afterEach(() => { cleanup(); delete window.awg; vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -146,6 +146,30 @@ describe('T055 when a notification is shown', () => {
     expect(readNotifyEnabled()).toBe(true);
     vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
     expect(() => writeNotifyEnabled(false)).not.toThrow();
+  });
+
+  it('a choice that cannot be saved still decides (r1 P2-1): the old value is removed, and the choice holds in memory', () => {
+    localStorage.setItem(NOTIFY_KEY, 'off');
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+    writeNotifyEnabled(true);
+    expect(localStorage.getItem(NOTIFY_KEY)).toBeNull();
+    expect(readNotifyEnabled()).toBe(true);
+    writeNotifyEnabled(false);
+    expect(readNotifyEnabled()).toBe(false);
+    // Even when the old value cannot be removed either.
+    vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => { throw new Error('blocked'); });
+    expect(() => writeNotifyEnabled(true)).not.toThrow();
+    expect(readNotifyEnabled()).toBe(true);
+  });
+
+  it('a choice saved after one that could not be is read from the storage again', () => {
+    const failing = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+    writeNotifyEnabled(false);
+    failing.mockRestore();
+    writeNotifyEnabled(true);
+    expect(localStorage.getItem(NOTIFY_KEY)).toBe('on');
+    localStorage.setItem(NOTIFY_KEY, 'off');
+    expect(readNotifyEnabled()).toBe(false);
   });
 
   it('read-only data still notifies, and nothing is sent to the backend', async () => {
@@ -273,7 +297,7 @@ describe('T055 in the app', () => {
     await screen.findAllByText('IPC 已連線');
     return view;
   };
-  const emitInApp = (escalation: Escalation) => act(async () => { fake.emit(update(fixtureSnapshot.seq + 1, escalation)); await Promise.resolve(); });
+  const emitInApp = (escalation: Escalation) => act(async () => { fake.emit(update(seq(), escalation)); await Promise.resolve(); });
 
   it('a click opens the session and scrolls to the card of the escalation', async () => {
     await mount('/#/sessions/s-plan-notes');
@@ -329,6 +353,52 @@ describe('T055 in the app', () => {
     fireEvent.click(box());
     expect(localStorage.getItem(NOTIFY_KEY)).toBe('on');
     expect(fake.bridge.send).not.toHaveBeenCalled();
+  });
+
+  it('"off" saved earlier, then a storage that refuses: turning it on notifies, turning it off again does not (r1 P2-1)', async () => {
+    localStorage.setItem(NOTIFY_KEY, 'off');
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+    await mount('/#/settings');
+    const box = screen.getByRole<HTMLInputElement>('checkbox', { name: '有需要我處理的事時通知我' });
+    expect(box.checked).toBe(false);
+    fireEvent.click(box);
+    expect(box.checked).toBe(true);
+    await emitInApp(open('esc-on-again'));
+    expect(FakeNotification.shown.map(item => item.options.tag)).toEqual(['esc-on-again']);
+    fireEvent.click(box);
+    expect(box.checked).toBe(false);
+    await emitInApp(open('esc-off-again'));
+    expect(FakeNotification.shown).toHaveLength(1);
+  });
+
+  it('the search for the card is replaced by a newer click and ends when the shell goes away (r1 P2-2)', async () => {
+    const view = await mount('/#/sessions/s-plan-notes');
+    const frames = new Map<number, FrameRequestCallback>();
+    let id = 0;
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { frames.set(++id, callback); return id; });
+    vi.stubGlobal('cancelAnimationFrame', (handle: number) => { frames.delete(handle); });
+    const lookups = vi.spyOn(document, 'querySelectorAll');
+    const searches = () => lookups.mock.calls.filter(call => call[0] === '[data-escalation-id]').length;
+    const frame = () => { const due = [...frames.values()]; frames.clear(); act(() => due.forEach(callback => callback(0))); };
+    // Both escalations are decided before their notifications are clicked, so no card is ever found.
+    for (const name of ['esc-first', 'esc-second']) {
+      await emitInApp(open(name));
+      await emitInApp(resolved(open(name)));
+    }
+    await act(async () => { FakeNotification.shown[0]!.onclick?.(); await Promise.resolve(); });
+    frame();
+    expect(searches()).toBe(1);
+    frame();
+    expect(searches()).toBe(2);
+    await act(async () => { FakeNotification.shown[1]!.onclick?.(); await Promise.resolve(); });
+    const before = searches();
+    frame();
+    expect(searches()).toBe(before + 1);
+    view.unmount();
+    frame();
+    frame();
+    expect(searches()).toBe(before + 1);
+    expect(scrolled).toHaveLength(0);
   });
 
   it('with the setting off in the settings page, no notification is shown', async () => {

@@ -9,8 +9,12 @@ export const NOTIFY_KEY = 'awg.notify.v1';
 export const NOTIFY_TITLE = '需要你處理';
 export const NOTIFY_BODY_LIMIT = 100;
 
+// When saving fails, the last choice made on this page is kept here, so what the checkbox shows is what the notifier does.
+let unsaved: boolean | undefined;
+
 /** The setting is on unless the page saved an explicit "off"; a missing key, another value or a failing storage means on. */
 export function readNotifyEnabled(): boolean {
+  if (unsaved !== undefined) return unsaved;
   try {
     return localStorage.getItem(NOTIFY_KEY) !== 'off';
   } catch {
@@ -18,13 +22,23 @@ export function readNotifyEnabled(): boolean {
   }
 }
 
-/** Saves the setting. A storage that fails is ignored: the choice still holds for this page. */
+/**
+ * Saves the setting. If the storage refuses, the old value is removed (a stale "off" must not outlive a choice of "on") and
+ * the choice is kept in memory for this page; nothing throws.
+ */
 export function writeNotifyEnabled(enabled: boolean): void {
   try {
     localStorage.setItem(NOTIFY_KEY, enabled ? 'on' : 'off');
+    unsaved = undefined;
   } catch {
-    /* Not saved. */
+    unsaved = enabled;
+    try { localStorage.removeItem(NOTIFY_KEY); } catch { /* Still only in memory. */ }
   }
+}
+
+/** For tests: forgets a choice that could not be saved. */
+export function forgetUnsavedNotifySetting(): void {
+  unsaved = undefined;
 }
 
 // Line breaks and tabs become one space; every other control character and the bidi controls are dropped.

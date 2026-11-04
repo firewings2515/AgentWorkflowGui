@@ -1,6 +1,8 @@
 // T042 r1-P2-2: app/main/index.ts itself installs the guards. This starts index.ts against a fake Electron (as
 // index.runtimes.test.ts does), then hands it a web contents made after start, the way Electron's
 // `web-contents-created` does, and checks the guard is on it; and that the default session refuses permissions.
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { FOCUS_WINDOW_CHANNEL } from '../preload/channels';
 import { APP_USER_MODEL_ID } from './app-id';
@@ -105,9 +107,16 @@ describe('T042 index.ts installs the guards', () => {
   it('T055: the notifications exception is wired with the app’s own URL matcher', async () => {
     await import('./index');
     await vi.waitFor(() => expect(hoisted.permissionRequest).toBeDefined());
-    const cb = vi.fn();
-    hoisted.permissionRequest!(undefined, 'notifications', cb, { requestingUrl: 'https://example.com/', isMainFrame: true });
-    expect(cb).toHaveBeenCalledWith(false);
+    const app = pathToFileURL(join(__dirname, '../renderer/index.html')).href;
+    const page = { getURL: () => app };
+    const refused = vi.fn();
+    hoisted.permissionRequest!(page, 'notifications', refused, { requestingUrl: 'https://example.com/', isMainFrame: true });
+    expect(refused).toHaveBeenCalledWith(false);
+    const granted = vi.fn();
+    hoisted.permissionRequest!(page, 'notifications', granted, { requestingUrl: app, isMainFrame: true });
+    expect(granted).toHaveBeenCalledWith(true);
+    expect(hoisted.permissionCheck!(page, 'notifications', 'file:///', { requestingUrl: app, isMainFrame: true })).toBe(true);
+    expect(hoisted.permissionCheck!(page, 'notifications', 'file:///', { requestingUrl: app })).toBe(false);
   });
 
   it('T055: focusWindow acts on the app’s own window only and uses nothing the page sends', async () => {

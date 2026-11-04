@@ -175,16 +175,21 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
 
   // T055: a clicked notification opens the session that raised the escalation (an open pane is just selected) and scrolls to its card.
   const openEscalation = useRef<(sessionId: SessionId, escalationId: string) => void>(() => undefined);
+  const scrollFrame = useRef<number | undefined>(undefined);
   useEffect(() => { openEscalation.current = (sessionId, escalationId) => {
     open(sessionId);
+    // A newer click replaces the search of an older one; leaving the shell ends it (r1 P2-2).
+    if (scrollFrame.current !== undefined) cancelAnimationFrame(scrollFrame.current);
     let tries = 0;
     const scroll = () => {
+      scrollFrame.current = undefined;
       const card = Array.from(document.querySelectorAll<HTMLElement>('[data-escalation-id]')).find(item => item.dataset['escalationId'] === escalationId);
       if (card) card.scrollIntoView?.({ block: 'center' });
-      else if (++tries < 30) requestAnimationFrame(scroll);
+      else if (++tries < 30) scrollFrame.current = requestAnimationFrame(scroll);
     };
-    requestAnimationFrame(scroll);
+    scrollFrame.current = requestAnimationFrame(scroll);
   }; });
+  useEffect(() => () => { if (scrollFrame.current !== undefined) cancelAnimationFrame(scrollFrame.current); scrollFrame.current = undefined; }, []);
   useEscalationNotice(store, (sessionId, escalationId) => openEscalation.current(sessionId, escalationId));
 
   const reload = () => { if (store && ipcState?.connection !== 'loading') void store.reconnect(); };

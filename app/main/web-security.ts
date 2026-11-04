@@ -36,6 +36,11 @@ export function guardWebContents(contents: GuardedContents, isTrustedUrl: (url: 
   contents.on('will-attach-webview', (event) => event.preventDefault());
 }
 
+/** The part of `WebContents` the permission guard uses. */
+export interface PermissionContents {
+  getURL(): string;
+}
+
 /** What Electron tells a permission request or check about where it comes from (the part the guard uses). */
 export interface PermissionDetails {
   readonly requestingUrl?: string;
@@ -45,20 +50,39 @@ export interface PermissionDetails {
 /** The part of Electron's `Session` the guard uses. */
 export interface GuardedSession {
   setPermissionRequestHandler(
-    handler: (webContents: unknown, permission: string, callback: (granted: boolean) => void, details?: PermissionDetails) => void,
+    handler: (webContents: PermissionContents | null | undefined, permission: string, callback: (granted: boolean) => void, details?: PermissionDetails) => void,
   ): void;
-  setPermissionCheckHandler(handler: (webContents: unknown, permission: string, requestingOrigin?: string, details?: PermissionDetails) => boolean): void;
+  setPermissionCheckHandler(
+    handler: (webContents: PermissionContents | null | undefined, permission: string, requestingOrigin?: string, details?: PermissionDetails) => boolean,
+  ): void;
   on(event: 'will-download', listener: (event: NavigationEvent) => void): unknown;
+}
+
+/** An origin written for comparison: Electron may or may not end a `file://` origin with slashes, and Node gives it as "null". */
+function originKey(url: string): string | undefined {
+  if (!URL.canParse(url)) return undefined;
+  const parsed = new URL(url);
+  return parsed.protocol === 'file:' ? 'file:' : parsed.origin.replace(/\/+$/, '');
 }
 
 /**
  * The one permission the app grants (U3 Q-15, T055): system notifications for a new escalation that needs the user.
- * Only `notifications`, only to the main frame of the app's own page (`isTrustedUrl`); a request without those details,
- * from another URL or from a frame is refused like every other permission.
+ * Every piece of evidence has to be there and has to be ours, or the answer is no: only `notifications`; the web contents
+ * exists and shows the app's own page; the request comes from its main frame (`isMainFrame === true`, not merely "not
+ * false"); the requesting URL is the app's own page; and, in a check, the requesting origin is that page's origin.
+ * Anything missing (a field Electron did not send, a null contents) means a refusal, like every other permission.
  */
-function notificationsAllowed(permission: string, details: PermissionDetails | undefined, isTrustedUrl: (url: string) => boolean): boolean {
-  if (permission !== 'notifications' || details === undefined) return false;
-  return details.isMainFrame !== false && typeof details.requestingUrl === 'string' && isTrustedUrl(details.requestingUrl);
+function notificationsAllowed(
+  contents: PermissionContents | null | undefined, permission: string, details: PermissionDetails | undefined,
+  isTrustedUrl: (url: string) => boolean, origin?: { given: string | undefined },
+): boolean {
+  if (permission !== 'notifications' || !contents || !details) return false;
+  if (details.isMainFrame !== true || typeof details.requestingUrl !== 'string' || !isTrustedUrl(details.requestingUrl)) return false;
+  const shown = contents.getURL();
+  if (!isTrustedUrl(shown)) return false;
+  if (origin === undefined) return true;
+  const expected = originKey(details.requestingUrl);
+  return expected !== undefined && typeof origin.given === 'string' && originKey(origin.given) === expected && originKey(shown) === expected;
 }
 
 /**
@@ -67,7 +91,8 @@ function notificationsAllowed(permission: string, details: PermissionDetails | u
  * check is refused.
  */
 export function guardSession(session: GuardedSession, isTrustedUrl: (url: string) => boolean = () => false): void {
-  session.setPermissionRequestHandler((_webContents, permission, callback, details) => callback(notificationsAllowed(permission, details, isTrustedUrl)));
-  session.setPermissionCheckHandler((_webContents, permission, _requestingOrigin, details) => notificationsAllowed(permission, details, isTrustedUrl));
+  session.setPermissionRequestHandler((contents, permission, callback, details) => callback(notificationsAllowed(contents, permission, details, isTrustedUrl)));
+  session.setPermissionCheckHandler((contents, permission, requestingOrigin, details) =>
+    notificationsAllowed(contents, permission, details, isTrustedUrl, { given: requestingOrigin }));
   session.on('will-download', (event) => event.preventDefault());
 }
