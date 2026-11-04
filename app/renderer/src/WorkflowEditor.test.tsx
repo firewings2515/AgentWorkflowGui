@@ -422,11 +422,11 @@ describe('T019 Workflow editor', () => {
     selectNode('實作');
     selectNode('範本設定');
     expect(document.activeElement).toBe(textField('範本名稱'));
-    fireEvent.click(screen.getByRole('link', { name: '工作台' }));
-    fireEvent.click(screen.getByRole('link', { name: 'Workflow 編輯器' }));
+    fireEvent.click(screen.getByRole('button', { name: '設定' }));
+    fireEvent.click(screen.getByRole('button', { name: '模板' }));
     expect(textField('範本名稱').value).toBe('跨頁草稿');
     expect(document.activeElement).toBe(screen.getByRole('heading', { name: '跨頁草稿' }));
-    fireEvent.change(screen.getByRole('combobox', { name: '外觀主題' }), { target: { value: 'light' } });
+    fireEvent.click(screen.getByRole('button', { name: '切換成淺色' }));
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe('light'));
     view.unmount();
     const missing = render(<Harness repository={createWorkflowRepository([template])} initialId="missing" />);

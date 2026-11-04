@@ -1,4 +1,4 @@
-import { Command, CommandResult, EventBatch, EventEnvelope, MERGEABLE_EVENT_TYPES, Snapshot } from '../../../contracts';
+import { Command, CommandResult, EventBatch, EventEnvelope, MERGEABLE_EVENT_TYPES, Snapshot, UiPreferences } from '../../../contracts';
 import type { AppEvent } from '../../../contracts';
 import type { AwgBridge } from '../../preload/bridge-types';
 import { blocksResubmit, unknownResult } from './command-feedback';
@@ -16,6 +16,8 @@ export interface CommandActivity {
 }
 export const COMMAND_HISTORY_LIMIT = 50;
 export const INTERRUPT_WAIT_MS = 10000;
+/** How long an accepted preferences.set may wait for its own preferences.updated before the store reads the Snapshot. */
+export const PREFERENCES_EVENT_WAIT_MS = 5000;
 export interface RendererState {
   snapshot: Snapshot | null;
   connection: 'idle' | 'loading' | 'ready' | 'error';
@@ -144,6 +146,30 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
   let invalidatedSeq = 0;
   let notificationPending = false;
   let notificationFrame: number | undefined;
+  // T051 r1 P1-1 / r2: preferences.set replaces the whole record, so every write is built from the Snapshot, and a write
+  // is only allowed once the Snapshot shows the previous one. `preferencesWrite` is the one write in progress (its
+  // request ID is its write ID): from sending until its own preferences.updated is applied (checked event by event, also
+  // inside a batch), or until a read that started after its receipt has finished. Only this write's own receipt
+  // changes it; a late receipt of an earlier write is ignored. A failed or uncertain write ends it here; the blocked
+  // command (uncertain) keeps writes stopped until the user has checked, as before.
+  let preferencesWrite: { id: string; preferences: UiPreferences; seen: boolean; receivedIn?: number } | null = null;
+  let preferencesTimer: ReturnType<typeof setTimeout> | undefined;
+  // r3: an uncertain preferences.set (time-out, possible side effects) is released only after a Snapshot read that
+  // started after its result: request ID -> the read generation at that result. `lastRead` is the latest finished read.
+  const uncertainPreferences = new Map<string, number>();
+  let lastRead = 0;
+  const samePreferences = (a: UiPreferences, b: UiPreferences) => JSON.stringify(UiPreferences.parse(a)) === JSON.stringify(UiPreferences.parse(b));
+  const endPreferencesWrite = () => { preferencesWrite = null; clearTimeout(preferencesTimer); preferencesTimer = undefined; };
+  /** Called for each event that was actually applied (not skipped as old). */
+  const observe = (event: AppEvent) => {
+    if (event.type !== 'preferences.updated' || !preferencesWrite || !samePreferences(event.preferences, preferencesWrite.preferences)) return;
+    if (preferencesWrite.receivedIn === undefined) preferencesWrite.seen = true; else endPreferencesWrite();
+  };
+  const applyObserved = (current: RendererState, envelope: EventEnvelope) => {
+    const next = applyEnvelope(current, envelope);
+    if (next !== current) observe(envelope.event);
+    return next;
+  };
   const publish = (next: RendererState, defer = false) => {
     if (next === state) return;
     // These guards survive pane/route changes.
@@ -176,7 +202,7 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
   const lastSeq = (delivery: Delivery) => 'toSeq' in delivery ? delivery.toSeq : delivery.seq;
   const firstSeq = (delivery: Delivery) => 'fromSeq' in delivery ? delivery.fromSeq : delivery.seq;
   const applyDelivery = (next: RendererState, delivery: Delivery) => {
-    if (!('envelopes' in delivery)) return applyEnvelope(next, delivery);
+    if (!('envelopes' in delivery)) return applyObserved(next, delivery);
     // Only adjacent deltas of exactly the same target can merge. Every barrier stays in order.
     const envelopes: EventEnvelope[] = [];
     for (const envelope of delivery.envelopes) {
@@ -189,7 +215,7 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
         envelopes[envelopes.length - 1] = { ...envelope, event: { ...b, delta: a.delta + b.delta } };
       } else envelopes.push(envelope);
     }
-    return envelopes.reduce(applyEnvelope, next);
+    return envelopes.reduce(applyObserved, next);
   };
   const receiveBatch = (batch: EventBatch) => {
     const parsed = EventBatch.safeParse(batch);
@@ -221,7 +247,7 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
     else if (state.snapshot && parsed.data.seq > state.snapshot.seq + 1) {
       void reconnect();
       buffer = [parsed.data];
-    } else publish(applyEnvelope(state, parsed.data), isDelta(parsed.data.event));
+    } else publish(applyObserved(state, parsed.data), isDelta(parsed.data.event));
   };
   // Subscribe before querying: events during snapshot() are buffered then filtered by its seq.
   const reconnect = (): Promise<void> => {
@@ -270,6 +296,9 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
             commands: next.commands[command.requestId] ? { ...next.commands, [command.requestId]: checked } : next.commands };
         }
         buffer = null;
+        lastRead = Math.max(lastRead, current);
+        // A read started after the receipt of the write in progress includes that write.
+        if (preferencesWrite?.receivedIn !== undefined && current > preferencesWrite.receivedIn) endPreferencesWrite();
         publish(next);
         if (typeof read === 'number') bridge.report?.({ kind: 'adopted', read, seq: next.snapshot!.seq });
         return;
@@ -280,7 +309,15 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
     return loading;
   };
   const readOnlyBlocks = (type: Command['type']) => state.snapshot?.app.status === 'read-only' && type !== 'backup.restore' && type !== 'backup.cancelRestore';
-  const isBlocked = (type: Command['type'], target: string) => readOnlyBlocks(type) || !!state.blockedCommands[blockKey(type, target)];
+  const isBlocked = (type: Command['type'], target: string) => readOnlyBlocks(type) || !!state.blockedCommands[blockKey(type, target)]
+    || (type === 'preferences.set' && !!preferencesWrite);
+  /** An uncertain whole-record preferences write is checked against a read that started after its result (r3). */
+  const needsReadBeforeAcknowledge = (type: Command['type'], target: string) => {
+    const activity = state.blockedCommands[blockKey(type, target)];
+    if (activity?.command.type !== 'preferences.set') return false;
+    const since = uncertainPreferences.get(activity.command.requestId);
+    return since !== undefined && !(state.connection === 'ready' && lastRead > since);
+  };
   const acknowledge = (type: Command['type'], target: string) => {
     const key = blockKey(type, target);
     const activity = state.blockedCommands[key];
@@ -290,6 +327,8 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
     if (activity.command.type === 'session.interrupt' && activity.result.ok) return;
     const command = activity.command;
     if (command.type === 'session.create' && (state.connection !== 'ready' || !activity.createCheck)) return;
+    if (needsReadBeforeAcknowledge(type, target)) return;
+    uncertainPreferences.delete(command.requestId);
     const id = activity.command.requestId;
     publish({ ...state, blockedCommands: without(state.blockedCommands, key),
       commands: state.commands[id] ? { ...state.commands, [id]: { ...state.commands[id], reviewed: true } } : state.commands });
@@ -333,6 +372,8 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
       const result: CommandResult = { ok: false, requestId: command.requestId, code: 'runtime_unavailable', message: '尚未完成資料同步，未送出指令。', retryable: true, mayHaveSideEffects: false };
       record(result); return result;
     }
+    // From here the command goes to the service (the early refusals above never start a preferences write).
+    if (command.type === 'preferences.set') { endPreferencesWrite(); preferencesWrite = { id: command.requestId, preferences: command.preferences, seen: false }; }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const validate = (value: CommandResult): CommandResult => {
       const parsed = CommandResult.safeParse(value);
@@ -359,6 +400,23 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
       // Also protect late create receipts: a timed-out screen can already be
       // watching this command, so do not expose success before its fresh read.
       const creating = command.type === 'session.create' && receipt.ok;
+      // r3: a receipt of a preferences write that has already ended (timed out, uncertain, replaced) is ignored with
+      // everything it would change, the blocked state included: only checking the result against a read releases it.
+      // (Other commands carry a revision or a create ID, so their late receipts may still settle a time-out, T027.)
+      if (command.type === 'preferences.set' && preferencesWrite?.id !== command.requestId) return;
+      if (command.type === 'preferences.set' && !receipt.ok && blocksResubmit(receipt)) uncertainPreferences.set(command.requestId, generation);
+      // Only the write in progress reacts to its own receipt.
+      if (command.type === 'preferences.set' && preferencesWrite?.id === command.requestId) {
+        if (receipt.ok && !preferencesWrite.seen && !(state.snapshot && samePreferences(state.snapshot.preferences, command.preferences))) {
+          preferencesWrite.receivedIn = generation;
+          const id = command.requestId;
+          // No own event in time: read the Snapshot (never resend); a read started now ends the wait when it finishes.
+          preferencesTimer = setTimeout(() => { void (async () => {
+            await loading;
+            if (preferencesWrite?.id === id) await reconnect();
+          })(); }, PREFERENCES_EVENT_WAIT_MS);
+        } else endPreferencesWrite();
+      }
       if (!creating) record(receipt);
       await refresh(receipt);
       if (creating) record(receipt);
@@ -387,12 +445,17 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
   };
   return {
     getSnapshot: () => state,
+    /** A preferences.set is on its way or not yet shown by the Snapshot: preferences writes wait. */
+    savingPreferences: () => !!preferencesWrite,
+    needsReadBeforeAcknowledge,
     subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     start: () => state.connection === 'idle' ? reconnect() : loading ?? Promise.resolve(),
     reconnect, send, isBlocked, acknowledge, loadHistory,
     query: (request: Parameters<typeof queryBridge>[1]) => queryBridge(bridge, request, timeoutMs),
     dispose: () => {
       interruptTimers.forEach(clearTimeout); interruptTimers.clear();
+      // The store outlives a remount: an in-flight or uncertain preferences write keeps its state; only the timer goes.
+      clearTimeout(preferencesTimer); preferencesTimer = undefined;
       generation++; unsubscribe?.(); unsubscribe = undefined; loading = undefined; buffer = null;
       notificationPending = false;
       publish({ ...state, connection: 'idle' });

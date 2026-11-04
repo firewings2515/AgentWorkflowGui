@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { LogicalSession, SessionId, Snapshot, WorkflowInstance } from '../../../../contracts';
 import { statusLabel } from '../ui';
+import { readOnlyProps } from '../read-only';
 import type { Theme } from '../theme';
 import { byRecent } from './demo-data';
 import type { SidebarMode, V4Page } from './demo-data';
@@ -15,11 +16,11 @@ type Section = 'pinned' | 'list';
 
 const modeLabels: Record<SidebarMode, string> = { chat: '對話', workflow: 'Workflow' };
 
-/** A run's state in the list. U2: contracts have no failed run; `blocked` is shown as 失敗 for now (T047-report.md §5). */
+/** A run's state in the list (U2_PLAN §2, Q-12): an open escalation is 等待核准; `blocked` is 卡住, in red. */
 export function runStatus(snapshot: Snapshot, instance: WorkflowInstance) {
   const pending = snapshot.escalations.filter(item => item.state === 'open' && item.instanceId === instance.id).length;
   const state = instance.state === 'running' && pending ? 'waiting' : instance.state;
-  const label = { running: '執行中', waiting: '等待核准', completed: '完成', blocked: '失敗', cancelled: '已取消' }[state];
+  const label = { running: '執行中', waiting: '等待核准', completed: '完成', blocked: '卡住', cancelled: '已取消' }[state];
   return { state, label, pending };
 }
 
@@ -32,6 +33,16 @@ export interface SidebarProps {
   onMode: (mode: SidebarMode) => void; onCollapse: (collapsed: boolean) => void; onNewChat: () => void; onStartWorkflow: () => void;
   onOpen: (id: SessionId) => void; onSplit: (id: SessionId) => void; onPin: (id: string) => void; onRename: (id: SessionId) => void;
   onRenameRun: (id: string, title: string) => void; onPage: (page: V4Page) => void; onTheme: (theme: Theme) => void;
+  /** Read-only data (T040): pinning and renaming are shown but disabled, with the reason. */
+  readOnly: boolean;
+  /** Pinning cannot be saved now (read-only, not synchronised, or a preferences change in flight). */
+  pinBlocked: boolean;
+  /** Why pinning is disabled, shown on the menu item (read-only, saving, not synchronised). */
+  pinReason?: string | undefined;
+  /** Why the theme cannot change now; undefined when it can. */
+  themeReason?: string | undefined;
+  /** The connection line at the bottom: the IPC state, or the demo note. */
+  connection: ReactNode;
 }
 
 export function Sidebar(props: SidebarProps) {
@@ -43,6 +54,7 @@ export function Sidebar(props: SidebarProps) {
   const [renaming, setRenaming] = useState('');
   const nav = useRef<HTMLElement>(null);
   const pinned = props.pinned[mode];
+  const readOnly = props.readOnly ? { title: readOnlyProps(true).title } : {};
   const title = (session: LogicalSession) => titles[session.id] ?? session.title;
   const runTitle = (instance: WorkflowInstance) => titles[instance.id] ?? instance.title;
   const chatSelected = props.page === 'chat' ? selectedId : undefined;
@@ -71,7 +83,7 @@ export function Sidebar(props: SidebarProps) {
         {row.children.length > 0 ? <button type="button" className="v4-row-toggle" aria-label={`${expanded ? '收合' : '展開'} ${row.label}`} aria-expanded={expanded}
           onClick={() => setOpenRows(previous => ({ ...previous, [row.key]: !expanded }))}>{expanded ? '▾' : '▸'}</button> : <span className="v4-row-spacer" />}
         {renaming === row.key ? <input className="v4-rename" aria-label="執行名稱" defaultValue={row.label} ref={input => { input?.focus(); input?.select(); }}
-          onBlur={event => { props.onRenameRun(row.key, event.currentTarget.value.trim() || row.label); setRenaming(''); }}
+          onBlur={event => { const value = event.currentTarget.value.trim(); if (value && value !== row.label) props.onRenameRun(row.key, value); setRenaming(''); }}
           onKeyDown={event => {
             if (event.key === 'Enter') event.currentTarget.blur();
             else if (event.key === 'Escape') { event.stopPropagation(); event.currentTarget.value = row.label; event.currentTarget.blur(); }
@@ -102,7 +114,7 @@ export function Sidebar(props: SidebarProps) {
     const nodes = runSessions(instance).filter(session => session.id !== instance.rootSessionId && !pinned.has(session.id));
     return listRow({
       key: instance.id, data: { 'data-run-id': instance.id, className: 'v4-run' }, label: runTitle(instance), tooltip: `${runTitle(instance)} · ${status.label}`,
-      dot: status.state, pending: status.pending, extra: <span className="v4-run-state">{status.label}</span>,
+      dot: status.state, pending: status.pending, extra: <span className="v4-run-state" data-state={status.state}>{status.label}</span>,
       selected: chatSelected === instance.rootSessionId, current: selectedRun === instance.id, defaultOpen: selectedRun === instance.id, menu: 'run',
       children: tree(nodes),
       onOpen: () => props.onOpen(instance.rootSessionId),
@@ -184,8 +196,8 @@ export function Sidebar(props: SidebarProps) {
     </nav>
     <div className="v4-sidebar-foot">
       <button type="button" className="v4-foot-link" aria-current={props.page === 'settings' ? 'page' : undefined} onClick={() => props.onPage('settings')}><span aria-hidden="true">⚙</span> 設定</button>
-      <div className="v4-connection"><span className="v4-dot" aria-hidden="true" /> 示意模式 · 未連接 runtime
-        <button type="button" className="v4-icon v4-theme" aria-label={props.theme === 'dark' ? '切換成淺色' : '切換成深色'} title="切換外觀" onClick={() => props.onTheme(props.theme === 'dark' ? 'light' : 'dark')}>{props.theme === 'dark' ? '☾' : '☀'}</button></div>
+      <div className="v4-connection">{props.connection}
+        <button type="button" className="v4-icon v4-theme" aria-label={props.theme === 'dark' ? '切換成淺色' : '切換成深色'} title={props.themeReason ?? '切換外觀'} disabled={!!props.themeReason} onClick={() => props.onTheme(props.theme === 'dark' ? 'light' : 'dark')}>{props.theme === 'dark' ? '☾' : '☀'}</button></div>
     </div>
     {menu && menuOpenId && <MenuList label={`${menuTitle} 的選單`} className="v4-context-menu"
       style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 180) }}
@@ -193,8 +205,8 @@ export function Sidebar(props: SidebarProps) {
       items={[
         { label: '開啟', onSelect: () => props.onOpen(menuOpenId) },
         { label: '在分割畫面開啟', disabled: menuOpenId === selectedId, onSelect: () => props.onSplit(menuOpenId) },
-        { label: props.pinned[modeOf(snapshot, menu.id)].has(menu.id) ? '取消釘選' : '釘選', onSelect: () => props.onPin(menu.id) },
-        { label: '重新命名', onSelect: () => { if (menuRun) setRenaming(menuRun.id); else props.onRename(menuOpenId); } },
+        { label: props.pinned[modeOf(snapshot, menu.id)].has(menu.id) ? '取消釘選' : '釘選', disabled: props.pinBlocked, title: props.pinBlocked ? props.pinReason : undefined, onSelect: () => props.onPin(menu.id) },
+        { label: '重新命名', disabled: props.readOnly, ...readOnly, onSelect: () => { if (menuRun) setRenaming(menuRun.id); else props.onRename(menuOpenId); } },
       ]} />}
   </aside>;
 }

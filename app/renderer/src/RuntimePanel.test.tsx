@@ -11,7 +11,6 @@ import type { RendererStore } from './renderer-store';
 import { fakeBridge } from './ipc-test-helpers';
 import { RuntimeNotice } from './RuntimeNotice';
 import { RuntimePanel } from './RuntimePanel';
-import { SessionCreate } from './SessionCreate';
 
 const stores: RendererStore[] = [];
 afterEach(() => { cleanup(); stores.forEach(store => store.dispose()); stores.length = 0; });
@@ -108,24 +107,19 @@ describe('T045 the dropdown notice', () => {
     expect(container.textContent).toBe('');
   });
 
-  it('shows next to the Model dropdown of the new-session form', async () => {
-    const fake = fakeBridge(fixtureSnapshot);
-    const store = createRendererStore(fake.bridge, 15000);
-    stores.push(store);
-    await store.start();
-    function Form() {
-      const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
-      return <SessionCreate snapshot={state.snapshot!} store={store} ipcState={state} onOpen={() => undefined} draft={{ agentId: '', modelKey: '', cwd: '', parentId: '' }} onDraft={() => undefined} />;
-    }
-    render(<Form />);
+  it('shows under the new chat input, next to its Model menu (T051: was the new-session form)', () => {
+    window.location.hash = '#/new';
+    render(<App snapshot={fixtureSnapshot} />);
     expect(screen.getByRole('list', { name: '無法使用的 Runtime' }).textContent).toContain('Codex');
+    window.location.hash = '';
   });
 });
 
 describe('T045 settings page', () => {
-  it('is reachable from the navigation and shows the Runtime section', () => {
-    window.location.hash = '#/settings';
+  it('is reachable from the sidebar and shows the Runtime section', () => {
+    window.location.hash = '#/new';
     render(<App snapshot={fixtureSnapshot} />);
+    fireEvent.click(screen.getByRole('button', { name: '設定' }));
     expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('設定');
     expect(screen.getByRole('heading', { name: 'Runtime', level: 2 })).toBeTruthy();
     expect(card('Claude Code')).toBeTruthy();

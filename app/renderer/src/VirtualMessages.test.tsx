@@ -6,7 +6,7 @@ import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
 import { longConversation } from '../../../contracts/fixtures/long-conversation';
 import { VirtualMessages } from './VirtualMessages';
 import { transcriptGeometry } from './transcript-test-geometry';
-import type { TranscriptPosition } from './workbench-state';
+import type { TranscriptPosition } from './shell-v4/pane-state';
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -162,5 +162,21 @@ describe('T041 variable-height window', () => {
     geometry.height = 160;
     act(() => resize(scroll.current!));
     expect(view.container.querySelectorAll('[data-message-id]').length).toBeLessThan(20);
+  });
+  it('T051: keeps following when the browser clamps scrollTop because the content got shorter', () => {
+    const { geometry } = transcriptGeometry();
+    const messages = longConversation({ turns: 30 }).messages;
+    const scroll = createRef<HTMLDivElement>();
+    const view = render(<div data-test-scroll ref={scroll}><VirtualMessages scroll={scroll} messages={messages} sessions={fixtureSnapshot.sessions} runtime="claude" visible /></div>);
+    const element = scroll.current!;
+    const bottom = () => element.scrollHeight - element.clientHeight;
+    expect(element.scrollTop).toBe(bottom());
+    // Measured rows came out shorter than estimated: the browser moves scrollTop up to the new bottom.
+    geometry.tail = -200;
+    fireEvent.scroll(element, { target: { scrollTop: bottom() } });
+    expect(view.queryByRole('button', { name: '跳到最新' })).toBeNull();
+    // Scrolling up for real still stops following.
+    fireEvent.scroll(element, { target: { scrollTop: bottom() - 300 } });
+    expect(view.getByRole('button', { name: '跳到最新' })).toBeTruthy();
   });
 });

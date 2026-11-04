@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest';
 import css from './styles.css?raw';
+// T051: the v0.4 shell's own stylesheet carries the conversation layout now.
+import v4css from './shell-v4/styles.css?raw';
 
 // Inspect declarations, not geometry: jsdom does not perform browser layout.
 function parseRules(source: string) {
@@ -40,8 +42,8 @@ function mediaViolations(rules: CSSRule[], inMedia = false): string[] {
     }
     if (!inMedia || rule.type !== CSSRule.STYLE_RULE) return [];
     const styleRule = rule as CSSStyleRule;
-    // Include qualified/combined selectors, but not .transcript-heading.
-    if (!/\.transcript(?![\w-])/.test(styleRule.selectorText)) return [];
+    // Include qualified/combined selectors (old and v0.4 transcripts), but not .transcript-heading or .v4-transcript-frame.
+    if (!/\.(v4-)?transcript(?![\w-])/.test(styleRule.selectorText)) return [];
     return ([
       ['min-height', '0'],
       ['overflow', 'auto'],
@@ -86,6 +88,7 @@ function mediaConflicts(rules: CSSRule[]) {
 
 describe('layout stylesheet declarations', () => {
   const rules = parseRules(css);
+  const v4 = parseRules(v4css);
 
   it('keeps dependency labels readable and reserves space for three rows', () => {
     expect(baseValue(rules, '.dependency-canvas', 'height')).toBe('360px');
@@ -95,24 +98,43 @@ describe('layout stylesheet declarations', () => {
     expect(baseValue(rules, '.dependency-canvas .task-dependency-node', 'overflow-wrap')).toBe('anywhere');
   });
 
+  // T051: the height chain of the v0.4 shell; every box down to the transcript must be able to shrink.
   it.each([
-    ['.workbench', 'grid-template-rows', 'minmax(0, 1fr)'],
-    ['.workspace-grid', 'grid-template-rows', 'minmax(0, 1fr)'],
-    ['.workspace-body', 'grid-template-rows', 'minmax(0, 1fr)'],
-    ['.page-content', 'min-height', '0'],
-    ['.workspace-grid', 'min-height', '0'],
-    ['.workspace', 'min-height', '0'],
-    ['.workspace-body', 'min-height', '0'],
-    ['.chat-panel', 'min-height', '0'],
-    ['.chat-panel', 'overflow', 'auto'],
-    ['.transcript-frame', 'min-height', '160px'],
-    ['.transcript-frame', 'flex', '1 0 160px'],
-    ['.transcript', 'min-height', '0'],
-    ['.transcript', 'overflow', 'auto'],
-    ['.pending-panel-scroll', 'max-height', 'min(240px, 32vh)'],
-    ['.pending-panel-scroll', 'overflow', 'auto'],
-    ['.composer', 'flex-shrink', '0'],
-    ['.app-shell', 'position', 'relative'],
+    ['.v4-shell', 'height', '100dvh'],
+    ['.v4-shell', 'overflow', 'hidden'],
+    ['.v4-main', 'min-height', '0'],
+    ['.v4-panes', 'min-height', '0'],
+    ['.v4-panes', 'grid-template-columns', 'minmax(0, 1fr)'],
+    ['.v4-pane', 'min-height', '0'],
+    ['.v4-pane-main', 'min-height', '0'],
+    ['.v4-transcript-frame', 'min-height', '0'],
+    ['.v4-transcript-frame', 'position', 'relative'],
+    ['.v4-transcript', 'min-height', '0'],
+    ['.v4-transcript', 'overflow', 'auto'],
+    ['.v4-transcript', 'overflow-anchor', 'none'],
+    ['.v4-composer-dock', 'flex-shrink', '0'],
+    ['.v4-details', 'min-height', '0'],
+    ['.v4-sections', 'min-height', '0'],
+    ['.v4-sections', 'overflow', 'auto'],
+  ])('v0.4 %s retains %s: %s in base rules', (selector, property, expected) => {
+    expect(baseValue(v4, selector, property)).toBe(expected);
+  });
+
+  it('the v0.4 transcript keeps shrinking and scrolling in every media query, without conflicts', () => {
+    expect(mediaViolations(v4)).toEqual([]);
+    expect(mediaConflicts(v4)).toEqual([]);
+  });
+
+  it('compacts the v0.4 composer for 768px height (T034) and stacks a split below 900px', () => {
+    const media = v4.filter((rule): rule is CSSMediaRule => rule.type === CSSRule.MEDIA_RULE);
+    const compact = media.find(rule => rule.conditionText === '(max-height: 800px)')!;
+    expect(baseValue(Array.from(compact.cssRules), '.v4-composer textarea', 'min-height')).toBe('40px');
+    const narrow = media.find(rule => rule.conditionText === '(max-width: 900px)')!;
+    expect(baseValue(Array.from(narrow.cssRules), '.v4-split', 'grid-template-columns')).toBe('minmax(0, 1fr)');
+    expect(baseValue(Array.from(narrow.cssRules), '.v4-split .v4-pane:not(.v4-pane-active)', 'display')).toBe('none');
+  });
+
+  it.each([
     ['.agent-form-actions', 'position', 'sticky'],
     ['.agent-form-actions', 'bottom', '0px'],
     ['.agent-form-actions', 'background', 'var(--panel)'],
@@ -126,11 +148,8 @@ describe('layout stylesheet declarations', () => {
     expect(mediaViolations(rules)).toEqual([]);
   });
 
-  it('compacts the composer for 768px height and stacks progress logs at 1024px width', () => {
+  it('stacks progress logs at 1024px width', () => {
     const media = rules.filter((rule): rule is CSSMediaRule => rule.type === CSSRule.MEDIA_RULE);
-    const compact = media.find(rule => rule.conditionText === '(max-height: 800px)')!;
-    expect(baseValue(Array.from(compact.cssRules), '.composer textarea', 'min-height')).toBe('44px');
-    expect(baseValue(Array.from(compact.cssRules), '.composer', 'padding')).toBe('8px 12px');
     const progress = media.find(rule => rule.conditionText === '(max-width: 1100px)')!;
     expect(baseValue(Array.from(progress.cssRules), '.progress-layout', 'grid-template-columns')).toBe('minmax(0, 1fr)');
     expect(baseValue(Array.from(progress.cssRules), '.progress-logs', 'max-height')).toBe('none');

@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+// T051: the same measurement on the v0.4 conversation pane (the old workbench is gone); compare with T051-perf-before.txt.
 import { act, cleanup, fireEvent, render } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import { App } from './App';
@@ -8,12 +9,12 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 it('records 2000-turn renderer event-to-React-commit baseline (jsdom, no layout or paint)', async () => {
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
-  window.history.replaceState(null, '', '/#/workbench');
+  window.history.replaceState(null, '', `/#/sessions/${performanceSnapshot().sessions[0]!.id}`);
   const data = performanceSnapshot();
   const view = render(<App snapshot={data} />);
   await act(async () => { await Promise.resolve(); });
-  const transcript = view.container.querySelector<HTMLDivElement>('.transcript')!;
-  const textarea = view.container.querySelector<HTMLTextAreaElement>('.composer textarea')!;
+  const transcript = view.container.querySelector<HTMLDivElement>('.v4-transcript')!;
+  const textarea = view.container.querySelector<HTMLTextAreaElement>('.v4-composer textarea')!;
   vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
     const top = this.classList.contains('virtual-messages') ? -transcript.scrollTop : 0;
     return { top, bottom: top, height: 0, width: 600, left: 0, right: 600, x: 0, y: top, toJSON: () => ({}) };
