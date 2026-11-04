@@ -2,7 +2,7 @@
 // T054 (U3-B) in the connected v0.4 shell: sidebar order by last message (Q-17), unread dots (Q-14) and the split layout
 // kept across restarts (Q-16). Fixture chats: 規劃想法 (s-plan-notes, last message 10:30) → 參考資料整理 (s-research,
 // reply 10:20); 規劃想法（轉交 Codex） (s-handoff-codex, no messages, created 10:40). Runs: inst-docs (12:03), inst-login (11:22).
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Command, CONTRACTS_VERSION, MessageId, SessionId } from '../../../../contracts';
 import type { AppEvent, Escalation, LogicalSession, Message, Snapshot } from '../../../../contracts';
@@ -11,7 +11,9 @@ import { App } from '../App';
 import { fakeBridge } from '../ipc-test-helpers';
 import { rendererStore } from '../renderer-store';
 import { PANES_KEY } from './pane-memory';
-import { SEEN_KEY } from './seen';
+import { LEGACY_SEEN_KEY, SEEN_KEY } from './seen';
+import { NARROW_MAX_WIDTH } from './ShellV4';
+import v4css from './styles.css?raw';
 
 let fake: ReturnType<typeof fakeBridge>;
 let seq: number;
@@ -21,6 +23,8 @@ const at = (time: string) => `2026-10-24T${time}:00+08:00`;
 const connect = (snapshot: Snapshot = fixtureSnapshot) => { fake = fakeBridge(snapshot); window.awg = fake.bridge; seq = snapshot.seq; };
 beforeEach(() => {
   vi.stubGlobal('ResizeObserver', class { observe = vi.fn(); unobserve = vi.fn(); disconnect = vi.fn(); });
+  // r1: the 500 ms write throttle is passed with a fake clock (which still runs, so findBy works).
+  vi.useFakeTimers({ shouldAdvanceTime: true });
   connect();
   window.history.replaceState(null, '', `/#/sessions/${plan.id}`); localStorage.clear();
 });
@@ -46,6 +50,11 @@ const message = (sessionId: string, createdAt: string, extra: Partial<Message> =
 const reply = (sessionId: string, createdAt: string, extra: Partial<Message> = {}) => emit({ type: 'message.completed', message: message(sessionId, createdAt, extra) });
 const userSays = (sessionId: string, createdAt: string) => reply(sessionId, createdAt, { role: 'user', origin: { kind: 'user' } });
 const stored = (key: string) => JSON.parse(localStorage.getItem(key) ?? 'null') as unknown;
+const seenRecord = () => stored(SEEN_KEY) as { version: number; since: string | null; seen: Record<string, string> };
+/** Past the 500 ms write throttle. */
+const settle = () => act(() => { vi.advanceTimersByTime(600); });
+/** The newest message in the fixture (m11, 11:22 +08:00): the baseline's `since`. */
+const FIXTURE_SINCE = '2026-10-24T03:22:00.000Z';
 const paneTitles = () => Array.from(document.querySelectorAll('[data-pane]')).map(pane => pane.getAttribute('aria-label'));
 const activePane = () => document.querySelector('.v4-pane-active')?.getAttribute('aria-label');
 
@@ -108,24 +117,30 @@ describe('T054 unread dots (Q-14)', () => {
   it('nothing lights up on the first start, and the baseline is saved', async () => {
     await setup('#/new');
     expect(anyUnread()).toBe(0);
-    await waitFor(() => expect(stored(SEEN_KEY)).toEqual({ [plan.id]: '2026-10-24T02:01:00.000Z', [research.id]: '2026-10-24T02:20:00.000Z', 's-wf-root': '2026-10-24T03:05:00.000Z', 's-wf-build-a': '2026-10-24T03:20:00.000Z' }));
+    settle();
+    expect(stored(SEEN_KEY)).toEqual({ version: 2, since: FIXTURE_SINCE,
+      seen: { [plan.id]: '2026-10-24T02:01:00.000Z', [research.id]: '2026-10-24T02:20:00.000Z', 's-wf-root': '2026-10-24T03:05:00.000Z', 's-wf-build-a': '2026-10-24T03:20:00.000Z' } });
+    // r1 P2-2: an older reply (as a history page brings) in a session the baseline has no reply for stays unlit.
+    reply(handoff.id, at('09:30'));
+    expect(dotted(rowOf(handoff.id))).toBe(false);
   });
 
   it('a reply lights up another session; the user\'s own message and a reply in a shown session do not; opening it clears the dot', async () => {
     await setup();
-    reply(handoff.id, at('11:00'));
+    reply(handoff.id, at('12:00'));
     expect(dotted(rowOf(handoff.id))).toBe(true);
     expect(within(rowOf(handoff.id) as HTMLElement).getByRole('img', { name: '有新訊息' })).toBeTruthy();
     userSays(research.id, at('11:01'));
     expect(dotted(rowOf(research.id))).toBe(false);
-    reply(plan.id, at('11:02'));
+    reply(plan.id, at('12:02'));
     expect(dotted(rowOf(plan.id))).toBe(false);
     // A sub-agent's reply does not count.
     reply(research.id, at('11:03'), { nativeTaskId: 'nt-1' } as Partial<Message>);
     expect(dotted(rowOf(research.id))).toBe(false);
     openRow(handoff.id);
     expect(anyUnread()).toBe(0);
-    await waitFor(() => expect(stored(SEEN_KEY)).toMatchObject({ [handoff.id]: '2026-10-24T03:00:00.000Z', [plan.id]: '2026-10-24T03:02:00.000Z' }));
+    settle();
+    expect(seenRecord().seen).toMatchObject({ [handoff.id]: '2026-10-24T04:00:00.000Z', [plan.id]: '2026-10-24T04:02:00.000Z' });
   });
 
   it('a session shown in either pane of a split stays unlit; it lights up once it is not shown (another page)', async () => {
@@ -161,7 +176,8 @@ describe('T054 unread dots (Q-14)', () => {
     userSays(created.sessionId, at('16:00'));
     reply(created.sessionId, at('16:01'));
     expect(anyUnread()).toBe(0);
-    await waitFor(() => expect(stored(SEEN_KEY)).toMatchObject({ [created.sessionId]: '2026-10-24T08:01:00.000Z' }));
+    settle();
+    expect(seenRecord().seen).toMatchObject({ [created.sessionId]: '2026-10-24T08:01:00.000Z' });
     // A chat that appeared elsewhere (not shown) lights up with its first reply.
     const other = { ...handoff, id: 's-elsewhere', title: '別處建立', createdAt: at('16:02') } as LogicalSession;
     emit({ type: 'session.updated', session: other });
@@ -171,7 +187,7 @@ describe('T054 unread dots (Q-14)', () => {
 
   it('a pending escalation\'s dot wins over the unread dot', async () => {
     await setup('#/new');
-    reply(handoff.id, at('11:00'));
+    reply(handoff.id, at('12:00'));
     expect(dotted(rowOf(handoff.id))).toBe(true);
     const escalation = { ...fixtureSnapshot.escalations[0]!, id: 'esc-t054', rootSessionId: handoff.id, fromSessionId: handoff.id } as Escalation;
     delete (escalation as Partial<Escalation>).instanceId;
@@ -191,12 +207,83 @@ describe('T054 unread dots (Q-14)', () => {
     expect(dotted(runRowOf('inst-login'))).toBe(false);
   });
 
-  it('a stored record lights up replies after the seen time at start-up, and a session it does not name', async () => {
-    localStorage.setItem(SEEN_KEY, JSON.stringify({ [plan.id]: at('09:00'), 's-gone': at('09:00'), 's-wf-root': at('12:00'), 's-wf-build-a': at('12:00') }));
+  it('a stored record lights up replies after the seen time at start-up, and one after since in a session it does not name', async () => {
+    localStorage.setItem(SEEN_KEY, JSON.stringify({ version: 2, since: at('10:10'), seen: { [plan.id]: at('09:00'), 's-gone': at('09:00'), 's-wf-root': at('12:00'), 's-wf-build-a': at('12:00') } }));
     await setup('#/new');
     expect(dotted(rowOf(plan.id))).toBe(true);
-    expect(dotted(rowOf(research.id))).toBe(true);
-    await waitFor(() => expect(Object.keys(stored(SEEN_KEY) as object)).not.toContain('s-gone'));
+    expect(dotted(rowOf(research.id))).toBe(true); // reply 10:20, after since
+    settle();
+    expect(Object.keys(seenRecord().seen)).not.toContain('s-gone');
+    expect(seenRecord().since).toBe(at('10:10'));
+    // With since after research's reply, it stays unlit.
+    cleanup(); localStorage.setItem(SEEN_KEY, JSON.stringify({ version: 2, since: at('10:30'), seen: { [plan.id]: at('09:00') } }));
+    await restart('#/new');
+    expect(dotted(rowOf(plan.id))).toBe(true);
+    expect(dotted(rowOf(research.id))).toBe(false);
+  });
+
+  it('reads the first format (awg.seen.v1) when there is no v2 record, and writes only v2', async () => {
+    localStorage.setItem(LEGACY_SEEN_KEY, JSON.stringify({ [plan.id]: at('09:00') }));
+    await setup('#/new');
+    expect(dotted(rowOf(plan.id))).toBe(true);
+    expect(dotted(rowOf(research.id))).toBe(true); // since = 09:00, the newest time in the v1 map
+    settle();
+    expect(seenRecord()).toMatchObject({ version: 2, since: '2026-10-24T01:00:00.000Z' });
+    expect(stored(LEGACY_SEEN_KEY)).toEqual({ [plan.id]: at('09:00') });
+  });
+
+  it('r1 P1-1: when narrow, the hidden pane of a split is not seen; it is once the window is wide again', async () => {
+    let narrow = false;
+    const query = new EventTarget();
+    Object.defineProperty(query, 'matches', { get: () => narrow });
+    vi.stubGlobal('matchMedia', vi.fn(() => query));
+    await setup();
+    fireEvent.contextMenu(rowOf(handoff.id).querySelector('.v4-session')!);
+    fireEvent.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: '在分割畫面開啟' }));
+    expect(activePane()).toBe(`對話：${handoff.title}`);
+    act(() => { narrow = true; query.dispatchEvent(new Event('change')); });
+    reply(plan.id, at('12:00')); reply(handoff.id, at('12:01'));
+    fireEvent.click(screen.getByRole('button', { name: '開啟側欄' }));
+    expect(dotted(rowOf(plan.id))).toBe(true);
+    expect(dotted(rowOf(handoff.id))).toBe(false);
+    settle();
+    expect(seenRecord().seen[plan.id]).toBe('2026-10-24T02:01:00.000Z');
+    act(() => { narrow = false; query.dispatchEvent(new Event('change')); });
+    expect(anyUnread()).toBe(0);
+    settle();
+    expect(seenRecord().seen[plan.id]).toBe('2026-10-24T04:00:00.000Z');
+  });
+
+  it('the narrow breakpoint is the one the stylesheet hides inactive panes at', () => {
+    const style = document.createElement('style');
+    style.textContent = v4css;
+    document.head.append(style);
+    const media = Array.from(style.sheet!.cssRules).filter((rule): rule is CSSMediaRule => rule instanceof CSSMediaRule);
+    style.remove();
+    const hiding = media.filter(rule => Array.from(rule.cssRules).some(inner => inner instanceof CSSStyleRule
+      && inner.selectorText === '.v4-split .v4-pane:not(.v4-pane-active)' && inner.style.display === 'none'));
+    expect(hiding.map(rule => rule.media.mediaText)).toEqual([`(max-width: ${NARROW_MAX_WIDTH}px)`]);
+  });
+
+  it('r1 P1-2: the demo neither reads nor writes the stored layout and seen times', () => {
+    const layout = JSON.stringify({ version: 1, active: 1, panes: [{ sessionId: plan.id, details: true, tab: 'tasks' }, { sessionId: handoff.id, details: false, tab: 'files' }] });
+    const seen = JSON.stringify({ version: 2, since: at('08:00'), seen: { [plan.id]: at('09:00'), 's-real-only': at('09:00') } });
+    const legacy = JSON.stringify({ [plan.id]: at('09:00') });
+    localStorage.setItem(PANES_KEY, layout); localStorage.setItem(SEEN_KEY, seen); localStorage.setItem(LEGACY_SEEN_KEY, legacy);
+    delete window.awg;
+    window.history.replaceState(null, '', '/');
+    render(<App />);
+    expect(screen.getByText('示意模式 · 未連接 runtime')).toBeTruthy();
+    // Not restored, and nothing lit from the stored seen times.
+    expect(screen.getByRole('heading', { name: '今天想做什麼？' })).toBeTruthy();
+    expect(anyUnread()).toBe(0);
+    openRow(plan.id);
+    fireEvent.contextMenu(rowOf(handoff.id).querySelector('.v4-session')!);
+    fireEvent.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: '在分割畫面開啟' }));
+    expect(paneTitles()).toHaveLength(2);
+    act(() => { vi.advanceTimersByTime(2000); });
+    cleanup();
+    expect([localStorage.getItem(PANES_KEY), localStorage.getItem(SEEN_KEY), localStorage.getItem(LEGACY_SEEN_KEY)]).toEqual([layout, seen, legacy]);
   });
 
   it('localStorage that throws on read and write changes nothing visible and raises nothing', async () => {
@@ -205,11 +292,12 @@ describe('T054 unread dots (Q-14)', () => {
     const errors = vi.spyOn(console, 'error');
     await setup();
     expect(anyUnread()).toBe(0);
-    reply(handoff.id, at('11:00'));
+    reply(handoff.id, at('12:00'));
     expect(dotted(rowOf(handoff.id))).toBe(true);
     openRow(handoff.id);
     expect(anyUnread()).toBe(0);
-    await waitFor(() => expect(write.mock.calls.some(([key]) => key === SEEN_KEY)).toBe(true));
+    settle();
+    expect(write.mock.calls.some(([key]) => key === SEEN_KEY)).toBe(true);
     cleanup();
     expect(errors).not.toHaveBeenCalled();
   });
@@ -272,11 +360,12 @@ describe('T054 split layout across restarts (Q-16)', () => {
 
   it('typing a draft does not write the layout; a failing write is ignored', async () => {
     await setup();
-    await waitFor(() => expect(localStorage.getItem(PANES_KEY)).not.toBeNull());
+    settle();
+    expect(localStorage.getItem(PANES_KEY)).not.toBeNull();
     const write = vi.spyOn(Storage.prototype, 'setItem');
     const box = screen.getByRole('textbox', { name: new RegExp(`^回覆 ${plan.title}`) });
     for (const text of ['一', '一二', '一二三']) fireEvent.change(box, { target: { value: text } });
-    await new Promise(resolve => setTimeout(resolve, 600));
+    settle();
     expect(write.mock.calls.filter(([key]) => key === PANES_KEY)).toHaveLength(0);
     write.mockImplementation(() => { throw new Error('quota'); });
     fireEvent.contextMenu(rowOf(handoff.id).querySelector('.v4-session')!);

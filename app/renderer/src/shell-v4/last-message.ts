@@ -43,9 +43,16 @@ export const lastMessageAt = (times: LastMessageTimes, session: SessionTimes) =>
 export const byLastMessage = (times: LastMessageTimes) => (a: SessionTimes, b: SessionTimes) =>
   lastMessageAt(times, b) - lastMessageAt(times, a) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
-/** A run's last message (Q-17): the newest of its node sessions, or the run's createdAt when it has none newer. */
-export const runLastMessageAt = (times: LastMessageTimes, instance: Pick<WorkflowInstance, 'createdAt'>, nodes: readonly SessionTimes[]) =>
-  nodes.reduce((latest, node) => Math.max(latest, lastMessageAt(times, node)), instant(instance.createdAt));
+/**
+ * A run's last message (Q-17): the newest counted message of any of its node sessions. Only when no node has one, the
+ * newest of the nodes' and the run's createdAt (r1 P2-1: a new node without messages must not move the run up).
+ */
+export function runLastMessageAt(times: LastMessageTimes, instance: Pick<WorkflowInstance, 'createdAt'>, nodes: readonly SessionTimes[]): number {
+  let newestMessage = -Infinity;
+  for (const node of nodes) newestMessage = Math.max(newestMessage, times.get(node.id) ?? -Infinity);
+  if (newestMessage > -Infinity) return newestMessage;
+  return nodes.reduce((latest, node) => Math.max(latest, instant(node.createdAt)), instant(instance.createdAt));
+}
 
 export interface MessageTimes { last: LastMessageTimes; replies: LastMessageTimes }
 

@@ -34,7 +34,7 @@ import { canMove } from './move-targets';
 import { NewChat, SettingsV4 } from './Pages';
 import { PANES_KEY, restoreLayout, serializeLayout, startPanes } from './pane-memory';
 import { openTarget, paneReducer } from './pane-state';
-import { initialSeen, markSeen, SEEN_KEY, unreadOf } from './seen';
+import { baselineSeen, initialSeen, LEGACY_SEEN_KEY, markSeen, SEEN_KEY, serializeSeen, unreadOf } from './seen';
 import { modeOf, Sidebar } from './Sidebar';
 import '../styles.css';
 import './styles.css';
@@ -44,8 +44,10 @@ export const SAVING_PREFERENCES = '正在儲存設定，完成後就能再改。
 /** WB-04 (T053): the tree changed since the Snapshot the user chose from; never sent again on its own. */
 export const STALE_MOVE = '這個對話剛被改過，請再試一次。';
 
-// Below this width the sidebar collapses by itself and opens as an overlay.
-const narrowQuery = '(max-width: 900px)';
+// Below this width the sidebar collapses by itself and opens as an overlay, and a split shows only its active pane
+// (styles.css `@media (max-width: 900px)`; layout.test checks the two match).
+export const NARROW_MAX_WIDTH = 900;
+const narrowQuery = `(max-width: ${NARROW_MAX_WIDTH}px)`;
 const isNarrow = () => window.matchMedia?.(narrowQuery).matches ?? false;
 const subscribeWidth = (onChange: () => void) => {
   const query = window.matchMedia?.(narrowQuery);
@@ -85,9 +87,9 @@ export interface ShellProps { snapshot: Snapshot; store?: RendererStore | undefi
  * Q-16 (T054): the address and panes to start with. The shell mounts only once the first Snapshot is there, so the stored
  * layout is checked against it here. An empty address (how Electron opens the page) goes to the restored active pane.
  */
-function startLayout(snapshot: Snapshot) {
+function startLayout(snapshot: Snapshot, persist: boolean) {
   const known = (id: string) => snapshot.sessions.some(session => session.id === id);
-  const restored = restoreLayout(readJson(PANES_KEY), known);
+  const restored = persist ? restoreLayout(readJson(PANES_KEY), known) : undefined;
   const opened = currentRoute();
   const activeSession = restored?.panes.find(pane => pane.id === restored.active)?.sessionId;
   const replace = !!activeSession && window.location.hash.replace(/^#/, '') === '';
@@ -96,7 +98,10 @@ function startLayout(snapshot: Snapshot) {
 }
 
 export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps) {
-  const [boot] = useState(() => startLayout(snapshot));
+  // r1 P1-2: the demo (no app service) never reads or writes the stored layout and seen times; they belong to the
+  // connected app's sessions, and demo data would replace them.
+  const [persist] = useState(() => !!store);
+  const [boot] = useState(() => startLayout(snapshot, persist));
   const [route, setRoute] = useState(boot.route);
   const known = (id: string) => snapshot.sessions.some(session => session.id === id);
   const [panes, dispatch] = useReducer(paneReducer, boot.panes);
@@ -137,9 +142,13 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   // Q-17 / Q-14 (T054): last-message and last-reply times keep their identity through message.delta, so the order and
   // the unread marks are worked out again only when a message is added or replaced.
   const times = useMessageTimes(snapshot.messages);
-  const [seen, setSeen] = useState(() => initialSeen(readJson(SEEN_KEY), snapshot.sessions, times.replies));
-  // A session shown in a pane is seen; the panes are hidden on every other page.
-  const visibleKey = page === 'chat' ? panes.panes.map(pane => pane.sessionId).join('\n') : '';
+  const [seen, setSeen] = useState(() => persist
+    ? initialSeen(readJson(SEEN_KEY), readJson(LEGACY_SEEN_KEY), snapshot.sessions, times.replies, times.last)
+    : baselineSeen(snapshot.sessions, times.replies, times.last));
+  // A session shown in a visible pane is seen. The panes are hidden on every other page, and when narrow a split shows
+  // only its active pane (r1 P1-1).
+  const shownPanes = page !== 'chat' ? [] : narrow ? (active ? [active] : []) : panes.panes;
+  const visibleKey = shownPanes.map(pane => pane.sessionId).join('\n');
   const visible = useMemo(() => visibleKey ? visibleKey.split('\n') : [], [visibleKey]);
   // Moved up while rendering (not in an effect), so a reply in a shown session never lights up, not even for a frame.
   const marked = markSeen(seen, times.replies, visible);
@@ -147,10 +156,10 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const unread = useMemo(() => unreadOf(times.replies, marked, visible), [times.replies, marked, visible]);
   // Q-16 / Q-14: both are written at most every 500 ms, and on page hide or unmount; a failed write is ignored.
   const [writers] = useState(() => ({ seen: createThrottledWriter(SEEN_KEY), panes: createThrottledWriter(PANES_KEY) }));
-  useEffect(() => { writers.seen.schedule(JSON.stringify(seen)); }, [seen, writers]);
+  useEffect(() => { if (persist) writers.seen.schedule(serializeSeen(seen)); }, [persist, seen, writers]);
   // Drafts and reading positions are not kept, so typing or scrolling does not write.
   const layoutText = useMemo(() => JSON.stringify(serializeLayout(panes)), [panes]);
-  useEffect(() => { writers.panes.schedule(layoutText); }, [layoutText, writers]);
+  useEffect(() => { if (persist) writers.panes.schedule(layoutText); }, [persist, layoutText, writers]);
   useEffect(() => {
     const flush = () => { writers.seen.flush(); writers.panes.flush(); };
     window.addEventListener('pagehide', flush);

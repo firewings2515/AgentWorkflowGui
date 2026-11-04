@@ -1,35 +1,41 @@
 // Unread marks (U3_PLAN Q-14, T054): a session is unread when its newest assistant reply is newer than the time it was
-// last seen. A session shown in any pane counts as seen up to that reply. The seen times live in this renderer only
-// (localStorage `awg.seen.v1`, `{sessionId: ISO time}`), never in the backend.
+// last seen. A session shown in a visible pane counts as seen up to that reply. The seen times live in this renderer
+// only (localStorage), never in the backend.
+//
+// r1 P2-2: the record also keeps `since`, the newest message time known when the baseline was taken. A session the
+// record does not name is unread only for a reply newer than that, so an older history page loaded later cannot light
+// it up, while a session created after the baseline still lights up with its first reply.
 import { instant } from './last-message';
 import type { LastMessageTimes } from './last-message';
 import type { StoredRead } from './local-store';
 
-export const SEEN_KEY = 'awg.seen.v1';
+/** `{ version: 2, since: ISO | null, seen: {sessionId: ISO} }`. */
+export const SEEN_KEY = 'awg.seen.v2';
+/** The first T054 format, `{sessionId: ISO}`; read when there is no v2 record, never written. */
+export const LEGACY_SEEN_KEY = 'awg.seen.v1';
 export type SeenTimes = Readonly<Record<string, string>>;
+export interface SeenRecord { readonly since: string | null; readonly seen: SeenTimes }
 
 const iso = (time: number) => new Date(time).toISOString();
 const validTime = (value: unknown): value is string => typeof value === 'string' && !Number.isNaN(Date.parse(value));
+const isMap = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
+const newest = (times: Iterable<number>) => { let max = -Infinity; for (const time of times) if (time > max) max = time; return max === -Infinity ? null : iso(max); };
 
-/** Everything as seen up to its newest reply: the first start, or a record that cannot be read, lights nothing up. */
-export function baselineSeen(sessions: readonly { id: string }[], replies: LastMessageTimes): SeenTimes {
+/**
+ * Everything as seen up to its newest reply: the first start, or a record that cannot be read, lights nothing up.
+ * `since` is the newest message (any counted role) in the Snapshot.
+ */
+export function baselineSeen(sessions: readonly { id: string }[], replies: LastMessageTimes, last: LastMessageTimes): SeenRecord {
   const seen: Record<string, string> = {};
   for (const session of sessions) {
     const reply = replies.get(session.id);
     if (reply !== undefined) seen[session.id] = iso(reply);
   }
-  return seen;
+  return { since: newest([...last.values(), ...replies.values()]), seen };
 }
 
-/**
- * The seen times at start-up from the stored record. Missing, unreadable or not an object: the baseline. Otherwise the
- * entries of sessions the Snapshot no longer has are dropped; an entry that is not a time takes the baseline. A session
- * the record does not name appeared since, so any reply it has is new.
- */
-export function initialSeen(stored: StoredRead, sessions: readonly { id: string }[], replies: LastMessageTimes): SeenTimes {
-  const record = stored.ok ? stored.value : undefined;
-  if (typeof record !== 'object' || record === null || Array.isArray(record)) return baselineSeen(sessions, replies);
-  const entries = record as Record<string, unknown>;
+/** Keeps the entries of sessions still in the Snapshot; an entry that is not a time takes that session's baseline. */
+function prune(entries: Record<string, unknown>, sessions: readonly { id: string }[], replies: LastMessageTimes): Record<string, string> {
   const seen: Record<string, string> = {};
   for (const session of sessions) {
     if (!Object.hasOwn(entries, session.id)) continue;
@@ -41,23 +47,47 @@ export function initialSeen(stored: StoredRead, sessions: readonly { id: string 
   return seen;
 }
 
-const seenAt = (seen: SeenTimes, id: string) => { const value = seen[id]; return value === undefined ? -Infinity : instant(value); };
+/**
+ * The seen record at start-up. A v2 record: its `since`, and its entries of sessions still in the Snapshot. No v2 record
+ * but a v1 map: its entries, with `since` the newest time in it. Anything else (missing, unreadable, malformed): the
+ * baseline. A session the record does not name appeared since, so only a reply newer than `since` makes it unread.
+ */
+export function initialSeen(stored: StoredRead, legacy: StoredRead, sessions: readonly { id: string }[], replies: LastMessageTimes, last: LastMessageTimes): SeenRecord {
+  if (stored.ok) {
+    const value = stored.value;
+    if (!isMap(value) || value.version !== 2 || !isMap(value.seen) || !(value.since === null || validTime(value.since))) return baselineSeen(sessions, replies, last);
+    return { since: value.since, seen: prune(value.seen, sessions, replies) };
+  }
+  if (legacy.ok && isMap(legacy.value)) {
+    const seen = prune(legacy.value, sessions, replies);
+    return { since: newest(Object.values(legacy.value).filter(validTime).map(instant)), seen };
+  }
+  return baselineSeen(sessions, replies, last);
+}
+
+export const serializeSeen = (record: SeenRecord) => JSON.stringify({ version: 2, since: record.since, seen: record.seen });
+
+const seenAt = (record: SeenRecord, id: string) => {
+  const value = record.seen[id];
+  if (value !== undefined) return instant(value);
+  return record.since === null ? -Infinity : instant(record.since);
+};
 
 /** Moves the seen time of each visible session up to its newest reply; the same object when nothing changes. */
-export function markSeen(seen: SeenTimes, replies: LastMessageTimes, visible: readonly string[]): SeenTimes {
+export function markSeen(record: SeenRecord, replies: LastMessageTimes, visible: readonly string[]): SeenRecord {
   let next: Record<string, string> | undefined;
   for (const id of visible) {
     const reply = replies.get(id);
-    if (reply === undefined || reply <= seenAt(seen, id)) continue;
-    next ??= { ...seen };
+    if (reply === undefined || (record.seen[id] !== undefined && reply <= instant(record.seen[id]))) continue;
+    next ??= { ...record.seen };
     next[id] = iso(reply);
   }
-  return next ?? seen;
+  return next ? { since: record.since, seen: next } : record;
 }
 
-/** Sessions with a reply newer than their seen time, except those shown in a pane right now. */
-export function unreadOf(replies: LastMessageTimes, seen: SeenTimes, visible: readonly string[]): ReadonlySet<string> {
+/** Sessions with a reply newer than their seen time, except those shown in a visible pane right now. */
+export function unreadOf(replies: LastMessageTimes, record: SeenRecord, visible: readonly string[]): ReadonlySet<string> {
   const unread = new Set<string>();
-  for (const [id, reply] of replies) if (reply > seenAt(seen, id) && !visible.includes(id)) unread.add(id);
+  for (const [id, reply] of replies) if (reply > seenAt(record, id) && !visible.includes(id)) unread.add(id);
   return unread;
 }

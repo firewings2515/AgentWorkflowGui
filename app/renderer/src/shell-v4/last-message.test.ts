@@ -48,12 +48,21 @@ describe('T054 last-message time (Q-17)', () => {
     expect(replies.has('b')).toBe(false);
   });
 
-  it('a run takes the newest of its node sessions, else the nodes\' or the run\'s createdAt', () => {
+  it('a run takes the newest message of its node sessions, else the nodes\' or the run\'s createdAt', () => {
     const times = lastMessageTimes({ messages: [message('m1', 'n1', '2026-11-04T09:00:00+08:00'), message('m2', 'n2', '2026-11-04T02:00:00.000Z')] });
     const run = { createdAt: '2026-11-04T00:00:00.000Z' };
     expect(runLastMessageAt(times, run, [session('n1'), session('n2')])).toBe(Date.parse('2026-11-04T02:00:00.000Z'));
     expect(runLastMessageAt(times, run, [session('n3', '2026-11-04T04:00:00.000Z')])).toBe(Date.parse('2026-11-04T04:00:00.000Z'));
     expect(runLastMessageAt(times, run, [])).toBe(Date.parse(run.createdAt));
+  });
+
+  it('r1 P2-1: a node without messages, created later, does not move the run past one with a newer message', () => {
+    // Run 1: created 00:00, node A's last message 02:00, node B (no messages) created 05:00. Run 2: last message 04:00.
+    const times = lastMessageTimes({ messages: [message('m1', 'A', '2026-11-04T02:00:00.000Z'), message('m2', 'C', '2026-11-04T04:00:00.000Z')] });
+    const first = runLastMessageAt(times, { createdAt: '2026-11-04T00:00:00.000Z' }, [session('A'), session('B', '2026-11-04T05:00:00.000Z')]);
+    const second = runLastMessageAt(times, { createdAt: '2026-11-04T00:00:00.000Z' }, [session('C')]);
+    expect(first).toBe(Date.parse('2026-11-04T02:00:00.000Z'));
+    expect(second).toBeGreaterThan(first);
   });
 });
 
@@ -72,10 +81,20 @@ describe('T054 times keep their identity through message.delta', () => {
     const added = messageTimesOf([...messages, message('m3', 'a', '2026-11-04T05:00:00.000Z')]);
     expect(added).not.toBe(first);
     expect(added.last.get('a')).toBe(Date.parse('2026-11-04T05:00:00.000Z'));
+    // r1 P2-3: each case starts from the original two messages cached, then an array of the same length with one field
+    // changed, so only the field comparison can make it work the times out again.
+    const base = messageTimesOf(messages);
+    expect(messageTimesOf([...messages])).toBe(base);
     const moved = messageTimesOf(messages.map(item => item.id === 'm1' ? { ...item, createdAt: '2026-11-04T06:00:00.000Z' } : item));
+    expect(moved).not.toBe(base);
     expect(moved.last.get('a')).toBe(Date.parse('2026-11-04T06:00:00.000Z'));
+    messageTimesOf(messages);
     const asUser = messageTimesOf(messages.map(item => item.id === 'm1' ? { ...item, role: 'user' as const, origin: { kind: 'user' as const } } : item));
     expect(asUser.replies.has('a')).toBe(false);
+    messageTimesOf(messages);
+    const subAgent = messageTimesOf(messages.map(item => item.id === 'm1' ? { ...item, nativeTaskId: 'nt-1' } as Message : item));
+    expect(subAgent.last.has('a')).toBe(false);
+    messageTimesOf(messages);
     expect(messageTimesOf(messages.slice(1)).last.has('a')).toBe(false);
   });
 });
