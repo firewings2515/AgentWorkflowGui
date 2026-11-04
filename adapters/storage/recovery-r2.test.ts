@@ -107,12 +107,12 @@ it('migration foreign-key violations roll back the entire upgrade and reopen the
   const file = path(); let s = await open(file);
   const before = s.db.prepare('SELECT name, sql FROM sqlite_schema ORDER BY name').all(); s.close();
   const migrations = [...MIGRATIONS,
-    { version: 11, name: 'first', sql: 'CREATE TABLE earlier_upgrade (id INTEGER)' },
-    { version: 12, name: 'foreign-key-violation', sql: "CREATE TABLE invalid_upgrade (ref TEXT REFERENCES logical_session(id)); INSERT INTO invalid_upgrade VALUES ('missing')" },
+    { version: latestVersion() + 1, name: 'first', sql: 'CREATE TABLE earlier_upgrade (id INTEGER)' },
+    { version: latestVersion() + 2, name: 'foreign-key-violation', sql: "CREATE TABLE invalid_upgrade (ref TEXT REFERENCES logical_session(id)); INSERT INTO invalid_upgrade VALUES ('missing')" },
   ];
   s = await open(file, 1, { migrations });
   expect(s.report.state).toEqual({ status: 'read-only', reason: 'migration-failed' });
-  expect(s.report.failedMigrationVersion).toBe(12);
+  expect(s.report.failedMigrationVersion).toBe(latestVersion() + 2);
   expect(schemaVersion(s.db)).toBe(latestVersion());
   expect(s.db.prepare('SELECT name, sql FROM sqlite_schema ORDER BY name').all()).toEqual(before);
   expect(s.db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);

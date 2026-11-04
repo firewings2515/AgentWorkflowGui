@@ -67,3 +67,10 @@ session、preferences、instance 的新欄位都是選填（沒有 Agent、`auto
 `workFolder`／`projectFolder`），所以舊的 body 不改。新表 `work_folder_claim` 記錄 GUI 自動建立的工作資料夾
 屬於哪個 session（一個 session 一筆、一個路徑一筆，路徑不分大小寫比對）。claim 先寫、資料夾後建；啟動時
 沒有對應 session（也沒有對應 run 的開始紀錄）的 claim 會刪掉，資料夾是空的才以非遞迴 rmdir 刪除。
+
+## v0.9（T050）
+
+migration v12 只把 agent／workflow／project 與 instance 內 template 的 `schemaVersion` 從 0.8.0 改為 0.9.0，
+不加表、不改欄位。側欄釘選 `UiPreferences.pinned`（`chat` 是 session id、`workflow` 是 run id，各最多 50 個、
+不重複）存在 preferences 的 body 裡，0.9 之前存的沒有這個欄位，讀成兩份空清單（`pinnedOf`）。`workflow.rename`
+改 run 的 `title`，用 instance 原本的整份 compare-and-set 更新寫回 body。
