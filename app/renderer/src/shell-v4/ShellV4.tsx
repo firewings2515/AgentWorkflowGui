@@ -34,7 +34,7 @@ import { canMove } from './move-targets';
 import { NewChat, SettingsV4 } from './Pages';
 import { PANES_KEY, restoreLayout, serializeLayout, startPanes } from './pane-memory';
 import { openTarget, paneReducer } from './pane-state';
-import { baselineSeen, initialSeen, LEGACY_SEEN_KEY, markSeen, SEEN_KEY, serializeSeen, unreadOf } from './seen';
+import { baselineSeen, initialSeen, markSeen, SEEN_KEY, serializeSeen, unreadOf } from './seen';
 import { modeOf, Sidebar } from './Sidebar';
 import '../styles.css';
 import './styles.css';
@@ -48,11 +48,20 @@ export const STALE_MOVE = '這個對話剛被改過，請再試一次。';
 // (styles.css `@media (max-width: 900px)`; layout.test checks the two match).
 export const NARROW_MAX_WIDTH = 900;
 const narrowQuery = `(max-width: ${NARROW_MAX_WIDTH}px)`;
-const isNarrow = () => window.matchMedia?.(narrowQuery).matches ?? false;
+/** r2 P2-1: matchMedia when there is one, else the window width; undefined when neither can tell. */
+const widthIsNarrow = (): boolean | undefined => typeof window.matchMedia === 'function' ? window.matchMedia(narrowQuery).matches
+  : typeof window.innerWidth === 'number' ? window.innerWidth <= NARROW_MAX_WIDTH : undefined;
+const isNarrow = () => widthIsNarrow() ?? false;
+/** For "seen": when the width is unknown, assume a split may show only its active pane. */
+const mayHideSplit = () => widthIsNarrow() ?? true;
 const subscribeWidth = (onChange: () => void) => {
-  const query = window.matchMedia?.(narrowQuery);
-  query?.addEventListener('change', onChange);
-  return () => query?.removeEventListener('change', onChange);
+  if (typeof window.matchMedia !== 'function') {
+    window.addEventListener('resize', onChange);
+    return () => window.removeEventListener('resize', onChange);
+  }
+  const query = window.matchMedia(narrowQuery);
+  query.addEventListener('change', onChange);
+  return () => query.removeEventListener('change', onChange);
 };
 // Pages that belong to one sidebar mode; going there switches the sidebar too. Settings keeps the current mode.
 const pageModes: Partial<Record<V4Page, SidebarMode>> = { new: 'chat', 'workflow-start': 'workflow', agents: 'workflow', templates: 'workflow', progress: 'workflow' };
@@ -108,6 +117,7 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const [mode, setMode] = useState<SidebarMode>(() => route.page === 'chat' && known(route.id) ? modeOf(snapshot, route.id) : route.page !== 'missing' ? pageModes[route.page] ?? 'chat' : 'chat');
   const [demoTheme, setDemoTheme] = useState<Theme>();
   const narrow = useSyncExternalStore(subscribeWidth, isNarrow);
+  const splitMayHide = useSyncExternalStore(subscribeWidth, mayHideSplit);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [narrowOpen, setNarrowOpen] = useState(false);
   // Demo only: renames and pins stay in this preview.
@@ -143,11 +153,11 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   // the unread marks are worked out again only when a message is added or replaced.
   const times = useMessageTimes(snapshot.messages);
   const [seen, setSeen] = useState(() => persist
-    ? initialSeen(readJson(SEEN_KEY), readJson(LEGACY_SEEN_KEY), snapshot.sessions, times.replies, times.last)
+    ? initialSeen(readJson(SEEN_KEY), snapshot.sessions, times.replies, times.last)
     : baselineSeen(snapshot.sessions, times.replies, times.last));
   // A session shown in a visible pane is seen. The panes are hidden on every other page, and when narrow a split shows
   // only its active pane (r1 P1-1).
-  const shownPanes = page !== 'chat' ? [] : narrow ? (active ? [active] : []) : panes.panes;
+  const shownPanes = page !== 'chat' ? [] : splitMayHide ? (active ? [active] : []) : panes.panes;
   const visibleKey = shownPanes.map(pane => pane.sessionId).join('\n');
   const visible = useMemo(() => visibleKey ? visibleKey.split('\n') : [], [visibleKey]);
   // Moved up while rendering (not in an effect), so a reply in a shown session never lights up, not even for a frame.

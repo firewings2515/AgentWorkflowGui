@@ -21,21 +21,19 @@ describe('T054 seen record at start-up', () => {
     ['seen is not a map', v2({ version: 2, since: null, seen: [] })],
     ['since is not a time', v2({ version: 2, since: 'yesterday', seen: {} })],
   ])('%s: every session is seen up to its newest reply, so nothing lights up', (_, stored) => {
-    const seen = initialSeen(stored, none, sessions, replies, last);
+    const seen = initialSeen(stored, sessions, replies, last);
     expect(seen).toEqual({ since: '2026-11-04T03:00:00.000Z', seen: { a: '2026-11-04T02:00:00.000Z', b: '2026-11-04T02:00:00.000Z' } });
     expect(unreadOf(replies, seen, []).size).toBe(0);
   });
 
   it('a v2 record: drops sessions that are gone, keeps valid times, takes the baseline for an entry that is not a time', () => {
-    const seen = initialSeen(v2({ version: 2, since: '2026-11-04T00:00:00.000Z', seen: { a: '2026-11-04T01:00:00.000Z', b: 42, gone: '2026-11-04T01:00:00.000Z' } }), none, sessions, replies, last);
+    const seen = initialSeen(v2({ version: 2, since: '2026-11-04T00:00:00.000Z', seen: { a: '2026-11-04T01:00:00.000Z', b: 42, gone: '2026-11-04T01:00:00.000Z' } }), sessions, replies, last);
     expect(seen).toEqual({ since: '2026-11-04T00:00:00.000Z', seen: { a: '2026-11-04T01:00:00.000Z', b: '2026-11-04T02:00:00.000Z' } });
     expect([...unreadOf(replies, seen, [])]).toEqual(['a']);
   });
 
-  it('no v2 record: a v1 map is read, with since the newest time in it; a malformed v2 record does not fall back to v1', () => {
-    const legacy = v2({ a: '2026-11-04T01:00:00.000Z', gone: '2026-11-04T01:30:00.000Z' });
-    expect(initialSeen(none, legacy, sessions, replies, last)).toEqual({ since: '2026-11-04T01:30:00.000Z', seen: { a: '2026-11-04T01:00:00.000Z' } });
-    expect(initialSeen(v2('bad'), legacy, sessions, replies, last).seen).toEqual(baselineSeen(sessions, replies, last).seen);
+  it('r2: only v2 is read; a v1-shaped map takes the baseline like any other shape', () => {
+    expect(initialSeen(v2({ a: '2026-11-04T01:00:00.000Z' }), sessions, replies, last)).toEqual(baselineSeen(sessions, replies, last));
   });
 
   it('a session the record does not name is unread only for a reply newer than since', () => {

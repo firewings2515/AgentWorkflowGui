@@ -11,8 +11,6 @@ import type { StoredRead } from './local-store';
 
 /** `{ version: 2, since: ISO | null, seen: {sessionId: ISO} }`. */
 export const SEEN_KEY = 'awg.seen.v2';
-/** The first T054 format, `{sessionId: ISO}`; read when there is no v2 record, never written. */
-export const LEGACY_SEEN_KEY = 'awg.seen.v1';
 export type SeenTimes = Readonly<Record<string, string>>;
 export interface SeenRecord { readonly since: string | null; readonly seen: SeenTimes }
 
@@ -48,21 +46,14 @@ function prune(entries: Record<string, unknown>, sessions: readonly { id: string
 }
 
 /**
- * The seen record at start-up. A v2 record: its `since`, and its entries of sessions still in the Snapshot. No v2 record
- * but a v1 map: its entries, with `since` the newest time in it. Anything else (missing, unreadable, malformed): the
- * baseline. A session the record does not name appeared since, so only a reply newer than `since` makes it unread.
+ * The seen record at start-up: a v2 record's `since`, and its entries of sessions still in the Snapshot. Anything else
+ * (missing, unreadable, broken JSON, another shape) takes the baseline (r2: only v2 exists; v1 was never released). A
+ * session the record does not name appeared since, so only a reply newer than `since` makes it unread.
  */
-export function initialSeen(stored: StoredRead, legacy: StoredRead, sessions: readonly { id: string }[], replies: LastMessageTimes, last: LastMessageTimes): SeenRecord {
-  if (stored.ok) {
-    const value = stored.value;
-    if (!isMap(value) || value.version !== 2 || !isMap(value.seen) || !(value.since === null || validTime(value.since))) return baselineSeen(sessions, replies, last);
-    return { since: value.since, seen: prune(value.seen, sessions, replies) };
-  }
-  if (legacy.ok && isMap(legacy.value)) {
-    const seen = prune(legacy.value, sessions, replies);
-    return { since: newest(Object.values(legacy.value).filter(validTime).map(instant)), seen };
-  }
-  return baselineSeen(sessions, replies, last);
+export function initialSeen(stored: StoredRead, sessions: readonly { id: string }[], replies: LastMessageTimes, last: LastMessageTimes): SeenRecord {
+  const value = stored.ok ? stored.value : undefined;
+  if (!isMap(value) || value.version !== 2 || !isMap(value.seen) || !(value.since === null || validTime(value.since))) return baselineSeen(sessions, replies, last);
+  return { since: value.since, seen: prune(value.seen, sessions, replies) };
 }
 
 export const serializeSeen = (record: SeenRecord) => JSON.stringify({ version: 2, since: record.since, seen: record.seen });

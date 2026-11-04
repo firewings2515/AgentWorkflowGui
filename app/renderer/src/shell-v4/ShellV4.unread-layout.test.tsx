@@ -11,7 +11,7 @@ import { App } from '../App';
 import { fakeBridge } from '../ipc-test-helpers';
 import { rendererStore } from '../renderer-store';
 import { PANES_KEY } from './pane-memory';
-import { LEGACY_SEEN_KEY, SEEN_KEY } from './seen';
+import { SEEN_KEY } from './seen';
 import { NARROW_MAX_WIDTH } from './ShellV4';
 import v4css from './styles.css?raw';
 
@@ -222,14 +222,36 @@ describe('T054 unread dots (Q-14)', () => {
     expect(dotted(rowOf(research.id))).toBe(false);
   });
 
-  it('reads the first format (awg.seen.v1) when there is no v2 record, and writes only v2', async () => {
-    localStorage.setItem(LEGACY_SEEN_KEY, JSON.stringify({ [plan.id]: at('09:00') }));
-    await setup('#/new');
+  it('r2: a v2 record that is broken JSON takes the baseline and lights nothing, like one with the wrong shape', async () => {
+    for (const bad of ['{invalid JSON', JSON.stringify({ version: 2, since: at('08:00'), seen: [] })]) {
+      cleanup(); localStorage.setItem(SEEN_KEY, bad);
+      await restart('#/new');
+      expect(anyUnread()).toBe(0);
+      settle();
+      expect(seenRecord()).toEqual({ version: 2, since: FIXTURE_SINCE, seen: expect.objectContaining({ [plan.id]: '2026-10-24T02:01:00.000Z' }) as unknown });
+    }
+  });
+
+  it('r2 P2-1: without matchMedia, the window width decides; with neither, only the active pane of a split is seen', async () => {
+    vi.stubGlobal('matchMedia', undefined);
+    vi.stubGlobal('innerWidth', 1200);
+    await setup();
+    fireEvent.contextMenu(rowOf(handoff.id).querySelector('.v4-session')!);
+    fireEvent.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: '在分割畫面開啟' }));
+    expect(activePane()).toBe(`對話：${handoff.title}`);
+    act(() => { vi.stubGlobal('innerWidth', NARROW_MAX_WIDTH - 100); window.dispatchEvent(new Event('resize')); });
+    reply(plan.id, at('12:00'));
+    fireEvent.click(screen.getByRole('button', { name: '開啟側欄' }));
     expect(dotted(rowOf(plan.id))).toBe(true);
-    expect(dotted(rowOf(research.id))).toBe(true); // since = 09:00, the newest time in the v1 map
-    settle();
-    expect(seenRecord()).toMatchObject({ version: 2, since: '2026-10-24T01:00:00.000Z' });
-    expect(stored(LEGACY_SEEN_KEY)).toEqual({ [plan.id]: at('09:00') });
+    act(() => { vi.stubGlobal('innerWidth', 1200); window.dispatchEvent(new Event('resize')); });
+    expect(anyUnread()).toBe(0);
+    // Neither matchMedia nor a width: the wide layout, but a reply in the inactive pane still lights up.
+    act(() => { vi.stubGlobal('innerWidth', undefined); window.dispatchEvent(new Event('resize')); });
+    expect(paneTitles()).toHaveLength(2);
+    reply(plan.id, at('12:10'));
+    expect(dotted(rowOf(plan.id))).toBe(true);
+    reply(handoff.id, at('12:11'));
+    expect(dotted(rowOf(handoff.id))).toBe(false);
   });
 
   it('r1 P1-1: when narrow, the hidden pane of a split is not seen; it is once the window is wide again', async () => {
@@ -268,8 +290,7 @@ describe('T054 unread dots (Q-14)', () => {
   it('r1 P1-2: the demo neither reads nor writes the stored layout and seen times', () => {
     const layout = JSON.stringify({ version: 1, active: 1, panes: [{ sessionId: plan.id, details: true, tab: 'tasks' }, { sessionId: handoff.id, details: false, tab: 'files' }] });
     const seen = JSON.stringify({ version: 2, since: at('08:00'), seen: { [plan.id]: at('09:00'), 's-real-only': at('09:00') } });
-    const legacy = JSON.stringify({ [plan.id]: at('09:00') });
-    localStorage.setItem(PANES_KEY, layout); localStorage.setItem(SEEN_KEY, seen); localStorage.setItem(LEGACY_SEEN_KEY, legacy);
+    localStorage.setItem(PANES_KEY, layout); localStorage.setItem(SEEN_KEY, seen);
     delete window.awg;
     window.history.replaceState(null, '', '/');
     render(<App />);
@@ -283,7 +304,7 @@ describe('T054 unread dots (Q-14)', () => {
     expect(paneTitles()).toHaveLength(2);
     act(() => { vi.advanceTimersByTime(2000); });
     cleanup();
-    expect([localStorage.getItem(PANES_KEY), localStorage.getItem(SEEN_KEY), localStorage.getItem(LEGACY_SEEN_KEY)]).toEqual([layout, seen, legacy]);
+    expect([localStorage.getItem(PANES_KEY), localStorage.getItem(SEEN_KEY)]).toEqual([layout, seen]);
   });
 
   it('localStorage that throws on read and write changes nothing visible and raises nothing', async () => {
