@@ -8,6 +8,7 @@ import { AgentCatalog } from '../AgentCatalog';
 import { createAgentDemo } from '../agent-demo';
 import { createIpcAgentRepository } from '../agent-repository';
 import { commandFeedback } from '../command-feedback';
+import { useEscalationNotice } from '../escalation-notify';
 import { FolderButton } from '../FolderButton';
 import type { RendererState, RendererStore } from '../renderer-store';
 import { sessionBlocksSend } from '../renderer-store';
@@ -174,6 +175,30 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
     const heading = page === 'settings' ? 'v4-settings-heading' : page === 'workflow-start' ? 'v4-start-heading' : page === 'missing' ? 'v4-missing-heading' : '';
     if (heading) document.getElementById(heading)?.focus({ preventScroll: true });
   }, [page]);
+
+  // T055: a clicked notification opens the session that raised the escalation (an open pane is just selected) and scrolls to its card.
+  const openEscalation = useRef<(sessionId: SessionId, escalationId: string) => void>(() => undefined);
+  const scrollFrame = useRef<number | undefined>(undefined);
+  const mounted = useRef(false);
+  useEffect(() => { openEscalation.current = (sessionId, escalationId) => {
+    if (!mounted.current) return;
+    open(sessionId);
+    // A newer click replaces the search of an older one; leaving the shell ends it (r1 P2-2).
+    if (scrollFrame.current !== undefined) cancelAnimationFrame(scrollFrame.current);
+    let tries = 0;
+    const scroll = () => {
+      scrollFrame.current = undefined;
+      const card = Array.from(document.querySelectorAll<HTMLElement>('[data-escalation-id]')).find(item => item.dataset['escalationId'] === escalationId);
+      if (card) card.scrollIntoView?.({ block: 'center' });
+      else if (++tries < 30) scrollFrame.current = requestAnimationFrame(scroll);
+    };
+    scrollFrame.current = requestAnimationFrame(scroll);
+  }; });
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; if (scrollFrame.current !== undefined) cancelAnimationFrame(scrollFrame.current); scrollFrame.current = undefined; };
+  }, []);
+  useEscalationNotice(store, (sessionId, escalationId) => openEscalation.current(sessionId, escalationId));
 
   const reload = () => { if (store && ipcState?.connection !== 'loading') void store.reconnect(); };
   // U2_PLAN §3-10: Ctrl+N (in Workflow mode: start a Workflow), Ctrl+Shift+N, F5. Physical key codes keep them working

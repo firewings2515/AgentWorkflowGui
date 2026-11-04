@@ -22,6 +22,7 @@ vi.mock('electron', () => {
         return hoisted.isPackaged.value;
       },
       setName: vi.fn(),
+      setAppUserModelId: vi.fn(),
       getVersion: () => '0.0.0',
       getPath: () => 'C:\\userData',
       getAppPath: () => 'C:\\project',
