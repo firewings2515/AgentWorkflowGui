@@ -59,10 +59,18 @@ export function useSessionDrag({ canDrag, start, live, onDrop }: SessionDragOpti
   // `shown` and `active` are cleared together, and a new drag clears `shown` first, so a shown drag is the active one;
   // the handlers still check that it is.
   const current = shown && live(shown) ? shown : null;
+  // The native event a row or the top zone has handled, so the list's own handler (bubbling after it) leaves it alone.
+  const handled = useRef<Event | null>(null);
   const accept = (event: DragEvent, key: string, allowed: boolean) => {
+    handled.current = event.nativeEvent;
     if (!current || active.current !== current || !ours(event)) return;
     if (allowed) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setOver(key); }
     else { event.dataTransfer.dropEffect = 'none'; setOver(null); }
+  };
+  /** An event no row or zone handled: the cursor is on no drop target. Nothing is taken, so the cursor shows no drop. */
+  const outside = (event: DragEvent) => {
+    if (handled.current === event.nativeEvent) return;
+    if (current && ours(event)) { event.dataTransfer.dropEffect = 'none'; setOver(null); }
   };
   const drop = (event: DragEvent, parentId: SessionId | null) => {
     if (!ours(event)) return;
@@ -106,9 +114,16 @@ export function useSessionDrag({ canDrag, start, live, onDrop }: SessionDragOpti
       onDragOver: (event: DragEvent) => accept(event, 'top', true),
       onDrop: (event: DragEvent) => drop(event, null),
     } : undefined,
-    /** For the list: leaving it clears the row under the cursor. */
-    onDragLeave: (event: DragEvent<HTMLElement>) => {
-      if (!(event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget))) setOver(null);
+    /**
+     * For the list. Leaving it clears the row under the cursor; so does reaching any part of it that is not a drop
+     * target (a pinned row, a heading, the empty space): r1 P2, a leave towards such a part stays inside the list.
+     */
+    list: {
+      onDragEnter: (event: DragEvent) => outside(event),
+      onDragOver: (event: DragEvent) => outside(event),
+      onDragLeave: (event: DragEvent<HTMLElement>) => {
+        if (!(event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget))) setOver(null);
+      },
     },
   };
 }

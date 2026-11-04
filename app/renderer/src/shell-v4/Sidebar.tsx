@@ -232,7 +232,7 @@ export function Sidebar(props: SidebarProps) {
       {([['templates', '模板', '⧉'], ['agents', 'Agent', '◎']] as const).map(([page, label, icon]) =>
         <button type="button" key={page} className="v4-foot-link" aria-current={props.page === page ? 'page' : undefined} onClick={() => props.onPage(page)}><span aria-hidden="true">{icon}</span> {label}</button>)}
     </div>}
-    <nav className="v4-sections" ref={nav} aria-label={mode === 'chat' ? '對話清單' : 'Workflow 清單'} onDragLeave={drag.onDragLeave} onKeyDown={event => {
+    <nav className="v4-sections" ref={nav} aria-label={mode === 'chat' ? '對話清單' : 'Workflow 清單'} {...drag.list} onKeyDown={event => {
       if (!(event.target instanceof HTMLElement) || !event.target.classList.contains('v4-session')) return;
       const item = event.target.closest<HTMLLIElement>('li');
       const toggle = item?.querySelector<HTMLButtonElement>(':scope > .v4-row > .v4-row-toggle');

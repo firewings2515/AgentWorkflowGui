@@ -372,6 +372,38 @@ describe('T056 clearing', () => {
     expect(topZone()).not.toBeNull();
   });
 
+  it('r1 P2: reaching a part of the list that is no target (a pinned row, a heading) puts the row light out; nothing is sent', async () => {
+    fake.data.snapshot = { ...fake.data.snapshot, preferences: { ...fake.data.snapshot.preferences, pinned: { chat: [plan.id], workflow: [] } } };
+    fake.bridge.send.mockImplementation(input => Promise.resolve(accepted(input)));
+    await setup();
+    const pinnedRow = document.querySelector<HTMLElement>(`.v4-sidebar section[aria-label="釘選"] [data-session-id="${plan.id}"] .v4-session`)!;
+    const data = await start(research.id);
+    const lit = () => document.querySelectorAll('.v4-sidebar [data-drop]').length;
+    drag('dragOver', row(handoff.id), data);
+    expect(row(handoff.id).dataset['drop']).toBe('over');
+    // The leave towards the pinned row stays inside the list, so only the pinned row's dragenter can tell.
+    fireEvent.dragLeave(row(handoff.id), { relatedTarget: pinnedRow, dataTransfer: data });
+    expect(drag('dragEnter', pinnedRow, data)).toEqual({ taken: false, effect: 'none' });
+    expect(lit()).toBe(0);
+    expect(drag('dragOver', pinnedRow, data).taken).toBe(false);
+    // A heading too, and the same for a row of the tree lit again first.
+    drag('dragOver', row(handoff.id), data);
+    expect(lit()).toBe(1);
+    drag('dragEnter', document.querySelector('.v4-sidebar section[aria-label="釘選"] h2')!, data);
+    expect(lit()).toBe(0);
+    drag('dragOver', row(handoff.id), data);
+    drag('dragOver', sidebar().getByRole('navigation'), data);
+    expect(lit()).toBe(0);
+    // A target row's own dragenter still lights it (the list's handler leaves events a row handled alone).
+    drag('dragEnter', row(handoff.id), data);
+    expect(row(handoff.id).dataset['drop']).toBe('over');
+    // A drop on the pinned row (the browser would not even fire it) sends nothing and ends the drag.
+    expect(drag('drop', pinnedRow, data).taken).toBe(false);
+    await act(async () => { await Promise.resolve(); });
+    expect(reparents()).toHaveLength(0);
+    expect(nothingLit()).toBe(true);
+  });
+
   it('leaving the list puts the row light out', async () => {
     await setup();
     const data = await start(research.id);
