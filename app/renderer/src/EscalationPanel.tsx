@@ -43,9 +43,9 @@ function ReferenceDetails({ escalation, snapshot }: { escalation: Escalation; sn
   return <details><summary>關聯內容與識別碼 · {ref.kind}</summary>{content && <p className="preserve-text">{content}</p>}<pre>{JSON.stringify(ref, null, 2)}</pre></details>;
 }
 
-function EscalationCard({ escalation, permission, snapshot, store, ipcState }: {
+function EscalationCard({ escalation, permission, snapshot, store, ipcState, compact }: {
   escalation: Escalation; permission: PermissionRequest | undefined; snapshot: Snapshot;
-  store: RendererStore | undefined; ipcState: RendererState | undefined;
+  store: RendererStore | undefined; ipcState: RendererState | undefined; compact: boolean;
 }) {
   const [note, setNote] = useState('');
   const [content, setContent] = useState('{}');
@@ -84,12 +84,9 @@ function EscalationCard({ escalation, permission, snapshot, store, ipcState }: {
     if (disabled || (decision === 'retry' && !risk)) return;
     void store.send({ type: 'delivery.resolve', requestId: RequestId.parse(crypto.randomUUID()), escalationId: escalation.id, decision, acceptDuplicateRisk: decision === 'retry' && risk });
   };
-  return <article className="escalation-card" aria-label={escalation.title}>
-    <h4>{escalation.title}</h4>
-    <p className="muted">來源：{snapshot.sessions.find(session => session.id === escalation.fromSessionId)?.title ?? escalation.fromSessionId} · {escalation.fromSessionId}</p>
-    <p className="preserve-text">{escalation.detail}</p>
-    {(escalation.rule || permission?.matchedRule) && <p>升級原因：<code>{escalation.rule ?? permission?.matchedRule}</code></p>}
-    {permission && <div className="permission-evidence">
+  const fromTitle = snapshot.sessions.find(session => session.id === escalation.fromSessionId)?.title ?? escalation.fromSessionId;
+  const rule = escalation.rule ?? permission?.matchedRule;
+  const evidence = permission && <div className="permission-evidence">
       <p>{permission.summary}</p>
       <dl>{permission.tool && <><dt>工具</dt><dd>{permission.tool}</dd></>}{permission.server && <><dt>MCP server</dt><dd>{permission.server}</dd></>}
         {permission.shell && <><dt>Shell</dt><dd>{permission.shell}</dd></>}{permission.cwd && <><dt>工作資料夾</dt><dd>{permission.cwd}</dd></>}
@@ -97,7 +94,22 @@ function EscalationCard({ escalation, permission, snapshot, store, ipcState }: {
       </dl>
       {permission.command && <pre>{permission.command}</pre>}
       {permission.elicitation?.mode === 'url' && <><p>{permission.elicitation.message}</p><p>請先自行確認此網址的內容，再決定是否核准：</p><code>{permission.elicitation.url}</code></>}
-    </div>}
+    </div>;
+  const noteField = <label>回覆說明（選填）<textarea rows={2} value={note} onChange={event => setNote(event.target.value)} /></label>;
+  // T051: in a conversation the card keeps the T047 shape (title, detail, rule, actions); the evidence and the note fold.
+  return <article className={compact ? 'escalation-card v4-escalation' : 'escalation-card'} aria-label={escalation.title}>
+    {compact ? <>
+      <header><span className="v4-escalation-icon" aria-hidden="true">!</span><strong>{escalation.title}</strong><span className="muted">來自 {fromTitle}</span></header>
+      {escalation.detail && <pre className="preserve-text">{escalation.detail}</pre>}
+      {rule && <p className="muted">符合規則：<code>{rule}</code>（自動核准之外的項目，要你決定）</p>}
+      {permission && <details className="v4-escalation-more"><summary>詳細內容</summary>{evidence}<p className="muted">來源 session：{escalation.fromSessionId}</p></details>}
+    </> : <>
+      <h4>{escalation.title}</h4>
+      <p className="muted">來源：{fromTitle} · {escalation.fromSessionId}</p>
+      <p className="preserve-text">{escalation.detail}</p>
+      {rule && <p>升級原因：<code>{rule}</code></p>}
+      {evidence}
+    </>}
     <ReferenceDetails escalation={escalation} snapshot={snapshot} />
     {planUnavailable && <p role="status" className="command-warning">{planUnavailable}</p>}
     {permissionUnavailable && <p role="status" className="command-warning">權限請求已撤回、已處理或資料尚未齊全，無法回覆。請重新讀取資料。</p>}
@@ -112,7 +124,7 @@ function EscalationCard({ escalation, permission, snapshot, store, ipcState }: {
           <div className="escalation-actions"><button {...readOnlyProps(snapshot.app.status === 'read-only')} type="button" onClick={() => resolve('wait')}>繼續等待</button><button {...readOnlyProps(snapshot.app.status === 'read-only')} type="button" onClick={() => resolve('cancel')}>取消送達</button><button {...readOnlyProps(snapshot.app.status === 'read-only')} type="button" disabled={!risk} onClick={() => resolve('retry')}>重試送達</button></div>
         </> : <>
           {permission?.elicitation?.mode === 'form' && <ElicitationFields elicitation={permission.elicitation} value={content} onChange={setContent} />}
-          <label>回覆說明（選填）<textarea rows={2} value={note} onChange={event => setNote(event.target.value)} /></label>
+          {compact ? <details className="v4-escalation-note"><summary>加上回覆說明</summary>{noteField}</details> : noteField}
           <div className="escalation-actions"><button {...readOnlyProps(snapshot.app.status === 'read-only')} type="button" className="primary" onClick={event => { if (event.currentTarget.form?.reportValidity()) respond('approve'); }}>核准</button><button {...readOnlyProps(snapshot.app.status === 'read-only')} type="button" onClick={() => respond('decline')}>拒絕</button></div>
         </>}
       </fieldset>
@@ -122,27 +134,43 @@ function EscalationCard({ escalation, permission, snapshot, store, ipcState }: {
   </article>;
 }
 
+/** Open escalations handled in this session: the ones it raised (U2_PLAN §3-12), for ordinary and workflow sessions alike. */
 export function openEscalations(snapshot: Snapshot, sessionId: SessionId) {
-  const session = snapshot.sessions.find(item => item.id === sessionId);
-  return snapshot.escalations.filter(item => item.state === 'open' && (item.rootSessionId === sessionId || (session?.kind === 'ordinary' && item.fromSessionId === sessionId)));
+  return snapshot.escalations.filter(item => item.state === 'open' && item.fromSessionId === sessionId);
 }
 
-export function EscalationPanel({ snapshot, sessionId, store, ipcState }: {
-  snapshot: Snapshot; sessionId: SessionId; store: RendererStore | undefined; ipcState: RendererState | undefined;
+/** For a workflow run's root session: the run's open escalations raised by its other nodes, listed with a way there. */
+export function runEscalations(snapshot: Snapshot, sessionId: SessionId) {
+  const session = snapshot.sessions.find(item => item.id === sessionId);
+  if (session?.kind !== 'workflow') return [];
+  const instance = snapshot.instances.find(item => item.id === session.workflow.instanceId);
+  if (instance?.rootSessionId !== sessionId) return [];
+  return snapshot.escalations.filter(item => item.state === 'open' && item.fromSessionId !== sessionId && (item.instanceId === instance.id || item.rootSessionId === sessionId));
+}
+
+/** `compact`: the v0.4 conversation's cards (T047 shape), one after another under a one-line heading. */
+export function EscalationPanel({ snapshot, sessionId, store, ipcState, compact = false }: {
+  snapshot: Snapshot; sessionId: SessionId; store: RendererStore | undefined; ipcState: RendererState | undefined; compact?: boolean;
 }) {
   const session = snapshot.sessions.find(item => item.id === sessionId);
   const escalations = openEscalations(snapshot, sessionId);
   if (escalations.length === 0) return null;
+  const card = (escalation: Escalation) => {
+    const ref = escalation.ref;
+    const permission = ref?.kind === 'permission' ? snapshot.permissionRequests.find(item => item.id === ref.permissionRequestId && item.sessionId === escalation.fromSessionId) : undefined;
+    return <EscalationCard key={escalation.id} escalation={escalation} permission={permission} snapshot={snapshot} store={store} ipcState={ipcState} compact={compact} />;
+  };
+  const authority = session?.kind === 'ordinary' ? '由你決定，不是 agent' : '由你決定，不是 root 的 AI';
+  if (compact) return <section className="v4-escalations" aria-label="升級待處理項目">
+    <p className="v4-escalations-head"><strong>待你處理（{escalations.length}）</strong> · <span className="approval-authority">{authority}</span>{!store && <span className="muted"> · 示意資料，未送出任何核准。</span>}</p>
+    {escalations.map(card)}
+  </section>;
   return <section className="escalation-panel" aria-label="升級待處理項目">
-    <h3>待你處理（{escalations.length}）</h3><p className="approval-authority">{session?.kind === 'ordinary' ? '由你決定，不是 agent' : '由你決定，不是 root 的 AI'}</p>
+    <h3>待你處理（{escalations.length}）</h3><p className="approval-authority">{authority}</p>
     {!store && <p className="muted">示意資料，未送出任何核准。</p>}
     {(Object.entries(groups) as [EscalationKind, string][]).map(([kind, label]) => {
       const items = escalations.filter(item => item.kind === kind);
-      return items.length > 0 && <section key={kind} aria-label={label}><h3>{label}（{items.length}）</h3>{items.map(escalation => {
-        const ref = escalation.ref;
-        const permission = ref?.kind === 'permission' ? snapshot.permissionRequests.find(item => item.id === ref.permissionRequestId && item.sessionId === escalation.fromSessionId) : undefined;
-        return <EscalationCard key={escalation.id} escalation={escalation} permission={permission} snapshot={snapshot} store={store} ipcState={ipcState} />;
-      })}</section>;
+      return items.length > 0 && <section key={kind} aria-label={label}><h3>{label}（{items.length}）</h3>{items.map(card)}</section>;
     })}
   </section>;
 }

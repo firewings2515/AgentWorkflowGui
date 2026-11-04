@@ -10,7 +10,7 @@ import { createRendererStore } from './renderer-store';
 import type { RendererStore } from './renderer-store';
 import { deferred, fakeBridge } from './ipc-test-helpers';
 import { LockWaits } from './LockWaits';
-import { SessionWorkspace } from './SessionWorkspace';
+import { ConversationHarness } from './shell-v4/conversation-test-harness';
 
 const stores: RendererStore[] = [];
 beforeEach(() => vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} }));
@@ -132,12 +132,9 @@ describe('T034 task pipeline', () => {
     expect(fake.bridge.send.mock.calls[0]![0]).toMatchObject({ instanceId: instance.id, expectedRevision: instance.revision });
   });
 
-  it('mounts fixture lock waits in SessionWorkspace above the conversation', () => {
+  it('mounts fixture lock waits in the conversation pane above the messages (T051: was SessionWorkspace)', () => {
     const lock = fixtureSnapshot.locks[0]!; const waiter = lock.waiters[0]!;
-    render(<SessionWorkspace snapshot={fixtureSnapshot} agentOptions={fixtureSnapshot.agents}
-      view={{ id: 'lock-view', sessionId: waiter.sessionId, contexts: {} }} active visible selection={undefined}
-      onFocus={vi.fn()} onClose={vi.fn()} onContext={vi.fn()} onOpen={vi.fn()} onAgent={vi.fn()} onModel={vi.fn()}
-      onTransfer={vi.fn()} onProgress={vi.fn()} onNotice={vi.fn()} />);
+    render(<ConversationHarness snapshot={fixtureSnapshot} sessionId={waiter.sessionId} />);
     const waits = within(screen.getByRole('region', { name: '檔案鎖等待' }));
     expect(waits.getByText(lock.path)).toBeTruthy();
     expect(waits.getByText(/持有者：.*s-research/)).toBeTruthy();

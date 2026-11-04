@@ -14,8 +14,8 @@ export function ConnectionStatus({ state, store }: { state: RendererState; store
         ? <span>等待新的 session revision</span>
         : command.type === 'session.create'
           ? createCheck === 'missing' && !state.snapshot?.sessions.some(session => session.id === command.sessionId)
-            ? <button disabled={state.connection !== 'ready'} onClick={() => store.acknowledge(command.type, commandTarget(command))}>我已確認沒有建立，重新填寫</button>
-            : <span>請回新增 session 頁面，重新讀取資料並依 session ID 核對</span>
+            ? <button disabled={state.connection !== 'ready'} onClick={() => store.acknowledge(command.type, commandTarget(command))}>我已確認沒有建立，可以重新送出</button>
+            : <span>請回新對話畫面，重新讀取資料並依 session ID 核對</span>
           : <button onClick={() => store.acknowledge(command.type, commandTarget(command))}>已核對結果</button>}
     </div>)}</details>}
     {commands.length > 0 && <details className="command-history"><summary>操作結果（{commands.length}）</summary><ol aria-label="操作結果">{commands.map(({ command, result, reviewed }, index) => <li key={command.requestId}>

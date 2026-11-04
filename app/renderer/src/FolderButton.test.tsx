@@ -5,12 +5,12 @@ import { FolderRequest, FolderTarget, RequestId } from '../../../contracts';
 import type { FolderResult } from '../../../contracts';
 import { FolderButton } from './FolderButton';
 import { deferred, fakeBridge } from './ipc-test-helpers';
-import { SessionCreate } from './SessionCreate';
+import { App } from './App';
 import { WorkflowStart } from './WorkflowStart';
 import { createRendererStore } from './renderer-store';
 import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
 
-afterEach(() => { cleanup(); delete window.awg; });
+afterEach(() => { cleanup(); delete window.awg; vi.unstubAllGlobals(); window.history.replaceState(null, '', '/'); });
 const click = () => fireEvent.click(screen.getByRole('button', { name: /選擇資料夾|在檔案總管開啟/ }));
 function bridge(result?: (request: FolderRequest) => Promise<FolderResult>) {
   const request = vi.fn(result ?? (request => Promise.resolve({ ok: true, requestId: request.requestId })));
@@ -50,20 +50,39 @@ describe('C-24 optional folder bridge', () => {
     const fake = fakeBridge(); const store = createRendererStore(fake.bridge); await store.start();
     try {
       render(<WorkflowStart snapshot={fixtureSnapshot} store={store} ipcState={store.getSnapshot()} onOpen={vi.fn()} />);
-      click(); await waitFor(() => expect(screen.getByRole<HTMLInputElement>('textbox', { name: '工作資料夾' }).value).toBe('E:/picked'));
+      fireEvent.click(screen.getAllByRole('button', { name: '選擇…' })[0]!);
+      await waitFor(() => expect(screen.getByRole<HTMLInputElement>('combobox', { name: '工作資料夾' }).value).toBe('E:/picked'));
+      expect(screen.getByRole<HTMLInputElement>('combobox', { name: '專案資料夾' }).value).toBe('');
       expect(fake.bridge.send).not.toHaveBeenCalled();
     } finally { store.dispose(); }
   });
-  it('preserves other session draft edits made while the picker was open', async () => {
+  it('keeps other new-chat choices made while the picker was open (T051: the folder chip of the new chat)', async () => {
+    vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
     const pending = deferred<FolderResult>(); const request = bridge(() => pending.promise);
-    const fake = fakeBridge(); const store = createRendererStore(fake.bridge); await store.start();
-    const onDraft = vi.fn(); const draft = { cwd: '', agentId: '', modelKey: '', parentId: '' };
-    const props = { snapshot: fixtureSnapshot, store, ipcState: store.getSnapshot(), onOpen: vi.fn(), onDraft };
-    try {
-      const view = render(<SessionCreate {...props} draft={draft} />); click();
-      view.rerender(<SessionCreate {...props} draft={{ ...draft, agentId: 'new-selection' }} />);
-      await act(async () => { pending.resolve({ ok: true, requestId: request.mock.calls[0]![0].requestId, path: 'E:/picked' }); await pending.promise; });
-      expect(onDraft).toHaveBeenCalledWith({ ...draft, agentId: 'new-selection', cwd: 'E:/picked' });
-    } finally { store.dispose(); }
+    window.history.replaceState(null, '', '/#/new');
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: '工作資料夾：自動建立' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '選擇資料夾…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Agent：無' }));
+    fireEvent.click(screen.getByRole('menuitemradio', { name: fixtureSnapshot.agents[0]!.name }));
+    await act(async () => { pending.resolve({ ok: true, requestId: request.mock.calls[0]![0].requestId, path: 'E:/picked' }); await pending.promise; });
+    expect(screen.getByRole('button', { name: 'Agent：' + fixtureSnapshot.agents[0]!.name })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '工作資料夾：E:/picked' })).toBeTruthy();
+    expect((window.awg as unknown as { send: ReturnType<typeof vi.fn> }).send).not.toHaveBeenCalled();
+  });
+  it('a cancelled or failed pick leaves the folder chip as it was', async () => {
+    vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
+    const request = bridge(req => Promise.resolve({ ok: true, requestId: req.requestId, path: null }));
+    window.history.replaceState(null, '', '/#/new');
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: '工作資料夾：自動建立' }));
+    await act(async () => { fireEvent.click(screen.getByRole('menuitem', { name: '選擇資料夾…' })); await Promise.resolve(); });
+    expect(screen.getByRole('button', { name: '工作資料夾：自動建立' })).toBeTruthy();
+    request.mockImplementation(req => Promise.resolve({ ok: false, requestId: req.requestId, code: 'internal_error', message: 'picked E:/x' }));
+    fireEvent.click(screen.getByRole('button', { name: '工作資料夾：自動建立' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '選擇資料夾…' }));
+    await screen.findByText('無法開啟資料夾視窗。');
+    expect(screen.queryByText(/picked E:/)).toBeNull();
+    expect(screen.getByRole('button', { name: '工作資料夾：自動建立' })).toBeTruthy();
   });
 });

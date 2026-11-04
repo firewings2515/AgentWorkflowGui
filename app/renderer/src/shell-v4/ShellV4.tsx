@@ -1,22 +1,40 @@
-// The v0.4 shell (REVISION_V0_4 U-03): a simple, Claude-like layout. T047 (U0) runs it only in demo mode with `?shell=v4`.
-import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
-import type { SessionId, Snapshot } from '../../../../contracts';
+// The v0.4 shell (REVISION_V0_4 §3, U2_PLAN §3 T051): a simple, Claude-like layout for the connected app and the demo.
+// Connected: `store` is the IPC renderer store and every control sends a real command. Demo: `store` is undefined,
+// `serviceStore` serves fixture data (history pages, preferences, backups) and controls say what they would send.
+import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from 'react';
+import type { LogicalSession, ModelOption, SessionId, Snapshot } from '../../../../contracts';
+import { AgentId, MessageId, RequestId } from '../../../../contracts';
 import { AgentCatalog } from '../AgentCatalog';
 import { createAgentDemo } from '../agent-demo';
+import { createIpcAgentRepository } from '../agent-repository';
+import { commandFeedback } from '../command-feedback';
+import { FolderButton } from '../FolderButton';
+import type { RendererState, RendererStore } from '../renderer-store';
+import { sessionBlocksSend } from '../renderer-store';
+import { StorageBanner } from '../StorageSettings';
 import { readTheme, THEME_KEY } from '../theme';
 import type { Theme } from '../theme';
+import { TransferDialog } from '../TransferDialog';
+import type { TransferPreview } from '../TransferDialog';
 import { WorkflowEditor } from '../WorkflowEditor';
 import { createWorkflowDemo } from '../workflow-demo';
+import { createIpcWorkflowRepository } from '../workflow-repository';
 import { WorkflowProgress } from '../WorkflowProgress';
-import { defaultModelKey } from './Composer';
+import { WorkflowStart } from '../WorkflowStart';
+import { defaultModelKey, modelKey } from './Composer';
 import type { ComposerChoice } from './Composer';
 import { Conversation } from './Conversation';
-import { demoPinned, nextAutoFolder, v4DemoSnapshot } from './demo-data';
-import type { SidebarMode, V4Page, V4Pane } from './demo-data';
-import { NewChat, SettingsV4, WorkflowStartV4 } from './Pages';
+import { useCreateFlow } from './create-flow';
+import { demoPinned } from './demo-data';
+import type { SidebarMode, V4Page } from './demo-data';
+import { recentFolders, requestFolder } from './folders';
+import { NewChat, SettingsV4 } from './Pages';
+import { initialPanes, openTarget, paneReducer } from './pane-state';
 import { modeOf, Sidebar } from './Sidebar';
 import '../styles.css';
-import './shell-v4.css';
+import './styles.css';
+
+export const APP_NAME = 'AgentWorkflowGui';
 
 // Below this width the sidebar collapses by itself and opens as an overlay.
 const narrowQuery = '(max-width: 900px)';
@@ -26,117 +44,281 @@ const subscribeWidth = (onChange: () => void) => {
   query?.addEventListener('change', onChange);
   return () => query?.removeEventListener('change', onChange);
 };
-const pages: readonly V4Page[] = ['new', 'chat', 'settings', 'workflow-start', 'agents', 'templates', 'progress'];
-const tabs = ['files', 'tasks', 'messages', 'info'] as const;
 // Pages that belong to one sidebar mode; going there switches the sidebar too. Settings keeps the current mode.
 const pageModes: Partial<Record<V4Page, SidebarMode>> = { new: 'chat', 'workflow-start': 'workflow', agents: 'workflow', templates: 'workflow', progress: 'workflow' };
 
-/** Initial state from the URL, so each screenshot state can be opened directly. Interaction works from there as usual. */
-function initial(snapshot: Snapshot) {
-  const params = new URLSearchParams(window.location.search);
-  const known = (id: string | null) => snapshot.sessions.find(session => session.id === id)?.id;
-  const page = pages.find(value => value === params.get('page')) ?? 'new';
-  const tab = tabs.find(value => value === params.get('tab')) ?? 'files';
-  const first = known(params.get('session')) ?? snapshot.sessions[0]?.id;
-  const second = known(params.get('split'));
-  const panes: V4Pane[] = [
-    ...(first ? [{ id: 'pane-1', sessionId: first, details: params.get('details') === '1', tab }] : []),
-    ...(second ? [{ id: 'pane-2', sessionId: second, details: false, tab: 'files' as const }] : []),
-  ];
-  const shown = page === 'chat' && !panes.length ? 'new' as const : page;
-  const mode = (['chat', 'workflow'] as const).find(value => value === params.get('mode'))
-    ?? (shown === 'chat' && first ? modeOf(snapshot, first) : pageModes[shown] ?? 'chat');
-  return { page: shown, panes, mode, sidebar: params.get('sidebar') !== '0', instance: params.get('instance') ?? snapshot.instances[0]?.id ?? '' };
+/** Hash routes keep pages addressable under Electron's file:// URL (and the Agent／template selection in the URL). */
+export interface Route { page: V4Page | 'missing'; id: string; path: string }
+const decode = (value: string | undefined) => { try { return decodeURIComponent(value ?? ''); } catch { return value ?? ''; } };
+export function parseRoute(hash: string): Route {
+  const path = (hash.replace(/^#/, '').split('?')[0] ?? '') || '/new';
+  let match: RegExpExecArray | null;
+  if (path === '/new' || path === '/workbench') return { page: 'new', id: '', path };
+  if ((match = /^\/sessions\/([^/]+)$/.exec(path))) return { page: 'chat', id: decode(match[1]), path };
+  if (path === '/settings') return { page: 'settings', id: '', path };
+  if (path === '/workflows/start') return { page: 'workflow-start', id: '', path };
+  if ((match = /^\/workflows\/([^/]+)\/edit$/.exec(path))) return { page: 'templates', id: decode(match[1]), path };
+  if ((match = /^\/agents(?:\/([^/]+))?$/.exec(path))) return { page: 'agents', id: decode(match[1]), path };
+  if ((match = /^\/workflow-instances\/([^/]+)$/.exec(path))) return { page: 'progress', id: decode(match[1]), path };
+  return { page: 'missing', id: '', path };
 }
+const routePath = (page: V4Page, id = '') => ({
+  new: '/new', chat: `/sessions/${encodeURIComponent(id)}`, settings: '/settings', 'workflow-start': '/workflows/start',
+  templates: `/workflows/${encodeURIComponent(id || 'unavailable')}/edit`, agents: id ? `/agents/${encodeURIComponent(id)}` : '/agents',
+  progress: `/workflow-instances/${encodeURIComponent(id)}`,
+})[page];
+const currentRoute = () => parseRoute(window.location.hash);
+const keyCodes: Record<string, string> = { n: 'KeyN', f5: 'F5' };
+const newId = () => RequestId.parse(crypto.randomUUID());
 
-export function ShellV4({ snapshot = v4DemoSnapshot }: { snapshot?: Snapshot }) {
-  const start = useMemo(() => initial(snapshot), [snapshot]);
-  const [page, setPage] = useState<V4Page>(start.page);
-  const [mode, setMode] = useState<SidebarMode>(start.mode);
-  const [panes, setPanes] = useState<V4Pane[]>(start.panes);
-  const [activePane, setActivePane] = useState('pane-1');
-  const [nextPane, setNextPane] = useState(3);
-  const [instanceId, setInstanceId] = useState(start.instance);
-  const [theme, setTheme] = useState<Theme>(() => readTheme('dark'));
+export interface ShellProps { snapshot: Snapshot; store?: RendererStore | undefined; serviceStore: RendererStore; ipcState?: RendererState | undefined }
+
+export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps) {
+  const [route, setRoute] = useState(currentRoute);
+  const known = (id: string) => snapshot.sessions.some(session => session.id === id);
+  const [panes, dispatch] = useReducer(paneReducer, route, start => initialPanes(start.page === 'chat' && known(start.id) ? start.id as SessionId : undefined));
+  const [mode, setMode] = useState<SidebarMode>(() => route.page === 'chat' && known(route.id) ? modeOf(snapshot, route.id) : route.page !== 'missing' ? pageModes[route.page] ?? 'chat' : 'chat');
+  const [demoTheme, setDemoTheme] = useState<Theme>();
   const narrow = useSyncExternalStore(subscribeWidth, isNarrow);
-  const [sidebarOpen, setSidebarOpen] = useState(start.sidebar);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [narrowOpen, setNarrowOpen] = useState(false);
+  // Demo only: renames and pins stay in this preview.
   const [titles, setTitles] = useState<Record<string, string>>({});
-  const [pinned, setPinned] = useState<Record<SidebarMode, ReadonlySet<string>>>(() => ({ chat: new Set(demoPinned.chat), workflow: new Set(demoPinned.workflow) }));
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [demoPins, setDemoPins] = useState<Record<SidebarMode, ReadonlySet<string>>>(() => ({ chat: new Set(demoPinned.chat), workflow: new Set(demoPinned.workflow) }));
+  // Demo only: Agent／Model choices of existing sessions (connected: those are commands).
   const [choices, setChoices] = useState<Record<string, ComposerChoice>>({});
+  const [newDraft, setNewDraft] = useState('');
+  const [newChoice, setNewChoice] = useState<ComposerChoice>(() => ({ folder: { kind: 'auto' }, agentId: '', modelKey: defaultModelKey(snapshot.modelOptions) }));
   const [editTitle, setEditTitle] = useState<{ sessionId: string; nonce: number }>({ sessionId: '', nonce: 0 });
+  const [firstNotSent, setFirstNotSent] = useState<ReadonlySet<string>>(new Set());
   const [notice, setNotice] = useState('');
-  const [{ repository: agentRepository, controls: agentDemo }] = useState(() => createAgentDemo(snapshot.agents, id => snapshot.sessions.some(session => session.agent?.id === id)));
-  const [{ repository: workflowRepository, controls: workflowDemo }] = useState(() => createWorkflowDemo(snapshot.workflows));
+  const [transfer, setTransfer] = useState<TransferPreview | null>(null);
+  const progressFrom = useRef<string | undefined>(undefined);
+  const [{ repository: workflowRepository, controls: workflowDemo }] = useState(() => store
+    ? { repository: createIpcWorkflowRepository(store), controls: undefined } : createWorkflowDemo(snapshot.workflows));
+  const [{ repository: agentRepository, controls: agentDemo }] = useState(() => store
+    ? { repository: createIpcAgentRepository(store), controls: undefined }
+    : createAgentDemo(snapshot.agents, id => snapshot.sessions.some(session => session.agent?.id === id) || workflowRepository.getSnapshot().some(workflow => workflow.nodes.some(node => node.kind === 'agent' && node.agentId === id))));
   const agents = useSyncExternalStore(agentRepository.subscribe, agentRepository.getSnapshot);
-  const autoFolder = nextAutoFolder(new Date());
-  const collapsed = narrow ? !narrowOpen : !sidebarOpen;
 
+  const readOnly = snapshot.app.status === 'read-only';
+  const damaged = snapshot.app.status === 'damaged';
+  const theme = store && !readOnly ? snapshot.preferences.theme : demoTheme ?? readTheme(snapshot.preferences.theme);
+  const commandDisabled = snapshot.app.status !== 'ready' || (!!store && ipcState?.connection !== 'ready');
+  const themeDisabled = !readOnly && (commandDisabled || !!store?.isBlocked('preferences.set', 'preferences'));
+  const collapsed = narrow ? !narrowOpen : !sidebarOpen;
+  const active = panes.panes.find(pane => pane.id === panes.active) ?? panes.panes[0];
+  const page: V4Page | 'missing' = route.page === 'chat' && !known(route.id) ? 'missing' : route.page;
+  // Discard the preview as soon as damaged data is observed, before recovery can render it again.
+  if (damaged && transfer) setTransfer(null);
+
+  const navigate = useCallback((path: string, replace = false) => {
+    if (replace) window.history.replaceState(null, '', `#${path}`); else window.history.pushState(null, '', `#${path}`);
+    setRoute(parseRoute(path));
+  }, []);
+  const go = (next: V4Page, id = '') => {
+    navigate(routePath(next, id));
+    const nextMode = pageModes[next];
+    if (nextMode) setMode(nextMode);
+    if (narrow) setNarrowOpen(false);
+  };
+  const open = (sessionId: SessionId, paneId?: string, draft?: string) => {
+    if (!known(sessionId)) { setNotice(`找不到 session：${sessionId}`); return; }
+    dispatch({ type: 'open', sessionId, ...(paneId ? { paneId } : {}), ...(draft !== undefined ? { draft } : {}) });
+    // Opening a node session from anywhere (split view, search, a link) shows it in Workflow mode, under its run.
+    setMode(modeOf(snapshot, sessionId));
+    navigate(routePath('chat', sessionId));
+    if (narrow) setNarrowOpen(false);
+  };
+  const split = (sessionId: SessionId) => {
+    if (!known(sessionId)) return;
+    dispatch({ type: 'split', sessionId });
+    setMode(modeOf(snapshot, sessionId));
+    navigate(routePath('chat', sessionId));
+  };
+  const closePane = (paneId: string) => {
+    const remaining = panes.panes.filter(pane => pane.id !== paneId);
+    dispatch({ type: 'close', paneId });
+    if (remaining[0]) navigate(routePath('chat', (remaining.find(pane => pane.id === panes.active) ?? remaining[0]).sessionId), true);
+    else go('new');
+  };
+
+  // A route changed outside the app (back／forward, a typed address) opens its session in the active pane.
+  const onRoute = useRef<(next: Route) => void>(() => undefined);
+  useEffect(() => {
+    onRoute.current = next => {
+      if (next.page !== 'chat' || !known(next.id)) return;
+      if (active?.sessionId !== next.id) dispatch({ type: 'open', sessionId: next.id as SessionId });
+      setMode(modeOf(snapshot, next.id));
+    };
+  });
+  useEffect(() => {
+    const sync = () => { const next = currentRoute(); setRoute(next); onRoute.current(next); };
+    window.addEventListener('hashchange', sync);
+    window.addEventListener('popstate', sync);
+    return () => { window.removeEventListener('hashchange', sync); window.removeEventListener('popstate', sync); };
+  }, []);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     try { localStorage.setItem(THEME_KEY, theme); } catch { /* The in-memory choice still works. */ }
   }, [theme]);
   // The new-chat page focuses its input instead; a conversation keeps focus where the user clicked.
-  useEffect(() => { document.getElementById(page === 'settings' ? 'v4-settings-heading' : page === 'workflow-start' ? 'v4-start-heading' : '')?.focus({ preventScroll: true }); }, [page]);
+  useEffect(() => {
+    const heading = page === 'settings' ? 'v4-settings-heading' : page === 'workflow-start' ? 'v4-start-heading' : page === 'missing' ? 'v4-missing-heading' : '';
+    if (heading) document.getElementById(heading)?.focus({ preventScroll: true });
+  }, [page]);
 
-  const active = panes.find(pane => pane.id === activePane) ?? panes[0];
-  // An existing session starts from its own Agent and Model; a new chat starts with no Agent and the default Model.
-  const choiceFor = (key: string, session?: Snapshot['sessions'][number]): ComposerChoice => choices[key] ?? (session
-    ? { folder: { kind: 'picked', path: session.cwd }, agentId: session.agent?.id ?? '', modelKey: `${session.requestedModel.runtime}:${session.requestedModel.model}` }
-    : { folder: { kind: 'auto' }, agentId: '', modelKey: defaultModelKey(snapshot.modelOptions) });
-  const go = (next: V4Page) => { setPage(next); const nextMode = pageModes[next]; if (nextMode) setMode(nextMode); if (narrow) setNarrowOpen(false); };
-  const patchPane = (id: string, patch: Partial<V4Pane>) => setPanes(previous => previous.map(pane => pane.id === id ? { ...pane, ...patch } : pane));
-  const open = (sessionId: SessionId) => {
-    const shown = panes.find(pane => pane.sessionId === sessionId);
-    if (shown) setActivePane(shown.id);
-    else if (active) patchPane(active.id, { sessionId });
-    else { setPanes([{ id: 'pane-1', sessionId, details: false, tab: 'files' }]); setActivePane('pane-1'); }
-    // Opening a node session from anywhere (split view, search, a link) shows it in Workflow mode, under its run.
-    setMode(modeOf(snapshot, sessionId));
-    go('chat');
+  const reload = () => { if (store && ipcState?.connection !== 'loading') void store.reconnect(); };
+  // U2_PLAN §3-10: Ctrl+N (in Workflow mode: start a Workflow), Ctrl+Shift+N, F5. Physical key codes keep them working
+  // with a non-Latin layout; IME composition, key repeat and an open dialog never trigger them (T027).
+  const shortcut = useRef<(event: KeyboardEvent) => void>(() => undefined);
+  useEffect(() => { shortcut.current = event => {
+    if (event.defaultPrevented || event.isComposing || event.altKey || event.metaKey) return;
+    const code = event.code || keyCodes[event.key.toLowerCase()];
+    const action = event.ctrlKey && code === 'KeyN' ? (event.shiftKey || mode === 'workflow' ? 'workflow' : 'new')
+      : !event.ctrlKey && !event.shiftKey && code === 'F5' ? 'reload' : undefined;
+    if (!action) return;
+    event.preventDefault();
+    if (event.repeat || document.querySelector('dialog[open]')) return;
+    if (action === 'reload') reload();
+    else if (!damaged) go(action === 'new' ? 'new' : 'workflow-start');
+  }; });
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => shortcut.current(event);
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
+  /** Sends with the revision of the latest Snapshot at the moment of sending, never the one rendered earlier. */
+  const sendTo = (sessionId: SessionId, text: string) => {
+    if (!store) return;
+    const current = store.getSnapshot().snapshot;
+    const latest = current?.sessions.find(session => session.id === sessionId);
+    if (!current || !latest || sessionBlocksSend(current, sessionId)) return;
+    void store.send({ type: 'session.send', requestId: newId(), sessionId, messageId: MessageId.parse(crypto.randomUUID()), expectedRevision: latest.revision, text, attachments: [] }).then(result => {
+      if (!result.ok) return;
+      dispatch({ type: 'sent', sessionId, text });
+      setFirstNotSent(previous => { if (!previous.has(sessionId)) return previous; const next = new Set(previous); next.delete(sessionId); return next; });
+    });
   };
-  const split = (sessionId: SessionId) => {
-    const other = panes.find(pane => pane.id !== active?.id);
-    if (!active) { open(sessionId); return; }
-    if (other) { patchPane(other.id, { sessionId }); setActivePane(other.id); }
-    else { const id = `pane-${nextPane}`; setNextPane(nextPane + 1); setPanes([...panes, { id, sessionId, details: false, tab: 'files' }]); setActivePane(id); }
-    setMode(modeOf(snapshot, sessionId));
-    go('chat');
+  const flow = useCreateFlow({ snapshot, store, ipcState, onOpened: (sessionId, text, send) => {
+    const draft = text || newDraft;
+    const paneId = openTarget(panes, sessionId);
+    // A draft the user already typed in that session (opened from the sidebar while creating) is kept.
+    const typed = panes.panes.find(pane => pane.id === paneId)?.contexts[sessionId]?.draft;
+    open(sessionId, paneId, typed ? undefined : draft);
+    setNewDraft(previous => previous === draft ? '' : previous);
+    if (send) sendTo(sessionId, draft);
+    else setFirstNotSent(previous => new Set(previous).add(sessionId));
+  } });
+  const pickNewFolder = () => { void requestFolder().then(outcome => {
+    if (outcome.kind === 'picked') setNewChoice(previous => ({ ...previous, folder: { kind: 'picked', path: outcome.path } }));
+    else if (outcome.kind === 'failed') setNotice(outcome.message);
+  }); };
+
+  const latestRevision = (sessionId: SessionId) => store?.getSnapshot().snapshot?.sessions.find(session => session.id === sessionId)?.revision;
+  const choiceFor = (session: LogicalSession): ComposerChoice => choices[session.id]
+    ?? { folder: { kind: 'picked', path: session.cwd }, agentId: session.agent?.id ?? '', modelKey: modelKey(session.requestedModel) };
+  const changeChoice = (session: LogicalSession, paneId: string, next: ComposerChoice) => {
+    const previous = choiceFor(session);
+    if (next.agentId !== previous.agentId && session.kind === 'ordinary') {
+      const revision = latestRevision(session.id);
+      if (store && revision !== undefined) void store.send({ type: 'session.setAgent', requestId: newId(), sessionId: session.id, expectedRevision: revision, agentId: next.agentId ? AgentId.parse(next.agentId) : null });
+      else if (!store) setChoices(all => ({ ...all, [session.id]: { ...previous, agentId: next.agentId } }));
+    }
+    if (next.modelKey !== previous.modelKey) {
+      const model: ModelOption | undefined = snapshot.modelOptions.find(item => modelKey(item) === next.modelKey);
+      if (!model) return;
+      if (model.runtime !== session.requestedModel.runtime) {
+        // Another tool is a transfer (R-02, R-12); a workflow node cannot change tools.
+        if (session.kind === 'ordinary') setTransfer({ sessionId: session.id, model, viewId: paneId });
+        else setNotice('workflow 的 node 不能換工具。');
+        return;
+      }
+      const selection = { runtime: model.runtime, model: model.model, ...(model.defaultEffort ? { effort: model.defaultEffort } : {}) };
+      const revision = latestRevision(session.id);
+      if (store && revision !== undefined) void store.send({ type: 'session.setModel', requestId: newId(), sessionId: session.id, expectedRevision: revision, model: selection });
+      else if (!store) setChoices(all => ({ ...all, [session.id]: { ...(all[session.id] ?? previous), modelKey: next.modelKey } }));
+    }
   };
-  const closePane = (id: string) => {
-    const remaining = panes.filter(pane => pane.id !== id);
-    setPanes(remaining);
-    if (remaining[0]) setActivePane(remaining[0].id); else setPage('new');
+  const renameSession = (sessionId: SessionId, title: string) => {
+    if (!store) { setTitles(previous => ({ ...previous, [sessionId]: title })); return; }
+    const revision = latestRevision(sessionId);
+    if (revision === undefined || readOnly) return;
+    void store.send({ type: 'session.rename', requestId: newId(), sessionId, expectedRevision: revision, title }).then(result => {
+      if (!result.ok) setNotice(`沒有改名：${result.code === 'stale_revision' ? '標題剛被更新，請再改一次。' : commandFeedback(result, 'session.rename')}`);
+    });
   };
+  const closeTransfer = () => {
+    const viewId = transfer?.viewId;
+    setTransfer(null);
+    requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-pane="${viewId}"] .v4-model > button`)?.focus());
+  };
+  const changeTheme = (next: Theme) => {
+    if (themeDisabled || next === theme) return;
+    const latest = store?.getSnapshot().snapshot?.preferences;
+    if (store && !readOnly) { if (latest) void store.send({ type: 'preferences.set', requestId: newId(), preferences: { ...latest, theme: next } }); }
+    else setDemoTheme(next);
+  };
+
+  if (damaged && snapshot.app.status === 'damaged') return <div className="connection-screen damaged-screen" data-testid="shell-v4">
+    <h1>{APP_NAME}</h1>
+    <section role="alert"><h2>資料損壞，所有操作已停用</h2>
+      <p>請保留資料庫並交由維護人員檢查。</p><dl><dt>原因代碼</dt><dd><code>{snapshot.app.reason}</code></dd><dt>資料庫位置</dt><dd><code>{snapshot.app.location}</code></dd></dl>
+      <FolderButton target={{ kind: 'app-data' }} />
+    </section>
+    <button type="button" disabled={!store || ipcState?.connection === 'loading'} onClick={reload}>重新讀取資料</button>
+    {ipcState?.connection === 'loading' && <p role="status">正在重新讀取資料…</p>}
+    {ipcState?.connection === 'error' && <p role="alert">資料同步失敗，請再次重新讀取。</p>}
+  </div>;
+
+  const connectionText = !store ? '示意模式 · 未連接 runtime' : ipcState?.connection === 'ready' ? 'IPC 已連線'
+    : ipcState?.connection === 'error' ? '資料同步失敗，保留上次資料' : '正在同步資料…';
+  const connection = <><span className="v4-dot" data-state={store ? ipcState?.connection : 'demo'} aria-hidden="true" /><span role="status">{connectionText}</span>
+    {store && <button type="button" className="v4-icon" aria-label="重新讀取資料" title="重新讀取資料（F5）" disabled={ipcState?.connection === 'loading'} onClick={reload}>↻</button>}</>;
+  const pinned = store ? { chat: new Set<string>(), workflow: new Set<string>() } : demoPins;
 
   let main;
-  if (page === 'chat' && panes.length) main = <div className={`v4-panes ${panes.length > 1 ? 'v4-split' : ''}`}>{panes.map(pane => {
+  if (page === 'chat' && panes.panes.length) main = <div className={`v4-panes ${panes.panes.length > 1 ? 'v4-split' : ''}`}>{panes.panes.map(pane => {
     const session = snapshot.sessions.find(item => item.id === pane.sessionId);
-    const title = titles[pane.sessionId] ?? session?.title ?? pane.sessionId;
+    const title = (session && titles[session.id]) ?? session?.title ?? pane.sessionId;
     const runTitle = session?.kind === 'workflow' ? titles[session.workflow.instanceId] : undefined;
-    return <Conversation key={pane.id} snapshot={snapshot} pane={pane} title={title} runTitle={runTitle} active={pane.id === active?.id} split={panes.length > 1}
-      agents={agents} draft={drafts[pane.sessionId] ?? ''} choice={choiceFor(pane.sessionId, session)}
-      editTitle={editTitle.sessionId === pane.sessionId ? editTitle.nonce : 0}
-      onDraft={text => setDrafts(previous => ({ ...previous, [pane.sessionId]: text }))}
-      onChoice={choice => setChoices(previous => ({ ...previous, [pane.sessionId]: choice }))}
-      onPane={patch => patchPane(pane.id, patch)} onRename={name => setTitles(previous => ({ ...previous, [pane.sessionId]: name }))}
-      onClose={() => closePane(pane.id)} onFocus={() => { if (pane.id !== activePane) setActivePane(pane.id); }}
-      onOpen={open} onProgress={id => { setInstanceId(id); go('progress'); }} onNotice={setNotice} />;
+    return <Conversation key={pane.id} snapshot={snapshot} store={store} historyStore={serviceStore} ipcState={ipcState} pane={pane} title={title} runTitle={runTitle}
+      active={pane.id === active?.id} split={panes.panes.length > 1} agents={agents} choice={session ? choiceFor(session) : newChoice}
+      editTitle={editTitle.sessionId === pane.sessionId ? editTitle.nonce : 0} firstNotSent={firstNotSent.has(pane.sessionId)}
+      onContext={patch => dispatch({ type: 'context', paneId: pane.id, sessionId: pane.sessionId, patch })}
+      onChoice={next => { if (session) changeChoice(session, pane.id, next); }} onSend={text => sendTo(pane.sessionId, text)}
+      onRename={name => renameSession(pane.sessionId, name)} onClose={() => closePane(pane.id)}
+      onFocus={() => {
+        if (pane.id === panes.active) return;
+        dispatch({ type: 'focus', paneId: pane.id });
+        // The focused pane of a split is the address of the page.
+        if (route.page === 'chat' && route.id !== pane.sessionId) navigate(routePath('chat', pane.sessionId), true);
+      }}
+      onOpen={id => open(id, pane.id)} onProgress={id => { progressFrom.current = pane.id; go('progress', id); }} onNotice={setNotice} />;
   })}</div>;
-  else if (page === 'settings') main = <SettingsV4 snapshot={snapshot} theme={theme} onTheme={setTheme} onNotice={setNotice} />;
-  else if (page === 'workflow-start') main = <WorkflowStartV4 snapshot={snapshot} autoFolder={autoFolder} onNotice={setNotice} />;
-  else if (page === 'progress') main = <div className="v4-page v4-page-wide"><WorkflowProgress snapshot={snapshot} instanceId={instanceId} store={undefined} ipcState={undefined} onOpen={open} onBack={() => go(active ? 'chat' : 'new')} /></div>;
-  else if (page === 'agents' || page === 'templates') main = null;
-  else main = <NewChat snapshot={snapshot} agents={agents} draft={drafts.new ?? ''} onDraft={text => setDrafts(previous => ({ ...previous, new: text }))}
-    choice={choiceFor('new')} onChoice={choice => setChoices(previous => ({ ...previous, new: choice }))} autoFolder={autoFolder} onNotice={setNotice} />;
+  else if (page === 'settings') main = <SettingsV4 snapshot={snapshot} store={store} serviceStore={serviceStore} ipcState={ipcState} theme={theme} themeDisabled={themeDisabled} onTheme={changeTheme} />;
+  else if (page === 'workflow-start') main = <WorkflowStart snapshot={snapshot} store={store} ipcState={ipcState} onOpen={id => open(id)} />;
+  else if (page === 'progress') main = <div className="v4-page v4-page-wide"><WorkflowProgress snapshot={snapshot} instanceId={route.id} store={store} ipcState={ipcState}
+    onOpen={id => open(id, progressFrom.current)} onBack={() => { if (active) open(active.sessionId); else go('new'); }} /></div>;
+  else if (page === 'missing') main = <section className="v4-page" aria-labelledby="v4-missing-heading"><div className="v4-page-column">
+    <h1 id="v4-missing-heading" tabIndex={-1}>{route.page === 'chat' ? `找不到 session：${route.id}` : '找不到頁面'}</h1>
+    {route.page !== 'chat' && <p>無法辨識路由：<code>{route.path}</code></p>}
+    <button type="button" onClick={() => go('new')}>回到新對話</button></div></section>;
+  else if (page === 'agents' || page === 'templates' || page === 'chat') main = null;
+  else main = <NewChat snapshot={snapshot} store={store} ipcState={ipcState} agents={agents} draft={newDraft} onDraft={setNewDraft} choice={newChoice} onChoice={setNewChoice}
+    flow={flow} recent={recentFolders(snapshot)} onPickFolder={pickNewFolder} onNotice={setNotice}
+    onSend={() => { if (!store) setNotice('示意模式：未連接 runtime，草稿已保留。連線時會依序送 session.create 與 session.send。'); else void flow.submit(newDraft, newChoice); }} />;
 
+  const selectedSession = page === 'chat' ? active?.sessionId : undefined;
   return <div className={`v4-shell ${collapsed ? 'v4-collapsed' : ''} ${narrow ? 'v4-narrow' : ''}`} data-testid="shell-v4">
-    <Sidebar snapshot={snapshot} titles={titles} pinned={pinned} mode={mode} selectedId={active?.sessionId} page={page} collapsed={collapsed} overlay={narrow} theme={theme}
+    <Sidebar snapshot={snapshot} titles={titles} pinned={pinned} mode={mode} selectedId={selectedSession} page={page === 'missing' ? 'chat' : page} collapsed={collapsed} overlay={narrow} theme={theme}
+      readOnly={readOnly} canPin={!store} canRenameRun={!store} connection={connection}
       onCollapse={value => { if (narrow) setNarrowOpen(!value); else setSidebarOpen(!value); }}
       onMode={value => { setMode(value); if (page === 'new' && value === 'workflow') go('workflow-start'); else if (page === 'workflow-start' && value === 'chat') go('new'); }}
-      onNewChat={() => go('new')} onStartWorkflow={() => go('workflow-start')} onOpen={open} onSplit={split} onTheme={setTheme} onPage={go}
-      onPin={id => setPinned(previous => {
+      onNewChat={() => go('new')} onStartWorkflow={() => go('workflow-start')} onOpen={id => open(id)} onSplit={split}
+      onTheme={changeTheme} onPage={next => go(next, next === 'templates' ? snapshot.workflows[0]?.id ?? '' : '')}
+      onPin={id => setDemoPins(previous => {
         const key = modeOf(snapshot, id); const next = new Set(previous[key]);
         if (next.has(id)) next.delete(id); else next.add(id);
         return { ...previous, [key]: next };
@@ -145,19 +327,23 @@ export function ShellV4({ snapshot = v4DemoSnapshot }: { snapshot?: Snapshot }) 
       onRename={id => { open(id); setEditTitle(previous => ({ sessionId: id, nonce: previous.nonce + 1 })); }} />
     {narrow && narrowOpen && <div className="v4-scrim" aria-hidden="true" onClick={() => setNarrowOpen(false)} />}
     <main className="v4-main">
-      {narrow && collapsed && <div className="v4-narrow-bar"><button type="button" className="v4-icon" aria-label="開啟側欄" onClick={() => setNarrowOpen(true)}>☰</button><strong>AgentWorkflowGui</strong>
+      {narrow && collapsed && <div className="v4-narrow-bar"><button type="button" className="v4-icon" aria-label="開啟側欄" onClick={() => setNarrowOpen(true)}>☰</button><strong>{APP_NAME}</strong>
         {mode === 'chat' ? <button type="button" className="v4-icon" aria-label="新對話" onClick={() => go('new')}>＋</button>
           : <button type="button" className="v4-icon" aria-label="開始 Workflow" onClick={() => go('workflow-start')}>＋</button>}</div>}
+      <StorageBanner snapshot={snapshot} store={serviceStore} onBackups={() => { go('settings'); requestAnimationFrame(() => document.getElementById('settings-backups-heading')?.focus()); }} />
       {page === 'new' && <div className="v4-main-actions"><button type="button" onClick={() => go('workflow-start')}>開始 Workflow…</button></div>}
       {main}
       <div className="v4-page v4-page-wide" hidden={page !== 'agents'}>
-        <AgentCatalog repository={agentRepository} demo={agentDemo} selectedId="" visible={page === 'agents'} onSelect={() => undefined} />
+        <AgentCatalog readOnly={readOnly} repository={agentRepository} demo={agentDemo} selectedId={page === 'agents' ? route.id : ''} visible={page === 'agents'}
+          onSelect={id => navigate(routePath('agents', id))} />
       </div>
       <div className="v4-page v4-page-wide v4-editor-page" hidden={page !== 'templates'}>
-        <WorkflowEditor repository={workflowRepository} demo={workflowDemo} agents={agents} models={snapshot.modelOptions} runtimes={snapshot.runtimes}
-          selectedId={snapshot.workflows[0]?.id ?? ''} visible={page === 'templates'} onSelect={() => undefined} />
+        <WorkflowEditor readOnly={readOnly} repository={workflowRepository} demo={workflowDemo} agents={agents} models={snapshot.modelOptions} runtimes={snapshot.runtimes}
+          selectedId={page === 'templates' ? route.id : ''} visible={page === 'templates'} onSelect={id => navigate(routePath('templates', id))} />
       </div>
     </main>
     {notice && <div className="v4-notice" role="status"><span>{notice}</span><button type="button" className="v4-icon" aria-label="關閉提示" onClick={() => setNotice('')}>×</button></div>}
+    {transfer && <TransferDialog key={`${transfer.sessionId}:${transfer.viewId}`} snapshot={snapshot} preview={transfer} store={store} ipcState={ipcState} onClose={closeTransfer}
+      onOpen={id => { open(id, transfer.viewId); closeTransfer(); }} />}
   </div>;
 }

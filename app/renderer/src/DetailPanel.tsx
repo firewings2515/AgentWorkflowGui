@@ -1,7 +1,7 @@
 import { readOnlyProps } from './read-only';
 import type { LogicalSession, NativeTask, SessionId, Snapshot, WorkflowInstance } from '../../../contracts';
-import { detailPanels } from './workbench-state';
-import type { DetailTab } from './workbench-state';
+import { detailPanels } from './shell-v4/pane-state';
+import type { DetailTab } from './shell-v4/pane-state';
 import { Empty, formatTime, observedModelText, Status } from './ui';
 import { RequestId } from '../../../contracts';
 import type { RendererStore } from './renderer-store';

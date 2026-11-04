@@ -13,7 +13,7 @@ export function transcriptGeometry() {
   });
   const rowHeight = (row: HTMLElement) => row.dataset.messageId ? row.dataset.messageId.endsWith('-u') ? 80 : 240 : Number.parseFloat(row.style.height) || 0;
   vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
-    return this.matches('.transcript, [data-test-scroll]') ? geometry.height : 0;
+    return this.matches('.transcript, .v4-transcript, [data-test-scroll]') ? geometry.height : 0;
   });
   vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(geometry.width);
   vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(function (this: HTMLElement) {
@@ -21,7 +21,7 @@ export function transcriptGeometry() {
     return geometry.top + geometry.tail + Array.from(list?.children ?? []).reduce((sum, row) => sum + rowHeight(row as HTMLElement), 0);
   });
   vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
-    const container = this.closest<HTMLElement>('.transcript, [data-test-scroll]');
+    const container = this.closest<HTMLElement>('.transcript, .v4-transcript, [data-test-scroll]');
     const top = this.classList.contains('virtual-messages') ? geometry.top - (container?.scrollTop ?? 0) : 0;
     const height = this.dataset.messageId ? rowHeight(this) : 0;
     return { top, bottom: top + height, height, width: geometry.width, left: 0, right: geometry.width, x: 0, y: top, toJSON: () => ({}) };

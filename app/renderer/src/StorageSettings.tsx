@@ -88,7 +88,8 @@ function OutcomeCheck({ store, types }: { store: RendererStore; types: Command['
   </section>;
 }
 
-export function BackupDialog({ store, demo, onClose }: { store: RendererStore; demo: boolean; onClose: () => void }) {
+/** Backup and restore, a section of the settings page (Q-13; it was a dialog of the old app menu). */
+export function BackupSection({ store, demo }: { store: RendererStore; demo: boolean }) {
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
   const [backups, setBackups] = useState<BackupInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -105,7 +106,7 @@ export function BackupDialog({ store, demo, onClose }: { store: RendererStore; d
     return () => { active = false; };
   }, [store, revision, storage?.lastBackupAt]);
   const blocked = state.connection !== 'ready' || state.snapshot?.app.status === 'damaged' || store.isBlocked('backup.restore', 'storage') || store.isBlocked('backup.cancelRestore', 'storage');
-  return <Modal title="備份與還原" onClose={onClose}>
+  return <section className="v4-card" id="settings-backups" aria-labelledby="settings-backups-heading"><h2 id="settings-backups-heading" tabIndex={-1}>備份與還原</h2>
     {demo && <p className="demo-badge">示意模式：僅變更示意資料，不會還原磁碟上的資料。</p>}
     <p>每天首次啟動自動備份，保留 30 天；資料升級前也會先備份。僅備份本應用程式資料，不包含工具登入憑證或工具自己的資料目錄。</p>
     {storage?.pendingRestore && <section role="status"><p>待還原：{storage.pendingRestore.backupId} · 備份時間：{backups.some(b => b.id === storage.pendingRestore?.backupId) ? date(backups.find(b => b.id === storage.pendingRestore?.backupId)!.createdAt) : '尚未取得或備份已不在清單中'}。下次啟動時套用，套用前會先備份現在的資料。</p><button disabled={blocked} onClick={() => {
@@ -121,10 +122,11 @@ export function BackupDialog({ store, demo, onClose }: { store: RendererStore; d
     {selected && <Modal title="確認還原" onClose={() => setSelected(null)}><p>還原 {date(selected.createdAt)} 的「{backupReasons[selected.reason]}」。</p><p>下次啟動時套用，套用前會先備份現在的資料。備份檢查失敗時會保留目前資料。</p><button disabled={blocked || !!storage?.pendingRestore || !backups.some(b => b.id === selected.id)} onClick={() => {
       void store.send({ type: 'backup.restore', requestId: queryId(), backupId: selected.id }).then(result => { setFeedback(result.ok ? '還原已接受，等待資料狀態更新；下次啟動時套用。' : commandFeedback(result)); setSelected(null); });
     }}>確認下次啟動還原</button></Modal>}
-  </Modal>;
+  </section>;
 }
 
-export function SettingsDialog({ store, demo, onClose }: { store: RendererStore; demo: boolean; onClose: () => void }) {
+/** How long idle runtimes stay open and how many may be open (the old app menu's 設定 dialog, now a settings section). */
+export function SupervisorSection({ store, demo }: { store: RendererStore; demo: boolean }) {
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
   const preferences = state.snapshot?.preferences;
   const [idle, setIdle] = useState(String(preferences?.supervisor.idleCloseMinutes ?? 15));
@@ -132,7 +134,7 @@ export function SettingsDialog({ store, demo, onClose }: { store: RendererStore;
   const [feedback, setFeedback] = useState('');
   const parsed = SupervisorSettings.safeParse({ idleCloseMinutes: Number(idle), maxOpenRuntimes: Number(limit) });
   const disabled = state.connection !== 'ready' || state.snapshot?.app.status !== 'ready' || store.isBlocked('preferences.set', 'preferences');
-  return <Modal title="設定" onClose={onClose}><p>閒置程序釋放後，會在需要時恢復；超過上限時先釋放最久未使用的閒置程序。</p>{demo && <p>示意模式：設定僅保留在這次預覽。</p>}
+  return <section className="v4-card" aria-labelledby="settings-supervisor-heading"><h2 id="settings-supervisor-heading">Runtime 程序</h2><p>閒置程序釋放後，會在需要時恢復；超過上限時先釋放最久未使用的閒置程序。</p>{demo && <p>示意模式：設定僅保留在這次預覽。</p>}
     {state.snapshot?.app.status === 'read-only' && <p>唯讀模式，設定無法儲存。</p>}
     <form onSubmit={event => {
       event.preventDefault(); if (disabled || !parsed.success) return;
@@ -144,5 +146,5 @@ export function SettingsDialog({ store, demo, onClose }: { store: RendererStore;
       {!parsed.success && <p role="alert">請輸入範圍內的整數。</p>}<button {...readOnlyProps(state.snapshot?.app.status === 'read-only')} type="submit" disabled={disabled || !parsed.success}>儲存設定</button></form>
     {feedback && <p role="status">{feedback}</p>}
     <OutcomeCheck store={store} types={['preferences.set']} />
-  </Modal>;
+  </section>;
 }

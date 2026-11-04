@@ -44,7 +44,7 @@ export function WorkflowProgress({ snapshot, instanceId, onOpen, onBack, store, 
 }) {
   const instance = snapshot.instances.find(i => i.id === instanceId);
   return <section className="workflow-progress" aria-label="Workflow 執行進度">
-    <header className="progress-header"><div><span className="eyebrow">指定執行群組 · 流程圖唯讀</span><h2>{instance?.title ?? '找不到指定的 Workflow 執行群組'}</h2><p className="muted">{instanceId}</p></div><button onClick={onBack}>返回工作台</button></header>
+    <header className="progress-header"><div><span className="eyebrow">指定執行群組 · 流程圖唯讀</span><h2>{instance?.title ?? '找不到指定的 Workflow 執行群組'}</h2><p className="muted">{instanceId}</p></div><button onClick={onBack}>返回對話</button></header>
     {!instance ? <Empty>無法取得指定執行群組，請確認 ID 與資料同步狀態。</Empty> : <>
       <p>群組狀態：<Status value={instance.state} /> · 啟動時範本：{instance.template.name} · v{instance.workflowRevision}</p>
       {instance.projectId && <div>專案：{snapshot.projects.find(p => p.id === instance.projectId)?.name ?? instance.projectId} <FolderButton target={{ kind: 'project', projectId: instance.projectId }} /></div>}

@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fixtureBackupList, fixtureReadOnlySnapshot, fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
 import { App } from './App';
-import { BackupDialog, SettingsDialog, StorageBanner } from './StorageSettings';
+import { BackupSection, SupervisorSection, StorageBanner } from './StorageSettings';
 import { createRendererStore } from './renderer-store';
 import { createStorageDemo } from './query-bridge';
 import { fakeBridge } from './ipc-test-helpers';
@@ -18,7 +18,7 @@ describe('T041 backup, settings and read-only UI', () => {
     const bridge = createStorageDemo({ ...fixtureReadOnlySnapshot, storage: {} });
     const send = vi.spyOn(bridge, 'send');
     const store = createRendererStore(bridge); await store.start();
-    render(<BackupDialog store={store} demo onClose={() => {}} />);
+    render(<BackupSection store={store} demo />);
     const restore = (await screen.findAllByRole('button', { name: /^還原 / }))[0]!;
     restore.focus(); fireEvent.click(restore);
     expect(send).not.toHaveBeenCalled();
@@ -41,7 +41,7 @@ describe('T041 backup, settings and read-only UI', () => {
   it('validates integer bounds and saves supervisor without overwriting theme', async () => {
     const bridge = createStorageDemo({ ...fixtureSnapshot, preferences: { ...fixtureSnapshot.preferences, theme: 'light' } });
     const send = vi.spyOn(bridge, 'send'); const store = createRendererStore(bridge); await store.start();
-    render(<SettingsDialog store={store} demo onClose={() => {}} />);
+    render(<SupervisorSection store={store} demo />);
     const idle = screen.getByRole('spinbutton', { name: /閒置分鐘數/ });
     const limit = screen.getByRole('spinbutton', { name: /程序上限/ });
     for (const value of ['', '0', '1441', '1.5']) {
@@ -56,20 +56,18 @@ describe('T041 backup, settings and read-only UI', () => {
     expect(send.mock.calls[0]?.[0]).toMatchObject({ type: 'preferences.set', preferences: { theme: 'light', supervisor: { idleCloseMinutes: 1440, maxOpenRuntimes: 32 } } });
     store.dispose();
   });
-  it('keeps readonly data browsable, disables writes, and restores app-menu focus', async () => {
-    window.history.replaceState(null, '', '/#/workbench');
+  it('keeps readonly data browsable, disables writes, and reaches settings and backups from the banner (T051: was the app menu)', async () => {
+    window.history.replaceState(null, '', '/#/sessions/s-plan-notes');
     vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
     render(<App snapshot={fixtureReadOnlySnapshot} />);
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('磁碟空間不足'));
     expect(screen.getByText(fixtureReadOnlySnapshot.app.status === 'read-only' ? fixtureReadOnlySnapshot.app.location : '')).toBeTruthy();
     expect(screen.getByRole<HTMLButtonElement>('button', { name: '送出' }).disabled).toBe(true);
-    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(true);
-    const menu = screen.getByRole('button', { name: '應用程式選單' });
-    fireEvent.click(menu); fireEvent.click(screen.getByRole('menuitem', { name: '設定' }));
-    const dialog = screen.getByRole('dialog', { name: '設定' });
-    expect(within(dialog).getByRole<HTMLButtonElement>('button', { name: '儲存設定' }).disabled).toBe(true);
-    fireEvent.keyDown(dialog, { key: 'Escape' }); expect(document.activeElement).toBe(menu);
-    fireEvent.click(menu); fireEvent.click(screen.getByRole('menuitem', { name: '備份與還原' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Model：/ }));
+    for (const item of screen.getAllByRole<HTMLButtonElement>('menuitemradio')) expect(item.disabled).toBe(true);
+    fireEvent.click(within(screen.getByRole('alert')).getByRole('button', { name: '備份與還原' }));
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('設定');
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '儲存設定' }).disabled).toBe(true);
     await screen.findByRole('button', { name: '取消待還原' });
     expect(screen.getByRole<HTMLButtonElement>('button', { name: '取消待還原' }).disabled).toBe(false);
   });
@@ -77,22 +75,29 @@ describe('T041 backup, settings and read-only UI', () => {
     const fake = fakeBridge(fixtureReadOnlySnapshot);
     const demo = createStorageDemo(fixtureReadOnlySnapshot);
     window.awg = { ...fake.bridge, ...{ query: demo.query } };
-    window.history.replaceState(null, '', '/#/workbench');
+    window.history.replaceState(null, '', '/#/sessions/s-plan-notes');
     render(<App />);
     await screen.findByRole('button', { name: '送出' });
-    fireEvent.change(screen.getByRole('combobox', { name: '外觀主題' }), { target: { value: 'light' } });
+    fireEvent.click(screen.getByRole('button', { name: '切換成淺色' }));
     expect(document.documentElement.dataset.theme).toBe('light');
     expect(localStorage.getItem(THEME_KEY)).toBe('light');
-    fireEvent.click(screen.getByRole('button', { name: '應用程式選單' }));
-    fireEvent.click(screen.getByRole('menuitemradio', { name: '深色主題' }));
-    expect(localStorage.getItem(THEME_KEY)).toBe('dark');
     expect(fake.bridge.send).not.toHaveBeenCalled();
-    for (const name of ['送出', '新增 session', '啟動 Workflow', '換到另一個工具']) {
-      const button = screen.getByRole<HTMLButtonElement>('button', { name });
-      expect(button.disabled).toBe(true);
+    for (const button of [screen.getByRole<HTMLButtonElement>('button', { name: '送出' }), document.querySelector<HTMLButtonElement>('.v4-title')!]) {
       expect(button.getAttribute('aria-describedby')).toBe('read-only-reason');
       expect(button.title).toContain('唯讀');
     }
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '送出' }).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: '設定' }));
+    fireEvent.click(screen.getByRole('radio', { name: '深色' }));
+    expect(localStorage.getItem(THEME_KEY)).toBe('dark');
+    expect(fake.bridge.send).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /^Workflow/ }));
+    fireEvent.click(screen.getByRole('button', { name: '開始 Workflow' }));
+    const start = screen.getByRole<HTMLButtonElement>('button', { name: '開始' });
+    expect(start.disabled).toBe(true);
+    expect(start.title).toContain('唯讀');
+    fireEvent.click(screen.getByRole('button', { name: /^對話/ }));
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '送出' }).title).toContain('唯讀');
     expect(document.querySelectorAll('.storage-summary')).toHaveLength(1);
     expect(document.getElementById('storage-details')!.hidden).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: '展開詳情' }));
@@ -103,11 +108,11 @@ describe('T041 backup, settings and read-only UI', () => {
   it.each([false, true])('disables read-only send even with a nonempty draft (connected bridge: %s)', async connected => {
     const fake = fakeBridge(fixtureReadOnlySnapshot);
     if (connected) window.awg = fake.bridge;
-    window.history.replaceState(null, '', '/#/workbench');
+    window.history.replaceState(null, '', '/#/sessions/s-plan-notes');
     // Snapshot mode isolates the UI guard from the store's independent guard.
     render(connected ? <App /> : <App snapshot={fixtureReadOnlySnapshot} />);
     const send = await screen.findByRole<HTMLButtonElement>('button', { name: '送出' });
-    const draft = screen.getByRole<HTMLTextAreaElement>('textbox', { name: /^傳訊息給 / });
+    const draft = screen.getByRole<HTMLTextAreaElement>('textbox', { name: /^回覆 / });
     fireEvent.change(draft, { target: { value: '唯讀模式仍可保留草稿' } });
     expect(draft.value).toBe('唯讀模式仍可保留草稿');
     expect(send.disabled).toBe(true);
@@ -119,7 +124,7 @@ describe('T041 backup, settings and read-only UI', () => {
     const bridge = createStorageDemo(initial);
     const send = vi.spyOn(bridge, 'send').mockImplementation(command => Promise.resolve(unknownResult(RequestId.parse(command.requestId))));
     const store = createRendererStore(bridge); await store.start();
-    render(type === 'preferences.set' ? <SettingsDialog store={store} demo={false} onClose={() => {}} /> : <BackupDialog store={store} demo={false} onClose={() => {}} />);
+    render(type === 'preferences.set' ? <SupervisorSection store={store} demo={false} /> : <BackupSection store={store} demo={false} />);
     if (type === 'backup.restore') {
       fireEvent.click((await screen.findAllByRole('button', { name: /^還原 / }))[0]!);
       fireEvent.click(screen.getByRole('button', { name: '確認下次啟動還原' }));

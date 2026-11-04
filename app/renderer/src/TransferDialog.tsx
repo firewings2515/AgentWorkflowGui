@@ -74,7 +74,7 @@ export function TransferDialog({ snapshot, preview, store, ipcState, onClose, on
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
     }
   }}>
-    <header><span className="eyebrow">跨工具轉交</span><h2 id="transfer-heading">轉交到新的 session</h2><button autoFocus onClick={onClose}>返回工作台</button></header>
+    <header><span className="eyebrow">跨工具轉交</span><h2 id="transfer-heading">轉交到新的 session</h2><button autoFocus onClick={onClose}>返回對話</button></header>
     <div className="transfer-body">
       <p>來源：{source?.title ?? preview.sessionId} · {source?.requestedModel.runtime ?? '工具未知'}<br /><code>{preview.sessionId}</code></p>
       <p className="muted">確認前不建立目標 session，也不傳送轉交內容。關閉視窗僅隱藏預覽；取消提案請使用下方按鈕。</p>

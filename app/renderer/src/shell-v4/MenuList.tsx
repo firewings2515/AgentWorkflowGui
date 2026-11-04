@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 
-export interface MenuItem { label: string; onSelect: () => void; disabled?: boolean; danger?: boolean }
+export interface MenuItem { label: string; onSelect: () => void; disabled?: boolean; danger?: boolean; title?: string | undefined }
 
 /** A role=menu list: focuses its first item, moves with arrows/Home/End, and closes on Esc, Tab or a click outside. */
 export function MenuList({ label, items, onClose, className = '', style, autoFocus = true }: {
@@ -26,7 +26,7 @@ export function MenuList({ label, items, onClose, className = '', style, autoFoc
     const next = event.key === 'ArrowDown' ? (current + 1) % buttons.length : event.key === 'ArrowUp' ? (current - 1 + buttons.length) % buttons.length
       : event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : -1;
     if (next >= 0) { event.preventDefault(); buttons[next]?.focus(); }
-  }}>{items.map(item => <button key={item.label} type="button" role="menuitem" className={item.danger ? 'danger' : undefined} disabled={item.disabled}
+  }}>{items.map(item => <button key={item.label} type="button" role="menuitem" className={item.danger ? 'danger' : undefined} disabled={item.disabled} title={item.title}
     onClick={() => { onClose(true); item.onSelect(); }}>{item.label}</button>)}</div>;
 }
 

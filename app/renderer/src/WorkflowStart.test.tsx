@@ -27,9 +27,10 @@ async function setup(snapshot: Snapshot = fixtureSnapshot, timeoutMs = 15000) {
 function fill() {
   fireEvent.change(screen.getByLabelText('標題'), { target: { value: '新的工作' } });
   fireEvent.change(screen.getByLabelText('工作資料夾'), { target: { value: 'E:\\work' } });
+  fireEvent.change(screen.getByLabelText('專案資料夾'), { target: { value: 'E:\\repo' } });
   fireEvent.change(screen.getByLabelText('第一則訊息'), { target: { value: '請完成實作' } });
 }
-const start = () => screen.getByRole<HTMLButtonElement>('button', { name: '啟動 Workflow' });
+const start = () => screen.getByRole<HTMLButtonElement>('button', { name: '開始' });
 
 describe('T025 workflow start', () => {
   it.each(['unknown_outcome', 'storage_failed'] as const)('reconciles %s with the generated instance ID using the start-screen reload action', async code => {
@@ -47,7 +48,7 @@ describe('T025 workflow start', () => {
     fireEvent.click(screen.getByRole('button', { name: '重新讀取資料並核對' }));
     await waitFor(() => expect(fake.bridge.snapshot).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(store.getSnapshot().connection).toBe('ready'));
-    expect(screen.queryByText(/已核對：執行群組已啟動/)).toBeNull();
+    expect(screen.queryByText(/已核對：執行群組已開始/)).toBeNull();
     fake.data.snapshot.instances.push({ ...fixtureSnapshot.instances[0]!, id: command.instanceId, rootSessionId: command.rootSessionId,
       tasks: fixtureSnapshot.instances[0]!.tasks.map(task => ({ ...task, instanceId: command.instanceId })),
     });
@@ -55,7 +56,7 @@ describe('T025 workflow start', () => {
     // A reload must pass the same contract validation as a real bridge snapshot.
     Snapshot.parse(fake.data.snapshot);
     fireEvent.click(screen.getByRole('button', { name: '重新讀取資料並核對' }));
-    await screen.findByText(`已核對：執行群組已啟動。執行群組：${command.instanceId}`);
+    await screen.findByText(`已核對：執行群組已開始。執行群組：${command.instanceId}`);
     expect(screen.getByRole<HTMLButtonElement>('button', { name: '開啟 root session' }).disabled).toBe(false);
     expect(screen.queryByText(/最新資料尚未出現本次執行群組/)).toBeNull();
     expect(screen.queryByText(new RegExp(code))).toBeNull();
@@ -75,7 +76,7 @@ describe('T025 workflow start', () => {
     await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(1));
     const command = Command.parse(fake.bridge.send.mock.calls[0]![0]);
     expect(command).toMatchObject({ type: 'workflow.start', workflowId: fixtureSnapshot.workflows[0]!.id,
-      workflowRevision: fixtureSnapshot.workflows[0]!.revision, title: '新的工作', workFolder: 'E:\\work', projectFolder: 'E:\\work', firstMessage: '請完成實作', crossToolConsent: true });
+      workflowRevision: fixtureSnapshot.workflows[0]!.revision, title: '新的工作', workFolder: 'E:\\work', projectFolder: 'E:\\repo', firstMessage: '請完成實作', crossToolConsent: true });
     if (command.type !== 'workflow.start') throw new Error('wrong command');
     expect(new Set([command.requestId, command.instanceId, command.rootSessionId]).size).toBe(3);
     await screen.findByText(/unsupported/);
@@ -137,9 +138,41 @@ describe('T025 workflow start', () => {
       response.resolve({ ok: true, requestId: RequestId.parse(fake.bridge.send.mock.calls[0]![0].requestId), created: [] });
       await Promise.resolve();
     });
-    await screen.findByText(/啟動指令已接受/);
+    await screen.findByText(/開始指令已接受/);
     expect(start().matches(':disabled')).toBe(true);
     expect(fake.bridge.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('T051 (Q-4／Q-8): leaves out an empty work folder, requires the project folder for worktree runs only', async () => {
+    const { fake } = await setup();
+    const template = fixtureSnapshot.workflows[0]!;
+    expect(template.isolation).toBe('worktree');
+    fireEvent.change(screen.getByLabelText('標題'), { target: { value: '只產報告' } });
+    fireEvent.change(screen.getByLabelText('第一則訊息'), { target: { value: '整理' } });
+    fireEvent.click(screen.getByRole('checkbox'));
+    expect(screen.getByLabelText('專案資料夾').getAttribute('aria-required')).toBe('true');
+    expect(start().disabled).toBe(true);
+    expect(screen.getByText('還沒選專案資料夾')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('專案資料夾'), { target: { value: '  E:/repo  ' } });
+    fireEvent.click(start());
+    await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(1));
+    const command = Command.parse(fake.bridge.send.mock.calls[0]![0]);
+    expect(command).toMatchObject({ type: 'workflow.start', projectFolder: 'E:/repo', title: '只產報告' });
+    expect('workFolder' in command).toBe(false);
+  });
+
+  it('T051 (Q-8): a same-folder run starts without any folder, and takes a project folder when given', async () => {
+    const snapshot = structuredClone(fixtureSnapshot);
+    snapshot.workflows[0]!.isolation = 'same-folder';
+    snapshot.workflows[0]!.nodes = snapshot.workflows[0]!.nodes.map(node => node.kind === 'agent' ? { ...node, model: { ...node.model, runtime: 'claude' } } : node);
+    const { fake } = await setup(Snapshot.parse(snapshot));
+    fireEvent.change(screen.getByLabelText('標題'), { target: { value: '報告' } });
+    fireEvent.change(screen.getByLabelText('第一則訊息'), { target: { value: '寫報告' } });
+    expect(screen.getByLabelText('專案資料夾').getAttribute('aria-required')).toBe('false');
+    fireEvent.click(start());
+    await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(1));
+    const command = Command.parse(fake.bridge.send.mock.calls[0]![0]);
+    expect('workFolder' in command || 'projectFolder' in command).toBe(false);
   });
 
   it('shows an empty state without creating a workflow', async () => {

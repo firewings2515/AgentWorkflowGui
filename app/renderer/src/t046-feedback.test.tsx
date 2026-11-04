@@ -3,7 +3,6 @@
 // on. A retry it refused says the retry is saved and to start a new session; a send it refused says the message was not
 // sent and to start a new session; a session in `error` says so where messages are written. The words come from the
 // code and the operation, never from the service's own message (which may be misleading).
-import { useState, useSyncExternalStore } from 'react';
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { EscalationId, RequestId } from '../../../contracts';
@@ -11,8 +10,7 @@ import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
 import { commandFeedback } from './command-feedback';
 import { ConnectionStatus } from './ConnectionStatus';
 import { createRendererStore, type RendererStore } from './renderer-store';
-import { SessionWorkspace } from './SessionWorkspace';
-import { contextFor, initialWorkspace } from './workbench-state';
+import { ConversationHarness } from './shell-v4/conversation-test-harness';
 import { fakeBridge } from './ipc-test-helpers';
 
 const stores: RendererStore[] = [];
@@ -66,16 +64,7 @@ describe('T046: what a refused retry or send tells the user', () => {
 });
 
 describe('T046: a session in error says so where messages are written', () => {
-  function Harness({ store }: { store: RendererStore }) {
-    const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
-    const snapshot = state.snapshot!;
-    const [view, setView] = useState(() => initialWorkspace(snapshot.sessions).views[0]!);
-    return (
-      <SessionWorkspace snapshot={snapshot} store={store} ipcState={state} agentOptions={snapshot.agents} view={view} active visible selection={undefined}
-        onFocus={() => {}} onClose={() => {}} onOpen={() => {}} onAgent={() => {}} onModel={() => {}} onTransfer={() => {}} onProgress={() => {}} onNotice={() => {}}
-        onContext={(patch) => setView((previous) => ({ ...previous, contexts: { ...previous.contexts, [previous.sessionId]: { ...contextFor(previous), ...patch } } }))} />
-    );
-  }
+  const Harness = ({ store }: { store: RendererStore }) => <ConversationHarness store={store} />;
   const first = fixtureSnapshot.sessions[0]!;
   const renderWith = async (activity: typeof first.activity) => {
     const snapshot = { ...fixtureSnapshot, sessions: fixtureSnapshot.sessions.map((s) => (s.id === first.id ? { ...s, activity } : s)) };

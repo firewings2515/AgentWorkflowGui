@@ -1,29 +1,20 @@
 // @vitest-environment jsdom
-import { useState, useSyncExternalStore } from 'react';
+// T051: the old SessionWorkspace tests (T040 long conversations, history pages, release causes) on the v0.4 conversation pane.
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
-import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
-import type { QueryResult } from '../../../contracts';
-import { SessionWorkspace } from './SessionWorkspace';
-import { createRendererStore } from './renderer-store';
-import type { RendererStore } from './renderer-store';
-import { createStorageDemo } from './query-bridge';
-import { contextFor, initialWorkspace } from './workbench-state';
-import { deferred, fakeBridge } from './ipc-test-helpers';
-import { transcriptGeometry } from './transcript-test-geometry';
-import { performanceSnapshot } from './performance-demo';
+import { fixtureSnapshot } from '../../../../contracts/fixtures/snapshot';
+import type { QueryResult } from '../../../../contracts';
+import { createRendererStore } from '../renderer-store';
+import type { RendererStore } from '../renderer-store';
+import { createStorageDemo } from '../query-bridge';
+import { deferred, fakeBridge } from '../ipc-test-helpers';
+import { transcriptGeometry } from '../transcript-test-geometry';
+import { performanceSnapshot } from '../performance-demo';
+import { ConversationHarness } from './conversation-test-harness';
 
 const stores: RendererStore[] = [];
 afterEach(() => { cleanup(); stores.forEach(store => store.dispose()); stores.length = 0; vi.restoreAllMocks(); vi.unstubAllGlobals(); });
-function Harness({ store }: { store: RendererStore }) {
-  const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
-  const snapshot = state.snapshot!;
-  const [view, setView] = useState(() => initialWorkspace(snapshot.sessions).views[0]!);
-  return <><button onClick={() => setView(previous => ({ ...previous, sessionId: snapshot.sessions.find(s => s.id !== previous.sessionId)!.id }))}>切換測試 session</button><SessionWorkspace snapshot={snapshot} store={store} ipcState={state} agentOptions={snapshot.agents} view={view} active visible selection={undefined}
-    onFocus={() => {}} onClose={() => {}} onOpen={() => {}} onAgent={() => {}} onModel={() => {}} onTransfer={() => {}} onProgress={() => {}} onNotice={() => {}}
-    onContext={patch => setView(previous => ({ ...previous, contexts: { ...previous.contexts, [previous.sessionId]: { ...contextFor(previous), ...patch } } }))} />
-    <output data-testid="reading">{JSON.stringify(contextFor(view).reading)}</output></>;
-}
+const Harness = ({ store }: { store: RendererStore }) => <ConversationHarness store={store} />;
 it('opens the full 2000-turn workspace at the latest message and restores context after a session switch', async () => {
   transcriptGeometry();
   const snapshot = performanceSnapshot();
@@ -31,7 +22,7 @@ it('opens the full 2000-turn workspace at the latest message and restores contex
   const view = render(<Harness store={store} />);
   const last = snapshot.messages.at(-1)!;
   expect(view.container.querySelector(`[data-message-id="${last.id}"]`)).not.toBeNull();
-  const transcript = screen.getByRole<HTMLElement>('region', { name: /對話$/ });
+  const transcript = screen.getByRole<HTMLElement>('region', { name: /對話內容$/ });
   expect(transcript.scrollTop).toBe(transcript.scrollHeight - transcript.clientHeight);
   fireEvent.scroll(transcript, { target: { scrollTop: 16000 } });
   const saved = screen.getByTestId('reading').textContent;
@@ -47,7 +38,7 @@ it('loads history by button or top scroll, shows loading, retries failures, then
   const query = vi.spyOn(bridge, 'query').mockImplementationOnce(() => pending.promise);
   const store = createRendererStore(bridge); stores.push(store); await store.start();
   render(<Harness store={store} />);
-  const transcript = screen.getByRole('region', { name: /對話$/ });
+  const transcript = screen.getByRole('region', { name: /對話內容$/ });
   fireEvent.click(screen.getByRole('button', { name: '載入更早的對話' }));
   expect(screen.getByRole<HTMLButtonElement>('button', { name: '正在載入更早的對話…' }).disabled).toBe(true);
   await act(async () => { pending.reject(new Error('歷史讀取失敗')); await Promise.resolve(); });

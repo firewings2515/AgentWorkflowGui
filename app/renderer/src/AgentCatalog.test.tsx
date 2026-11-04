@@ -101,8 +101,8 @@ describe('T011 Agent 管理', () => {
     fireEvent.click(list().getByRole('button', { name: /實作 Agent/ }));
     click('編輯');
     change('指示（必填）', '實作草稿保留');
-    fireEvent.click(screen.getByRole('link', { name: '工作台' }));
-    fireEvent.click(screen.getByRole('link', { name: 'Agent 管理' }));
+    fireEvent.click(screen.getByRole('button', { name: '設定' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Agent' }));
     expect(field('指示（必填）').value).toBe('規劃草稿保留');
     fireEvent.click(list().getByRole('button', { name: /實作 Agent/ }));
     expect(field('指示（必填）').value).toBe('實作草稿保留');
@@ -215,8 +215,10 @@ describe('T011 Agent 管理', () => {
       window.dispatchEvent(new PopStateEvent('popstate'));
     });
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(document.activeElement).toBe(screen.getByRole('heading', { name: '工作台', level: 1 }));
-    fireEvent.click(screen.getByRole('link', { name: 'Agent 管理' }));
+    // T051: the old workbench route is the new chat, whose input takes the focus.
+    expect(document.activeElement).toBe(screen.getByRole('textbox', { name: /輸入訊息/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Workflow/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Agent' }));
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(document.activeElement).toBe(screen.getByRole('heading', { name: planner.name }));
   });
@@ -262,8 +264,8 @@ describe('T011 Agent 管理', () => {
       click('＋ 建立 Agent');
       expectSelectedScroll();
       expect(list().getAllByRole('button').at(-1)?.getAttribute('aria-current')).toBe('true');
-      fireEvent.click(screen.getByRole('link', { name: '工作台' }));
-      fireEvent.click(screen.getByRole('link', { name: 'Agent 管理' }));
+      fireEvent.click(screen.getByRole('button', { name: '設定' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Agent' }));
       expectSelectedScroll();
     } finally {
       Reflect.deleteProperty(HTMLElement.prototype, 'scrollIntoView');
@@ -339,15 +341,17 @@ describe('T011 Agent 管理', () => {
     expect(screen.getByText(`Agent ID：${id}`)).toBeTruthy();
   });
 
-  it('makes a saved new definition available in the ordinary session picker', async () => {
+  it('makes a saved new definition available in the new chat Agent chip (T051: was the session picker)', async () => {
     render(<App />);
     click('＋ 建立 Agent');
     change('名稱（必填）', '使用者新角色');
     change('指示（必填）', '使用者新指示');
     click('儲存');
     await screen.findByText(/已儲存「使用者新角色」/);
-    fireEvent.click(screen.getByRole('link', { name: '工作台' }));
-    expect(within(screen.getByRole('combobox', { name: 'Agent' })).getByRole('option', { name: '使用者新角色' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /^對話/ }));
+    fireEvent.click(screen.getByRole('button', { name: '新對話' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Agent：無' }));
+    expect(within(screen.getByRole('menu', { name: 'Agent：無' })).getByRole('menuitemradio', { name: '使用者新角色' })).toBeTruthy();
   });
 
   it('retains drafts when the save facade rejects unexpectedly', async () => {

@@ -11,14 +11,17 @@ import type { RendererStore } from './renderer-store';
 import { fakeBridge } from './ipc-test-helpers';
 
 const root = SessionId.parse('s-wf-root');
+// T051 (U2_PLAN §3-12): a card is shown in the session that raised it. The fixture's git push comes from this node.
+const buildB = SessionId.parse('s-wf-build-b');
 const ordinary = fixtureSnapshot.sessions[0]!.id;
 const stores: RendererStore[] = [];
 afterEach(() => { cleanup(); stores.forEach(store => store.dispose()); stores.length = 0; });
-function Harness({ store, sessionId = root }: { store: RendererStore; sessionId?: SessionId }) {
+/** Without a session: the root and the node that raised the git push, side by side, as two conversation panes would. */
+function Harness({ store, sessionId }: { store: RendererStore; sessionId?: SessionId | undefined }) {
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
-  return <EscalationPanel snapshot={state.snapshot!} store={store} ipcState={state} sessionId={sessionId} />;
+  return <>{(sessionId ? [sessionId] : [root, buildB]).map(id => <EscalationPanel key={id} snapshot={state.snapshot!} store={store} ipcState={state} sessionId={id} />)}</>;
 }
-async function setup(snapshot: Snapshot = fixtureSnapshot, sessionId = root) {
+async function setup(snapshot: Snapshot = fixtureSnapshot, sessionId?: SessionId) {
   const fake = fakeBridge(snapshot);
   const store = createRendererStore(fake.bridge);
   stores.push(store);
@@ -113,7 +116,7 @@ describe('T025 escalation decisions', () => {
       kind: 'lock-timeout', title: '檔案鎖等待逾時', detail: '', state: 'open', createdAt: waiter.since,
       ref: { kind: 'lock', path: lock.path, sessionId: waiter.sessionId, holderSessionId: lock.holderSessionId } });
     data.escalations = [escalation];
-    const { fake } = await setup(data);
+    const { fake } = await setup(data, waiter.sessionId);
     const target = card(escalation.title);
     expect(target.getByText(/當時持有者：s-research.*等待／寫入者：s-plan-notes/)).toBeTruthy();
     const waits = within(target.getByRole('region', { name: '檔案鎖等待' }));
@@ -122,12 +125,15 @@ describe('T025 escalation decisions', () => {
     expect(waits.getByText(/已等待/)).toBeTruthy();
     expect(fake.bridge.send).not.toHaveBeenCalled();
   });
-  it('groups only open escalations belonging to this root, with explicit user authority', async () => {
-    const { fake, store, rerender } = await setup();
+  it('groups only the open escalations this session raised, with explicit user authority (T051: by fromSessionId)', async () => {
+    const { fake, store, rerender } = await setup(fixtureSnapshot, root);
     expect(screen.getByText('由你決定，不是 root 的 AI')).toBeTruthy();
-    expect(screen.getByRole('region', { name: '權限' })).toBeTruthy();
+    expect(screen.queryByRole('region', { name: '權限' })).toBeNull();
     expect(screen.getByRole('region', { name: '結果未知' })).toBeTruthy();
     expect(screen.queryByRole('article', { name: '確認 task 清單' })).toBeNull();
+    rerender(<Harness store={store} sessionId={buildB} />);
+    expect(screen.getByRole('region', { name: '權限' })).toBeTruthy();
+    expect(screen.queryByRole('region', { name: '結果未知' })).toBeNull();
     rerender(<Harness store={store} sessionId={ordinary} />);
     expect(screen.queryByRole('article')).toBeNull();
     expect(fake.bridge.send).not.toHaveBeenCalled();

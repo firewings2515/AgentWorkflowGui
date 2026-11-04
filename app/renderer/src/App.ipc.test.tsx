@@ -19,6 +19,10 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); rendererStore(fake.bridge).dispose(); delete window.awg; vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 const click = (name: string) => fireEvent.click(screen.getByRole('button', { name }));
+const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const reply = (title: string) => screen.getByRole<HTMLTextAreaElement>('textbox', { name: new RegExp(`^回覆 ${escape(title)}`) });
+const sidebarRow = (title: string) => within(screen.getByRole('complementary', { name: '側欄' })).getByRole('button', { name: title });
+const openSession = (id: string) => window.history.replaceState(null, '', `/#/sessions/${id}`);
 async function openAgents() {
   window.history.replaceState(null, '', '/#/agents');
   render(<App />);
@@ -36,12 +40,14 @@ describe('IPC rendering and actions', () => {
     expect(screen.getByText(/資料同步失敗/)).toBeTruthy();
     fake.data.snapshot = { ...fixtureSnapshot, sessions: [], agents: [], workflows: [] };
     click('重新讀取資料');
-    await screen.findByRole('heading', { name: '開啟一段對話' });
+    // T051: with no sessions the app opens on the new chat.
+    await screen.findByRole('heading', { name: '今天想做什麼？' });
     expect(screen.queryByText(/示意資料/)).toBeNull();
     expect(fake.bridge.send).not.toHaveBeenCalled();
   });
 
   it('applies increasing seq in the UI and reconnects on online without resending after remount', async () => {
+    openSession(fixtureSnapshot.sessions[0]!.id);
     const first = render(<StrictMode><App /></StrictMode>);
     await screen.findByText('IPC 已連線');
     const session = fixtureSnapshot.sessions[0]!;
@@ -160,19 +166,23 @@ describe('IPC rendering and actions', () => {
   it('keeps an in-flight message bound to its original session when selection changes', async () => {
     const response = deferred<CommandResult>();
     fake.bridge.send.mockReturnValueOnce(response.promise);
-    render(<App />); await screen.findByText('IPC 已連線');
     const original = fixtureSnapshot.sessions[0]!;
     const target = fixtureSnapshot.sessions.find(session => session.kind === 'ordinary' && session.id !== original.id)!;
-    fireEvent.change(screen.getByRole('textbox', { name: `傳訊息給 ${original.title}` }), { target: { value: '固定目標' } });
+    openSession(original.id);
+    render(<App />); await screen.findByText('IPC 已連線');
+    fireEvent.change(reply(original.title), { target: { value: '固定目標' } });
     click('送出');
     await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(1));
     const sent = fake.bridge.send.mock.calls[0]![0];
     expect(sent).toMatchObject({ type: 'session.send', sessionId: original.id, expectedRevision: original.revision, text: '固定目標' });
     expect(Command.safeParse(sent).success).toBe(true);
-    fireEvent.click(screen.getByRole('button', { name: new RegExp(`^${target.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} `) }));
-    fireEvent.change(screen.getByRole('textbox', { name: `傳訊息給 ${target.title}` }), { target: { value: '另一個草稿' } });
+    fireEvent.click(sidebarRow(target.title));
+    fireEvent.change(reply(target.title), { target: { value: '另一個草稿' } });
     await act(async () => { response.resolve({ ok: true, requestId: RequestId.parse(sent.requestId), created: [] }); await Promise.resolve(); });
-    expect(screen.getByRole<HTMLTextAreaElement>('textbox', { name: `傳訊息給 ${target.title}` }).value).toBe('另一個草稿');
+    expect(reply(target.title).value).toBe('另一個草稿');
+    // The accepted message clears only its own session's draft.
+    fireEvent.click(sidebarRow(original.title));
+    expect(reply(original.title).value).toBe('');
     cleanup(); render(<App />);
     expect(fake.bridge.send).toHaveBeenCalledTimes(1);
   });
@@ -193,7 +203,7 @@ describe('IPC rendering and actions', () => {
       return { ok: true, requestId: command.requestId, created: [] };
     });
     render(<App />); await screen.findByText('IPC 已連線');
-    fireEvent.change(screen.getByRole('combobox', { name: '外觀主題' }), { target: { value: 'light' } });
+    fireEvent.click(screen.getByRole('button', { name: '切換成淺色' }));
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe('light'));
     expect(fake.bridge.send.mock.calls[0]![0]).toMatchObject({ type: 'preferences.set', preferences: { ...fixtureSnapshot.preferences, theme: 'light' } });
     expect(fake.bridge.snapshot).toHaveBeenCalledTimes(1);
@@ -244,22 +254,29 @@ describe('IPC rendering and actions', () => {
     const task = { ...fixtureSnapshot.nativeTasks.find(item => item.state === 'running')!, sessionId: session.id };
     fake.data.snapshot.nativeTasks = [task];
     fake.bridge.send.mockReturnValueOnce(deferred<CommandResult>().promise);
+    openSession(session.id);
     render(<App />); await screen.findByText('IPC 已連線');
     vi.useFakeTimers();
-    fireEvent.change(screen.getByRole('textbox', { name: `傳訊息給 ${session.title}` }), { target: { value: '待核對的訊息' } });
+    fireEvent.change(reply(session.title), { target: { value: '待核對的訊息' } });
     click('送出');
     await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
     vi.useRealTimers();
     expect(screen.getByRole<HTMLButtonElement>('button', { name: '送出' }).disabled).toBe(true);
-    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Agent' }).disabled).toBe(false);
-    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Model' }).disabled).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: /^Model：/ }));
+    expect(screen.getAllByRole<HTMLButtonElement>('menuitemradio').some(item => !item.disabled)).toBe(true);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    click('開啟細節窗格');
     fireEvent.click(screen.getByRole('tab', { name: '任務流程' }));
     expect(screen.getByRole<HTMLButtonElement>('button', { name: '停止這個子 agent' }).disabled).toBe(false);
     click('停止這個子 agent');
     await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(2));
     expect(fake.bridge.send.mock.calls[1]![0]).toMatchObject({ type: 'nativeTask.stop', sessionId: session.id, nativeTaskId: task.id });
+    // T051: the outcomes to check moved from the footer to the settings page.
+    click('設定');
     fireEvent.click(screen.getByText('待核對操作（1）'));
     click('已核對結果');
+    fireEvent.click(sidebarRow(session.title));
+    expect(reply(session.title).value).toBe('待核對的訊息');
     expect(screen.getByRole<HTMLButtonElement>('button', { name: '送出' }).disabled).toBe(false);
     expect(fake.bridge.send).toHaveBeenCalledTimes(2);
     click('送出');
