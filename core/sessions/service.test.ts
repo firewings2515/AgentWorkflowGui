@@ -4,14 +4,16 @@ import { describe, expect, it } from 'vitest';
 import {
   AppEvent,
   CommandResult,
+  InstanceId,
   ItemId,
   LogicalSession,
   MessageId,
   NativeTaskId,
+  NodeId,
   PermissionRequestId,
   type Escalation,
   OperationId,
-  type SessionId,
+  SessionId,
   TurnId,
 } from '../../contracts';
 import { FakeHandle, permissionRequest } from './testing/fake-adapter';
@@ -198,6 +200,25 @@ describe('other session commands', () => {
     expect((await session(w, 'session-a')).parentId).toBe(parent);
     const loop = await w.run({ type: 'session.reparent', requestId: rid(), sessionId: parent, expectedRevision: await latest(w, 'session-p'), parentId: sessionId });
     expect(failed(loop)).toBe('invalid_request');
+  });
+
+  it('U3 Q-18: refuses a workflow session as the new parent, and still moves below an ordinary one or to the top', async () => {
+    const w = await world();
+    const { sessionId } = await created(w);
+    const { sessionId: other } = await created(w, 'codex', 'session-o');
+    const base = await session(w, 'session-o');
+    const node = SessionId.parse('session-wf');
+    await w.repositories.sessions.create({ ...base, id: node, kind: 'workflow', title: 'node', agent: { id: AGENT, revision: 0 },
+      workflow: { instanceId: InstanceId.parse('inst-1'), nodeId: NodeId.parse('n-1') } });
+    const below = await w.run({ type: 'session.reparent', requestId: rid(), sessionId, expectedRevision: await latest(w, 'session-a'), parentId: node });
+    expect(failed(below)).toBe('invalid_request');
+    expect((await session(w, 'session-a')).parentId).toBeUndefined();
+    expect((await w.run({ type: 'session.reparent', requestId: rid(), sessionId, expectedRevision: await latest(w, 'session-a'), parentId: other })).ok).toBe(true);
+    expect((await session(w, 'session-a')).parentId).toBe(other);
+    // The cycle check is unchanged.
+    expect(failed(await w.run({ type: 'session.reparent', requestId: rid(), sessionId: other, expectedRevision: await latest(w, 'session-o'), parentId: sessionId }))).toBe('invalid_request');
+    expect((await w.run({ type: 'session.reparent', requestId: rid(), sessionId, expectedRevision: await latest(w, 'session-a'), parentId: null })).ok).toBe(true);
+    expect((await session(w, 'session-a')).parentId).toBeUndefined();
   });
 
   it('stops a running native task of the session only', async () => {

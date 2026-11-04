@@ -1249,7 +1249,10 @@ export class SessionService {
     // A workflow session's parent is the session that created it; only the ordinary tree can be reorganised (WB-01).
     if (session.kind !== 'ordinary') return fail(requestId, 'invalid_transition', 'Only ordinary sessions can be moved in the tree');
     if (parentId !== null) {
-      if (!sessions.some((s) => s.id === parentId)) return fail(requestId, 'not_found', 'Unknown parent session');
+      const parent = sessions.find((s) => s.id === parentId);
+      if (parent === undefined) return fail(requestId, 'not_found', 'Unknown parent session');
+      // U3 Q-18: an ordinary session never sits below a workflow session (it would show at the top of the chat list).
+      if (parent.kind !== 'ordinary') return fail(requestId, 'invalid_request', 'The parent must be an ordinary session');
       // Walking up from the new parent must never reach the session itself.
       let cursor: SessionId | undefined = parentId;
       while (cursor !== undefined) {

@@ -7,6 +7,8 @@ import type { Theme } from '../theme';
 import { byRecent } from './demo-data';
 import type { SidebarMode, V4Page } from './demo-data';
 import { MenuList } from './MenuList';
+import type { MenuItem } from './MenuList';
+import { MovePicker } from './MovePicker';
 
 // REVISION_V0_4 §3.1 / Q-9: one sidebar with a 對話｜Workflow switch on top. Both modes share the same parts and
 // behaviour (＋, search, pinned, list, context menu, keys, rail, overlay); only the ＋ action and the list differ.
@@ -33,6 +35,10 @@ export interface SidebarProps {
   onMode: (mode: SidebarMode) => void; onCollapse: (collapsed: boolean) => void; onNewChat: () => void; onStartWorkflow: () => void;
   onOpen: (id: SessionId) => void; onSplit: (id: SessionId) => void; onPin: (id: string) => void; onRename: (id: SessionId) => void;
   onRenameRun: (id: string, title: string) => void; onPage: (page: V4Page) => void; onTheme: (theme: Theme) => void;
+  /** WB-04 (T053): move an ordinary session below another one, or to the top with null. */
+  onMove: (id: SessionId, parentId: SessionId | null) => void;
+  /** Why moving this session is disabled now (read-only, not synchronised, a move in flight or unconfirmed); undefined when it can move. */
+  moveReason: (id: SessionId) => string | undefined;
   /** Read-only data (T040): pinning and renaming are shown but disabled, with the reason. */
   readOnly: boolean;
   /** Pinning cannot be saved now (read-only, not synchronised, or a preferences change in flight). */
@@ -52,6 +58,7 @@ export function Sidebar(props: SidebarProps) {
   const [openRows, setOpenRows] = useState<Record<string, boolean>>({});
   const [menu, setMenu] = useState<ContextTarget | null>(null);
   const [renaming, setRenaming] = useState('');
+  const [picker, setPicker] = useState<{ sessionId: SessionId; from: HTMLElement } | null>(null);
   const nav = useRef<HTMLElement>(null);
   const pinned = props.pinned[mode];
   const readOnly = props.readOnly ? { title: readOnlyProps(true).title } : {};
@@ -139,6 +146,13 @@ export function Sidebar(props: SidebarProps) {
   const menuRun = menu?.kind === 'run' ? snapshot.instances.find(instance => instance.id === menu.id) : undefined;
   const menuOpenId = menuSession?.id ?? menuRun?.rootSessionId;
   const menuTitle = menuSession ? title(menuSession) : menuRun ? runTitle(menuRun) : '';
+  // WB-04: only an ordinary session moves in the tree, wherever its row is (list, pinned, search in either mode).
+  const moveItems = (session: LogicalSession | undefined, from: HTMLElement): MenuItem[] => {
+    if (session?.kind !== 'ordinary') return [];
+    const reason = props.moveReason(session.id);
+    const below: MenuItem = { label: '移到…底下', disabled: !!reason, title: reason, onSelect: () => setPicker({ sessionId: session.id, from }) };
+    return session.parentId === undefined ? [below] : [below, { label: '移到最上層', disabled: !!reason, title: reason, onSelect: () => props.onMove(session.id, null) }];
+  };
   const add = mode === 'chat' ? { label: '新對話', onClick: props.onNewChat, active: props.page === 'new' } : { label: '開始 Workflow', onClick: props.onStartWorkflow, active: props.page === 'workflow-start' };
 
   if (collapsed && !props.overlay) return <aside className="v4-sidebar v4-rail" aria-label="側欄（已收合）">
@@ -148,7 +162,7 @@ export function Sidebar(props: SidebarProps) {
   if (collapsed) return null;
 
   return <aside className={`v4-sidebar ${props.overlay ? 'v4-sidebar-overlay' : ''}`} aria-label="側欄" onKeyDown={event => {
-    if (event.key === 'Escape' && props.overlay && !menu) props.onCollapse(true);
+    if (event.key === 'Escape' && props.overlay && !menu && !picker) props.onCollapse(true);
   }}>
     <div className="v4-sidebar-top">
       <div className="v4-mode" role="group" aria-label="側欄模式">
@@ -200,13 +214,17 @@ export function Sidebar(props: SidebarProps) {
         <button type="button" className="v4-icon v4-theme" aria-label={props.theme === 'dark' ? '切換成淺色' : '切換成深色'} title={props.themeReason ?? '切換外觀'} disabled={!!props.themeReason} onClick={() => props.onTheme(props.theme === 'dark' ? 'light' : 'dark')}>{props.theme === 'dark' ? '☾' : '☀'}</button></div>
     </div>
     {menu && menuOpenId && <MenuList label={`${menuTitle} 的選單`} className="v4-context-menu"
-      style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 180) }}
+      style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - (menuSession?.kind === 'ordinary' ? 250 : 180)) }}
       onClose={restore => { const from = menu.from; setMenu(null); if (restore) from.focus(); }}
       items={[
         { label: '開啟', onSelect: () => props.onOpen(menuOpenId) },
         { label: '在分割畫面開啟', disabled: menuOpenId === selectedId, onSelect: () => props.onSplit(menuOpenId) },
         { label: props.pinned[modeOf(snapshot, menu.id)].has(menu.id) ? '取消釘選' : '釘選', disabled: props.pinBlocked, title: props.pinBlocked ? props.pinReason : undefined, onSelect: () => props.onPin(menu.id) },
         { label: '重新命名', disabled: props.readOnly, ...readOnly, onSelect: () => { if (menuRun) setRenaming(menuRun.id); else props.onRename(menuOpenId); } },
+        ...moveItems(menuSession, menu.from),
       ]} />}
+    {picker && <MovePicker snapshot={snapshot} sessionId={picker.sessionId} titles={titles}
+      onClose={() => { const from = picker.from; setPicker(null); if (from.isConnected) from.focus(); }}
+      onPick={parentId => props.onMove(picker.sessionId, parentId)} />}
   </aside>;
 }
