@@ -401,6 +401,28 @@ describe('T055 in the app', () => {
     expect(scrolled).toHaveLength(0);
   });
 
+  it('a notification clicked after the shell is gone does nothing: no window focus, no open, no search, no frame (r2 P2)', async () => {
+    const view = await mount('/#/sessions/s-plan-notes');
+    await emitInApp(open('esc-late'));
+    await emitInApp(resolved(open('esc-late')));
+    expect(FakeNotification.shown).toHaveLength(1);
+    const late = FakeNotification.shown[0]!;
+    const click = late.onclick;
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => frames.push(callback));
+    const lookups = vi.spyOn(document, 'querySelectorAll');
+    view.unmount();
+    // The notification is closed and cannot call back; and a handler kept from before is dead too.
+    expect(late.close).toHaveBeenCalled();
+    expect(late.onclick).toBeNull();
+    const hash = window.location.hash;
+    click?.();
+    expect(focusWindow).not.toHaveBeenCalled();
+    expect(frames).toHaveLength(0);
+    expect(lookups.mock.calls.filter(call => call[0] === '[data-escalation-id]')).toHaveLength(0);
+    expect(window.location.hash).toBe(hash);
+  });
+
   it('with the setting off in the settings page, no notification is shown', async () => {
     await mount('/#/settings');
     fireEvent.click(screen.getByRole('checkbox', { name: '有需要我處理的事時通知我' }));

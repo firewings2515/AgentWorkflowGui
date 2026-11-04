@@ -97,6 +97,9 @@ export function startEscalationNotifier(options: NotifierOptions): () => void {
   const { store, onActivate } = options;
   const seen = new Set<string>();
   let needsBaseline = true;
+  // Notifications still on screen: once the notifier is stopped (the shell is gone) a click on one must do nothing (r2 P2).
+  let stopped = false;
+  const live = new Set<NotificationLike>();
   const evaluate = () => {
     const state = store.getSnapshot();
     const snapshot: Snapshot | null = state.snapshot;
@@ -112,7 +115,10 @@ export function startEscalationNotifier(options: NotifierOptions): () => void {
         if (!api || api.permission !== 'granted') continue;
         const sessionTitle = snapshot.sessions.find(session => session.id === item.fromSessionId)?.title;
         const shown = new api(NOTIFY_TITLE, { body: notificationBody(sessionTitle, item.title), tag: item.id });
+        live.add(shown);
         shown.onclick = () => {
+          if (stopped) return;
+          live.delete(shown);
           try { (options.focusWindow ?? defaultFocusWindow)(); } catch { /* The session still opens. */ }
           onActivate(item.fromSessionId, item.id);
           try { shown.close(); } catch { /* Already closed. */ }
@@ -123,7 +129,16 @@ export function startEscalationNotifier(options: NotifierOptions): () => void {
     }
   };
   evaluate();
-  return store.subscribe(evaluate);
+  const unsubscribe = store.subscribe(evaluate);
+  return () => {
+    stopped = true;
+    unsubscribe();
+    for (const shown of live) {
+      shown.onclick = null;
+      try { shown.close(); } catch { /* Already closed. */ }
+    }
+    live.clear();
+  };
 }
 
 /** Starts the notifier while the connected shell is mounted. Without a store (the demo) nothing is watched. */
