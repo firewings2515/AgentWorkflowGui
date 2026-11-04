@@ -5,7 +5,6 @@ import type { z } from 'zod';
 import {
   AUTO_TITLE_MAX_LENGTH,
   Command,
-  CONTRACTS_VERSION,
   DEFAULT_SESSION_TITLE,
   LogicalSession,
   Snapshot,
@@ -20,10 +19,6 @@ const omit = <T extends object>(record: T, ...keys: string[]) => Object.fromEntr
 const model = { runtime: 'codex', model: 'gpt-6-luna' };
 
 describe('contracts 0.8', () => {
-  it('is version 0.8.0', () => {
-    expect(CONTRACTS_VERSION).toBe('0.8.0');
-  });
-
   it('session.create: the Agent and the folder are optional; a folder given is not empty', () => {
     const bare = { type: 'session.create', requestId: 'r1', sessionId: 's-1', kind: 'ordinary', model };
     expect(ok(Command, bare)).toBe(true);

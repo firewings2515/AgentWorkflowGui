@@ -31,6 +31,7 @@ import {
   type PayloadHash,
   type ReportToRootToolInput,
   type ReportToRootToolResult,
+  SESSION_TITLE_MAX_LENGTH,
   SessionId,
   type TaskId,
   type Timestamp,
@@ -320,7 +321,8 @@ export class WorkflowEngine implements WorkflowHooks {
           (instance.workflowId === workflowId &&
             instance.workflowRevision === workflowRevision &&
             instance.rootSessionId === rootSessionId &&
-            instance.title === title &&
+            // Not the title (T050): the start identity above carries the title it was started with, and the run may
+            // have been renamed since (workflow.rename), which is no reason to refuse the repeat.
             instance.projectFolder === project));
       if (!same) return taken();
     }
@@ -1294,6 +1296,32 @@ export class WorkflowEngine implements WorkflowHooks {
   execute(command: CommandOf<'workflow.complete' | 'workflow.cancel' | 'task.retryCleanup'>): Promise<CommandResult> | undefined {
     if (this.pipeline === undefined) return undefined;
     return command.type === 'task.retryCleanup' ? this.pipeline.retryCleanup(command) : this.pipeline.end(command);
+  }
+
+  /**
+   * `workflow.rename` (U2, T050): the run's title only, in any state, ended runs too; in the run's queue, in order with
+   * ending it and with its handoffs. Trimmed, 1 to SESSION_TITLE_MAX_LENGTH characters as session.rename. A repeat that
+   * finds the title already given succeeds without writing or announcing anything (CR-2), whatever revision it names;
+   * otherwise a compare-and-set on `expectedRevision`, announced with `instance.updated` once written.
+   */
+  rename(command: CommandOf<'workflow.rename'>): Promise<CommandResult> {
+    const { requestId, instanceId, expectedRevision } = command;
+    const title = command.title.trim();
+    if (title.length === 0 || Array.from(title).length > SESSION_TITLE_MAX_LENGTH)
+      return Promise.resolve(fail(requestId, 'invalid_request', `A title has 1 to ${String(SESSION_TITLE_MAX_LENGTH)} characters`));
+    return this.serial(`instance:${instanceId}`, async () => {
+      if (this.options.sessions.isClosing()) return fail(requestId, 'runtime_unavailable', 'The application is closing');
+      const instance = await this.repos.instances.get(instanceId);
+      if (instance === undefined) return fail(requestId, 'not_found', 'Unknown workflow run');
+      if (instance.title === title) return ok(requestId, { revision: instance.revision });
+      if (instance.revision !== expectedRevision) return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
+      // Only the title: the state, the tasks and everything else stay as stored at this revision.
+      const saved = await this.repos.instances.update({ ...instance, revision: instance.revision + 1, title }, instance.revision);
+      // Written meanwhile by something outside the run's queue (a task update): the user renames what they see now.
+      if (saved.status === 'stale') return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
+      this.options.publish({ type: 'instance.updated', instance: saved.record });
+      return ok(requestId, { revision: saved.record.revision });
+    });
   }
 
   /** Why the user may not send to this session now (a task merged and cleaned up, a folder gone; R-06), or undefined. */

@@ -53,6 +53,7 @@ const ruleMessages = {
   'transfer.failed-dispatched-nothing': 'a failed transfer dispatched nothing',
   'transfer.created-session': 'createdSessionId is set exactly when the target was created',
   'transfer.cancel-reason-only-cancelled': 'only a cancelled proposal has a cancel reason',
+  'preferences.pinned-unique': 'a pinned list names each ID once',
   // locks.ts
   'lock.approval-needs-request': 'a held Codex approval names its request',
   'lock.waiters-distinct': 'each waiter is listed once and is not the holder',

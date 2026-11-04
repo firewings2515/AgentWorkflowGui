@@ -49,7 +49,6 @@ describe('v11: data stored under contracts 0.7', () => {
     try {
       expect(db.prepare('SELECT max(version) AS v FROM schema_migration').get()?.v).toBe(latestVersion());
       const data = await createRepositories(db).readSnapshotData();
-      expect(CONTRACTS_VERSION).toBe('0.8.0');
       expect(data.agents.map((a) => a.schemaVersion)).toEqual([CONTRACTS_VERSION]);
       expect(data.workflows.map((w) => w.schemaVersion)).toEqual([CONTRACTS_VERSION]);
       expect(data.projects.map((p) => p.schemaVersion)).toEqual([CONTRACTS_VERSION]);

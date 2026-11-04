@@ -398,6 +398,15 @@ CREATE TABLE work_folder_claim (
 CREATE INDEX work_folder_claim_by_day ON work_folder_claim (day, seq);
 `;
 
+// Contracts 0.9 (T050): only the version. The pinned lists live in the preferences body (optional, absent before 0.9)
+// and a run's title in the instance body, which the compare-and-set update rewrites whole.
+const contracts09V12 = `
+UPDATE agent SET body = json_set(body, '$.schemaVersion', '0.9.0') WHERE json_extract(body, '$.schemaVersion') = '0.8.0';
+UPDATE workflow SET body = json_set(body, '$.schemaVersion', '0.9.0') WHERE json_extract(body, '$.schemaVersion') = '0.8.0';
+UPDATE project SET body = json_set(body, '$.schemaVersion', '0.9.0') WHERE json_extract(body, '$.schemaVersion') = '0.8.0';
+UPDATE workflow_instance SET body = json_set(body, '$.template.schemaVersion', '0.9.0') WHERE json_extract(body, '$.template.schemaVersion') = '0.8.0';
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
@@ -410,6 +419,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 9, name: 'storage-0.7-delivery', sql: storage07V9 },
   { version: 10, name: 'storage-0.7-history', sql: pagingV10 },
   { version: 11, name: 'contracts-0.8', sql: contracts08V11 },
+  { version: 12, name: 'contracts-0.9', sql: contracts09V12 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;

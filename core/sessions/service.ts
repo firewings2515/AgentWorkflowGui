@@ -44,6 +44,7 @@ import {
   type NodeId,
   type WorkflowInstance,
   AttemptId,
+  UiPreferences,
 } from '../../contracts';
 import { DeliveryService, type DeliveryEscalation, type DispatchCall, type DispatchOutcome, type PayloadDelivery, type RecoveryReport } from '../delivery';
 import { type AbortLike, LockCoordinator, type LockCoordinatorOptions, type LockEscalation } from '../locks';
@@ -109,6 +110,8 @@ export interface WorkflowHooks {
    * `unsupported`, as without hooks).
    */
   execute?(command: CommandOf<'workflow.complete' | 'workflow.cancel' | 'task.retryCleanup'>): Promise<CommandResult> | undefined;
+  /** Renaming a run (U2, T050); `unsupported` without it. */
+  rename?(command: CommandOf<'workflow.rename'>): Promise<CommandResult>;
   /**
    * Why the user may not send to this session now (R-06: a merged task's session once its worktree is removed,
    * or a session whose folder is gone), or undefined when it may.
@@ -912,6 +915,9 @@ export class SessionService {
       case 'workflow.cancel':
       case 'task.retryCleanup':
         return this.workflow?.execute?.(command) ?? fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
+      // A run's title (U2, T050): the engine's, with or without the task pipeline.
+      case 'workflow.rename':
+        return this.workflow?.rename?.(command) ?? fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
       // Backups (C-28, wired in T040) and runtime detection (C-33, wired in T045) belong to the main process.
       case 'backup.restore':
       case 'backup.cancelRestore':
@@ -1036,6 +1042,11 @@ export class SessionService {
     const title = command.title.trim();
     if (title.length === 0 || Array.from(title).length > SESSION_TITLE_MAX_LENGTH)
       return fail(requestId, 'invalid_request', `A title has 1 to ${SESSION_TITLE_MAX_LENGTH} characters`);
+    // A repeat that finds the title already given (CR-2, T050) succeeds and writes nothing, whatever revision it names;
+    // not while the session still waits for its first message to name it: renaming it ends that wait.
+    const current = await this.repos.sessions.get(sessionId);
+    if (current === undefined) return fail(requestId, 'not_found', 'Unknown session');
+    if (current.title === title && current.autoTitle !== true) return ok(requestId, { revision: current.revision });
     // The user's title stays: the first message no longer names the session.
     return this.updateFromCommand(requestId, sessionId, expectedRevision, (s) => withoutAutoTitle({ ...s, title }));
   }
@@ -1047,9 +1058,13 @@ export class SessionService {
   }
 
   private async setPreferences(command: CommandOf<'preferences.set'>): Promise<CommandResult> {
-    const refused = await this.checkWorkFolderRoot(command.preferences.workFolderRoot);
+    // Checked here too, whoever sent it (T050): a pinned list with a repeated ID or more than PINNED_LIMIT is refused,
+    // never cut or merged. IDs that name nothing loaded are kept: the renderer skips them (a session may load later).
+    const checked = UiPreferences.safeParse(command.preferences);
+    if (!checked.success) return fail(command.requestId, 'invalid_request', 'The preferences do not match the contract');
+    const refused = await this.checkWorkFolderRoot(checked.data.workFolderRoot);
     if (refused !== undefined) return fail(command.requestId, 'invalid_request', refused);
-    const preferences = await this.repos.preferences.set(command.preferences);
+    const preferences = await this.repos.preferences.set(checked.data);
     this.options.publish({
       type: 'preferences.updated',
       preferences,
