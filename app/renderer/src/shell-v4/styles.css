@@ -45,6 +45,10 @@
 .v4-activity[data-state='running'] { background: var(--running); }
 .v4-activity[data-state='waiting-user'], .v4-activity[data-state='waiting-lock'] { background: var(--warning); }
 .v4-activity[data-state='error'] { background: var(--error); }
+/* Q-14 (T054): an assistant reply not seen yet. Blue in both themes; a pending escalation dot replaces it. */
+:root, :root[data-theme='dark'] { --v4-unread: #6cb4ff; }
+:root[data-theme='light'] { --v4-unread: #1f6fd1; }
+.v4-unread { flex: 0 0 8px; width: 8px; height: 8px; margin-right: 4px; border-radius: 50%; background: var(--v4-unread); }
 /* A dot that says "something is waiting for you"; the count is not shown (REVISION_V0_4 §3.1). */
 .v4-alert { flex: 0 0 8px; width: 8px; height: 8px; margin-right: 4px; border-radius: 50%; background: var(--warning); box-shadow: 0 0 0 2px var(--panel), 0 0 6px var(--warning); }
 .v4-run-title { flex: 1; min-width: 0; padding: 5px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13px; }

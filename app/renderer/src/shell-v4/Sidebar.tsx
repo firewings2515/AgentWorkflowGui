@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { LogicalSession, SessionId, Snapshot, WorkflowInstance } from '../../../../contracts';
 import { statusLabel } from '../ui';
 import { readOnlyProps } from '../read-only';
 import type { Theme } from '../theme';
-import { byRecent } from './demo-data';
 import type { SidebarMode, V4Page } from './demo-data';
+import { byLastMessage, runLastMessageAt } from './last-message';
+import type { LastMessageTimes } from './last-message';
 import { MenuList } from './MenuList';
 import type { MenuItem } from './MenuList';
 import { MovePicker } from './MovePicker';
@@ -47,6 +48,10 @@ export interface SidebarProps {
   pinReason?: string | undefined;
   /** Why the theme cannot change now; undefined when it can. */
   themeReason?: string | undefined;
+  /** Last-message time per session (Q-17): every list is ordered by it, newest first. */
+  times: LastMessageTimes;
+  /** Sessions with an assistant reply not seen yet (Q-14): a blue dot at the end of the row. */
+  unread: ReadonlySet<string>;
   /** The connection line at the bottom: the IPC state, or the demo note. */
   connection: ReactNode;
 }
@@ -68,6 +73,16 @@ export function Sidebar(props: SidebarProps) {
     if (from.isConnected) from.focus();
   }, [picker]);
   const nav = useRef<HTMLElement>(null);
+  // Q-17: one ordering for every list. Filtering keeps it, so no list is sorted while rendering; a message.delta keeps
+  // `sessions`, `instances` and `times` (useMessageTimes), so it does not sort again either.
+  const { times } = props;
+  const sortedSessions = useMemo(() => snapshot.sessions.toSorted(byLastMessage(times)), [snapshot.sessions, times]);
+  const sortedRuns = useMemo(() => {
+    const nodes = new Map<string, LogicalSession[]>();
+    for (const session of snapshot.sessions) if (session.kind === 'workflow') nodes.set(session.workflow.instanceId, [...(nodes.get(session.workflow.instanceId) ?? []), session]);
+    const at = new Map(snapshot.instances.map(instance => [instance.id, runLastMessageAt(times, instance, nodes.get(instance.id) ?? [])]));
+    return snapshot.instances.toSorted((a, b) => at.get(b.id)! - at.get(a.id)! || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  }, [snapshot.instances, snapshot.sessions, times]);
   const pinned = props.pinned[mode];
   const readOnly = props.readOnly ? { title: readOnlyProps(true).title } : {};
   const title = (session: LogicalSession) => titles[session.id] ?? session.title;
@@ -89,7 +104,7 @@ export function Sidebar(props: SidebarProps) {
 
   /** One list row, the same for a chat, a node session and a run: toggle, main button, children. Pending items show as a dot, not a count. */
   const listRow = (row: {
-    key: string; data: Record<string, string>; label: string; tooltip: string; dot: string; pending: number; extra?: ReactNode;
+    key: string; data: Record<string, string>; label: string; tooltip: string; dot: string; pending: number; unread: boolean; extra?: ReactNode;
     selected: boolean; current?: boolean; children: ReactNode[]; defaultOpen: boolean; onOpen: () => void; menu: ContextTarget['kind'];
   }) => {
     const expanded = openRows[row.key] ?? row.defaultOpen;
@@ -108,7 +123,9 @@ export function Sidebar(props: SidebarProps) {
           <span className="v4-activity" data-state={row.dot} aria-hidden="true" />
           <span className="v4-session-title">{row.label}</span>
           {row.extra}
-          {row.pending > 0 && <span className="v4-alert" role="img" aria-label="有待處理項目" />}
+          {/* Q-14: a pending escalation's dot wins over the unread dot. */}
+          {row.pending > 0 ? <span className="v4-alert" role="img" aria-label="有待處理項目" />
+            : row.unread && <span className="v4-unread" role="img" aria-label="有新訊息" />}
         </button>}
       </div>
       {row.children.length > 0 && expanded && <ul>{row.children}</ul>}
@@ -116,20 +133,22 @@ export function Sidebar(props: SidebarProps) {
   };
   const sessionRow = (session: LogicalSession, pool: readonly LogicalSession[], tag?: string): ReactNode => listRow({
     key: session.id, data: { 'data-session-id': session.id }, label: title(session), tooltip: `${title(session)} · ${statusLabel(session.activity)}`,
-    dot: session.activity, pending: pendingFrom(session.id), selected: chatSelected === session.id, defaultOpen: true, menu: 'session',
+    dot: session.activity, pending: pendingFrom(session.id), unread: props.unread.has(session.id), selected: chatSelected === session.id, defaultOpen: true, menu: 'session',
     ...(tag ? { extra: <span className="v4-row-tag">{tag}</span> } : {}),
-    children: pool.filter(child => child.parentId === session.id).sort(byRecent).map(child => sessionRow(child, pool)), onOpen: () => props.onOpen(session.id),
+    children: pool.filter(child => child.parentId === session.id).map(child => sessionRow(child, pool)), onOpen: () => props.onOpen(session.id),
   });
-  const tree = (pool: readonly LogicalSession[]) => pool.filter(session => !pool.some(parent => parent.id === session.parentId)).sort(byRecent).map(session => sessionRow(session, pool));
-  const runSessions = (instance: WorkflowInstance) => snapshot.sessions.filter(session => session.kind === 'workflow' && session.workflow.instanceId === instance.id);
-  const lastActive = (instance: WorkflowInstance) => runSessions(instance).reduce((latest, session) => session.updatedAt > latest ? session.updatedAt : latest, instance.createdAt);
+  /** Pools come from `sortedSessions`, so roots and children are already newest first. */
+  const tree = (pool: readonly LogicalSession[]) => pool.filter(session => !pool.some(parent => parent.id === session.parentId)).map(session => sessionRow(session, pool));
+  const runSessions = (instance: WorkflowInstance) => sortedSessions.filter(session => session.kind === 'workflow' && session.workflow.instanceId === instance.id);
   // A run row stands for its root session; its other node sessions are indented below, folded unless the selection is inside.
   const runRow = (instance: WorkflowInstance): ReactNode => {
     const status = runStatus(snapshot, instance);
-    const nodes = runSessions(instance).filter(session => session.id !== instance.rootSessionId && !pinned.has(session.id));
+    const sessions = runSessions(instance);
+    const nodes = sessions.filter(session => session.id !== instance.rootSessionId && !pinned.has(session.id));
     return listRow({
       key: instance.id, data: { 'data-run-id': instance.id, className: 'v4-run' }, label: runTitle(instance), tooltip: `${runTitle(instance)} · ${status.label}`,
-      dot: status.state, pending: status.pending, extra: <span className="v4-run-state" data-state={status.state}>{status.label}</span>,
+      // Q-14: the run row lights up when any of its node sessions has an unseen reply.
+      dot: status.state, pending: status.pending, unread: sessions.some(session => props.unread.has(session.id)), extra: <span className="v4-run-state" data-state={status.state}>{status.label}</span>,
       selected: chatSelected === instance.rootSessionId, current: selectedRun === instance.id, defaultOpen: selectedRun === instance.id, menu: 'run',
       children: tree(nodes),
       onOpen: () => props.onOpen(instance.rootSessionId),
@@ -142,13 +161,14 @@ export function Sidebar(props: SidebarProps) {
   </section>;
 
   // Search covers both modes; opening a result switches the sidebar to that result's mode.
-  const matches = query.trim() ? snapshot.sessions.filter(session => title(session).toLowerCase().includes(query.trim().toLowerCase())).sort(byRecent) : undefined;
+  const matches = query.trim() ? sortedSessions.filter(session => title(session).toLowerCase().includes(query.trim().toLowerCase())) : undefined;
   const runOf = (session: LogicalSession) => session.kind === 'workflow' ? snapshot.instances.find(instance => instance.id === session.workflow.instanceId) : undefined;
-  const runs = snapshot.instances.filter(instance => !pinned.has(instance.id)).sort((a, b) => lastActive(b).localeCompare(lastActive(a)));
-  const chats = snapshot.sessions.filter(session => session.kind === 'ordinary' && !pinned.has(session.id));
+  const runs = sortedRuns.filter(instance => !pinned.has(instance.id));
+  const chats = sortedSessions.filter(session => session.kind === 'ordinary' && !pinned.has(session.id));
+  // Pinned: runs first, then sessions; each group newest last message first.
   const pinnedRows = [
-    ...snapshot.instances.filter(instance => pinned.has(instance.id)).map(runRow),
-    ...snapshot.sessions.filter(session => pinned.has(session.id)).sort(byRecent).map(session => sessionRow(session, [])),
+    ...sortedRuns.filter(instance => pinned.has(instance.id)).map(runRow),
+    ...sortedSessions.filter(session => pinned.has(session.id)).map(session => sessionRow(session, [])),
   ];
   const menuSession = menu?.kind === 'session' ? snapshot.sessions.find(session => session.id === menu.id) : undefined;
   const menuRun = menu?.kind === 'run' ? snapshot.instances.find(instance => instance.id === menu.id) : undefined;
