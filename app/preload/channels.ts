@@ -29,3 +29,6 @@ export const QUERY_CHANNEL = 'app:query';
 
 /** Renderer -> main: one FolderRequest (C-24), answered with a FolderResult (invoke). */
 export const FOLDER_CHANNEL = 'app:folder';
+
+/** Renderer -> main: bring the window to the front (invoke). Carries nothing: the main process picks its own window. */
+export const FOCUS_WINDOW_CHANNEL = 'app:focus-window';

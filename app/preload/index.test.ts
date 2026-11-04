@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { type EventBatch, type EventEnvelope, FolderRequest, QueryRequest } from '../../contracts';
 import type { AppBridge } from './bridge-types';
-import { APP_INFO_CHANNEL, BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, EVENT_CHANNEL, FOLDER_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL, SNAPSHOT_READ_CHANNEL, WINDOW_REPORT_CHANNEL } from './channels';
+import { APP_INFO_CHANNEL, BATCH_ACK_CHANNEL, BATCH_CHANNEL, COMMAND_CHANNEL, EVENT_CHANNEL, FOCUS_WINDOW_CHANNEL, FOLDER_CHANNEL, QUERY_CHANNEL, SNAPSHOT_CHANNEL, SNAPSHOT_READ_CHANNEL, WINDOW_REPORT_CHANNEL } from './channels';
 
 type Listener = (event: unknown, batch: EventBatch) => void;
 
@@ -47,7 +47,7 @@ beforeEach(() => {
 describe('preload bridge', () => {
   it('exposes exactly the typed API and no ipcRenderer', async () => {
     const bridge = await loadBridge();
-    expect(Object.keys(bridge).sort()).toEqual(['folders', 'getAppInfo', 'onBatch', 'onEvent', 'query', 'readSnapshot', 'report', 'send', 'snapshot']);
+    expect(Object.keys(bridge).sort()).toEqual(['focusWindow', 'folders', 'getAppInfo', 'onBatch', 'onEvent', 'query', 'readSnapshot', 'report', 'send', 'snapshot']);
     expect(Object.keys(bridge.folders ?? {})).toEqual(['request']);
     expect(electron.exposed.size).toBe(1);
   });
@@ -75,6 +75,17 @@ describe('preload bridge', () => {
       [WINDOW_REPORT_CHANNEL, { kind: 'adopted', read: 3, seq: 40 }],
       [WINDOW_REPORT_CHANNEL, { kind: 'applied', toSeq: 41 }],
     ]);
+  });
+
+  it('focusWindow sends only its channel: whatever the page passes never reaches the main process (T055)', async () => {
+    const bridge = await loadBridge();
+    electron.invoke.mockResolvedValue('anything the main process answers');
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the extra arguments on purpose
+    const call = bridge.focusWindow as unknown as (...args: unknown[]) => Promise<unknown>;
+    await expect(call('E:\\other\\window', { id: 7 }, () => undefined)).resolves.toBeUndefined();
+    await bridge.focusWindow?.();
+    expect(electron.invoke.mock.calls).toEqual([[FOCUS_WINDOW_CHANNEL], [FOCUS_WINDOW_CHANNEL]]);
+    expect(electron.send).not.toHaveBeenCalled();
   });
 
   it('routes folder requests to their own channel (C-24)', async () => {

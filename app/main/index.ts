@@ -2,13 +2,15 @@ import { join } from 'node:path';
 import { app, BrowserWindow, dialog, Menu, nativeTheme, session, shell } from 'electron';
 import { WindowsProcessHost } from '../../adapters/process';
 import type { Theme } from '../../contracts';
-import { APP_INFO_CHANNEL, FOLDER_CHANNEL } from '../preload/channels';
+import { APP_INFO_CHANNEL, FOCUS_WINDOW_CHANNEL, FOLDER_CHANNEL } from '../preload/channels';
+import { APP_USER_MODEL_ID } from './app-id';
 import { registerAppIpc } from './app-ipc';
 import { type Backend, type DamagedBackend, startBackend } from './backend';
 import { sdkBundledClaude } from './claude-exe';
 import { EventBus } from './event-bus';
 import { realFolder } from './exe-search';
 import { faultPointFrom } from './fault-points';
+import { focusWindow } from './focus-window';
 import { handleFolderRequest } from './folders';
 import { handleTrusted } from './ipc';
 import { type PerfLog, startPerfLog } from './perf-log';
@@ -119,13 +121,17 @@ async function confirmExit(ready: Backend): Promise<boolean> {
 }
 
 app.setName(APP_NAME);
+// Windows shows system notifications under this ID (T055).
+if (process.platform === 'win32') app.setAppUserModelId(APP_USER_MODEL_ID);
 // The renderer is a single local page showing untrusted text (T042): before any window exists.
 app.on('web-contents-created', (_event, contents) => guardWebContents(contents, isTrustedUrl));
 
 void app.whenReady().then(async () => {
   perf?.mark('app-ready');
-  guardSession(session.defaultSession);
+  guardSession(session.defaultSession, isTrustedUrl);
   handleTrusted(APP_INFO_CHANNEL, getTrustedSender, () => ({ name: APP_NAME, version: app.getVersion() }));
+  // A clicked notification brings the window forward. The handler takes no argument: nothing the page sends is used (T055).
+  handleTrusted(FOCUS_WINDOW_CHANNEL, getTrustedSender, () => focusWindow(mainWindow));
   Menu.setApplicationMenu(Menu.buildFromTemplate(hiddenMenuTemplate(devUrl !== undefined)));
   applyTheme(theme);
   const bus = new EventBus();

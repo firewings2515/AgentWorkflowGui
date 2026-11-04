@@ -16,6 +16,7 @@ import { Composer, modelKey } from './Composer';
 import type { ComposerChoice } from './Composer';
 import type { useCreateFlow } from './create-flow';
 import { workFolderRoot } from './folders';
+import { NotifySetting } from '../escalation-notify';
 
 /** Claude's blank conversation: one prompt line and the input box. The session is created only on send (Q-3). */
 export function NewChat({ snapshot, store, ipcState, agents, draft, onDraft, choice, onChoice, flow, recent, onPickFolder, onSend, onNotice }: {
@@ -126,6 +127,7 @@ export function SettingsV4({ snapshot, store, serviceStore, ipcState, theme, the
         <Field label="外觀"><div className="v4-segmented" role="radiogroup" aria-label="外觀">
           {(['dark', 'light'] as const).map(value => <button key={value} type="button" role="radio" aria-checked={theme === value} disabled={themeDisabled} onClick={() => onTheme(value)}>{value === 'dark' ? '深色' : '淺色'}</button>)}
         </div></Field>
+        <NotifySetting />
         <WorkFolderSetting snapshot={snapshot} store={serviceStore} demo={!store} />
       </section>
       <section className="v4-card v4-runtime" aria-labelledby="settings-runtime-heading"><h2 id="settings-runtime-heading">Runtime</h2>

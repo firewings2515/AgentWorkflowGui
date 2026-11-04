@@ -97,7 +97,7 @@ function EscalationCard({ escalation, permission, snapshot, store, ipcState, com
     </div>;
   const noteField = <label>回覆說明（選填）<textarea rows={2} value={note} onChange={event => setNote(event.target.value)} /></label>;
   // T051: in a conversation the card keeps the T047 shape (title, detail, rule, actions); the evidence and the note fold.
-  return <article className={compact ? 'escalation-card v4-escalation' : 'escalation-card'} aria-label={escalation.title}>
+  return <article className={compact ? 'escalation-card v4-escalation' : 'escalation-card'} aria-label={escalation.title} data-escalation-id={escalation.id}>
     {compact ? <>
       <header><span className="v4-escalation-icon" aria-hidden="true">!</span><strong>{escalation.title}</strong><span className="muted">來自 {fromTitle}</span></header>
       {escalation.detail && <pre className="preserve-text">{escalation.detail}</pre>}

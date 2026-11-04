@@ -6,6 +6,7 @@ import {
   BATCH_ACK_CHANNEL,
   BATCH_CHANNEL,
   COMMAND_CHANNEL,
+  FOCUS_WINDOW_CHANNEL,
   FOLDER_CHANNEL,
   QUERY_CHANNEL,
   SNAPSHOT_CHANNEL,
@@ -39,6 +40,8 @@ const bridge: AppBridge = {
   snapshot: () => ipcRenderer.invoke(SNAPSHOT_CHANNEL) as Promise<Snapshot>,
   send: (command) => ipcRenderer.invoke(COMMAND_CHANNEL, command) as Promise<CommandResult>,
   query: (request) => ipcRenderer.invoke(QUERY_CHANNEL, request) as Promise<QueryResult>,
+  // No parameter on purpose: nothing from the page reaches the main process with this call (T055).
+  focusWindow: () => ipcRenderer.invoke(FOCUS_WINDOW_CHANNEL).then(() => undefined),
   readSnapshot: () => ipcRenderer.invoke(SNAPSHOT_READ_CHANNEL) as Promise<SnapshotRead>,
   // The main process checks what it gets; nothing of it is trusted.
   report: (report) => ipcRenderer.send(WINDOW_REPORT_CHANNEL, report),

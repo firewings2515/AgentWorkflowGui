@@ -3,10 +3,10 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { APP_INFO_CHANNEL, COMMAND_CHANNEL, FOLDER_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
+import { APP_INFO_CHANNEL, COMMAND_CHANNEL, FOCUS_WINDOW_CHANNEL, FOLDER_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
 import { guardHandler } from './ipc';
 import type { IpcSenderEvent, TrustedSender } from './ipc-guard';
-import { type GuardedContents, type GuardedSession, guardSession, guardWebContents, type NavigationEvent } from './web-security';
+import { type GuardedContents, type GuardedSession, guardSession, guardWebContents, type NavigationEvent, type PermissionDetails } from './web-security';
 import { createWebPreferences } from './window-options';
 
 vi.mock('electron', () => ({ ipcMain: { handle: () => undefined } }));
@@ -70,10 +70,63 @@ describe('T042 C2/C3/C6: the window never leaves its page', () => {
   });
 });
 
+describe('T055: the one permission, notifications for the app’s own main frame', () => {
+  const rig = () => {
+    let request: ((wc: unknown, permission: string, cb: (granted: boolean) => void, details?: PermissionDetails) => void) | undefined;
+    let check: ((wc: unknown, permission: string, origin?: string, details?: PermissionDetails) => boolean) | undefined;
+    const session: GuardedSession = {
+      setPermissionRequestHandler: (h) => {
+        request = h;
+      },
+      setPermissionCheckHandler: (h) => {
+        check = h;
+      },
+      on: () => undefined,
+    };
+    guardSession(session, isTrustedUrl);
+    const asked = (permission: string, details?: PermissionDetails) => {
+      const cb = vi.fn();
+      request!(undefined, permission, cb, details);
+      return cb.mock.calls[0]![0] as boolean;
+    };
+    const checked = (permission: string, details?: PermissionDetails) => check!(undefined, permission, 'file://', details);
+    return { asked, checked };
+  };
+
+  it('notifications are granted to the app’s own page in its main frame, in a request and in a check', () => {
+    const { asked, checked } = rig();
+    for (const details of [{ requestingUrl: `${APP}#/settings`, isMainFrame: true }, { requestingUrl: APP }]) {
+      expect(asked('notifications', details)).toBe(true);
+      expect(checked('notifications', details)).toBe(true);
+    }
+  });
+
+  it.each([
+    ['another URL', { requestingUrl: 'https://example.com/', isMainFrame: true }],
+    ['a local file that is not the app', { requestingUrl: 'file:///C:/Windows/win.ini', isMainFrame: true }],
+    ['a sub-frame, even with the app’s URL', { requestingUrl: APP, isMainFrame: false }],
+    ['a request that names no URL', { isMainFrame: true }],
+    ['a request with no details', undefined],
+  ])('notifications are refused for %s', (_name, details) => {
+    const { asked, checked } = rig();
+    expect(asked('notifications', details)).toBe(false);
+    expect(checked('notifications', details)).toBe(false);
+  });
+
+  it('every other permission is refused for the app’s own page too', () => {
+    const { asked, checked } = rig();
+    const details = { requestingUrl: APP, isMainFrame: true };
+    for (const permission of ['media', 'geolocation', 'openExternal', 'clipboard-read', 'clipboard-sanitized-write', 'fullscreen', 'pointerLock', 'midi', 'Notifications']) {
+      expect(asked(permission, details), permission).toBe(false);
+      expect(checked(permission, details), permission).toBe(false);
+    }
+  });
+});
+
 describe('T042 F3/C5: no permission is ever granted', () => {
   it('every request and check is refused, and downloads are cancelled', () => {
     let request: ((wc: unknown, permission: string, cb: (granted: boolean) => void) => void) | undefined;
-    let check: (() => boolean) | undefined;
+    let check: ((wc: unknown, permission: string) => boolean) | undefined;
     let download: ((e: NavigationEvent) => void) | undefined;
     const session: GuardedSession = {
       setPermissionRequestHandler: (h) => {
@@ -92,7 +145,7 @@ describe('T042 F3/C5: no permission is ever granted', () => {
       request!(undefined, permission, cb);
       expect(cb, permission).toHaveBeenCalledWith(false);
     }
-    expect(check!()).toBe(false);
+    expect(check!(undefined, 'notifications')).toBe(false);
     const e = { preventDefault: vi.fn() };
     download!(e);
     expect(e.preventDefault).toHaveBeenCalled();
@@ -178,7 +231,7 @@ describe('T042 D1: IPC from anything but the app’s own page', () => {
   ];
 
   it.each(senders)('is refused on every channel from %s; the handler never sees the arguments', (_name, event) => {
-    for (const channel of [APP_INFO_CHANNEL, SNAPSHOT_CHANNEL, COMMAND_CHANNEL, FOLDER_CHANNEL]) {
+    for (const channel of [APP_INFO_CHANNEL, SNAPSHOT_CHANNEL, COMMAND_CHANNEL, FOLDER_CHANNEL, FOCUS_WINDOW_CHANNEL]) {
       const handler = vi.fn();
       const guarded = guardHandler(channel, () => trusted, handler);
       let message = '';

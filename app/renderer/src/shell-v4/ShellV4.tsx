@@ -8,6 +8,7 @@ import { AgentCatalog } from '../AgentCatalog';
 import { createAgentDemo } from '../agent-demo';
 import { createIpcAgentRepository } from '../agent-repository';
 import { commandFeedback } from '../command-feedback';
+import { useEscalationNotice } from '../escalation-notify';
 import { FolderButton } from '../FolderButton';
 import type { RendererState, RendererStore } from '../renderer-store';
 import { sessionBlocksSend } from '../renderer-store';
@@ -171,6 +172,20 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
     const heading = page === 'settings' ? 'v4-settings-heading' : page === 'workflow-start' ? 'v4-start-heading' : page === 'missing' ? 'v4-missing-heading' : '';
     if (heading) document.getElementById(heading)?.focus({ preventScroll: true });
   }, [page]);
+
+  // T055: a clicked notification opens the session that raised the escalation (an open pane is just selected) and scrolls to its card.
+  const openEscalation = useRef<(sessionId: SessionId, escalationId: string) => void>(() => undefined);
+  useEffect(() => { openEscalation.current = (sessionId, escalationId) => {
+    open(sessionId);
+    let tries = 0;
+    const scroll = () => {
+      const card = Array.from(document.querySelectorAll<HTMLElement>('[data-escalation-id]')).find(item => item.dataset['escalationId'] === escalationId);
+      if (card) card.scrollIntoView?.({ block: 'center' });
+      else if (++tries < 30) requestAnimationFrame(scroll);
+    };
+    requestAnimationFrame(scroll);
+  }; });
+  useEscalationNotice(store, (sessionId, escalationId) => openEscalation.current(sessionId, escalationId));
 
   const reload = () => { if (store && ipcState?.connection !== 'loading') void store.reconnect(); };
   // U2_PLAN §3-10: Ctrl+N (in Workflow mode: start a Workflow), Ctrl+Shift+N, F5. Physical key codes keep them working

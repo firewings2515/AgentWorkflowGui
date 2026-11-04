@@ -1,6 +1,7 @@
 // What the app's web contents may do (T042, V-18). The renderer is one local page that shows untrusted text
 // (conversations, file names, errors): nothing in it may open a window, leave the page, load a frame, attach a
-// <webview>, start a download or be granted a permission. Applied to every web contents the app creates, not
+// <webview>, start a download or be granted a permission (the one exception is
+// the notification of an escalation that needs the user, see `guardSession`: U3 Q-15, T055). Applied to every web contents the app creates, not
 // only the main window, so a contents made some other way gets the same rules.
 // https://www.electronjs.org/docs/latest/tutorial/security
 
@@ -35,19 +36,38 @@ export function guardWebContents(contents: GuardedContents, isTrustedUrl: (url: 
   contents.on('will-attach-webview', (event) => event.preventDefault());
 }
 
+/** What Electron tells a permission request or check about where it comes from (the part the guard uses). */
+export interface PermissionDetails {
+  readonly requestingUrl?: string;
+  readonly isMainFrame?: boolean;
+}
+
 /** The part of Electron's `Session` the guard uses. */
 export interface GuardedSession {
-  setPermissionRequestHandler(handler: (webContents: unknown, permission: string, callback: (granted: boolean) => void) => void): void;
-  setPermissionCheckHandler(handler: () => boolean): void;
+  setPermissionRequestHandler(
+    handler: (webContents: unknown, permission: string, callback: (granted: boolean) => void, details?: PermissionDetails) => void,
+  ): void;
+  setPermissionCheckHandler(handler: (webContents: unknown, permission: string, requestingOrigin?: string, details?: PermissionDetails) => boolean): void;
   on(event: 'will-download', listener: (event: NavigationEvent) => void): unknown;
 }
 
 /**
- * Electron grants every permission unless told otherwise (notifications, media, geolocation, opening an
- * external protocol). The renderer needs none of them, so every request and check is refused.
+ * The one permission the app grants (U3 Q-15, T055): system notifications for a new escalation that needs the user.
+ * Only `notifications`, only to the main frame of the app's own page (`isTrustedUrl`); a request without those details,
+ * from another URL or from a frame is refused like every other permission.
  */
-export function guardSession(session: GuardedSession): void {
-  session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
-  session.setPermissionCheckHandler(() => false);
+function notificationsAllowed(permission: string, details: PermissionDetails | undefined, isTrustedUrl: (url: string) => boolean): boolean {
+  if (permission !== 'notifications' || details === undefined) return false;
+  return details.isMainFrame !== false && typeof details.requestingUrl === 'string' && isTrustedUrl(details.requestingUrl);
+}
+
+/**
+ * Electron grants every permission unless told otherwise (notifications, media, geolocation, opening an
+ * external protocol). The renderer needs none of them except the notification above, so every other request and
+ * check is refused.
+ */
+export function guardSession(session: GuardedSession, isTrustedUrl: (url: string) => boolean = () => false): void {
+  session.setPermissionRequestHandler((_webContents, permission, callback, details) => callback(notificationsAllowed(permission, details, isTrustedUrl)));
+  session.setPermissionCheckHandler((_webContents, permission, _requestingOrigin, details) => notificationsAllowed(permission, details, isTrustedUrl));
   session.on('will-download', (event) => event.preventDefault());
 }

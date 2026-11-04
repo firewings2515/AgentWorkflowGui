@@ -27,6 +27,11 @@ export interface AwgBridge {
    * without it (tests, an older preload) disables the folder buttons. Never rejects for a bad request.
    */
   folders?: { request(request: FolderRequest): Promise<FolderResult> };
+  /**
+   * Brings the app window to the front (a clicked notification, T055). Takes no argument: the main process picks its own
+   * window. Present in the app; optional so a renderer without it (tests, an older preload) simply does not bring it forward.
+   */
+  focusWindow?(): Promise<void>;
 }
 
 /** One Snapshot read (T040 r3): `read` names it, so the renderer can say it took this one and no other. */
