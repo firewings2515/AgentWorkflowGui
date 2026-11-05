@@ -1,12 +1,12 @@
 import { readOnlyProps } from './read-only';
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { NodeId } from '../../../contracts';
-import type { AgentDefinition, ModelOption, RuntimeStatus, WorkflowNode, WorkflowTemplate } from '../../../contracts';
+import { NodeId, STARTER_WORKFLOW_ID } from '../../../contracts';
+import type { AgentDefinition, ModelOption, RuntimeStatus, WorkflowInstance, WorkflowNode, WorkflowTemplate } from '../../../contracts';
 import type { WorkflowRepository } from './workflow-repository';
-import { workflowSaveCommand } from './workflow-repository';
+import { addStarterCommand, workflowDeleteCommand, workflowSaveCommand } from './workflow-repository';
 import type { WorkflowDemoControls } from './workflow-demo';
 import { blocksResubmit, commandFeedback, unknownResult } from './command-feedback';
-import { connectNodes, destinationKey, destinationValue, isolationLabels, removeGraphSelection, replaceNode, setRoot, updateDraftGraph, workflowIssues } from './workflow-editor-state';
+import { connectNodes, copyWorkflowDraft, createWorkflowDraft, defaultModelOption, destinationKey, destinationValue, isolationLabels, needsAgent, removeGraphSelection, replaceNode, setRoot, updateDraftGraph, workflowIssues } from './workflow-editor-state';
 import type { GraphSelection, WorkflowIssue } from './workflow-editor-state';
 import { workflowIssueLabel } from './workflow-validation';
 import { WorkflowInspector, WorkflowSettings, workflowFieldId } from './WorkflowInspector';
@@ -14,7 +14,8 @@ import { NODE_DRAG_TYPE, WorkflowCanvas } from './workflow-canvas/WorkflowCanvas
 import './workflow-editor.css';
 
 interface Draft {
-  workflow: WorkflowTemplate; expectedRevision: number; dirty: boolean; selection: GraphSelection;
+  /** null: a new template (T063), saved with `expectedRevision: null`. */
+  workflow: WorkflowTemplate; expectedRevision: number | null; dirty: boolean; selection: GraphSelection;
   pending: boolean; error: string; message: string; attempted: boolean; failNext: boolean; conflict: boolean;
   automaticEdges: string[];
   deletedEdges: string[]; connectionTarget: string;
@@ -28,6 +29,8 @@ const newDraft = (workflow: WorkflowTemplate): Draft => ({
   automaticEdges: [], deletedEdges: [], connectionTarget: '',
   destinationChoices: {}, destinationPrompt: false, blocked: false, warning: false,
 });
+/** A new or copied template (T063): a draft only, counted once saved. */
+const unsavedDraft = (workflow: WorkflowTemplate): Draft => ({ ...newDraft(workflow), expectedRevision: null, dirty: true });
 
 function DeleteGraphDialog({ workflow, selection, onCancel, onConfirm }: {
   workflow: WorkflowTemplate; selection: NonNullable<GraphSelection>; onCancel: () => void; onConfirm: () => void;
@@ -60,14 +63,49 @@ function DeleteGraphDialog({ workflow, selection, onCancel, onConfirm }: {
   </dialog>;
 }
 
-export function WorkflowEditor({ repository, demo, agents, models, runtimes = [], selectedId, visible, onSelect, readOnly = false }: {
+/** T063: deleting a whole template, as the node dialog does it. Runs not ended are listed; they keep the template. */
+function DeleteTemplateDialog({ workflow, dirty, running, onCancel, onConfirm }: {
+  workflow: WorkflowTemplate; dirty: boolean; running: readonly WorkflowInstance[]; onCancel: () => void; onConfirm: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useLayoutEffect(() => {
+    const previous = document.activeElement;
+    const element = dialog.current;
+    if (element?.showModal) element.showModal(); else element?.setAttribute('open', '');
+    element?.querySelector('button')?.focus();
+    return () => { element?.close?.(); if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
+  }, []);
+  return <dialog ref={dialog} aria-labelledby="workflow-template-delete-title" onCancel={event => { event.preventDefault(); onCancel(); }} onKeyDown={event => {
+    if (event.key !== 'Tab') return;
+    const buttons = Array.from(dialog.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? []);
+    if (event.shiftKey && document.activeElement === buttons[0]) { event.preventDefault(); buttons.at(-1)?.focus(); }
+    else if (!event.shiftKey && document.activeElement === buttons.at(-1)) { event.preventDefault(); buttons[0]?.focus(); }
+  }}>
+    <h2 id="workflow-template-delete-title">刪除範本「{workflow.name}」？</h2>
+    <p>範本會從清單移除，無法復原。已結束的執行會保留，仍可打開查看。</p>
+    {dirty && <p>這個範本的未儲存草稿也會一併捨棄。</p>}
+    {running.length > 0 && <div className="field-error" role="alert"><p>有 {running.length} 個還沒結束的執行使用這個範本，請先完成或取消後再刪除：</p><ul>{running.map(run => <li key={run.id}>{run.title}</li>)}</ul></div>}
+    <div className="workflow-actions"><button onClick={onCancel}>取消</button><button className="workflow-danger" disabled={running.length > 0} onClick={onConfirm}>確認刪除範本</button></div>
+  </dialog>;
+}
+
+export function WorkflowEditor({ repository, demo, agents, models, runtimes = [], selectedId, visible, onSelect, readOnly = false, instances = [], onOpenAgents, newTemplateRequest = 0 }: {
   readOnly?: boolean; repository: WorkflowRepository; demo?: WorkflowDemoControls | undefined; agents: readonly AgentDefinition[]; models: readonly ModelOption[]; runtimes?: readonly RuntimeStatus[];
   selectedId: string; visible: boolean; onSelect: (id: string) => void;
+  /** T063: the runs, to tell which ones still use a template before it is deleted. */
+  instances?: readonly WorkflowInstance[];
+  /** T063: opens the Agent page (a new template needs an Agent). */
+  onOpenAgents?: () => void;
+  /** T063: a new value asks for a new template (「開始 Workflow」's 「新增範本」). */
+  newTemplateRequest?: number;
 }) {
   const workflows = useSyncExternalStore(repository.subscribe, repository.getSnapshot);
   const isDemo = repository.mode === 'demo';
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [deleteTarget, setDeleteTarget] = useState<GraphSelection>(null);
+  const [deleteTemplate, setDeleteTemplate] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [starter, setStarter] = useState({ pending: false, error: '' });
   const [renderedId, setRenderedId] = useState(selectedId);
   const [focusRequest, setFocusRequest] = useState<{ id: string; field: string; sequence: number } | null>(null);
   const consumedFocus = useRef(0);
@@ -78,7 +116,7 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
   const locks = useRef(new Set<string>());
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const saved = workflows.find(workflow => workflow.id === selectedId);
-  if (renderedId !== selectedId) { setRenderedId(selectedId); setDeleteTarget(null); }
+  if (renderedId !== selectedId) { setRenderedId(selectedId); setDeleteTarget(null); setDeleteTemplate(false); }
   let draft = drafts[selectedId];
   if (saved && !draft) {
     const initialized = newDraft(saved);
@@ -86,10 +124,13 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
     setDrafts(previous => ({ ...previous, [selectedId]: initialized }));
   }
   if ((!visible || (deleteTarget && !draft)) && deleteTarget) setDeleteTarget(null);
+  if ((!visible || !saved) && deleteTemplate) setDeleteTemplate(false);
   const workflow = draft?.workflow;
   const selection = draft?.selection ?? null;
   const selectedNode = selection?.kind === 'node' ? workflow?.nodes.find(node => node.id === selection.id) : undefined;
-  const stale = !!draft && (draft.conflict || saved?.revision !== draft.expectedRevision);
+  const isNew = draft?.expectedRevision === null;
+  // A new template is stale only when its save says so (its ID was taken meanwhile).
+  const stale = !!draft && (draft.conflict || (!isNew && saved?.revision !== draft.expectedRevision));
   const issues = draft?.attempted && workflow ? workflowIssues(workflow) : [];
   const pending = draft?.pending ?? false;
   const error = draft?.error;
@@ -121,6 +162,59 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
     const current = previous[id];
     return current ? { ...previous, [id]: { ...current, ...value } } : previous;
   });
+  /** T063: a new or copied template, as a draft that counts only once saved. */
+  const startDraft = (value: WorkflowTemplate) => {
+    if (readOnly) return;
+    setDrafts(previous => ({ ...previous, [value.id]: unsavedDraft(value) }));
+    setNotice('');
+    onSelect(value.id);
+  };
+  const createNew = () => startDraft(createWorkflowDraft(agents, models));
+  const createNewRef = useRef(createNew);
+  useEffect(() => { createNewRef.current = createNew; });
+  const handledRequest = useRef(newTemplateRequest);
+  useEffect(() => {
+    if (newTemplateRequest === handledRequest.current) return;
+    handledRequest.current = newTemplateRequest;
+    createNewRef.current();
+  }, [newTemplateRequest]);
+  const forget = (id: string) => setDrafts(previous => { const next = { ...previous }; delete next[id]; return next; });
+  const discardNew = () => { forget(selectedId); onSelect(workflows[0]?.id ?? ''); };
+  const removeTemplate = async () => {
+    if (readOnly || !saved || !draft || pending || locks.current.has(selectedId)) return;
+    const target = selectedId;
+    const command = workflowDeleteCommand(saved);
+    setDeleteTemplate(false);
+    locks.current.add(target);
+    patch(target, { pending: true, error: '', message: '' });
+    try {
+      const result = await repository.delete(command);
+      if (!mounted.current) return;
+      // Gone already (a repeat, or deleted elsewhere): nothing is left to keep.
+      if (result.ok || result.code === 'not_found') {
+        forget(target);
+        setNotice(result.ok ? `已刪除範本「${saved.name}」。` : `範本「${saved.name}」已不存在。`);
+        onSelect(repository.getSnapshot().find(item => item.id !== target)?.id ?? '');
+      } else patch(target, { pending: false, blocked: blocksResubmit(result), warning: result.code === 'unknown_outcome', error: isDemo ? result.message : commandFeedback(result, 'workflow.delete') });
+    } catch { if (mounted.current) patch(target, { pending: false, error: '刪除服務無法回應，範本仍保留。' }); }
+    finally { locks.current.delete(target); }
+  };
+  const starterMissing = !!repository.addStarter && !workflows.some(item => item.id === STARTER_WORKFLOW_ID);
+  const addStarter = async () => {
+    if (readOnly || !repository.addStarter || starter.pending) return;
+    setStarter({ pending: true, error: '' });
+    try {
+      const result = await repository.addStarter(addStarterCommand());
+      if (!mounted.current) return;
+      if (!result.ok) { setStarter({ pending: false, error: commandFeedback(result) }); return; }
+      setStarter({ pending: false, error: '' });
+      setNotice('已加入起始範本「規劃 → 實作 → 審查」。');
+      onSelect(STARTER_WORKFLOW_ID);
+    } catch { if (mounted.current) setStarter({ pending: false, error: '服務無法回應，起始範本沒有加入。' }); }
+  };
+  const running = saved ? instances.filter(run => run.workflowId === saved.id && run.state !== 'completed' && run.state !== 'cancelled') : [];
+  const writeProps = readOnlyProps(readOnly);
+  const starterButton = starterMissing && <button type="button" {...writeProps} disabled={readOnly || starter.pending} onClick={() => { void addStarter(); }}>{starter.pending ? '加入中…' : '加入起始範本'}</button>;
   const change = (value: WorkflowTemplate, manualEdge?: { source: string; target: string }) => {
     if (!pending && draft && workflow) {
       const destinationChoices = Object.fromEntries(value.nodes.flatMap(node => node.outputRules.flatMap(rule => {
@@ -171,14 +265,14 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
           expectedRevision: result.revision, pending: false, dirty: false, attempted: false, conflict: false,
           automaticEdges: [], deletedEdges: [], connectionTarget: '',
           destinationChoices: {}, destinationPrompt: false,
-          message: `${isDemo ? '示意模式 · ' : ''}已儲存「${command.workflow.name}」，revision ${result.revision}。${isDemo ? '僅保留於本次開啟期間。' : ''}`,
+          message: `${isDemo ? '示意模式 · ' : ''}已${command.expectedRevision === null ? '建立' : '儲存'}「${command.workflow.name}」，revision ${result.revision}。${isDemo ? '僅保留於本次開啟期間。' : ''}`,
         });
       }
     } catch { if (mounted.current) patch(target, { pending: false, error: '儲存服務無法回應，草稿仍保留。' }); }
     finally { locks.current.delete(target); if (mounted.current && demo) patch(target, { failNext: demo.hasSaveFailure(target) }); }
   };
 
-  const defaultModel = models.find(model => !model.hidden && model.isDefault) ?? models.find(model => !model.hidden);
+  const defaultModel = defaultModelOption(models);
   const addNode = (kind: WorkflowNode['kind'], position?: WorkflowNode['position']) => {
     if (!workflow || pending) return;
     const base = {
@@ -201,12 +295,29 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
 
   return <section ref={shell} className="workflow-editor" hidden={!visible} aria-label="Workflow 編輯內容">
     {readOnly && <p className="storage-banner">唯讀模式：可查看或編輯草稿，無法儲存 Workflow。</p>}
-    <header className="workflow-toolbar"><div><span className="eyebrow">設定 / Workflow</span><h2 ref={heading} tabIndex={-1}>{workflow?.name || (workflow ? '未命名 Workflow' : '找不到指定的 Workflow 範本')}</h2>
-      <p className="muted">{workflow ? `revision ${draft?.expectedRevision} · ${draft?.dirty ? '有未儲存草稿' : '已載入範本'}` : workflows.length ? `範本 ID：${selectedId}` : '尚無 Workflow 範本'}</p></div>
-      <div className="workflow-actions"><label>範本<select aria-label="Workflow 範本" value={saved?.id ?? ''} onChange={event => { setDeleteTarget(null); onSelect(event.target.value); }}><option disabled value="">選取範本</option>{workflows.map(item => <option key={item.id} value={item.id}>{item.name}{drafts[item.id]?.dirty ? ' · 草稿' : ''}</option>)}</select></label>
-        {workflow && <button id={workflowFieldId('save')} className="primary" {...readOnlyProps(readOnly)} disabled={readOnly || pending || draft?.blocked || repository.isBlocked?.(selectedId) || stale} onClick={() => { void save(); }}>{pending ? '儲存中…' : '儲存 Workflow'}</button>}
+    <header className="workflow-toolbar"><div><span className="eyebrow">設定 / Workflow</span><h2 ref={heading} tabIndex={-1}>{workflow?.name || (workflow ? '未命名 Workflow' : workflows.length ? '找不到指定的 Workflow 範本' : 'Workflow 範本')}</h2>
+      <p className="muted">{workflow ? (isNew ? '新範本 · 尚未儲存' : `revision ${draft?.expectedRevision} · ${draft?.dirty ? '有未儲存草稿' : '已載入範本'}`) : workflows.length ? `範本 ID：${selectedId}` : '尚無 Workflow 範本'}</p></div>
+      <div className="workflow-actions"><label>範本<select aria-label="Workflow 範本" value={draft ? selectedId : ''} onChange={event => { setDeleteTarget(null); setNotice(''); onSelect(event.target.value); }}><option disabled value="">選取範本</option>{workflows.map(item => <option key={item.id} value={item.id}>{item.name}{drafts[item.id]?.dirty ? ' · 草稿' : ''}</option>)}
+          {Object.values(drafts).filter(item => item.expectedRevision === null && !workflows.some(known => known.id === item.workflow.id)).map(item => <option key={item.workflow.id} value={item.workflow.id}>{item.workflow.name || '未命名 Workflow'} · 未儲存</option>)}</select></label>
+        {draft && <button type="button" {...writeProps} disabled={readOnly} onClick={createNew}>新增範本</button>}
+        {saved && <button type="button" {...writeProps} disabled={readOnly} onClick={() => startDraft(copyWorkflowDraft(saved))}>複製</button>}
+        {saved && <button type="button" className="workflow-danger" {...writeProps} disabled={readOnly || pending || draft?.blocked} onClick={() => setDeleteTemplate(true)}>刪除範本</button>}
+        {isNew && <button type="button" disabled={pending} onClick={discardNew}>捨棄新範本</button>}
+        {draft && starterButton}
+        {workflow && <button id={workflowFieldId('save')} className="primary" {...writeProps} disabled={readOnly || pending || draft?.blocked || repository.isBlocked?.(selectedId) || stale} onClick={() => { void save(); }}>{pending ? '儲存中…' : '儲存 Workflow'}</button>}
       </div>
     </header>
+    {notice && <p className="workflow-notice" role="status">{notice}</p>}
+    {starter.error && <p className="field-error workflow-notice" role="alert">{starter.error}</p>}
+    {!draft && <div className="workflow-empty">
+      {!workflows.length && <h3>還沒有 Workflow 範本</h3>}
+      <p className="muted">範本決定 Workflow 有哪些節點、各用哪個 Agent 和 Model，以及節點之間怎麼交接。</p>
+      <div className="workflow-actions">
+        <button type="button" className="primary" {...writeProps} disabled={readOnly} onClick={createNew}>新增範本</button>
+        {starterButton}
+      </div>
+      {starterMissing && <p className="muted">起始範本「規劃 → 實作 → 審查」：規劃拆解 task（清單先給你確認），實作照 task 修改，審查檢查後回報規劃。</p>}
+    </div>}
     {draft && workflow && <>
       <div className="workflow-feedback-area">
         {!pending && (draft.blocked || repository.isBlocked?.(selectedId)) && <button onClick={() => {
@@ -236,6 +347,8 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
           <button disabled={pending} onClick={() => { patch(selectedId, { destinationChoices: {}, destinationPrompt: false }); requestFocus('save'); }}>放棄所有目的地選擇</button>
         </div>}
         {draft.message && <p role="status">{draft.message}</p>}
+        {needsAgent(workflow) && <div className="workflow-validation" role="alert"><strong>需要 Agent：{agents.length ? '有節點還沒選 Agent，請在節點設定選一個。' : '還沒有任何 Agent，請先新增 Agent，再回來選。'}</strong>
+          {!agents.length && onOpenAgents && <button type="button" onClick={onOpenAgents}>前往 Agent 頁</button>}</div>}
         {stale && <div className="workflow-feedback" data-workflow-feedback role="alert" tabIndex={-1}>
           <p>版本已變更：草稿基於 revision {draft.expectedRevision}，目前為 {saved?.revision ?? '不存在'}。草稿未被覆蓋，請比對後再處理。</p>
           {saved && <><details><summary>比對草稿與目前已儲存版本</summary><div className="workflow-comparison"><div><h3>你的草稿</h3><pre>{JSON.stringify(workflow, null, 2)}</pre></div><div><h3>目前已儲存版本</h3><pre>{JSON.stringify(saved, null, 2)}</pre></div></div></details>
@@ -284,6 +397,7 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
         </aside>
       </div>
     </>}
+    {visible && saved && draft && deleteTemplate && <DeleteTemplateDialog workflow={saved} dirty={draft.dirty} running={running} onCancel={() => setDeleteTemplate(false)} onConfirm={() => { void removeTemplate(); }} />}
     {visible && workflow && deleteTarget && <DeleteGraphDialog workflow={workflow} selection={deleteTarget} onCancel={() => setDeleteTarget(null)} onConfirm={() => {
       const after = removeGraphSelection(workflow, deleteTarget);
       let next: GraphSelection = null;

@@ -608,6 +608,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       isIgnored: (path) => (isPipelineFolder(path) && ref.workflow?.pipeline?.ownsPath(path) === true) || ignored.isIgnored(path),
     },
     listModels,
+    // T063: the starter set takes the models listed so far (none yet at a first start: its fallbacks).
+    modelOptions: () => modelOptions,
     isRuntimeAvailable,
     onSessionOpened: (sessionId) => {
       void repositories.sessions.get(sessionId).then((s) => s && (watchers.start(sessionId, s.folderScope.workspaceRoot), ignored.acquire(sessionId, s.folderScope.workspaceRoot)));
@@ -714,6 +716,16 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   // After recovery: what it dispatched has made those sessions used just now.
   const idleTimer = setInterval(() => void supervisor.tick(), options.supervisor?.tickMs ?? SUPERVISOR_DEFAULTS.tickMs);
   idleTimer.unref();
+
+  // 7b. The starter set (T063): added once at a first start (the `starter-offered` mark), never into an install in use and
+  // never on read-only data. Awaited, so the first Snapshot of the window shows it; a failure is only logged (the user
+  // can still add it from the templates page).
+  if (readOnly === undefined) {
+    await service
+      .installStarterOnce()
+      .then((r) => r.added.length > 0 && log(`[backend] the starter set was added (${String(r.added.length)} records)`))
+      .catch((error: unknown) => log(`[backend] adding the starter set failed (${describe(error)})`));
+  }
 
   // 8. The auto-archive (U4, T059): conversations and ended runs without a message for `autoArchiveDays`, through the
   // archive commands with the revision it read (a refusal skips it until the next pass). Once now, without waiting for

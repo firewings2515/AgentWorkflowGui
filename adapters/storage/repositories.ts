@@ -8,9 +8,9 @@ import { SqliteHandoffRepository, SqlitePeerMessageRepository } from './delivery
 import { SqliteTransferRepository } from './transfer-repository';
 import { DEFAULT_BLOB_THRESHOLD_BYTES, run, type StorageContext } from './codec';
 import { SqliteConversationRepository } from './conversation-repository';
-import { agentRepository, projectRepository, workflowRepository } from './definition-repository';
+import { agentRepository, projectRepository, seedDefinitions, workflowRepository } from './definition-repository';
 import { SqliteSessionRepository } from './session-repository';
-import { SqliteEscalationRepository, SqliteOwnedProcessRepository, SqlitePreferencesRepository } from './small-repositories';
+import { SqliteEscalationRepository, SqliteMarkerRepository, SqliteOwnedProcessRepository, SqlitePreferencesRepository } from './small-repositories';
 import { readTransaction } from './transaction';
 import { SqliteWorkFolderClaimRepository } from './work-folder-repository';
 
@@ -49,6 +49,8 @@ export const createRepositories = (db: DatabaseSync, options: RepositoryOptions 
     transfers,
     projects,
     workFolders: new SqliteWorkFolderClaimRepository(ctx),
+    markers: new SqliteMarkerRepository(ctx),
+    seedDefinitions: (seed) => seedDefinitions(ctx, seed),
     readSnapshotData: (options = {}) =>
       run(() =>
         readTransaction(db, (): SnapshotData => {

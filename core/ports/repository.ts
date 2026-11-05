@@ -119,6 +119,26 @@ export interface PreferencesRepository {
   set(preferences: UiPreferences): Promise<UiPreferences>;
 }
 
+/**
+ * One-time marks of the app (T063), set once and never cleared: `starter-offered` says the starter set was added (or
+ * not needed) once, so a first start adds it only once. Kept in the database, so a restored backup carries its marks.
+ */
+export interface MarkerRepository {
+  has(name: string): Promise<boolean>;
+  /** A mark already set keeps its first time. */
+  set(name: string, at: Timestamp): Promise<void>;
+}
+
+/**
+ * What `AppRepositories.seedDefinitions` writes (T063, the starter set): Agents and templates made only where their ID is
+ * free, and a mark, all in one transaction.
+ */
+export interface DefinitionSeed {
+  agents: readonly AgentDefinition[];
+  workflows: readonly WorkflowTemplate[];
+  mark?: { name: string; at: Timestamp };
+}
+
 export interface OwnedProcessRepository {
   record(process: OwnedProcess): Promise<void>;
   markEnded(pid: number, startedAt: Timestamp, at: Timestamp): Promise<void>;
@@ -228,5 +248,13 @@ export interface AppRepositories {
   projects: ProjectRepository;
   /** Which GUI-made work folder belongs to which session (T048). */
   workFolders: WorkFolderClaimRepository;
+  /** One-time marks (T063). */
+  markers: MarkerRepository;
+  /**
+   * In ONE transaction (T063): each Agent and template whose ID is free is stored with revision 0 (one already stored
+   * under its ID is kept as it is), then the mark is set; every record passes its schema. All or nothing: a failure
+   * leaves none of it. Returns the IDs stored now.
+   */
+  seedDefinitions(seed: DefinitionSeed): Promise<string[]>;
   readSnapshotData(options?: SnapshotOptions): Promise<SnapshotData>;
 }

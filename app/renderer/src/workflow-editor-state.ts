@@ -1,4 +1,5 @@
-import type { NodeId, OutputRule, WorkflowEdge, WorkflowNode, WorkflowTemplate } from '../../../contracts';
+import { AgentId, CONTRACTS_VERSION, NodeId, WorkflowId } from '../../../contracts';
+import type { AgentDefinition, ModelOption, ModelSelection, OutputRule, WorkflowEdge, WorkflowNode, WorkflowTemplate } from '../../../contracts';
 export { workflowIssues } from './workflow-validation';
 export type { WorkflowIssue } from './workflow-validation';
 
@@ -61,3 +62,43 @@ export function removeGraphSelection(workflow: WorkflowTemplate, selection: Grap
     edges: workflow.edges.filter(edge => !removesEdge(edge)),
   };
 }
+
+/** The model a new node starts with: the first default the runtimes listed (not hidden), else any listed one. */
+export const defaultModelOption = (models: readonly ModelOption[]) => models.find(model => !model.hidden && model.isDefault) ?? models.find(model => !model.hidden);
+/** Before any runtime listed a model (T063): what the starter set falls back to for Claude. */
+const FALLBACK_MODEL: ModelSelection = { runtime: 'claude', model: 'sonnet' };
+const selectionOf = (model: ModelOption | undefined): ModelSelection => model
+  ? { runtime: model.runtime, model: model.model, ...(model.defaultEffort ? { effort: model.defaultEffort } : {}) } : { ...FALLBACK_MODEL };
+
+/**
+ * A new template (T063): 「未命名 Workflow」, same-folder, one root node on the first Agent and the default model. Without
+ * any Agent the root's Agent is empty: the editor says it needs one and the contract refuses to save it.
+ */
+export function createWorkflowDraft(agents: readonly AgentDefinition[], models: readonly ModelOption[], now = new Date().toISOString()): WorkflowTemplate {
+  return {
+    schemaVersion: CONTRACTS_VERSION, id: WorkflowId.parse(crypto.randomUUID()), revision: 0, name: '未命名 Workflow', description: '',
+    reworkLimit: 2, isolation: 'same-folder', edges: [], updatedAt: now,
+    nodes: [{
+      kind: 'agent', id: NodeId.parse(crypto.randomUUID()), label: 'Root', agentId: agents[0]?.id ?? ('' as AgentId), model: selectionOf(defaultModelOption(models)),
+      isRoot: true, writePolicy: 'write', concurrency: 1, inputRules: [], outputRules: [], position: { x: 80, y: 160 },
+    }],
+  };
+}
+
+/**
+ * A copy of a saved template (T063): a new ID, 「名稱（副本）」 and revision 0; every node gets a new ID, and the edges and
+ * output rules follow it. Everything else is copied as it is.
+ */
+export function copyWorkflowDraft(saved: WorkflowTemplate, now = new Date().toISOString()): WorkflowTemplate {
+  const ids = new Map(saved.nodes.map(node => [node.id as string, NodeId.parse(crypto.randomUUID())]));
+  const idOf = (id: NodeId) => ids.get(id) ?? id;
+  const copy = structuredClone(saved);
+  return {
+    ...copy, id: WorkflowId.parse(crypto.randomUUID()), revision: 0, name: `${saved.name}（副本）`, updatedAt: now,
+    nodes: copy.nodes.map(node => ({ ...node, id: idOf(node.id), outputRules: node.outputRules.map(rule => rule.target.kind === 'node' ? { ...rule, target: { kind: 'node' as const, nodeId: idOf(rule.target.nodeId) } } : rule) })),
+    edges: copy.edges.map(edge => ({ source: idOf(edge.source), target: idOf(edge.target) })),
+  };
+}
+
+/** Whether an Agent node names no Agent (T063: a new template made before any Agent existed). */
+export const needsAgent = (workflow: WorkflowTemplate) => workflow.nodes.some(node => node.kind === 'agent' && !node.agentId);

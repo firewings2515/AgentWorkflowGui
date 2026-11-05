@@ -15,3 +15,4 @@ export * from './runtimes';
 export * from './ipc';
 export * from './mcp';
 export * from './process';
+export * from './starter';

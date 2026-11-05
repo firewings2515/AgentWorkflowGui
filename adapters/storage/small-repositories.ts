@@ -6,7 +6,7 @@ import {
   UiPreferences,
   type EscalationId,
 } from '../../contracts';
-import type { EscalationRepository, OwnedProcessRepository, PreferencesRepository } from '../../core/ports';
+import type { EscalationRepository, MarkerRepository, OwnedProcessRepository, PreferencesRepository } from '../../core/ports';
 import { checkRecord, epochMs, instantKey, readRecord, run, type StorageContext } from './codec';
 import { committed, unchanged, writeTransaction } from './transaction';
 
@@ -112,6 +112,25 @@ export class SqliteOwnedProcessRepository implements OwnedProcessRepository {
     return run(() => {
       const rows = this.ctx.db.prepare('SELECT body FROM owned_process WHERE ended_at IS NULL ORDER BY recorded_ms, rowid').all() as unknown as BodyRow[];
       return rows.map((row) => readRecord(OwnedProcess, 'owned_process', row.body));
+    });
+  }
+}
+
+/** One-time marks (T063, migration v14): one row per mark, never removed. */
+export class SqliteMarkerRepository implements MarkerRepository {
+  constructor(private readonly ctx: StorageContext) {}
+
+  has(name: string): Promise<boolean> {
+    return run(() => this.ctx.db.prepare('SELECT 1 AS found FROM app_marker WHERE name = ?').get(name) !== undefined);
+  }
+
+  set(name: string, at: Timestamp): Promise<void> {
+    return run(() => {
+      writeTransaction(this.ctx.db, () => {
+        const parsed = Timestamp.parse(at);
+        const changed = this.ctx.db.prepare('INSERT INTO app_marker (name, at) VALUES (?, ?) ON CONFLICT (name) DO NOTHING').run(name, parsed).changes;
+        return changed === 0 ? unchanged(undefined) : committed(undefined);
+      });
     });
   }
 }

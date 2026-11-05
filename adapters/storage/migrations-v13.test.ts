@@ -45,18 +45,16 @@ const v12 = () => {
 };
 
 describe('v13: data stored under contracts 0.9', () => {
-  it('reads every record as it was, the versioned ones at 0.10.0; not archived; the auto-archive at 14 days', async () => {
+  it('reads every record as it was, the versioned ones at the current version; not archived; the auto-archive at 14 days', async () => {
     const { session, instance } = v12();
     const db = openDatabase(path);
     try {
-      expect(db.prepare('SELECT max(version) AS v FROM schema_migration').get()?.v).toBe(13);
-      expect(latestVersion()).toBe(13);
-      expect(CONTRACTS_VERSION).toBe('0.10.0');
+      expect(db.prepare('SELECT max(version) AS v FROM schema_migration').get()?.v).toBe(latestVersion());
       const data = await createRepositories(db).readSnapshotData();
-      expect(data.agents.map((a) => a.schemaVersion)).toEqual(['0.10.0']);
-      expect(data.workflows.map((w) => w.schemaVersion)).toEqual(['0.10.0']);
-      expect(data.projects.map((p) => p.schemaVersion)).toEqual(['0.10.0']);
-      expect(data.instances.map((i) => i.template.schemaVersion)).toEqual(['0.10.0']);
+      expect(data.agents.map((a) => a.schemaVersion)).toEqual([CONTRACTS_VERSION]);
+      expect(data.workflows.map((w) => w.schemaVersion)).toEqual([CONTRACTS_VERSION]);
+      expect(data.projects.map((p) => p.schemaVersion)).toEqual([CONTRACTS_VERSION]);
+      expect(data.instances.map((i) => i.template.schemaVersion)).toEqual([CONTRACTS_VERSION]);
       expect(data.instances[0]).toMatchObject({ id: instance.id, title: instance.title });
       expect(data.instances[0]!.archivedAt).toBeUndefined();
       const read = data.sessions.find((s) => s.id === session.id)!;

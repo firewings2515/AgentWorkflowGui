@@ -45,6 +45,7 @@ import {
   type DeliveryState,
   type NodeId,
   type WorkflowInstance,
+  type WorkflowId,
   AttemptId,
   UiPreferences,
   pinnedOf,
@@ -92,6 +93,7 @@ import { SessionRuntimes } from './runtimes';
 import { type Allocated, WorkFolders } from './work-folders';
 import { WrittenPaths, type WrittenPathsOptions } from './written-paths';
 import { gated, ServiceClosedError } from './write-gate';
+import { installStarter, type StarterInstall } from '../workflow/starter';
 
 type Failure = Extract<CommandResult, { ok: false }>;
 type Success = Extract<CommandResult, { ok: true }>;
@@ -129,6 +131,11 @@ export interface WorkflowHooks {
   execute?(command: CommandOf<'workflow.complete' | 'workflow.cancel' | 'task.retryCleanup'>): Promise<CommandResult> | undefined;
   /** Renaming a run (U2, T050); `unsupported` without it. */
   rename?(command: CommandOf<'workflow.rename'>): Promise<CommandResult>;
+  /**
+   * The `workflow.start` calls of a template (T063), read without waiting: `active` under way now, `generation` every one
+   * ever begun. `workflow.delete` refuses while one is under way or one began during its checks. Absent: none.
+   */
+  templateStarts?(workflowId: WorkflowId): { active: number; generation: number };
   /**
    * Why the user may not send to this session now (R-06: a merged task's session once its worktree is removed,
    * or a session whose folder is gone), or undefined when it may.
@@ -240,6 +247,8 @@ export interface SessionServiceOptions {
   /** A new GUI MCP mount for a session (T016 `mount()`); the old token stops working. */
   mountMcp(sessionId: SessionId): McpMount | Promise<McpMount>;
   listModels(runtime: Runtime): Promise<ModelOption[]>;
+  /** The models listed so far (T063: the starter set's models); none listed yet when absent or empty. */
+  modelOptions?(): readonly ModelOption[];
   /** Whether a runtime can be used at all (e.g. its executable was found). Defaults to yes. */
   isRuntimeAvailable?(runtime: Runtime): boolean;
   /** A session's runtime came up / was released (the main process watches its folder, ends its Job, revokes its token). */
@@ -942,6 +951,11 @@ export class SessionService {
         if (saved.status === 'stale') return fail(command.requestId, 'stale_revision', 'The workflow has changed since it was loaded', { retryable: true });
         return ok(command.requestId, { revision: saved.record.revision });
       }
+      case 'workflow.delete':
+        // One delete of a template at a time; the checks against `workflow.start` are in deleteWorkflow.
+        return this.serial(`workflow-template:${command.workflowId}`, () => (this.closing ? Promise.resolve(closingFailure(command.requestId)) : this.deleteWorkflow(command)));
+      case 'workflow.addStarter':
+        return this.serial('starter', () => (this.closing ? Promise.resolve(closingFailure(command.requestId)) : this.addStarter(command)));
       case 'escalation.respond':
         return this.respond(command);
       case 'delivery.resolve':
@@ -1685,6 +1699,43 @@ export class SessionService {
     if (result === 'not-found') return fail(requestId, 'not_found', 'Unknown agent');
     if (result === 'stale') return fail(requestId, 'stale_revision', 'The agent has changed since it was loaded', { retryable: true });
     return ok(requestId);
+  }
+
+  /**
+   * `workflow.delete` (T063). A run not completed or cancelled that uses the template refuses it; ended runs keep their
+   * own copy (`instance.template`). Against a `workflow.start` of it, whose reading of the template and writing of the
+   * run are apart: a start under way when the delete begins refuses it, and so does one that begins during the checks
+   * (its `generation`); the last check and the delete have no await between them, and the storage runs the delete at
+   * once, so a start that begins after it finds no template.
+   */
+  private async deleteWorkflow(command: CommandOf<'workflow.delete'>): Promise<CommandResult> {
+    const { requestId, workflowId, expectedRevision } = command;
+    const starts = (): { active: number; generation: number } => this.workflow?.templateStarts?.(workflowId) ?? { active: 0, generation: 0 };
+    const starting = () => fail(requestId, 'invalid_transition', 'A run of this workflow is starting', { retryable: true, reason: 'template-in-use' });
+    const before = starts();
+    if (before.active > 0) return starting();
+    const running = (await this.repos.instances.list()).filter((i) => i.workflowId === workflowId && i.state !== 'completed' && i.state !== 'cancelled');
+    if (running.length > 0) return fail(requestId, 'invalid_transition', 'A run that has not ended uses this workflow', { reason: 'template-in-use' });
+    const after = starts();
+    if (after.active > 0 || after.generation !== before.generation) return starting();
+    const result = await this.repos.workflows.delete(workflowId, expectedRevision);
+    if (result === 'not-found') return fail(requestId, 'not_found', 'Unknown workflow');
+    if (result === 'stale') return fail(requestId, 'stale_revision', 'The workflow has changed since it was loaded', { retryable: true });
+    return ok(requestId);
+  }
+
+  /**
+   * The first start's starter set (T063): added once (the `starter-offered` mark), never into an install in use, in the
+   * same queue as `workflow.addStarter`. The main process calls it after recovery, never on read-only data.
+   */
+  installStarterOnce(): Promise<StarterInstall> {
+    return this.serial('starter', () => installStarter(this.repos, { models: this.options.modelOptions?.() ?? [], now: this.options.now(), mode: 'first-start' }));
+  }
+
+  /** `workflow.addStarter` (T063): what of the starter set is missing, with the models listed now. */
+  private async addStarter(command: CommandOf<'workflow.addStarter'>): Promise<CommandResult> {
+    const installed = await installStarter(this.repos, { models: this.options.modelOptions?.() ?? [], now: this.options.now(), mode: 'user' });
+    return ok(command.requestId, installed.workflow === undefined ? {} : { revision: installed.workflow.revision });
   }
 
   private async respond(command: CommandOf<'escalation.respond'>): Promise<CommandResult> {

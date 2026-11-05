@@ -3,20 +3,31 @@ import type { CommandResult } from '../../../contracts';
 import type { RendererStore } from './renderer-store';
 
 export type SaveWorkflowCommand = Extract<Command, { type: 'workflow.save' }>;
+export type DeleteWorkflowCommand = Extract<Command, { type: 'workflow.delete' }>;
+export type AddStarterCommand = Extract<Command, { type: 'workflow.addStarter' }>;
 export interface WorkflowRepository {
   readonly mode: 'demo' | 'ipc';
   getSnapshot: () => readonly WorkflowTemplate[];
   subscribe: (listener: () => void) => () => void;
   save: (command: SaveWorkflowCommand) => Promise<CommandResult>;
+  /** T063: deletes a saved template (contracts 0.11). */
+  delete: (command: DeleteWorkflowCommand) => Promise<CommandResult>;
+  /** T063: adds the starter set; absent in the demo (it has no core to make it). */
+  addStarter?: (command: AddStarterCommand) => Promise<CommandResult>;
   isBlocked?: (id: string) => boolean;
   acknowledge?: (id: string) => void;
 }
 const emptyWorkflows: readonly WorkflowTemplate[] = [];
 export function createIpcWorkflowRepository(store: RendererStore): WorkflowRepository {
   return { mode: 'ipc', getSnapshot: () => store.getSnapshot().snapshot?.workflows ?? emptyWorkflows, subscribe: store.subscribe,
-    save: store.send, isBlocked: id => store.isBlocked('workflow.save', `workflow:${id}`),
-    acknowledge: id => store.acknowledge('workflow.save', `workflow:${id}`) };
+    save: store.send, delete: store.send, addStarter: store.send,
+    isBlocked: id => store.isBlocked('workflow.save', `workflow:${id}`) || store.isBlocked('workflow.delete', `workflow:${id}`),
+    acknowledge: id => { store.acknowledge('workflow.save', `workflow:${id}`); store.acknowledge('workflow.delete', `workflow:${id}`); } };
 }
+export const workflowDeleteCommand = (workflow: WorkflowTemplate): DeleteWorkflowCommand => ({
+  type: 'workflow.delete', requestId: RequestId.parse(crypto.randomUUID()), workflowId: workflow.id, expectedRevision: workflow.revision,
+});
+export const addStarterCommand = (): AddStarterCommand => ({ type: 'workflow.addStarter', requestId: RequestId.parse(crypto.randomUUID()) });
 export const workflowSaveCommand = (workflow: WorkflowTemplate, expectedRevision: number | null): SaveWorkflowCommand => ({
   type: 'workflow.save', requestId: RequestId.parse(crypto.randomUUID()), workflow, expectedRevision,
 });
@@ -44,6 +55,16 @@ export function createWorkflowRepository(initial: readonly WorkflowTemplate[], s
       workflows = current ? workflows.map(item => item.id === saved.id ? saved : item) : [...workflows, saved];
       listeners.forEach(listener => listener());
       return { ok: true, requestId: command.requestId, revision: saved.revision, created: [] };
+    },
+    delete: async command => {
+      await Promise.resolve();
+      const current = workflows.find(item => item.id === command.workflowId);
+      const fail = (code: Extract<CommandResult, { ok: false }>['code'], message: string): CommandResult => ({ ok: false, requestId: command.requestId, code, message, retryable: false, mayHaveSideEffects: false });
+      if (!current) return fail('not_found', '此 Workflow 已不存在。');
+      if (current.revision !== command.expectedRevision) return fail('stale_revision', 'Workflow 已有較新版本。');
+      workflows = workflows.filter(item => item.id !== command.workflowId);
+      listeners.forEach(listener => listener());
+      return { ok: true, requestId: command.requestId, created: [] };
     },
   };
 }

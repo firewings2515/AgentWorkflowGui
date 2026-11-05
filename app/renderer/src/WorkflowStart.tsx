@@ -13,9 +13,11 @@ import { recentFolders, workFolderRoot } from './shell-v4/folders';
  * (empty: a new dated folder in the default location) and the project folder, the repository task worktrees come from
  * (required with worktree isolation; optional in a same-folder run, where non-root nodes then work in it).
  */
-export function WorkflowStart({ snapshot, store, ipcState, onOpen }: {
+export function WorkflowStart({ snapshot, store, ipcState, onOpen, onNewTemplate }: {
   snapshot: Snapshot; store: RendererStore | undefined; ipcState: RendererState | undefined;
   onOpen: (id: SessionId) => void;
+  /** T063: goes to the templates page with a new template. */
+  onNewTemplate?: () => void;
 }) {
   const [template, setTemplate] = useState<WorkflowTemplate | undefined>(() => snapshot.workflows[0]);
   const [title, setTitle] = useState('');
@@ -52,7 +54,7 @@ export function WorkflowStart({ snapshot, store, ipcState, onOpen }: {
     }}>
       <h1 id="v4-start-heading" tabIndex={-1}>開始 Workflow</h1>
       {!store && <p className="command-warning">示意模式：連接應用程式服務後才能開始。</p>}
-      {snapshot.workflows.length === 0 && <p>尚無 Workflow 範本，請先到「模板」儲存範本。</p>}
+      {snapshot.workflows.length === 0 && <p>尚無 Workflow 範本。{onNewTemplate ? <button type="button" onClick={onNewTemplate}>新增範本</button> : '請先到「模板」儲存範本。'}</p>}
       <fieldset className="v4-fieldset" {...readOnlyProps(readOnly)} disabled={disabled}>
         <legend className="sr-only">開始設定</legend>
         <section className="v4-card" aria-label="範本">

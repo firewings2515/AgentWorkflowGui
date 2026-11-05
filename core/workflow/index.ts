@@ -2,3 +2,4 @@
 export { WorkflowEngine, type HandoffCallContext, type ReportCallContext, type WorkflowEngineOptions } from './engine';
 export * from './graph';
 export * from './ids';
+export * from './starter';

@@ -53,7 +53,7 @@ export function workflowIssueMessage(issue: z.core.$ZodIssue): string {
   if (['concurrency', 'acceptanceLimit', 'reworkLimit', 'revision'].includes(field)) {
     return field === 'reworkLimit' ? '請輸入大於或等於 0 的整數。' : '請輸入大於或等於 1 的整數。';
   }
-  if (issue.code === 'too_small') return field === 'nodes' ? '請至少新增一個節點。' : '此欄位不可空白。';
+  if (issue.code === 'too_small') return field === 'nodes' ? '請至少新增一個節點。' : field === 'agentId' ? '需要 Agent，請先新增 Agent 再選取。' : '此欄位不可空白。';
   if (issue.code === 'too_big') return '此欄位超過允許的上限。';
   if (issue.code === 'invalid_value' || issue.code === 'invalid_union') return '請選取有效的選項。';
   if (issue.code === 'unrecognized_keys') return '包含不支援的欄位，請重新載入已儲存版本。';

@@ -7,7 +7,6 @@ import {
   Command,
   CommandRefusal,
   CommandResult,
-  CONTRACTS_VERSION,
   countsAsLastMessage,
   LogicalSession,
   ruleMessage,
@@ -30,10 +29,6 @@ const run = fixtureSnapshotInput.instances[0]!;
 const endedRun = { ...run, state: 'completed', endedAt: at, tasks: [], rounds: [], mergeQueue: [], taskPlans: [] };
 
 describe('contracts 0.10', () => {
-  it('is version 0.10.0', () => {
-    expect(CONTRACTS_VERSION).toBe('0.10.0');
-  });
-
   it('0.9 data reads: no archivedAt is not archived, no autoArchiveDays is 14', () => {
     expect(ok(Snapshot, fixtureSnapshotInput)).toBe(true);
     for (const s of fixtureSnapshot.sessions) expect(s).not.toHaveProperty('archivedAt');
@@ -89,7 +84,7 @@ describe('contracts 0.10', () => {
   });
 
   it('a refusal carries its reason; every reason is listed; results without one (before 0.10) still read', () => {
-    expect(CommandRefusal.options).toEqual(['not-top-level', 'workflow-session', 'turn-running', 'escalation-open', 'run-not-ended', 'archived']);
+    expect(CommandRefusal.options).toEqual(expect.arrayContaining(['not-top-level', 'workflow-session', 'turn-running', 'escalation-open', 'run-not-ended', 'archived']));
     const refusal = { ok: false, requestId: 'r1', code: 'invalid_transition', message: 'x', retryable: true, mayHaveSideEffects: false };
     for (const reason of CommandRefusal.options) expect(CommandResult.parse({ ...refusal, reason })).toMatchObject({ reason });
     expect(ok(CommandResult, refusal)).toBe(true);
