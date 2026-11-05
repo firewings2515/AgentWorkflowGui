@@ -183,6 +183,9 @@ export class TransferService implements TransferHooks {
     if (!sessions.runtimeAvailable(p.target.runtime)) return fail(requestId, 'runtime_unavailable', `${p.target.runtime} is not available on this computer`);
     const source = await this.repos.sessions.get(p.sourceSessionId);
     if (source === undefined) return fail(requestId, 'not_found', 'The source session no longer exists');
+    // U4: a proposal made just as its conversation was archived (an active one keeps it from being archived afterwards).
+    if (await sessions.inArchivedTree(source.id))
+      return { ...fail(requestId, 'invalid_transition', 'The conversation is archived; unarchive it first'), reason: 'archived' };
     if (await this.sourceChanged(p)) {
       await this.markStale(p);
       return fail(requestId, 'stale_revision', 'The source session changed after the transfer was prepared; prepare it again');

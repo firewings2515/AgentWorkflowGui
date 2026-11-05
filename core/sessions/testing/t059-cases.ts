@@ -9,9 +9,12 @@ import {
   type LogicalSession,
   MessageId,
   NodeId,
+  OperationId,
+  PayloadHash,
   pinnedOf,
   SessionId,
   type Timestamp,
+  TransferId,
   TurnId,
   type UiPreferences,
   WorkflowInstance,
@@ -699,6 +702,236 @@ export const t059Cases = (backend: string, storage: T059Storage) =>
           expect((await runOf(w, 'run-1')).archivedAt).toBeUndefined();
           expect((await runOf(w, 'run-1')).revision).toBe(rev);
         });
+      });
+    });
+
+    describe('r1: the archive commit and what it must see', () => {
+      /** A write held until the test lets it go (it holds the archive commit meanwhile, when it takes it). */
+      const gate = () => {
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => (release = resolve));
+        return { held, release };
+      };
+      const ticks = async (n = 3) => {
+        for (let i = 0; i < n; i++) await settle();
+      };
+      const later = (w: World, days = 15) => w.clock.advance(days * DAY);
+
+      it('P1-1: a send refused because its message ID is taken leaves the archive as it was', async () => {
+        const w = await begin();
+        await chat(w, 'a');
+        await chat(w, 'b');
+        await message(w, 'a', w.clock.now());
+        const taken = (await w.repositories.conversations.get(sid('a'))).messages[0]!.id;
+        expect(await archive(w, 'b')).toMatchObject({ ok: true });
+        const rev = await revision(w, 'b');
+        const result = await w.run({ type: 'session.send', requestId: rid(), sessionId: sid('b'), messageId: taken, expectedRevision: rev, text: 'x', attachments: [] });
+        expect(result).toMatchObject({ ok: false, code: 'invalid_request' });
+        expect(await archivedAt(w, 'b')).toBe(w.clock.now());
+        expect(await revision(w, 'b')).toBe(rev);
+        expect((await w.repositories.conversations.get(sid('b'))).messages).toEqual([]);
+      });
+
+      it('P1-1: a send whose message write fails leaves the archive as it was', async () => {
+        const w = await begin();
+        await chat(w, 'b');
+        expect(await archive(w, 'b')).toMatchObject({ ok: true });
+        const rev = await revision(w, 'b');
+        const conversations = w.repositories.conversations;
+        const append = conversations.appendMessage.bind(conversations);
+        conversations.appendMessage = () => Promise.reject(new Error('disk'));
+        await expect(w.run({ type: 'session.send', requestId: rid(), sessionId: sid('b'), messageId: MessageId.parse('w-1'), expectedRevision: rev, text: 'x', attachments: [] })).rejects.toThrow();
+        conversations.appendMessage = append;
+        expect(await archivedAt(w, 'b')).toBe(w.clock.now());
+        expect(await revision(w, 'b')).toBe(rev);
+      });
+
+      it('P1-2: a pin being saved when the auto-archive command comes is seen by its commit: skipped, and the pin stays', async () => {
+        const w = await begin();
+        await chat(w, 'top');
+        later(w);
+        // The user's pin is being written (slowly) when the archive command comes.
+        const preferences = w.repositories.preferences;
+        const set = preferences.set.bind(preferences);
+        const slow = gate();
+        preferences.set = async (p) => {
+          await slow.held;
+          return set(p);
+        };
+        let pinning: Promise<unknown> | undefined;
+        const archiver = archiverOf(w, async () => {
+          pinning = w.run({ type: 'preferences.set', requestId: rid(), preferences: { ...(await w.repositories.preferences.get()), pinned: { chat: [sid('top')], workflow: [] } } });
+          await settle();
+        });
+        const pass = archiver.run();
+        for (let i = 0; i < 20 && pinning === undefined; i++) await settle();
+        await ticks();
+        slow.release();
+        expect(await pass).toMatchObject({ archived: 0, skipped: 1 });
+        expect(await pinning).toMatchObject({ ok: true });
+        preferences.set = set;
+        expect(await archivedAt(w, 'top')).toBeUndefined();
+        expect(pinnedOf(await w.repositories.preferences.get()).chat).toEqual(['top']);
+      });
+
+      it('P1-2: the same for a run (a node session pinned on the way)', async () => {
+        const w = await begin();
+        await workflowRun(w, 'run-1', ['wf-root', 'wf-node']);
+        await pin(w, ['run-1-base']);
+        later(w);
+        const preferences = w.repositories.preferences;
+        const set = preferences.set.bind(preferences);
+        const slow = gate();
+        preferences.set = async (p) => {
+          await slow.held;
+          return set(p);
+        };
+        let pinning: Promise<unknown> | undefined;
+        const archiver = archiverOf(w, async (kind) => {
+          if (kind !== 'run') return;
+          pinning = w.run({ type: 'preferences.set', requestId: rid(), preferences: { ...(await w.repositories.preferences.get()), pinned: { chat: [sid('run-1-base')], workflow: [InstanceId.parse('wf-node')] } } });
+          await settle();
+        });
+        const pass = archiver.run();
+        for (let i = 0; i < 40 && pinning === undefined; i++) await settle();
+        await ticks();
+        slow.release();
+        await pass;
+        expect(await pinning).toMatchObject({ ok: true });
+        preferences.set = set;
+        expect((await runOf(w, 'run-1')).archivedAt).toBeUndefined();
+        expect(pinnedOf(await w.repositories.preferences.get()).workflow).toEqual(['wf-node']);
+      });
+
+      it('P1-3: a session made below the tree while it is archived, and sent to: never an archived tree with its new message', async () => {
+        const w = await begin();
+        await chat(w, 'top');
+        later(w);
+        // While the archive reads the tree inside its locks, a child is made below the top and written to.
+        const sessions = w.repositories.sessions;
+        const list = sessions.list.bind(sessions);
+        let reads = 0;
+        let made: Promise<unknown> | undefined;
+        sessions.list = async () => {
+          const found = await list();
+          if (++reads === 2) {
+            made = (async () => {
+              const { result } = await created(w, 'codex', 'late-child', { parentId: sid('top') });
+              if (result.ok) await send(w, 'late-child');
+              return result;
+            })();
+            await ticks();
+          }
+          return found;
+        };
+        const result = await w.service.archiveTree(rid(), sid('top'), await revision(w, 'top'));
+        await made;
+        sessions.list = list;
+        const child = await w.repositories.sessions.get(sid('late-child'));
+        const childMessages = child === undefined ? [] : (await w.repositories.conversations.get(child.id)).messages;
+        const archived = (await archivedAt(w, 'top')) !== undefined;
+        // Either the archive saw the child (and did not archive), or the child was refused below the archived tree.
+        expect(archived && childMessages.length > 0).toBe(false);
+        if (archived) expect(child).toBeUndefined();
+        else expect(result).toMatchObject({ ok: false });
+      });
+
+      it('P1-3: a session made below a tree just archived is refused (archived)', async () => {
+        const w = await begin();
+        await chat(w, 'top');
+        expect(await archive(w, 'top')).toMatchObject({ ok: true });
+        // Past the quick check before the folder is made: refused where it is stored.
+        const service = w.service;
+        const inArchived = service.inArchivedTree.bind(service);
+        service.inArchivedTree = () => Promise.resolve(false);
+        const { result } = await created(w, 'codex', 'child', { parentId: sid('top') });
+        service.inArchivedTree = inArchived;
+        expect(refused(result)).toEqual({ code: 'invalid_transition', reason: 'archived' });
+        expect(await w.repositories.sessions.get(sid('child'))).toBeUndefined();
+      });
+
+      it('P1-4: an escalation being opened when the archive comes is seen by its commit: refused escalation-open', async () => {
+        const w = await begin();
+        await chat(w, 'top');
+        await chat(w, 'child', 'top');
+        const escalations = w.repositories.escalations;
+        const upsert = escalations.upsert.bind(escalations);
+        const slow = gate();
+        escalations.upsert = async (e) => {
+          await slow.held;
+          return upsert(e);
+        };
+        // Through the service's storage, as the gate, the lock coordinator, the engine and the pipeline write escalations.
+        const opening = w.service.storage.repositories.escalations.upsert({
+          id: EscalationId.parse('esc-late'), rootSessionId: sid('child'), fromSessionId: sid('child'), kind: 'lock-timeout', title: 'Lock', detail: '',
+          ref: { kind: 'lock', path: 'E:\\work\\project\\a.txt', sessionId: sid('child') }, state: 'open', createdAt: w.clock.now(),
+        });
+        await settle();
+        const archiving = archive(w, 'top');
+        await ticks();
+        slow.release();
+        const result = await archiving;
+        await opening;
+        escalations.upsert = upsert;
+        expect(refused(result)).toEqual({ code: 'invalid_transition', reason: 'escalation-open' });
+        expect(await archivedAt(w, 'top')).toBeUndefined();
+      });
+
+      it('P1-4: the same for a run', async () => {
+        const w = await begin();
+        await workflowRun(w, 'run-1', ['wf-root']);
+        const escalations = w.repositories.escalations;
+        const upsert = escalations.upsert.bind(escalations);
+        const slow = gate();
+        escalations.upsert = async (e) => {
+          await slow.held;
+          return upsert(e);
+        };
+        const opening = w.service.storage.repositories.escalations.upsert({
+          id: EscalationId.parse('esc-run'), instanceId: InstanceId.parse('run-1'), rootSessionId: sid('wf-root'), fromSessionId: sid('wf-root'), kind: 'confirmation', title: 'Report', detail: '', state: 'open', createdAt: w.clock.now(),
+        });
+        await settle();
+        const archiving = archiveRun(w, 'run-1');
+        await ticks();
+        slow.release();
+        const result = await archiving;
+        await opening;
+        escalations.upsert = upsert;
+        expect(refused(result)).toEqual({ code: 'invalid_transition', reason: 'escalation-open' });
+      });
+
+      it('an escalation opened right after the commit waits for it and is stored then (nothing is lost)', async () => {
+        const w = await begin();
+        await chat(w, 'top');
+        const [result] = await Promise.all([
+          archive(w, 'top'),
+          (async () => {
+            await settle();
+            await w.service.storage.repositories.escalations.upsert({
+              id: EscalationId.parse('esc-after'), rootSessionId: sid('top'), fromSessionId: sid('top'), kind: 'confirmation', title: 'Later', detail: '', state: 'open', createdAt: w.clock.now(),
+            });
+          })(),
+        ]);
+        expect(result.ok || refused(result)?.reason === 'escalation-open').toBe(true);
+        expect(await w.repositories.escalations.get(EscalationId.parse('esc-after'))).toMatchObject({ state: 'open' });
+      });
+
+      it('an active transfer of a session of the tree keeps it from being archived', async () => {
+        const w = await begin();
+        await chat(w, 'top');
+        const base = await get(w, 'top');
+        await w.repositories.transfers.create({
+          id: TransferId.parse('tr-1'), operationId: OperationId.parse('op-tr-1'), revision: 0, sourceSessionId: base.id, sourceRevision: base.revision,
+          target: { runtime: 'claude', model: 'haiku' }, content: { goal: 'g', note: '', noteSource: 'gui-digest', diff: '', testOutput: '' },
+          payloadHash: PayloadHash.parse(`sha256:${'0'.repeat(64)}`), state: 'awaiting-confirmation', createdAt: w.clock.now(),
+        });
+        // Waiting for the user's confirmation: answered first, as an escalation is.
+        expect(refused(await archive(w, 'top'))).toEqual({ code: 'invalid_transition', reason: 'escalation-open' });
+        const awaiting = (await w.repositories.transfers.get(TransferId.parse('tr-1')))!;
+        await w.repositories.transfers.update({ ...awaiting, revision: 1, state: 'draft' }, 0);
+        expect(refused(await archive(w, 'top'))).toEqual({ code: 'invalid_transition', reason: 'turn-running' });
+        await w.repositories.transfers.update({ ...awaiting, revision: 2, state: 'cancelled', cancelledAt: w.clock.now(), cancelReason: 'user' }, 1);
+        expect(await archive(w, 'top')).toMatchObject({ ok: true });
       });
     });
   });

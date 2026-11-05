@@ -180,8 +180,9 @@ export const ErrorCode = z.enum([
  * - `not-top-level` (`invalid_request`): the session sits below another; only the top session of a tree is archived.
  * - `workflow-session` (`invalid_request`): a workflow session; its run is archived instead (`workflow.archive`).
  * - `turn-running` (`invalid_transition`, retryable): a turn of a session of the tree or run is running (or waits for the
- *   user, a file lock or a delivery's outcome).
- * - `escalation-open` (`invalid_transition`): an escalation of the tree or run is still open.
+ *   user, a file lock or a delivery's outcome), or a transfer of one of its sessions is under way.
+ * - `escalation-open` (`invalid_transition`): an escalation of the tree or run is still open, or a transfer of one of its
+ *   sessions waits for the user's confirmation.
  * - `run-not-ended` (`invalid_transition`): the run is not completed or cancelled.
  * - `archived` (`invalid_transition`): the session (or the new parent of `session.reparent`, the parent of
  *   `session.create`, the source of `transfer.prepare`) is in an archived tree; unarchive it first.
