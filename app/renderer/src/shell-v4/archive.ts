@@ -136,8 +136,34 @@ export function archiveBlock(snapshot: Pick<Snapshot, 'sessions' | 'instances' |
   return undefined;
 }
 
-/** Whether any of these sessions is doing something now (the 「已封存」 heading's mark, T059 ★D). */
-export const anyBusy = (sessions: Iterable<LogicalSession>) => { for (const session of sessions) if (busy(session)) return true; return false; };
+/**
+ * Which archived conversations and runs have something going on now (the 「已封存」 headings' mark, T059 ★D): a session
+ * that is busy, or a running main turn of one (a turn can run while the session's own activity still says idle).
+ */
+export function archivedBusy(index: ArchivedIndex, snapshot: Pick<Snapshot, 'sessions' | 'turns'>): { chat: boolean; workflow: boolean } {
+  if (!index.sessions.size && !index.runSessions.size) return { chat: false, workflow: false };
+  const turning = new Set<string>();
+  for (const turn of snapshot.turns) if (turn.state === 'running' && turn.nativeTaskId === undefined) turning.add(turn.sessionId);
+  let chat = false; let workflow = false;
+  for (const session of snapshot.sessions) {
+    if (!busy(session) && !turning.has(session.id)) continue;
+    if (index.sessions.has(session.id)) chat = true;
+    if (index.runSessions.has(session.id)) workflow = true;
+  }
+  return { chat, workflow };
+}
+
+/** Children by parent ID, each list in the pool's order (newest first): one pass, so a tree is built without rescanning. */
+export function childrenIndex(pool: readonly LogicalSession[]): ReadonlyMap<string, readonly LogicalSession[]> {
+  const ids = new Set<string>(pool.map(session => session.id));
+  const children = new Map<string, LogicalSession[]>();
+  for (const session of pool) {
+    if (session.parentId === undefined || !ids.has(session.parentId)) continue;
+    const list = children.get(session.parentId);
+    if (list) list.push(session); else children.set(session.parentId, [session]);
+  }
+  return children;
+}
 
 /** localStorage key of the 「已封存」 sections' open state, one per sidebar mode (T054's way: renderer-only memory). */
 export const ARCHIVED_OPEN_KEY = 'awg.archived-open.v1';

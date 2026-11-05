@@ -82,6 +82,8 @@ const refuse = (code: ErrorCode, extra: Record<string, unknown> = {}) => fake.br
   Promise.resolve({ ok: false, requestId: RequestId.parse(input.requestId), code, message: '', retryable: false, mayHaveSideEffects: false, ...extra } as CommandResult));
 const notice = () => document.querySelector('.v4-notice span')?.textContent;
 const LONG_WAIT = 20_000;
+/** 參考資料整理's running main turn in the fixture. */
+const researchTurn = fixtureSnapshot.turns.find(turn => turn.sessionId === 's-research' && turn.state === 'running')!;
 /** An open escalation of a conversation (no run). */
 const openEscalation = (id: string, from: string, root: string): Escalation => {
   const item = { ...fixtureSnapshot.escalations.find(entry => entry.state === 'open')!, id: id as never, fromSessionId: from as never, rootSessionId: root as never };
@@ -121,8 +123,30 @@ describe('the 已封存 section (chat mode)', () => {
     expect(within(region('已封存')!).queryByRole('img', { name: '已封存的項目有待處理項目' })).toBeNull();
     emit({ type: 'escalation.updated', escalation: openEscalation('esc-old', 's-old-child', 's-old') });
     expect(within(region('已封存')!).getByRole('img', { name: '已封存的項目有待處理項目' })).toBeTruthy();
+    // Idle, but its main turn still runs: still marked (r1 P2-2). Once the turn ends, no mark.
     emit({ type: 'session.updated', session: { ...sessionNow('s-research'), activity: 'idle', revision: revisionOf('s-research') + 1 } });
+    expect(within(region('已封存')!).getByRole('img', { name: '已封存的項目裡有工作正在進行' })).toBeTruthy();
+    emit({ type: 'turn.updated', turn: { ...researchTurn, state: 'completed', endedAt: at } });
     expect(within(region('已封存')!).queryByRole('img', { name: '已封存的項目裡有工作正在進行' })).toBeNull();
+  });
+
+  it('r1 P2-2 (Astra\'s case): every session idle, a running main turn comes in by turn.updated: marked; a sub-agent turn alone: not', async () => {
+    loadData(archivedData(s => ({
+      sessions: s.sessions.map(session => ['s-research', 's-docs-rev-codex'].includes(session.id) ? { ...session, activity: 'idle' as const } : session),
+      turns: s.turns.filter(turn => turn.sessionId !== 's-research'),
+    })));
+    await setup();
+    const mark = () => within(region('已封存')!).queryByRole('img', { name: '已封存的項目裡有工作正在進行' });
+    expect(mark()).toBeNull();
+    emit({ type: 'turn.updated', turn: { ...researchTurn, id: 'turn-sub' as never, sessionId: 's-old-child' as never, nativeTaskId: 'nt-x' as never } });
+    expect(mark()).toBeNull();
+    emit({ type: 'turn.updated', turn: { ...researchTurn, id: 'turn-old' as never, sessionId: 's-old-child' as never } });
+    expect(mark()).not.toBeNull();
+    // Workflow mode: a node of the archived run gets a running turn.
+    toWorkflow();
+    expect(mark()).toBeNull();
+    emit({ type: 'turn.updated', turn: { ...researchTurn, id: 'turn-docs' as never, sessionId: 's-docs-rev-claude' as never } });
+    expect(mark()).not.toBeNull();
   });
 
   it('follows session.updated: archived by the backend (auto-archive) moves to the section; unarchived moves back', async () => {
@@ -236,16 +260,23 @@ describe('封存／取消封存 in the menu', () => {
 
   it('sends session.archive with the top session\'s revision in the latest Snapshot; the list follows the event', async () => {
     await setup();
-    const menu = openMenu('s-quiet');
-    // A newer revision arrives while the menu is open: the command carries it.
-    emit({ type: 'session.updated', session: { ...sessionNow('s-quiet'), title: '安靜的對話（改）', revision: revisionOf('s-quiet') + 1 } });
-    fake.data.snapshot = { ...fake.data.snapshot, sessions: fake.data.snapshot.sessions.map(session => session.id === 's-quiet' ? { ...session, revision: session.revision + 1 } : session) };
+    const store = rendererStore(fake.bridge);
+    const latest = () => store.getSnapshot().snapshot!.sessions.find(session => session.id === 's-quiet')!;
+    const drawn = latest().revision;
+    const item = openMenu('s-quiet').getByRole('menuitem', { name: '封存' });
     fake.bridge.send.mockImplementation(input => Promise.resolve(accepted(input)));
-    fireEvent.click(menu.getByRole('menuitem', { name: '封存' }));
+    // r1 P2-3: a newer revision reaches the store and the item is clicked in the same tick, before React draws it (the
+    // event goes in outside act, so its render waits). The command must carry the store's revision, not the drawn one.
+    vi.spyOn(console, 'error').mockImplementation(() => undefined); // React's "not wrapped in act" note for that event
+    fake.emit({ schemaVersion: CONTRACTS_VERSION, seq: ++seq, event: { type: 'session.updated', session: { ...latest(), title: '安靜的對話（改）', revision: drawn + 1 } } });
+    expect(latest().revision).toBe(drawn + 1);
+    expect(rowButton('s-quiet').textContent).not.toContain('（改）');
+    fireEvent.click(item);
     await waitFor(() => expect(archiveCommands()).toHaveLength(1));
-    expect(archiveCommands()[0]).toMatchObject({ type: 'session.archive', sessionId: 's-quiet', expectedRevision: revisionOf('s-quiet') });
+    expect(archiveCommands()[0]).toMatchObject({ type: 'session.archive', sessionId: 's-quiet', expectedRevision: drawn + 1 });
+    await waitFor(() => expect(rowButton('s-quiet').textContent).toContain('（改）'));
     expect(ids('對話')).toContain('s-quiet');
-    emit({ type: 'session.updated', session: { ...sessionNow('s-quiet'), archivedAt: at, revision: revisionOf('s-quiet') + 1 } as LogicalSession });
+    emit({ type: 'session.updated', session: { ...latest(), archivedAt: at, revision: drawn + 2 } as LogicalSession });
     expect(ids('對話')).not.toContain('s-quiet');
   });
 
