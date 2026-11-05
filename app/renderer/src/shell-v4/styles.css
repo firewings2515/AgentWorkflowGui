@@ -189,7 +189,7 @@
 .v4-segmented button { padding: 5px 16px; border: 0; background: var(--transparent); }
 .v4-segmented button[aria-checked='true'] { background: var(--raised); font-weight: 600; }
 .v4-card-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 8px; }
-.v4-check { display: flex; align-items: flex-start; gap: 10px; line-height: 1.6; }
+.v4-check, .v4-card .v4-check { display: flex; align-items: flex-start; gap: 10px; line-height: 1.6; }
 .v4-check input, .v4-field .v4-check input { width: auto; flex: 0 0 auto; padding: 0; margin-top: 5px; }
 .v4-editor-page { display: flex; flex-direction: column; }
 
