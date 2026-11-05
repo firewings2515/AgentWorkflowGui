@@ -100,6 +100,11 @@ export interface ConversationRepository {
    * `invalid-cursor` for a cursor this store did not hand out for this session.
    */
   page(sessionId: SessionId, before: HistoryCursor, limitTurns: number): Promise<HistoryPage | 'invalid-cursor'>;
+  /**
+   * When the session's newest message that counts for its last-message time (`countsAsLastMessage`, Q-17) was created, in
+   * epoch milliseconds; undefined when it has none. Seeks the session's message index from its newest end (U4).
+   */
+  latestMessageMs(sessionId: SessionId): Promise<number | undefined>;
 }
 
 export interface EscalationRepository {

@@ -74,3 +74,13 @@ migration v12 只把 agent／workflow／project 與 instance 內 template 的 `s
 不加表、不改欄位。側欄釘選 `UiPreferences.pinned`（`chat` 是 session id、`workflow` 是 run id，各最多 50 個、
 不重複）存在 preferences 的 body 裡，0.9 之前存的沒有這個欄位，讀成兩份空清單（`pinnedOf`）。`workflow.rename`
 改 run 的 `title`，用 instance 原本的整份 compare-and-set 更新寫回 body。
+
+## v0.10（T059）
+
+migration v13 只把 agent／workflow／project 與 instance 內 template 的 `schemaVersion` 從 0.9.0 改為 0.10.0，
+不加表、不改欄位、不加索引。封存標記 `archivedAt` 存在根 session（一般 session）與 instance 的 body 裡，
+`autoArchiveDays` 存在 preferences 的 body 裡；0.10 之前存的都沒有這些欄位，讀成「未封存」、自動封存 14 天
+（`autoArchiveDaysOf`）。instance 的 `archivedAt` 只允許在已結束的 run 上（規則 `instance.archived-ended`），
+寫入時 `checkRecord` 也會擋。自動封存要的「最後訊息時間」用 `ConversationRepository.latestMessageMs`：沿既有的
+`message_by_session (session_id, at_ms)` 從最新一筆往回找第一則使用者或助理、且不是子代理的訊息。備份是整個
+資料庫檔，封存標記跟著一起備份與還原。

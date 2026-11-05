@@ -24,6 +24,7 @@ import type {
   HistoryPage,
   HistoryPageInfo,
 } from '../../../contracts';
+import { countsAsLastMessage } from '../../../contracts';
 import type { AppRepositories, Conversation, DefinitionRepository, NodeSessionKey, SaveResult, SnapshotData, WorkFolderClaim, WorkFolderClaimRepository } from '../../ports';
 
 /** A deep copy (core has no structuredClone: no DOM or Node types); records are plain JSON. */
@@ -164,6 +165,10 @@ export class MemoryRepositories implements AppRepositories {
     upsertPermissionRequest: (request: Conversation['permissionRequests'][number]) => this.upsert('permissionRequests', request),
     upsertArtifact: (artifact: Conversation['artifacts'][number]) => this.upsert('artifacts', artifact),
     get: (sessionId: SessionId) => Promise.resolve(copy(this.conversationRecords.get(sessionId) ?? emptyConversation())),
+    latestMessageMs: (sessionId: SessionId): Promise<number | undefined> => {
+      const times = (this.conversationRecords.get(sessionId)?.messages ?? []).filter(countsAsLastMessage).map((m) => Date.parse(m.createdAt));
+      return Promise.resolve(times.length === 0 ? undefined : Math.max(...times));
+    },
     page: (sessionId: SessionId, before: HistoryCursor, limitTurns: number): Promise<HistoryPage | 'invalid-cursor'> =>
       new Promise((resolve) => {
         const boundary = this.cursors.get(sessionId)?.get(before);

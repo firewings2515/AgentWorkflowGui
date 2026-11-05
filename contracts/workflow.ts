@@ -365,6 +365,8 @@ export const WorkflowInstance = z
     createdAt: Timestamp,
     /** When the user ended it (`workflow.complete` / `workflow.cancel`); absent on runs stored before 0.6. */
     endedAt: Timestamp.optional(),
+    /** When the run was archived (U4, 0.10), by the user or the auto-archive: only an ended run, only a mark. Absent: not archived. */
+    archivedAt: Timestamp.optional(),
   })
   .superRefine((inst, ctx) => {
     if (inst.template.id !== inst.workflowId || inst.template.revision !== inst.workflowRevision) addRuleIssue(ctx, 'instance.template-pinned', ['template']);
@@ -378,6 +380,7 @@ export const WorkflowInstance = z
     // it merges, and the tasks of an ended run are made final by the command that ends it.
     const ended = inst.state === 'completed' || inst.state === 'cancelled';
     if (inst.endedAt !== undefined && !ended) addRuleIssue(ctx, 'instance.ended-at', ['endedAt']);
+    if (inst.archivedAt !== undefined && !ended) addRuleIssue(ctx, 'instance.archived-ended', ['archivedAt']);
     // A run ended under 0.6 carries endedAt; then nothing of it may still be in progress (T028 r2 P1).
     if (inst.endedAt !== undefined && (inst.tasks.some((t) => !finalTaskStatuses.includes(t.status)) || inst.mergeQueue.some((m) => !finalMergeStates.includes(m.state))))
       addRuleIssue(ctx, 'instance.ended-work-final', ['tasks']);

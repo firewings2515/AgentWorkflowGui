@@ -133,6 +133,9 @@ export class TransferService implements TransferHooks {
     const source = await this.repos.sessions.get(sourceSessionId);
     if (source === undefined) return fail(requestId, 'not_found', 'Unknown session');
     if (source.kind !== 'ordinary') return fail(requestId, 'invalid_request', 'Only an ordinary session can be transferred to another tool');
+    // U4: its new session would join the archived conversation (it takes the source's parent); unarchived first.
+    if (await sessions.inArchivedTree(source.id))
+      return { ...fail(requestId, 'invalid_transition', 'The conversation is archived; unarchive it first'), reason: 'archived' };
     if (target.runtime === source.requestedModel.runtime)
       return fail(requestId, 'invalid_request', 'A transfer goes to another tool; a model of the same tool is changed on the session itself');
     if (!sessions.runtimeAvailable(target.runtime)) return fail(requestId, 'runtime_unavailable', `${target.runtime} is not available on this computer`);

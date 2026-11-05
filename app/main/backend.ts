@@ -51,7 +51,7 @@ import type {
   WorkFolderFs,
 } from '../../core/ports';
 import { StorageReadOnlyError, StorageWriteError } from '../../core/ports';
-import { Redactor, SessionService } from '../../core/sessions';
+import { AutoArchiver, type AutoArchiveReport, Redactor, SessionService } from '../../core/sessions';
 import { IdleSupervisor, SUPERVISOR_DEFAULTS } from '../../core/supervisor';
 import { TransferService } from '../../core/transfer';
 import { WorkflowEngine } from '../../core/workflow';
@@ -107,6 +107,12 @@ export interface BackendOptions {
    * `maxOpen` here override them (tests and development runs only; 0: no limit).
    */
   supervisor?: { idleMs?: number; maxOpen?: number; tickMs?: number };
+  /**
+   * The auto-archive (U4, T059): once after the start, then every `intervalMs` (default AUTO_ARCHIVE_INTERVAL_MS, an
+   * hour); its clock is `now`. `false`: not scheduled (tests that keep old data as it is); `Backend.autoArchive.run()`
+   * still runs a pass.
+   */
+  autoArchive?: { intervalMs?: number } | false;
   /** A development run's fault point for the crash tests (fault-points.ts, T039); never set in a packaged app. */
   faultPoint?: FaultPoint;
   /** Storage fault hooks (adapters/storage/testing, T038): tests only. */
@@ -123,6 +129,9 @@ export interface BackendOptions {
 
 /** Turns per session in the Snapshot by default: the renderer reads older history 50 turns a page (T041). */
 export const SNAPSHOT_TURNS = 50;
+
+/** How often the auto-archive looks (U4): every hour, and once at the start. */
+export const AUTO_ARCHIVE_INTERVAL_MS = 3_600_000;
 
 /** Commands accepted while the data is read-only (C-29): they write nothing of the app's database. */
 const READ_ONLY_COMMANDS: ReadonlySet<Command['type']> = new Set(['backup.restore', 'backup.cancelRestore', 'runtime.detect']);
@@ -150,6 +159,8 @@ export interface Backend {
   git: GitPort;
   /** Closes idle runtimes while the app runs (T036); its timer is the backend's. */
   supervisor: IdleSupervisor;
+  /** The auto-archive (U4): `run()` is one pass now (the timer runs it too; a pass under way is not started again). */
+  autoArchive: { run(): Promise<AutoArchiveReport> };
   /** What exiting now would cut off (R-14). */
   unfinishedWork(): Promise<{ runningSessions: number; heldRequests: number; runningNativeTasks: number; commands: number }>;
   shutdown(): Promise<void>;
@@ -304,7 +315,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   let readOnly: ReadOnlyReason | undefined = opened.status === 'read-only' ? opened.reason : undefined;
   // Listened to from here on, before anything else writes (the orphan cleanup below may already fill the disk): the
   // views are told, nothing more is stored or dispatched, and no idle runtime is closed any more.
-  const late: { supervisor?: IdleSupervisor } = {};
+  const late: { supervisor?: IdleSupervisor; archiver?: AutoArchiver } = {};
   /** The supervisor's limits from the user's preferences (C-30), unless the options override them. */
   const limitsOf = (preferences: UiPreferences | undefined) => ({
     idleMs: options.supervisor?.idleMs ?? (preferences === undefined ? SUPERVISOR_DEFAULTS.idleMs : preferences.supervisor.idleCloseMinutes * 60_000),
@@ -315,6 +326,8 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     readOnly = reason;
     log(`[backend] the data turned read-only (${reason})`);
     late.supervisor?.stop();
+    // Nothing is archived from read-only data (U4); a pass under way stops before its next command.
+    late.archiver?.stop();
     void bus.publish({ type: 'app.readOnly', reason, location: options.dbPath, at: now() });
   });
 
@@ -702,6 +715,28 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
   const idleTimer = setInterval(() => void supervisor.tick(), options.supervisor?.tickMs ?? SUPERVISOR_DEFAULTS.tickMs);
   idleTimer.unref();
 
+  // 8. The auto-archive (U4, T059): conversations and ended runs without a message for `autoArchiveDays`, through the
+  // archive commands with the revision it read (a refusal skips it until the next pass). Once now, without waiting for
+  // it, then every hour; never from read-only data; shutdown stops it and never waits for it.
+  let archiveSeq = 0;
+  let archiveStopped = false;
+  const archiver = new AutoArchiver({
+    repositories,
+    commands: service,
+    now: () => Date.parse(now()),
+    requestId: () => `auto-archive-${String(++archiveSeq)}`,
+    mayWrite: () => readOnly === undefined && !archiveStopped,
+    log,
+  });
+  late.archiver = archiver;
+  if (readOnly !== undefined) archiver.stop();
+  let archiveTimer: ReturnType<typeof setInterval> | undefined;
+  if (options.autoArchive !== false) {
+    void archiver.run();
+    archiveTimer = setInterval(() => void archiver.run(), options.autoArchive?.intervalMs ?? AUTO_ARCHIVE_INTERVAL_MS);
+    archiveTimer.unref();
+  }
+
   let closing: Promise<void> | undefined;
   /** What the views show of backups and restores (C-28); a catalog that cannot be read shows nothing. */
   const storageInfo = async (): Promise<StorageInfo> => {
@@ -821,6 +856,10 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
       // tool calls, then every session closed gracefully, then whatever is left in a Job.
       clearInterval(idleTimer);
       supervisor.stop();
+      // Stopped, never waited for (U4): a pass under way ends before its next command.
+      archiveStopped = true;
+      clearInterval(archiveTimer);
+      archiver.stop();
       service.beginClose();
       probesStopped = true;
       await mcp.close().catch(() => undefined);
@@ -848,6 +887,7 @@ export async function startBackend(options: BackendOptions): Promise<Backend | D
     mcp,
     git,
     supervisor,
+    autoArchive: { run: () => archiver.run() },
     async unfinishedWork() {
       const work = await service.unfinishedWork();
       const owned = await host.listOwned().catch(() => []);
