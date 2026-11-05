@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
-import { RequestId } from '../../../../contracts';
+import { AUTO_ARCHIVE_DEFAULT_DAYS, autoArchiveDaysOf, RequestId } from '../../../../contracts';
 import type { AgentDefinition, Snapshot } from '../../../../contracts';
 import type { AppInfo } from '../../../preload/bridge-types';
 import { blocksResubmit, commandFeedback } from '../command-feedback';
@@ -100,6 +100,53 @@ function WorkFolderSetting({ snapshot, store, demo }: { snapshot: Snapshot; stor
   </>;
 }
 
+/** Whole days the auto-archive accepts (contracts 0.10 `autoArchiveDays`). */
+export const AUTO_ARCHIVE_RANGE = '請輸入 1～365 的整數。';
+const parseDays = (text: string) => /^\d+$/.test(text.trim()) && Number(text) >= 1 && Number(text) <= 365 ? Number(text) : undefined;
+
+/**
+ * U4 (T060): the auto-archive. On／off and the days; read with `autoArchiveDaysOf` (absent is 14, null is off). Saved
+ * with preferences.set, the whole record built from the latest Snapshot at the moment of sending (T059 §6-5: a pin the
+ * archive took away is not put back from an older copy).
+ */
+function AutoArchiveSetting({ snapshot, store, demo }: { snapshot: Snapshot; store: RendererStore; demo: boolean }) {
+  const current = autoArchiveDaysOf(snapshot.preferences);
+  const [days, setDays] = useState(String(current ?? AUTO_ARCHIVE_DEFAULT_DAYS));
+  const [seen, setSeen] = useState(current);
+  const [feedback, setFeedback] = useState('');
+  if (seen !== current) { setSeen(current); setDays(String(current ?? AUTO_ARCHIVE_DEFAULT_DAYS)); }
+  const readOnly = snapshot.app.status === 'read-only';
+  const disabled = readOnly || snapshot.app.status !== 'ready' || store.getSnapshot().connection !== 'ready' || store.isBlocked('preferences.set', 'preferences');
+  const parsed = parseDays(days);
+  const save = (value: number | null) => {
+    const latest = store.getSnapshot().snapshot?.preferences;
+    if (!latest || disabled) return;
+    setFeedback('');
+    void store.send({ type: 'preferences.set', requestId: RequestId.parse(crypto.randomUUID()), preferences: { ...latest, autoArchiveDays: value } })
+      .then(result => setFeedback(result.ok ? '已儲存。' : commandFeedback(result)));
+  };
+  return <>
+    <Field label="自動封存" hint="對話或已結束的 Workflow 執行超過這些天沒有新訊息，就移到側欄的「已封存」。只是標記，不會刪除；在已封存的對話送出訊息會自動取消封存。">
+      <div className="v4-auto-archive">
+        <label className="v4-check"><input type="checkbox" checked={current !== null} disabled={disabled} {...readOnlyProps(readOnly)}
+          onChange={event => save(event.target.checked ? parsed ?? AUTO_ARCHIVE_DEFAULT_DAYS : null)} /><span>閒置一段時間後自動封存</span></label>
+        <div className="v4-days-row">
+          <input className="v4-days" type="number" inputMode="numeric" min={1} max={365} step={1} aria-label="自動封存天數" value={days}
+            disabled={disabled || current === null} aria-invalid={parsed === undefined} onChange={event => { setDays(event.target.value); setFeedback(''); }} />
+          <span>天沒有新訊息就封存（1～365）</span>
+        </div>
+      </div>
+    </Field>
+    {parsed === undefined && current !== null && <p role="alert" className="field-error">{AUTO_ARCHIVE_RANGE}</p>}
+    <div className="v4-card-actions">
+      {demo && <span className="v4-muted">示意模式：只改這次預覽的資料。</span>}
+      {feedback && <span role="status">{feedback}</span>}
+      <button type="button" className="primary" {...readOnlyProps(readOnly)} disabled={disabled || current === null || parsed === undefined || parsed === current}
+        onClick={() => { if (parsed !== undefined) save(parsed); }}>儲存天數</button>
+    </div>
+  </>;
+}
+
 function About() {
   const [info, setInfo] = useState<AppInfo>();
   const [failed, setFailed] = useState(false);
@@ -129,6 +176,7 @@ export function SettingsV4({ snapshot, store, serviceStore, ipcState, theme, the
         </div></Field>
         <NotifySetting />
         <WorkFolderSetting snapshot={snapshot} store={serviceStore} demo={!store} />
+        <AutoArchiveSetting snapshot={snapshot} store={serviceStore} demo={!store} />
       </section>
       <section className="v4-card v4-runtime" aria-labelledby="settings-runtime-heading"><h2 id="settings-runtime-heading">Runtime</h2>
         <RuntimePanel snapshot={snapshot} store={store} ipcState={ipcState} /></section>

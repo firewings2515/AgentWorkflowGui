@@ -88,7 +88,16 @@ export interface ConversationProps {
   onContext: (patch: Partial<SessionContext>) => void; onChoice: (choice: ComposerChoice) => void;
   onSend: (text: string) => void; onRename: (title: string) => void; onClose: () => void; onFocus: () => void;
   onOpen: (id: SessionId) => void; onProgress: (instanceId: string) => void; onNotice: (text: string) => void;
+  /**
+   * U4 (T060): set when this session is in an archived conversation or run. The banner's 取消封存 is the shell's (it
+   * sends the top session's or the run's id); `reason` disables it. Sending a message works as always: the backend
+   * unarchives in the same command.
+   */
+  archive?: { kind: 'session' | 'run'; reason: string | undefined; onUnarchive: () => void } | undefined;
 }
+
+/** Commands whose result shows elsewhere (a notice), not on the composer's last-result line. */
+const elsewhere = new Set(['session.rename', 'session.archive', 'session.unarchive']);
 
 export function Conversation(props: ConversationProps) {
   const { snapshot, store, ipcState, pane, title, active, split, onContext, onNotice } = props;
@@ -123,7 +132,7 @@ export function Conversation(props: ConversationProps) {
   const interrupt = blockedCommands.find(item => item.command.type === 'session.interrupt' && item.command.sessionId === session.id);
   const lastInterrupt = commands.filter(item => item.command.type === 'session.interrupt' && item.command.sessionId === session.id).at(-1);
   const staleSend = blockedCommands.find(item => item.command.type === 'session.send' && item.command.sessionId === session.id && item.result && !item.result.ok && item.result.code === 'stale_revision' && !item.result.mayHaveSideEffects);
-  const activity = commands.filter(item => 'sessionId' in item.command && item.command.sessionId === session.id && item.command.type !== 'session.rename').at(-1);
+  const activity = commands.filter(item => 'sessionId' in item.command && item.command.sessionId === session.id && !elsewhere.has(item.command.type)).at(-1);
   const choiceBlocked = !!store && (notReady || snapshot.app.status !== 'ready' || store.isBlocked('session.setModel', `session:${session.id}`) || store.isBlocked('session.setAgent', `session:${session.id}`));
   const finish = (save: boolean) => {
     setEditing(false);
@@ -151,6 +160,12 @@ export function Conversation(props: ConversationProps) {
         <button type="button" className="v4-icon" aria-pressed={context.details} aria-label={context.details ? '關閉細節窗格' : '開啟細節窗格'} title="細節" onClick={() => onContext({ details: !context.details })}>◫</button>
         {split && <button type="button" className="v4-icon" aria-label={`關閉分割畫面：${title}`} title="只關閉這一側的畫面" onClick={props.onClose}>×</button>}
       </header>
+      {props.archive && <div className="v4-archived-banner" role="status">
+        <span className="v4-archived-badge">已封存</span>
+        <span>{props.archive.kind === 'run' ? '這次執行已封存。' : '這個對話已封存。'}送出訊息會自動取消封存。</span>
+        <button type="button" disabled={!!props.archive.reason} title={props.archive.reason} aria-describedby={readOnly ? 'read-only-reason' : undefined}
+          onClick={props.archive.onUnarchive}>{props.archive.reason === '正在取消封存…' ? '正在取消封存…' : '取消封存'}</button>
+      </div>}
       {(closeCause || exited || session.activity === 'error') && <div className="v4-session-notes">
         {closeCause && <p className="v4-muted">{closeCause === 'idle' ? '閒置自動釋放' : '超過程序上限而釋放'}</p>}
         {exited && <p role="status">Runtime 曾回報結束，請核對最新 session 狀態；訊息送達結果另列。</p>}

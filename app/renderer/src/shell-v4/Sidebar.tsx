@@ -4,8 +4,10 @@ import type { LogicalSession, SessionId, Snapshot, WorkflowInstance } from '../.
 import { statusLabel } from '../ui';
 import { readOnlyProps } from '../read-only';
 import type { Theme } from '../theme';
+import { archivedBusy, archiveTargetOf, childrenIndex, isArchived } from './archive';
+import type { ArchivedIndex, ArchivedOpen, ArchiveTarget } from './archive';
 import type { SidebarMode, V4Page } from './demo-data';
-import { byLastMessage, runLastMessageAt } from './last-message';
+import { byLastMessage, lastMessageAt, runLastMessageAt } from './last-message';
 import type { LastMessageTimes } from './last-message';
 import { MenuList } from './MenuList';
 import type { MenuItem } from './MenuList';
@@ -56,7 +58,25 @@ export interface SidebarProps {
   unread: ReadonlySet<string>;
   /** The connection line at the bottom: the IPC state, or the demo note. */
   connection: ReactNode;
+  /** U4 (T060): what is archived, worked out once per Snapshot by the shell. Archived items show only in 「已封存」. */
+  archived: ArchivedIndex;
+  /** Whether each mode's 「已封存」 section is open (closed by default, kept in localStorage by the shell). */
+  archivedOpen: ArchivedOpen;
+  onArchivedOpen: (mode: SidebarMode, open: boolean) => void;
+  /** Archives (true) or unarchives (false) a conversation's top session or a run. */
+  onArchive: (target: ArchiveTarget, archive: boolean) => void;
+  /** Why archiving (true) or unarchiving (false) is disabled now; undefined when it can be sent. */
+  archiveReason: (target: ArchiveTarget, archive: boolean) => string | undefined;
 }
+
+type Kids = (id: string) => readonly LogicalSession[];
+const none: readonly LogicalSession[] = [];
+const noKids: Kids = () => none;
+
+/** The mark of an archived search result. */
+export const ARCHIVED_TAG = '已封存';
+/** On the 釘選 item of an archived item that is not pinned: it would show nowhere but in 「已封存」. */
+export const ARCHIVED_PIN = '已封存的項目不能釘選，請先取消封存。';
 
 export function Sidebar(props: SidebarProps) {
   const { snapshot, titles, mode, selectedId, collapsed } = props;
@@ -85,6 +105,34 @@ export function Sidebar(props: SidebarProps) {
     const at = new Map(snapshot.instances.map(instance => [instance.id, runLastMessageAt(times, instance, nodes.get(instance.id) ?? [])]));
     return snapshot.instances.toSorted((a, b) => at.get(b.id)! - at.get(a.id)! || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   }, [snapshot.instances, snapshot.sessions, times]);
+  const { archived } = props;
+  // U4 (T060): the 「已封存」 sections, derived like the lists above: worked out again only when the sessions, runs, times
+  // or what is archived change, never on a render that changes none of them (T040). Conversations go by the newest
+  // message of the whole tree (Q-17, as the auto-archive does); runs keep sortedRuns' order.
+  const archivedLists = useMemo(() => {
+    const chatPool = archived.sessions.size ? sortedSessions.filter(session => archived.sessions.has(session.id)) : [];
+    const treeAt = new Map<string, number>();
+    for (const session of chatPool) {
+      const top = archived.tops.get(session.id)?.id ?? session.id;
+      treeAt.set(top, Math.max(treeAt.get(top) ?? -Infinity, lastMessageAt(times, session)));
+    }
+    const roots = chatPool.filter(session => archived.roots.has(session.id))
+      .sort((a, b) => treeAt.get(b.id)! - treeAt.get(a.id)! || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const runs = archived.runs.size ? sortedRuns.filter(instance => archived.runs.has(instance.id)) : [];
+    return { roots, runs, children: childrenIndex(chatPool) };
+  }, [archived, sortedSessions, sortedRuns, times]);
+  // The headings' running mark: sessions and running turns (r1 P2-2), apart from the lists so a turn does not sort again.
+  const { turns } = snapshot;
+  const archivedRunning = useMemo(() => archivedBusy(archived, { sessions: snapshot.sessions, turns }), [archived, snapshot.sessions, turns]);
+  const archivedPending = useMemo(() => {
+    let chat = false; let workflow = false;
+    if (archived.sessions.size || archived.runs.size) for (const item of snapshot.escalations) {
+      if (item.state !== 'open') continue;
+      if (archived.sessions.has(item.fromSessionId)) chat = true;
+      if (archived.runSessions.has(item.fromSessionId) || (item.instanceId !== undefined && archived.runs.has(item.instanceId))) workflow = true;
+    }
+    return { chat, workflow };
+  }, [archived, snapshot.escalations]);
   const pinned = props.pinned[mode];
   const readOnly = props.readOnly ? { title: readOnlyProps(true).title } : {};
   const title = (session: LogicalSession) => titles[session.id] ?? session.title;
@@ -92,7 +140,7 @@ export function Sidebar(props: SidebarProps) {
   // T056: only rows of the chat tree drag (not pinned, not search, not Workflow mode), and only while they can move.
   const inChatTree = (id: SessionId) => {
     const session = snapshot.sessions.find(item => item.id === id);
-    return mode === 'chat' && !query.trim() && session?.kind === 'ordinary' && !props.pinned.chat.has(id);
+    return mode === 'chat' && !query.trim() && session?.kind === 'ordinary' && !props.pinned.chat.has(id) && !archived.sessions.has(id);
   };
   const canDrag = (id: SessionId) => !props.readOnly && !props.moveReason(id);
   const drag = useSessionDrag({
@@ -123,14 +171,16 @@ export function Sidebar(props: SidebarProps) {
   /** One list row, the same for a chat, a node session and a run: toggle, main button, children. Pending items show as a dot, not a count. */
   const listRow = (row: {
     key: string; data: Record<string, string>; label: string; tooltip: string; dot: string; pending: number; unread: boolean; extra?: ReactNode;
-    selected: boolean; current?: boolean; children: ReactNode[]; defaultOpen: boolean; onOpen: () => void; menu: ContextTarget['kind'];
+    selected: boolean; current?: boolean; defaultOpen: boolean; onOpen: () => void; menu: ContextTarget['kind'];
+    /** How many children the row has; their rows are built only while it is unfolded (T060 r1 P2-1). */
+    childCount: number; children: () => ReactNode[];
     /** T056: a row of the chat tree is a drag source and a drop target. */
     drag?: { source: ReturnType<typeof drag.source>; target: ReturnType<typeof drag.target>; dragging: boolean };
   }) => {
     const expanded = openRows[row.key] ?? row.defaultOpen;
     return <li key={row.key} {...row.data}>
       <div className={`v4-row ${row.selected ? 'v4-row-selected' : ''} ${row.current ? 'v4-row-current' : ''}`} {...row.drag?.target}>
-        {row.children.length > 0 ? <button type="button" className="v4-row-toggle" aria-label={`${expanded ? '收合' : '展開'} ${row.label}`} aria-expanded={expanded}
+        {row.childCount > 0 ? <button type="button" className="v4-row-toggle" aria-label={`${expanded ? '收合' : '展開'} ${row.label}`} aria-expanded={expanded}
           onClick={() => setOpenRows(previous => ({ ...previous, [row.key]: !expanded }))}>{expanded ? '▾' : '▸'}</button> : <span className="v4-row-spacer" />}
         {renaming === row.key ? <input className="v4-rename" aria-label="執行名稱" defaultValue={row.label} ref={input => { input?.focus(); input?.select(); }}
           onBlur={event => { const value = event.currentTarget.value.trim(); if (value && value !== row.label) props.onRenameRun(row.key, value); setRenaming(''); }}
@@ -149,30 +199,43 @@ export function Sidebar(props: SidebarProps) {
             : row.unread && <span className="v4-unread" role="img" aria-label="有新訊息" />}
         </button>}
       </div>
-      {row.children.length > 0 && expanded && <ul>{row.children}</ul>}
+      {row.childCount > 0 && expanded && <ul>{row.children()}</ul>}
     </li>;
   };
-  const sessionRow = (session: LogicalSession, pool: readonly LogicalSession[], tag?: string, inTree = false): ReactNode => listRow({
+  /**
+   * `kids`: the children of a session in the list being built (none for pinned rows and search results). `tags`: small
+   * labels after the title (a search result's run, 已封存). `open`: whether children start unfolded.
+   */
+  const sessionRow = (session: LogicalSession, kids: Kids, tags: readonly string[] = [], inTree = false, open = true): ReactNode => {
+    const children = kids(session.id);
+    return listRow({
     key: session.id, data: { 'data-session-id': session.id }, label: title(session), tooltip: `${title(session)} · ${statusLabel(session.activity)}`,
-    dot: session.activity, pending: pendingFrom(session.id), unread: props.unread.has(session.id), selected: chatSelected === session.id, defaultOpen: true, menu: 'session',
-    ...(tag ? { extra: <span className="v4-row-tag">{tag}</span> } : {}),
-    children: pool.filter(child => child.parentId === session.id).map(child => sessionRow(child, pool, undefined, inTree)), onOpen: () => props.onOpen(session.id),
+    dot: session.activity, pending: pendingFrom(session.id), unread: props.unread.has(session.id), selected: chatSelected === session.id, defaultOpen: open, menu: 'session',
+    ...(tags.length ? { extra: <>{tags.map(tag => <span key={tag} className={`v4-row-tag ${tag === ARCHIVED_TAG ? 'v4-archived-tag' : ''}`}>{tag}</span>)}</> } : {}),
+    childCount: children.length, children: () => children.map(child => sessionRow(child, kids, [], inTree, open)), onOpen: () => props.onOpen(session.id),
     ...(inTree ? { drag: { source: drag.source(session.id), target: drag.target(session.id), dragging: drag.dragging === session.id } } : {}),
-  });
+    });
+  };
   /** Pools come from `sortedSessions`, so roots and children are already newest first. `inTree`: the chat list's tree (T056). */
-  const tree = (pool: readonly LogicalSession[], inTree = false) => pool.filter(session => !pool.some(parent => parent.id === session.parentId)).map(session => sessionRow(session, pool, undefined, inTree));
+  const tree = (pool: readonly LogicalSession[], inTree = false) => {
+    const index = childrenIndex(pool);
+    const ids = new Set<string>(pool.map(session => session.id));
+    const kids: Kids = id => index.get(id) ?? none;
+    return pool.filter(session => session.parentId === undefined || !ids.has(session.parentId)).map(session => sessionRow(session, kids, [], inTree));
+  };
   const runSessions = (instance: WorkflowInstance) => sortedSessions.filter(session => session.kind === 'workflow' && session.workflow.instanceId === instance.id);
   // A run row stands for its root session; its other node sessions are indented below, folded unless the selection is inside.
   const runRow = (instance: WorkflowInstance): ReactNode => {
     const status = runStatus(snapshot, instance);
     const sessions = runSessions(instance);
-    const nodes = sessions.filter(session => session.id !== instance.rootSessionId && !pinned.has(session.id));
+    // A pinned node shows in 釘選 instead, unless its run is archived (then the pin shows nowhere, T060).
+    const nodes = sessions.filter(session => session.id !== instance.rootSessionId && (!pinned.has(session.id) || archived.runs.has(instance.id)));
     return listRow({
       key: instance.id, data: { 'data-run-id': instance.id, className: 'v4-run' }, label: runTitle(instance), tooltip: `${runTitle(instance)} · ${status.label}`,
       // Q-14: the run row lights up when any of its node sessions has an unseen reply.
       dot: status.state, pending: status.pending, unread: sessions.some(session => props.unread.has(session.id)), extra: <span className="v4-run-state" data-state={status.state}>{status.label}</span>,
       selected: chatSelected === instance.rootSessionId, current: selectedRun === instance.id, defaultOpen: selectedRun === instance.id, menu: 'run',
-      children: tree(nodes),
+      childCount: nodes.length, children: () => tree(nodes),
       onOpen: () => props.onOpen(instance.rootSessionId),
     });
   };
@@ -186,13 +249,29 @@ export function Sidebar(props: SidebarProps) {
   // Search covers both modes; opening a result switches the sidebar to that result's mode.
   const matches = query.trim() ? sortedSessions.filter(session => title(session).toLowerCase().includes(query.trim().toLowerCase())) : undefined;
   const runOf = (session: LogicalSession) => session.kind === 'workflow' ? snapshot.instances.find(instance => instance.id === session.workflow.instanceId) : undefined;
-  const runs = sortedRuns.filter(instance => !pinned.has(instance.id));
-  const chats = sortedSessions.filter(session => session.kind === 'ordinary' && !pinned.has(session.id));
+  // U4 (T060): archived items show only in 「已封存」, also when a pin of theirs was left in the preferences (T059 ★H).
+  const runs = sortedRuns.filter(instance => !pinned.has(instance.id) && !archived.runs.has(instance.id));
+  const chats = sortedSessions.filter(session => session.kind === 'ordinary' && !pinned.has(session.id) && !archived.sessions.has(session.id));
   // Pinned: runs first, then sessions; each group newest last message first.
   const pinnedRows = [
-    ...sortedRuns.filter(instance => pinned.has(instance.id)).map(runRow),
-    ...sortedSessions.filter(session => pinned.has(session.id)).map(session => sessionRow(session, [])),
+    ...sortedRuns.filter(instance => pinned.has(instance.id) && !archived.runs.has(instance.id)).map(runRow),
+    ...sortedSessions.filter(session => pinned.has(session.id) && !archived.sessions.has(session.id) && !archived.runSessions.has(session.id)).map(session => sessionRow(session, noKids)),
   ];
+  // Archived trees start folded, unless the open session is inside (as a run row does).
+  const selectedTop = chatSelected && archived.sessions.has(chatSelected) ? archived.tops.get(chatSelected)?.id : undefined;
+  const archivedKids: Kids = id => archivedLists.children.get(id) ?? none;
+  const archivedCount = mode === 'chat' ? archivedLists.roots.length : archivedLists.runs.length;
+  const archivedOpen = props.archivedOpen[mode];
+  // T060 r1 P2-1: the rows are built only while the section shows and is open; closed, it costs its heading only.
+  const archivedSection = () => archivedCount > 0 && <section className="v4-section v4-archived" aria-label="已封存">
+    <h2><button type="button" aria-expanded={archivedOpen} onClick={() => props.onArchivedOpen(mode, !archivedOpen)}>
+      <span>已封存</span>
+      {archivedRunning[mode] && <span className="v4-activity" data-state="running" role="img" aria-label="已封存的項目裡有工作正在進行" />}
+      {archivedPending[mode] && <span className="v4-alert" role="img" aria-label="已封存的項目有待處理項目" />}
+      <span className="v4-count">{archivedCount}</span><span aria-hidden="true">{archivedOpen ? '▾' : '▸'}</span></button></h2>
+    {archivedOpen && <ul className="v4-tree">{mode === 'chat'
+      ? archivedLists.roots.map(root => sessionRow(root, archivedKids, [], false, root.id === selectedTop)) : archivedLists.runs.map(runRow)}</ul>}
+  </section>;
   const menuSession = menu?.kind === 'session' ? snapshot.sessions.find(session => session.id === menu.id) : undefined;
   const menuRun = menu?.kind === 'run' ? snapshot.instances.find(instance => instance.id === menu.id) : undefined;
   const menuOpenId = menuSession?.id ?? menuRun?.rootSessionId;
@@ -204,6 +283,24 @@ export function Sidebar(props: SidebarProps) {
     const below: MenuItem = { label: '移到…底下', disabled: !!reason, title: reason, onSelect: () => setPicker({ sessionId: session.id, from }) };
     return session.parentId === undefined ? [below] : [below, { label: '移到最上層', disabled: !!reason, title: reason, onSelect: () => props.onMove(session.id, null) }];
   };
+  // U4 (T060): 封存／取消封存 only for a conversation's top session and for a run. The reasons come from the shell
+  // (read-only, not synchronised, in flight, and what the Snapshot shows); the backend's answer still has the last word.
+  const archiveItems = (): MenuItem[] => {
+    let target: ArchiveTarget | undefined;
+    if (menuRun) target = { kind: 'run', id: menuRun.id };
+    else if (menuSession?.kind === 'ordinary') {
+      const top = archiveTargetOf(snapshot, menuSession.id);
+      if (top?.id === menuSession.id) target = top;
+    }
+    if (!target) return [];
+    const done = target.kind === 'run' ? archived.runs.has(target.id) : archived.roots.has(target.id);
+    const reason = props.archiveReason(target, !done);
+    const chosen = target;
+    return [{ label: done ? '取消封存' : '封存', disabled: !!reason, title: reason, onSelect: () => props.onArchive(chosen, !done) }];
+  };
+  const menuPinned = menu ? props.pinned[modeOf(snapshot, menu.id)].has(menu.id) : false;
+  // An archived item is not pinned (it would show only in 「已封存」); a pin left behind can still be taken away.
+  const pinArchived = !!menu && !menuPinned && isArchived(archived, menu.id);
   const add = mode === 'chat' ? { label: '新對話', onClick: props.onNewChat, active: props.page === 'new' } : { label: '開始 Workflow', onClick: props.onStartWorkflow, active: props.page === 'workflow-start' };
 
   if (collapsed && !props.overlay) return <aside className="v4-sidebar v4-rail" aria-label="側欄（已收合）">
@@ -251,13 +348,17 @@ export function Sidebar(props: SidebarProps) {
       }
     }}>
       {matches ? <section className="v4-section" aria-label="搜尋結果"><h2 className="v4-section-plain">搜尋結果 <span className="v4-count">{matches.length}</span></h2>
-        {matches.length ? <ul className="v4-tree">{matches.map(session => sessionRow(session, [], runOf(session) && runTitle(runOf(session)!)))}</ul>
+        {matches.length ? <ul className="v4-tree">{matches.map(session => {
+          const run = runOf(session);
+          return sessionRow(session, noKids, [...(run ? [runTitle(run)] : []), ...(archived.sessions.has(session.id) || archived.runSessions.has(session.id) ? [ARCHIVED_TAG] : [])]);
+        })}</ul>
           : <p className="v4-muted v4-section-note">沒有符合的對話或 Workflow。</p>}</section> : <>
         {pinnedRows.length > 0 && section('pinned', '釘選', <ul className="v4-tree">{pinnedRows}</ul>, pinnedRows.length)}
         {mode === 'chat'
           ? section('list', '對話', chats.length ? <ul className="v4-tree">{tree(chats, true)}</ul> : <p className="v4-muted v4-section-note">還沒有對話。</p>, chats.length,
             drag.top && <div className="v4-drop-top" aria-hidden="true" {...drag.top}>移到最上層</div>)
           : section('list', '執行', runs.length ? <ul className="v4-tree">{runs.map(runRow)}</ul> : <p className="v4-muted v4-section-note">還沒有執行過 Workflow。</p>, runs.length)}
+        {archivedSection()}
       </>}
     </nav>
     <div className="v4-sidebar-foot">
@@ -266,14 +367,16 @@ export function Sidebar(props: SidebarProps) {
         <button type="button" className="v4-icon v4-theme" aria-label={props.theme === 'dark' ? '切換成淺色' : '切換成深色'} title={props.themeReason ?? '切換外觀'} disabled={!!props.themeReason} onClick={() => props.onTheme(props.theme === 'dark' ? 'light' : 'dark')}>{props.theme === 'dark' ? '☾' : '☀'}</button></div>
     </div>
     {menu && menuOpenId && <MenuList label={`${menuTitle} 的選單`} className="v4-context-menu"
-      style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - (menuSession?.kind === 'ordinary' ? 250 : 180)) }}
+      style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - (menuSession?.kind === 'ordinary' ? 290 : 215)) }}
       onClose={restore => { const from = menu.from; setMenu(null); if (restore) from.focus(); }}
       items={[
         { label: '開啟', onSelect: () => props.onOpen(menuOpenId) },
         { label: '在分割畫面開啟', disabled: menuOpenId === selectedId, onSelect: () => props.onSplit(menuOpenId) },
-        { label: props.pinned[modeOf(snapshot, menu.id)].has(menu.id) ? '取消釘選' : '釘選', disabled: props.pinBlocked, title: props.pinBlocked ? props.pinReason : undefined, onSelect: () => props.onPin(menu.id) },
+        { label: menuPinned ? '取消釘選' : '釘選', disabled: props.pinBlocked || pinArchived,
+          title: props.pinBlocked ? props.pinReason : pinArchived ? ARCHIVED_PIN : undefined, onSelect: () => props.onPin(menu.id) },
         { label: '重新命名', disabled: props.readOnly, ...readOnly, onSelect: () => { if (menuRun) setRenaming(menuRun.id); else props.onRename(menuOpenId); } },
         ...moveItems(menuSession, menu.from),
+        ...archiveItems(),
       ]} />}
     {picker && <MovePicker snapshot={snapshot} sessionId={picker.sessionId} titles={titles}
       onClose={() => { restoreFocus.current = picker.from; setPicker(null); }}
