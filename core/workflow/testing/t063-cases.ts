@@ -79,6 +79,29 @@ export const t063WorkflowCases = (backend: string, make: MakeWorld) =>
       expect((await instanceOf(w)).state).toBe('running');
     });
 
+    it('r1 P2: a start that begins AND ends while the delete reads the runs is caught by the generation alone', async () => {
+      const w = await make();
+      const instances = w.repositories.instances;
+      const list = instances.list.bind(instances);
+      let start: Promise<CommandResult> | undefined;
+      // The delete's read of the runs is taken before the start; the start then runs to its end (active is 0 again)
+      // before the read comes back, so only the generation tells that a run of the template was made meanwhile.
+      instances.list = async () => {
+        if (start !== undefined) return list();
+        const before = await list();
+        start = w.engine.start(startCommand());
+        expect(await start).toMatchObject({ ok: true });
+        await settle();
+        expect(w.engine.templateStarts(WORKFLOW)).toEqual({ active: 0, generation: 1 });
+        expect(before.some((i) => i.workflowId === WORKFLOW)).toBe(false);
+        return before;
+      };
+      expect(refusal(await w.run(deleteOf(0)))).toEqual({ code: 'invalid_transition', reason: 'template-in-use', retryable: true });
+      instances.list = list;
+      expect(await w.repositories.workflows.get(WORKFLOW)).toBeDefined();
+      expect((await instanceOf(w)).state).toBe('running');
+    });
+
     it('a start after the delete, with the revision it saw, finds no template and makes nothing', async () => {
       const w = await make();
       expect(await w.run(deleteOf(0))).toMatchObject({ ok: true });

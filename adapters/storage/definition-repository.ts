@@ -1,8 +1,8 @@
 // Agents and workflow templates (T015): one row per ID, edited by compare-and-set on `revision`
 // (DATA_RUNTIME §1). The stored record always carries the row's revision, so reading needs no second source.
 import type { z } from 'zod';
-import { AgentDefinition, ProjectSettings, WorkflowTemplate, type AgentId, type ProjectId, type Revision, type WorkflowId } from '../../contracts';
-import type { DefinitionRepository, DeleteResult, SaveResult } from '../../core/ports';
+import { AgentDefinition, ProjectSettings, Timestamp, WorkflowTemplate, type AgentId, type ProjectId, type Revision, type WorkflowId } from '../../contracts';
+import type { DefinitionRepository, DefinitionSeed, DeleteResult, SaveResult } from '../../core/ports';
 import { StoredDataError, checkRecord, readRecord, run, type StorageContext } from './codec';
 import { committed, unchanged, writeTransaction } from './transaction';
 
@@ -82,3 +82,28 @@ export class SqliteDefinitionRepository<T extends { id: string; revision: number
 export const agentRepository = (ctx: StorageContext) => new SqliteDefinitionRepository<AgentDefinition, AgentId>(ctx, 'agent', AgentDefinition);
 export const workflowRepository = (ctx: StorageContext) => new SqliteDefinitionRepository<WorkflowTemplate, WorkflowId>(ctx, 'workflow', WorkflowTemplate);
 export const projectRepository = (ctx: StorageContext) => new SqliteDefinitionRepository<ProjectSettings, ProjectId>(ctx, 'project', ProjectSettings);
+
+/**
+ * The starter set's write (T063): in one transaction, each record whose ID is free is inserted with revision 0 (as
+ * `save(record, null)` would), then the mark (`app_marker`, migration v14); any failure rolls all of it back.
+ */
+export const seedDefinitions = (ctx: StorageContext, seed: DefinitionSeed): Promise<string[]> =>
+  run(() =>
+    writeTransaction<string[]>(ctx.db, () => {
+      const added: string[] = [];
+      const insert = <T extends { id: string }>(table: 'agent' | 'workflow', schema: z.ZodType<T>, record: T) => {
+        const parsed = checkRecord(schema, table, record);
+        if (ctx.db.prepare(`SELECT 1 AS found FROM ${table} WHERE id = ?`).get(parsed.id) !== undefined) return;
+        ctx.db.prepare(`INSERT INTO ${table} (id, revision, body) VALUES (?, 0, ?)`).run(parsed.id, JSON.stringify({ ...parsed, revision: 0 }));
+        added.push(parsed.id);
+      };
+      for (const agent of seed.agents) insert('agent', AgentDefinition, agent);
+      for (const workflow of seed.workflows) insert('workflow', WorkflowTemplate, workflow);
+      let marked = false;
+      if (seed.mark !== undefined) {
+        const at = checkRecord(Timestamp, 'app_marker', seed.mark.at);
+        marked = ctx.db.prepare('INSERT INTO app_marker (name, at) VALUES (?, ?) ON CONFLICT (name) DO NOTHING').run(seed.mark.name, at).changes > 0;
+      }
+      return added.length > 0 || marked ? committed(added) : unchanged(added);
+    }),
+  );

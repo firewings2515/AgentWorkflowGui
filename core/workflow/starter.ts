@@ -124,11 +124,11 @@ export interface StarterInstall {
   skipped?: 'marked' | 'in-use';
 }
 
-type StarterRepositories = Pick<AppRepositories, 'agents' | 'workflows' | 'markers'>;
+type StarterRepositories = Pick<AppRepositories, 'agents' | 'workflows' | 'markers' | 'seedDefinitions'>;
 
 /**
- * Adds what of the starter set is missing, then sets the mark (last, so a start that stopped half way finishes it next
- * time). `first-start`: only once (the mark), and never into an install in use: an Agent or a template that is not one of
+ * Adds what of the starter set is missing and sets the mark, in one transaction (`seedDefinitions`): a failure leaves
+ * none of it, and the next start adds all of it. `first-start`: only once (the mark), and never into an install in use: an Agent or a template that is not one of
  * the starter set's means the user has data, and only the mark is set. `user`: whenever asked. An Agent or a template
  * already stored under a starter ID is kept as it is, edited or not.
  */
@@ -148,18 +148,8 @@ export const installStarter = async (
     }
   }
   const set = starterSet(models, now);
-  const added: string[] = [];
-  for (const agent of set.agents) {
-    if ((await repos.agents.get(agent.id)) !== undefined) continue;
-    // Stale: made meanwhile under the same ID; kept as it is.
-    if ((await repos.agents.save(agent, null)).status === 'saved') added.push(agent.id);
-  }
-  let workflow = await repos.workflows.get(set.workflow.id);
-  if (workflow === undefined) {
-    const saved = await repos.workflows.save(set.workflow, null);
-    if (saved.status === 'saved') added.push(set.workflow.id);
-    workflow = saved.status === 'saved' ? saved.record : saved.current;
-  }
-  await repos.markers.set(STARTER_MARKER, now);
+  // One transaction (T063 r1 P1): the Agents, the template and the mark are stored together or not at all.
+  const added = await repos.seedDefinitions({ agents: set.agents, workflows: [set.workflow], mark: { name: STARTER_MARKER, at: now } });
+  const workflow = await repos.workflows.get(set.workflow.id);
   return { added, ...(workflow !== undefined && { workflow }) };
 };

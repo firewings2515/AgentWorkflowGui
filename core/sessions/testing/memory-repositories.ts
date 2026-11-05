@@ -24,8 +24,8 @@ import type {
   HistoryPage,
   HistoryPageInfo,
 } from '../../../contracts';
-import { countsAsLastMessage } from '../../../contracts';
-import type { AppRepositories, Conversation, DefinitionRepository, NodeSessionKey, SaveResult, SnapshotData, WorkFolderClaim, WorkFolderClaimRepository } from '../../ports';
+import { AgentDefinition as AgentSchema, countsAsLastMessage, Timestamp as TimestampSchema, WorkflowTemplate as WorkflowSchema } from '../../../contracts';
+import type { AppRepositories, Conversation, DefinitionSeed, DefinitionRepository, NodeSessionKey, SaveResult, SnapshotData, WorkFolderClaim, WorkFolderClaimRepository } from '../../ports';
 
 /** A deep copy (core has no structuredClone: no DOM or Node types); records are plain JSON. */
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -202,6 +202,22 @@ export class MemoryRepositories implements AppRepositories {
       return Promise.resolve();
     },
   };
+
+  /** All or nothing, as the SQLite one: every record is checked before anything is stored. */
+  seedDefinitions(seed: DefinitionSeed): Promise<string[]> {
+    try {
+      const agents = seed.agents.map((a) => AgentSchema.parse(a));
+      const workflows = seed.workflows.map((w) => WorkflowSchema.parse(w));
+      const mark = seed.mark === undefined ? undefined : { name: seed.mark.name, at: TimestampSchema.parse(seed.mark.at) };
+      const added: string[] = [];
+      for (const a of agents) if (!this.agents.records.has(a.id)) { this.agents.records.set(a.id, { ...copy(a), revision: 0 }); added.push(a.id); }
+      for (const w of workflows) if (!this.workflows.records.has(w.id)) { this.workflows.records.set(w.id, { ...copy(w), revision: 0 }); added.push(w.id); }
+      if (mark !== undefined && !this.markerRecords.has(mark.name)) this.markerRecords.set(mark.name, mark.at);
+      return Promise.resolve(added);
+    } catch (error) {
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
 
   readonly claimRecords = new Map<SessionId, WorkFolderClaim>();
   readonly workFolders: WorkFolderClaimRepository = {

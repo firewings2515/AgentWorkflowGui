@@ -101,6 +101,34 @@ describe('installStarter at a first start', () => {
     expect(await repos.markers.has(STARTER_MARKER)).toBe(true);
   });
 
+  it('r1 P1: a failed write leaves no Agent, no template and no mark; the next start adds all of it', async () => {
+    const repos = new MemoryRepositories();
+    const seed = repos.seedDefinitions.bind(repos);
+    let calls = 0;
+    repos.seedDefinitions = (s) => (++calls === 1 ? Promise.reject(new Error('injected:write')) : seed(s));
+    await expect(first(repos)).rejects.toThrow('injected:write');
+    expect(await repos.agents.list()).toEqual([]);
+    expect(await repos.workflows.list()).toEqual([]);
+    expect(await repos.markers.has(STARTER_MARKER)).toBe(false);
+    expect((await first(repos)).added).toHaveLength(4);
+    expect(await repos.markers.has(STARTER_MARKER)).toBe(true);
+  });
+
+  it('r1 P1: the memory seed is all or nothing too (an invalid template after valid Agents)', async () => {
+    const repos = new MemoryRepositories();
+    const set = starterSet([], now);
+    await expect(repos.seedDefinitions({ agents: set.agents, workflows: [{ ...set.workflow, nodes: [] }], mark: { name: STARTER_MARKER, at: now } })).rejects.toThrow();
+    expect(await repos.agents.list()).toEqual([]);
+    expect(await repos.markers.has(STARTER_MARKER)).toBe(false);
+  });
+
+  it('never goes through the one-record saves (a failing workflows.save cannot leave half of it)', async () => {
+    const repos = new MemoryRepositories();
+    repos.workflows.save = () => Promise.reject(new Error('injected:save'));
+    repos.agents.save = () => Promise.reject(new Error('injected:save'));
+    expect((await first(repos)).added).toHaveLength(4);
+  });
+
   it('uses the models listed now', async () => {
     const repos = new MemoryRepositories();
     await installStarter(repos, { models: [option({ runtime: 'codex', model: 'gpt-z', isDefault: true, efforts: ['high'] })], now, mode: 'first-start' });

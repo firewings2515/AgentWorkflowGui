@@ -129,6 +129,16 @@ export interface MarkerRepository {
   set(name: string, at: Timestamp): Promise<void>;
 }
 
+/**
+ * What `AppRepositories.seedDefinitions` writes (T063, the starter set): Agents and templates made only where their ID is
+ * free, and a mark, all in one transaction.
+ */
+export interface DefinitionSeed {
+  agents: readonly AgentDefinition[];
+  workflows: readonly WorkflowTemplate[];
+  mark?: { name: string; at: Timestamp };
+}
+
 export interface OwnedProcessRepository {
   record(process: OwnedProcess): Promise<void>;
   markEnded(pid: number, startedAt: Timestamp, at: Timestamp): Promise<void>;
@@ -240,5 +250,11 @@ export interface AppRepositories {
   workFolders: WorkFolderClaimRepository;
   /** One-time marks (T063). */
   markers: MarkerRepository;
+  /**
+   * In ONE transaction (T063): each Agent and template whose ID is free is stored with revision 0 (one already stored
+   * under its ID is kept as it is), then the mark is set; every record passes its schema. All or nothing: a failure
+   * leaves none of it. Returns the IDs stored now.
+   */
+  seedDefinitions(seed: DefinitionSeed): Promise<string[]>;
   readSnapshotData(options?: SnapshotOptions): Promise<SnapshotData>;
 }
