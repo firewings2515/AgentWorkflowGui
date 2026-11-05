@@ -309,3 +309,17 @@
 .v4-row[data-drop='over'], .v4-row[data-drop='over']:hover { box-shadow: inset 0 0 0 2px var(--accent); background: var(--accent-bg); }
 .v4-drop-top { position: absolute; inset: 0; z-index: 1; display: flex; align-items: center; padding: 0 8px; border: 1px dashed var(--accent); border-radius: 8px; background: var(--panel); color: var(--accent); font-size: 11px; font-weight: 600; }
 .v4-drop-top[data-drop='over'] { border-style: solid; background: var(--accent-bg); }
+
+/* U4 (T060): the 「已封存」 section at the end of the list, its marks, and the archived banner of a conversation. */
+.v4-archived { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 4px; }
+.v4-archived h2 .v4-activity, .v4-archived h2 .v4-alert { flex: 0 0 8px; }
+.v4-archived .v4-session { opacity: 0.85; }
+.v4-row-tag.v4-archived-tag { flex: 0 0 auto; padding: 0 5px; border: 1px solid var(--line); border-radius: 4px; }
+.v4-archived-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 18px; border-bottom: 1px solid var(--line); background: var(--raised); font-size: 12px; }
+.v4-archived-banner > span:nth-child(2) { flex: 1; min-width: 12em; color: var(--muted); }
+.v4-archived-badge { padding: 1px 6px; border: 1px solid var(--line); border-radius: 4px; font-weight: 600; }
+.v4-auto-archive { display: grid; gap: 8px; }
+.v4-card .v4-auto-archive .v4-check { display: flex; align-items: center; gap: 8px; margin: 0; }
+.v4-auto-archive .v4-check input { width: auto; margin: 0; padding: 0; }
+.v4-days-row { display: flex; align-items: center; gap: 8px; }
+.v4-field .v4-days-row .v4-days { width: 7em; flex: 0 0 auto; }

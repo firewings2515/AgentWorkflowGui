@@ -1,4 +1,4 @@
-import type { CommandResult, ErrorCode } from '../../../contracts';
+import type { CommandRefusal, CommandResult, ErrorCode } from '../../../contracts';
 
 type Failure = Extract<CommandResult, { ok: false }>;
 const explanations: Record<ErrorCode, string> = {
@@ -17,6 +17,22 @@ const explanations: Record<ErrorCode, string> = {
   internal_error: '服務發生錯誤，請重新讀取並核對狀態。',
 };
 
+/**
+ * Words for each CommandResult `reason` (contracts 0.10, T059 report §4 and r1/r2). The backend has the last word: a
+ * refusal the renderer could not foresee (a payload waiting to be sent is `turn-running` too) shows these words as well.
+ */
+export const REFUSAL_TEXT: Record<CommandRefusal, string> = {
+  'not-top-level': '只能封存最上層的對話。',
+  'workflow-session': 'Workflow 的 session 請改封存整個執行。',
+  'turn-running': '有工作正在進行，結束後才能封存。',
+  'escalation-open': '有待處理的項目，處理後才能封存。',
+  'run-not-ended': '這次執行還沒結束，結束後才能封存。',
+  archived: '這個對話已封存，請先取消封存。',
+};
+/** The words for a reason; undefined for none or one this renderer does not know (the caller keeps its general words). */
+export const refusalText = (reason: unknown): string | undefined =>
+  typeof reason === 'string' && Object.hasOwn(REFUSAL_TEXT, reason) ? REFUSAL_TEXT[reason as CommandRefusal] : undefined;
+
 export const blocksResubmit = (result: CommandResult) => !result.ok && (result.mayHaveSideEffects || result.code === 'unknown_outcome');
 /** What a code means for one operation, where the general words would leave the user without a way on (T046). */
 const byOperation: Partial<Record<string, Partial<Record<ErrorCode, string>>>> = {
@@ -31,7 +47,8 @@ export function commandFeedback(result: Failure, operation?: string): string {
   const savedRetry = operation === 'delivery.resolve' && result.code === 'runtime_unavailable' && result.mayHaveSideEffects;
   if (savedRetry) return byOperation['delivery.resolve']!.runtime_unavailable!;
   const words = operation === undefined || operation === 'delivery.resolve' ? undefined : byOperation[operation]?.[result.code];
-  const explanation = words ?? explanations[result.code];
+  // A reason (0.10) says more than the code; an unknown one keeps the general words.
+  const explanation = refusalText(result.reason) ?? words ?? explanations[result.code];
   return explanation + (result.mayHaveSideEffects && result.code !== 'unknown_outcome' ? ' 可能已產生變更，請先核對；不可直接重試。' : '');
 }
 

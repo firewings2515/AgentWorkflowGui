@@ -7,7 +7,7 @@ import { AgentId, MessageId, PINNED_LIMIT, pinnedOf, RequestId } from '../../../
 import { AgentCatalog } from '../AgentCatalog';
 import { createAgentDemo } from '../agent-demo';
 import { createIpcAgentRepository } from '../agent-repository';
-import { commandFeedback } from '../command-feedback';
+import { commandFeedback, refusalText } from '../command-feedback';
 import { useEscalationNotice } from '../escalation-notify';
 import { FolderButton } from '../FolderButton';
 import type { RendererState, RendererStore } from '../renderer-store';
@@ -23,6 +23,8 @@ import { createWorkflowDemo } from '../workflow-demo';
 import { createIpcWorkflowRepository } from '../workflow-repository';
 import { WorkflowProgress } from '../WorkflowProgress';
 import { WorkflowStart } from '../WorkflowStart';
+import { ARCHIVED_OPEN_KEY, archiveBlock, archivedIndex, archivedTargetIn, archiveTargetOf, readArchivedOpen, targetArchived, targetRevision } from './archive';
+import type { ArchivedOpen, ArchiveTarget } from './archive';
 import { defaultModelKey, modelKey } from './Composer';
 import type { ComposerChoice } from './Composer';
 import { Conversation } from './Conversation';
@@ -44,6 +46,15 @@ export const APP_NAME = 'AgentWorkflowGui';
 export const SAVING_PREFERENCES = '正在儲存設定，完成後就能再改。';
 /** WB-04 (T053): the tree changed since the Snapshot the user chose from; never sent again on its own. */
 export const STALE_MOVE = '這個對話剛被改過，請再試一次。';
+/** U4 (T060): a run changed since the Snapshot the user chose from; never sent again on its own. */
+export const STALE_RUN = '這次執行剛被改過，請再試一次。';
+/** U4 (T060): an archive command of this target whose result is not known; it is checked on the settings page. */
+export const ARCHIVE_UNCERTAIN = '上次封存的結果無法確認，請到設定頁「待核對操作」核對後再試。';
+/** U4 (T060): moving into, out of or within an archived conversation (the backend refuses with `archived`). */
+export const ARCHIVED_MOVE = '已封存的對話不能移動，請先取消封存。';
+const isArchiveCommandOf = (command: { type: string; sessionId?: string; instanceId?: string }, target: ArchiveTarget) => target.kind === 'session'
+  ? (command.type === 'session.archive' || command.type === 'session.unarchive') && command.sessionId === target.id
+  : (command.type === 'workflow.archive' || command.type === 'workflow.unarchive') && command.instanceId === target.id;
 
 // Below this width the sidebar collapses by itself and opens as an overlay, and a split shows only its active pane
 // (styles.css `@media (max-width: 900px)`; layout.test checks the two match).
@@ -166,7 +177,15 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   if (marked !== seen) setSeen(marked);
   const unread = useMemo(() => unreadOf(times.replies, marked, visible), [times.replies, marked, visible]);
   // Q-16 / Q-14: both are written at most every 500 ms, and on page hide or unmount; a failed write is ignored.
-  const [writers] = useState(() => ({ seen: createThrottledWriter(SEEN_KEY), panes: createThrottledWriter(PANES_KEY) }));
+  const [writers] = useState(() => ({ seen: createThrottledWriter(SEEN_KEY), panes: createThrottledWriter(PANES_KEY), archived: createThrottledWriter(ARCHIVED_OPEN_KEY) }));
+  // U4 (T060): which 「已封存」 sections are open, kept like the layout (connected app only; closed by default).
+  const [archivedOpen, setArchivedOpen] = useState<ArchivedOpen>(() => readArchivedOpen(persist ? readJson(ARCHIVED_OPEN_KEY) : { ok: false }));
+  const archivedOpenText = useMemo(() => JSON.stringify(archivedOpen), [archivedOpen]);
+  const archivedOpenChanged = useRef(false);
+  useEffect(() => { if (persist && archivedOpenChanged.current) writers.archived.schedule(archivedOpenText); }, [persist, archivedOpenText, writers]);
+  // What is archived, once per change of the sessions or runs (not per message delta, T040).
+  const { sessions: allSessions, instances: allInstances } = snapshot;
+  const archived = useMemo(() => archivedIndex({ sessions: allSessions, instances: allInstances }), [allSessions, allInstances]);
   // Only sessions that still exist are written (T058): one that went away (a restored backup) is dropped at the next write.
   const sessionKey = snapshot.sessions.map(session => session.id).join('\n');
   const seenText = useMemo(() => serializeSeen(seen, new Set(sessionKey.split('\n'))), [seen, sessionKey]);
@@ -175,7 +194,7 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const layoutText = useMemo(() => JSON.stringify(serializeLayout(panes)), [panes]);
   useEffect(() => { if (persist) writers.panes.schedule(layoutText); }, [persist, layoutText, writers]);
   useEffect(() => {
-    const flush = () => { writers.seen.flush(); writers.panes.flush(); };
+    const flush = () => { writers.seen.flush(); writers.panes.flush(); writers.archived.flush(); };
     window.addEventListener('pagehide', flush);
     return () => { window.removeEventListener('pagehide', flush); flush(); };
   }, [writers]);
@@ -385,7 +404,49 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
     // Read from the store at this moment, so a second choice in the same tick already sees the first send.
     const activity = store && Object.values(store.getSnapshot().blockedCommands).find(item => item.command.type === 'session.reparent' && item.command.sessionId === sessionId);
     if (activity) return activity.result ? '上次移動的結果無法確認，請到設定頁「待核對操作」核對後再試。' : '正在移動這個對話…';
+    if (archived.sessions.has(sessionId)) return ARCHIVED_MOVE;
     return undefined;
+  };
+  /**
+   * U4 (T060): why archiving (true) or unarchiving (false) the target cannot be sent now: read-only, not synchronised, an
+   * archive command of it in flight or uncertain, and (archiving only) what the latest Snapshot shows (archiveBlock).
+   * Only a forecast: whatever is sent, the backend's answer is shown.
+   */
+  const archiveReason = (target: ArchiveTarget, archive: boolean): string | undefined => {
+    if (readOnly) return readOnlyProps(true).title;
+    if (commandDisabled) return '資料尚未同步完成。';
+    const activity = store && Object.values(store.getSnapshot().blockedCommands).find(item => isArchiveCommandOf(item.command, target));
+    if (activity) return activity.result ? ARCHIVE_UNCERTAIN : activity.command.type.endsWith('unarchive') ? '正在取消封存…' : '正在封存…';
+    if (!archive) return undefined;
+    const block = archiveBlock(store?.getSnapshot().snapshot ?? snapshot, target);
+    return block && (refusalText(block) ?? '目前狀態不允許此操作。');
+  };
+  /**
+   * session.archive／unarchive (the top session's id and revision) or workflow.archive／unarchive (the run's), with the
+   * revision of the latest Snapshot at the moment of sending. A success changes nothing here: the sidebar follows
+   * session.updated／instance.updated. A refusal is shown and never sent again on its own (stale_revision as in T053).
+   */
+  const setArchived = (target: ArchiveTarget, archive: boolean) => {
+    const verb = archive ? '封存' : '取消封存';
+    const stale = target.kind === 'run' ? STALE_RUN : STALE_MOVE;
+    const reason = archiveReason(target, archive);
+    if (reason) { setNotice(`沒有${verb}：${reason}`); return; }
+    const type = target.kind === 'run' ? (archive ? 'workflow.archive' : 'workflow.unarchive') : (archive ? 'session.archive' : 'session.unarchive');
+    if (!store) { setNotice(`示意模式：未連接 runtime。連線時會送 ${type}。`); return; }
+    const current = store.getSnapshot().snapshot;
+    const now = current ? targetArchived(current, target) : undefined;
+    const revision = current ? targetRevision(current, target) : undefined;
+    // The conversation must still be a top one (it may have been moved below another since the menu was drawn).
+    const top = current && target.kind === 'session' ? archiveTargetOf(current, target.id)?.id === target.id : true;
+    if (!current || now === undefined || revision === undefined || !top) { setNotice(stale); return; }
+    if (now === archive) return;
+    const command = target.kind === 'run'
+      ? { type: archive ? 'workflow.archive' as const : 'workflow.unarchive' as const, requestId: newId(), instanceId: target.id, expectedRevision: revision }
+      : { type: archive ? 'session.archive' as const : 'session.unarchive' as const, requestId: newId(), sessionId: target.id, expectedRevision: revision };
+    void store.send(command).then(result => {
+      if (result.ok) return;
+      setNotice(result.code === 'stale_revision' && !result.mayHaveSideEffects ? stale : `沒有${verb}：${commandFeedback(result, command.type)}`);
+    });
   };
   /**
    * WB-04: session.reparent with the session's revision in the latest Snapshot, after checking the move there again. A
@@ -446,7 +507,9 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
     const session = snapshot.sessions.find(item => item.id === pane.sessionId);
     const title = (session && titles[session.id]) ?? session?.title ?? pane.sessionId;
     const runTitle = session?.kind === 'workflow' ? titles[session.workflow.instanceId] : undefined;
-    return <Conversation key={pane.id} snapshot={snapshot} store={store} historyStore={serviceStore} ipcState={ipcState} pane={pane} title={title} runTitle={runTitle}
+    // U4 (T060): the banner's 取消封存 sends the top session's (or the run's) id, also from a session below it.
+    const archiveTarget = session && archivedTargetIn(archived, session);
+    return <Conversation archive={archiveTarget && { kind: archiveTarget.kind, reason: archiveReason(archiveTarget, false), onUnarchive: () => setArchived(archiveTarget, false) }} key={pane.id} snapshot={snapshot} store={store} historyStore={serviceStore} ipcState={ipcState} pane={pane} title={title} runTitle={runTitle}
       active={pane.id === active?.id} split={panes.panes.length > 1} agents={agents} choice={session ? choiceFor(session) : newChoice}
       editTitle={editTitle.sessionId === pane.sessionId ? editTitle.nonce : 0} firstNotSent={firstNotSent.has(pane.sessionId)}
       onContext={patch => dispatch({ type: 'context', paneId: pane.id, sessionId: pane.sessionId, patch })}
@@ -482,6 +545,8 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
       onNewChat={() => go('new')} onStartWorkflow={() => go('workflow-start')} onOpen={id => open(id)} onSplit={split}
       onTheme={changeTheme} onPage={next => go(next, next === 'templates' ? snapshot.workflows[0]?.id ?? '' : '')}
       onPin={togglePin} onRenameRun={renameRun} onMove={moveSession} moveReason={moveReason}
+      archived={archived} archivedOpen={archivedOpen} archiveReason={archiveReason} onArchive={setArchived}
+      onArchivedOpen={(value, open) => { archivedOpenChanged.current = true; setArchivedOpen(previous => ({ ...previous, [value]: open })); }}
       onRename={id => { open(id); setEditTitle(previous => ({ sessionId: id, nonce: previous.nonce + 1 })); }} />
     {narrow && narrowOpen && <div className="v4-scrim" aria-hidden="true" onClick={() => setNarrowOpen(false)} />}
     <main className="v4-main">
