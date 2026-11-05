@@ -10,7 +10,7 @@
 import type { AppEvent, CommandResult, LogicalSession, MessageOrigin, ModelSelection, PayloadHash, Timestamp, TransferCancelReason, TransferId, TransferProposal } from '../../contracts';
 import type { DeliveryEscalation, PayloadDelivery } from '../delivery';
 import type { HistoryEntry, StoredDelivery } from '../ports';
-import type { CommandOf, SessionService, TransferCommand, TransferHooks } from '../sessions';
+import { ArchivedTreeError, type CommandOf, type SessionService, type TransferCommand, type TransferHooks } from '../sessions';
 import { agentNoteOf, contentVersion, digestOf, DRAFT_GOAL, entriesOf, frameText, NOTE_REQUEST } from './frame';
 import { noteOperationOf, payloadOperationOf, targetSessionOf, transferOfOperation, transferOfProvision, transferOfSession } from './ids';
 
@@ -35,6 +35,9 @@ const fail = (requestId: Failure['requestId'], code: Failure['code'], message: s
   retryable: flags.retryable ?? false,
   mayHaveSideEffects: flags.mayHaveSideEffects ?? false,
 });
+
+/** A transfer of a session of an archived conversation (U4): refused, `archived`; the conversation is unarchived first. */
+const archivedFailure = (requestId: Failure['requestId']): Failure => ({ ...fail(requestId, 'invalid_transition', 'The conversation is archived; unarchive it first'), reason: 'archived' });
 
 /**
  * Who a transfer's payloads come from (G-1): the transfer and its source session, never the user (the
@@ -135,7 +138,7 @@ export class TransferService implements TransferHooks {
     if (source.kind !== 'ordinary') return fail(requestId, 'invalid_request', 'Only an ordinary session can be transferred to another tool');
     // U4: its new session would join the archived conversation (it takes the source's parent); unarchived first.
     if (await sessions.inArchivedTree(source.id))
-      return { ...fail(requestId, 'invalid_transition', 'The conversation is archived; unarchive it first'), reason: 'archived' };
+      return archivedFailure(requestId);
     if (target.runtime === source.requestedModel.runtime)
       return fail(requestId, 'invalid_request', 'A transfer goes to another tool; a model of the same tool is changed on the session itself');
     if (!sessions.runtimeAvailable(target.runtime)) return fail(requestId, 'runtime_unavailable', `${target.runtime} is not available on this computer`);
@@ -157,7 +160,15 @@ export class TransferService implements TransferHooks {
       state: 'draft',
       createdAt: this.options.now(),
     };
-    if ((await this.repos.transfers.create(draft)) === 'exists') return fail(requestId, 'already_exists', 'A transfer with this ID already exists');
+    let stored: 'created' | 'exists';
+    try {
+      stored = await this.repos.transfers.create(draft);
+    } catch (error) {
+      // Its conversation was archived since the check above (T059 r2): refused where the proposal is stored.
+      if (error instanceof ArchivedTreeError) return archivedFailure(requestId);
+      throw error;
+    }
+    if (stored === 'exists') return fail(requestId, 'already_exists', 'A transfer with this ID already exists');
     await this.publish(transferId);
     await this.advance(draft);
     return ok(requestId, { revision: (await this.repos.transfers.get(transferId))?.revision ?? 0, created });
@@ -185,7 +196,7 @@ export class TransferService implements TransferHooks {
     if (source === undefined) return fail(requestId, 'not_found', 'The source session no longer exists');
     // U4: a proposal made just as its conversation was archived (an active one keeps it from being archived afterwards).
     if (await sessions.inArchivedTree(source.id))
-      return { ...fail(requestId, 'invalid_transition', 'The conversation is archived; unarchive it first'), reason: 'archived' };
+      return archivedFailure(requestId);
     if (await this.sourceChanged(p)) {
       await this.markStale(p);
       return fail(requestId, 'stale_revision', 'The source session changed after the transfer was prepared; prepare it again');
@@ -199,7 +210,14 @@ export class TransferService implements TransferHooks {
       approvedAt: this.options.now(),
       provision: sessions.provisionFor(targetSessionOf(p.id)),
     };
-    const saved = await this.repos.transfers.update(approved, p.revision);
+    let saved: Awaited<ReturnType<typeof this.repos.transfers.update>>;
+    try {
+      saved = await this.repos.transfers.update(approved, p.revision);
+    } catch (error) {
+      // Its conversation was archived since the check above (T059 r2): refused where the approval is written.
+      if (error instanceof ArchivedTreeError) return archivedFailure(requestId);
+      throw error;
+    }
     if (saved.status === 'stale') return fail(requestId, 'stale_revision', 'The transfer has changed since it was loaded', { retryable: true });
     await this.publish(p.id);
     return this.carryOut(requestId, saved.record);

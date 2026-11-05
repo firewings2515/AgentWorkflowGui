@@ -22,6 +22,7 @@ import {
 } from '../../../contracts';
 import { fixtureSnapshotInput } from '../../../contracts/fixtures/snapshot';
 import type { AppRepositories, DeliveryStore } from '../../ports';
+import { payloadInput } from '../../delivery/testing/fixtures';
 import { AutoArchiver, type AutoArchiveCommands } from '../archive';
 import { AGENT, created, rid, settle, type World, worldOn } from './harness';
 
@@ -932,6 +933,64 @@ export const t059Cases = (backend: string, storage: T059Storage) =>
         expect(refused(await archive(w, 'top'))).toEqual({ code: 'invalid_transition', reason: 'turn-running' });
         await w.repositories.transfers.update({ ...awaiting, revision: 2, state: 'cancelled', cancelledAt: w.clock.now(), cancelReason: 'user' }, 1);
         expect(await archive(w, 'top')).toMatchObject({ ok: true });
+      });
+    });
+
+    describe('r2: deliveries waiting for a session of the tree', () => {
+      /** A user's message for the session, accepted and not sent (its runtime could not take it yet). */
+      const waiting = async (w: World, id: string, name: string) => {
+        const session = await get(w, id);
+        return payloadInput({
+          kind: 'user-message', operationId: OperationId.parse(`user-message:${name}`), sourceCallRef: `call-${name}`, counts: [],
+          target: { sessionId: session.id, ...(session.nativeSessionRef !== undefined && { nativeSessionRef: session.nativeSessionRef }) },
+          context: { runtime: 'codex', cwd: session.cwd, entry: { kind: 'new-turn' }, session: { model: session.requestedModel, readOnly: false } },
+        });
+      };
+
+      it('a payload accepted and not sent yet keeps the tree from being archived; once it has an outcome, it may be', async () => {
+        const w = await begin();
+        await chat(w, 'top');
+        await chat(w, 'child', 'top');
+        expect(await w.store.accept(await waiting(w, 'child', 'r2-1'))).toMatchObject({ status: 'accepted' });
+        expect(refused(await archive(w, 'top'))).toEqual({ code: 'invalid_transition', reason: 'turn-running' });
+        expect(await archivedAt(w, 'top')).toBeUndefined();
+        await w.store.recordOutcome(OperationId.parse('user-message:r2-1'), { kind: 'cancelled', detail: 'test', at: w.clock.now() });
+        expect(await archive(w, 'top')).toMatchObject({ ok: true });
+      });
+
+      it('a payload accepted while the archive holds its commit waits for it: never accepted between the last check and the mark', async () => {
+        const w = await begin();
+        await chat(w, 'top');
+        const order: string[] = [];
+        const sessions = w.repositories.sessions;
+        const update = sessions.update.bind(sessions);
+        sessions.update = async (session, expected) => {
+          if (session.kind === 'ordinary' && session.archivedAt !== undefined) order.push('mark');
+          return update(session, expected);
+        };
+        const store = w.store;
+        const accept = store.accept.bind(store);
+        store.accept = (input) => {
+          order.push('accept');
+          return accept(input);
+        };
+        // Inside the archive's checks (it reads the open escalations there), a payload for the top is accepted through
+        // the service's store, as a peer message or a handoff is.
+        const input = await waiting(w, 'top', 'r2-2');
+        let accepting: Promise<unknown> | undefined;
+        const escalations = w.repositories.escalations;
+        const list = escalations.list.bind(escalations);
+        escalations.list = (filter) => {
+          accepting ??= w.service.storage.store.accept(input);
+          return list(filter);
+        };
+        const result = await archive(w, 'top');
+        expect(await accepting).toMatchObject({ status: 'accepted' });
+        sessions.update = update;
+        store.accept = accept;
+        escalations.list = list;
+        expect(result).toMatchObject({ ok: true });
+        expect(order).toEqual(['mark', 'accept']);
       });
     });
   });

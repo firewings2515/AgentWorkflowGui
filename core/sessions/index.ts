@@ -4,6 +4,7 @@ export { REDACTED, Redactor, tokenForms } from './redact';
 export { SessionRuntimes, type SessionRuntimesOptions } from './runtimes';
 export {
   type CommandOf,
+  ArchivedTreeError,
   SessionService,
   type SessionServiceOptions,
   type TransferCommand,

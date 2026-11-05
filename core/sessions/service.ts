@@ -38,6 +38,7 @@ import {
   type SessionItem,
   type TaskId,
   type Timestamp,
+  type TransferProposal,
   type Turn,
   type WaitForFileToolInput,
   type WaitForFileToolResult,
@@ -467,7 +468,12 @@ export class SessionService {
   constructor(private readonly options: SessionServiceOptions) {
     // Storage only through the write gate: once shutdown returned, nothing reaches it (r2-P1-4).
     this.repos = this.withArchiveCommit(gated(options.repositories, () => this.closed));
-    this.store = gated(options.store, () => this.closed);
+    // A payload accepted for a session takes the archive commit too (T059 r2): one accepted before an archive's last
+    // check is seen there (`archiveRefusal`); one accepted after it comes after the mark (U4 ★D).
+    const gatedStore = gated(options.store, () => this.closed);
+    this.store = new Proxy(gatedStore, {
+      get: (target, key): unknown => (key === 'accept' ? (input: Parameters<DeliveryStore['accept']>[0]) => this.commit(() => target.accept(input)) : Reflect.get(target, key)),
+    });
     this.written = new WrittenPaths(options.written);
     if (options.workFolders !== undefined) {
       const { fs, defaultRoot, day } = options.workFolders;
@@ -1420,31 +1426,57 @@ export class SessionService {
   }
 
   /**
-   * This service's storage with the archive commit around what an archive must see (T059 r1): writing an escalation, and
-   * storing an ordinary session below another (refused there when that tree is archived, ArchivedTreeError). A session
-   * stored at the top joins no tree, and a workflow session no conversation: neither waits. A transfer's new session is
-   * not refused either: an active transfer of a tree keeps it from being archived, so none is made below an archived one.
+   * This service's storage with the archive commit around everything that adds to a conversation an archive must see
+   * (T059 r1, r2): writing an escalation; storing an ordinary session below another, a transfer's new session too
+   * (refused there when that tree is archived, ArchivedTreeError); storing a transfer proposal and writing its approval
+   * (refused there when its source's tree is archived). A session stored at the top joins no tree, and a workflow session
+   * no conversation: neither waits. Other transfer writes (progress, cancel) add nothing and do not wait.
    */
   private withArchiveCommit(repositories: AppRepositories): AppRepositories {
+    const stored = repositories.sessions;
+    /** Whether this session is in an archived conversation, as stored now. */
+    const archivedTree = async (sessionId: SessionId): Promise<boolean> => {
+      const session = await stored.get(sessionId);
+      const top = session === undefined ? undefined : await topOfStored(session, (id) => stored.get(id));
+      return top?.kind === 'ordinary' && top.archivedAt !== undefined;
+    };
     const escalations = new Proxy(repositories.escalations, {
       get: (target, key): unknown => (key === 'upsert' ? (escalation: Escalation) => this.commit(() => target.upsert(escalation)) : Reflect.get(target, key)),
     });
-    const below = (session: LogicalSession) => session.kind === 'ordinary' && session.parentId !== undefined && session.derivedFromSessionId === undefined;
-    const sessions = new Proxy(repositories.sessions, {
+    const below = (session: LogicalSession) => session.kind === 'ordinary' && session.parentId !== undefined;
+    const sessions = new Proxy(stored, {
       get: (target, key): unknown =>
         key === 'create'
           ? (session: LogicalSession) =>
               !below(session)
                 ? target.create(session)
                 : this.commit(async () => {
-                    const parent = session.parentId === undefined ? undefined : await target.get(session.parentId);
-                    const top = parent === undefined ? undefined : await topOfStored(parent, (id) => target.get(id));
-                    if (top?.kind === 'ordinary' && top.archivedAt !== undefined) throw new ArchivedTreeError();
+                    if (session.parentId !== undefined && (await archivedTree(session.parentId))) throw new ArchivedTreeError();
                     return target.create(session);
                   })
           : Reflect.get(target, key),
     });
-    return new Proxy(repositories, { get: (target, key): unknown => (key === 'escalations' ? escalations : key === 'sessions' ? sessions : Reflect.get(target, key)) });
+    const approval = (p: TransferProposal) => p.state === 'approved' && p.approvedRevision === p.revision;
+    const transfers = new Proxy(repositories.transfers, {
+      get: (target, key): unknown =>
+        key === 'create'
+          ? (proposal: TransferProposal) =>
+              this.commit(async () => {
+                if (await archivedTree(proposal.sourceSessionId)) throw new ArchivedTreeError();
+                return target.create(proposal);
+              })
+          : key === 'update'
+            ? (proposal: TransferProposal, expectedRevision: number) =>
+                !approval(proposal)
+                  ? target.update(proposal, expectedRevision)
+                  : this.commit(async () => {
+                      if (await archivedTree(proposal.sourceSessionId)) throw new ArchivedTreeError();
+                      return target.update(proposal, expectedRevision);
+                    })
+            : Reflect.get(target, key),
+    });
+    const views: Partial<Record<PropertyKey, unknown>> = { escalations, sessions, transfers };
+    return new Proxy(repositories, { get: (target, key): unknown => (key in views ? views[key] : Reflect.get(target, key)) });
   }
 
   /** `session.unarchive` (U4): the top session's mark cleared; nothing is pinned again. */
@@ -1537,6 +1569,14 @@ export class SessionService {
     const transfers = (await this.repos.transfers.list()).filter((p) => ids.has(p.sourceSessionId) || (p.createdSessionId !== undefined && ids.has(p.createdSessionId)));
     if (transfers.some((p) => p.state === 'draft' || (p.state === 'approved' && p.delivery?.state !== 'sent')))
       return fail(requestId, 'invalid_transition', 'A transfer of it is under way; archive it once it has finished', { retryable: true, reason: 'turn-running' });
+    // A payload accepted for one of its sessions and not sent yet (T059 r2): a user's message that waits for its runtime, a
+    // peer message, a handoff, a notice or a retry queued behind the queues this archive holds. It would start a turn
+    // there. A delivery whose outcome stays unknown is reconciling (above) or has its escalation (below).
+    for (const session of sessions) {
+      const records = await this.store.listByTarget(session.id);
+      if (records.some((r) => r.kind !== 'provision' && r.outcome === undefined && r.delivery.state === 'pending'))
+        return fail(requestId, 'invalid_transition', 'A message to it is waiting to be sent; archive it once it has gone', { retryable: true, reason: 'turn-running' });
+    }
     const open = await this.repos.escalations.list({ state: 'open' });
     // A transfer waiting for the user's confirmation is answered first, as an escalation is.
     if (escalationOpenIn(open, ids, instanceId) || transfers.some((p) => p.state === 'awaiting-confirmation'))
