@@ -1,0 +1,111 @@
+// T061: the app icon is wired into the build, lives in a tracked folder and has the sizes Windows asks for. What the
+// main process hands to BrowserWindow is checked in app/main/t042-index.test.ts (it starts index.ts on a fake Electron).
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { join, posix } from 'node:path';
+import { describe, expect, it } from 'vitest';
+
+const root = join(import.meta.dirname, '..');
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const read = (name: string) => readFileSync(join(root, name), 'utf8');
+const configLines = read('electron-builder.yml')
+  .split(/\r?\n/)
+  .filter((l) => !l.trim().startsWith('#'));
+
+/** The value of `key: value` inside the top-level section `section` (two-space indentation). */
+function setting(section: string, key: string): string | undefined {
+  const start = configLines.findIndex((l) => l === `${section}:`);
+  if (start < 0) return undefined;
+  for (const line of configLines.slice(start + 1)) {
+    if (line !== '' && !line.startsWith(' ')) break;
+    const match = new RegExp(`^ {2}${key}: (.+)$`).exec(line);
+    if (match?.[1] !== undefined) return match[1].trim().replace(/^(['"])(.*)\1$/, '$2');
+  }
+  return undefined;
+}
+
+/** A config path as electron-builder reads it: relative to the project, `/` or `\` as separators, no `..` out of it. */
+function projectPath(configured: string): string {
+  const normalized = posix.normalize(configured.replaceAll('\\', '/'));
+  expect(normalized.startsWith('../') || normalized === '..' || posix.isAbsolute(normalized) || /^[a-z]:/i.test(normalized)).toBe(false);
+  return normalized;
+}
+
+/** Git's own answer (the whole .gitignore, root rules and nested ones), run in this checkout. */
+function gitIgnores(path: string): boolean {
+  try {
+    execFileSync('git', ['-c', 'core.longpaths=true', '-C', root, 'check-ignore', '-q', '--no-index', '--', path], { stdio: 'ignore' });
+    return true;
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    if (status === 1) return false;
+    throw error;
+  }
+}
+
+const PNG_IEND = Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
+
+/** Only the bytes given are looked at: signature, an IHDR of length 13 with this size, and a closing IEND chunk. */
+function expectCompletePng(bytes: Buffer, width: number, height: number): void {
+  expect(bytes.length).toBeGreaterThanOrEqual(57);
+  expect(bytes.subarray(0, 8).equals(PNG_SIGNATURE)).toBe(true);
+  expect(bytes.readUInt32BE(8)).toBe(13);
+  expect(bytes.subarray(12, 16).toString('ascii')).toBe('IHDR');
+  expect(bytes.readUInt32BE(16)).toBe(width);
+  expect(bytes.readUInt32BE(20)).toBe(height);
+  expect(bytes.subarray(bytes.length - 12).equals(PNG_IEND)).toBe(true);
+}
+
+describe('T061 app icon', () => {
+  const iconPaths = {
+    'win.icon': setting('win', 'icon'),
+    'nsis.installerIcon': setting('nsis', 'installerIcon'),
+    'nsis.uninstallerIcon': setting('nsis', 'uninstallerIcon'),
+  };
+
+  for (const [name, configured] of Object.entries(iconPaths)) {
+    it(`${name} is set, exists and git does not ignore it`, () => {
+      expect(configured).toBeDefined();
+      const path = projectPath(configured ?? '');
+      expect(path).toMatch(/\.ico$/i);
+      expect(existsSync(join(root, path))).toBe(true);
+      expect(gitIgnores(path)).toBe(false);
+    });
+  }
+
+  it('the icon the window uses is among the files the installer carries', () => {
+    expect(configLines).toContain('  - assets/icon.ico');
+  });
+
+  it('the ignore check sees the folders that would hide an icon', () => {
+    // The check itself must be able to say yes: generated folders are ignored, whatever the spelling.
+    expect(gitIgnores('build-resources/icon.ico')).toBe(true);
+    expect(gitIgnores(projectPath('./build-resources\\icon.ico'))).toBe(true);
+    expect(gitIgnores('release/icon.ico')).toBe(true);
+    expect(gitIgnores('assets/icon.ico')).toBe(false);
+  });
+
+  it('icon.ico holds 16, 24, 32, 48, 64, 128 and 256 pixel PNG images, each complete inside its own range', () => {
+    const ico = readFileSync(join(root, 'assets', 'icon.ico'));
+    expect(ico.readUInt16LE(0)).toBe(0);
+    expect(ico.readUInt16LE(2)).toBe(1);
+    const count = ico.readUInt16LE(4);
+    expect(ico.length).toBeGreaterThanOrEqual(6 + count * 16);
+    const sizes = Array.from({ length: count }, (_, i) => {
+      const entry = 6 + i * 16;
+      const width = ico.readUInt8(entry) || 256; // the directory writes 256 as 0
+      const height = ico.readUInt8(entry + 1) || 256;
+      const size = ico.readUInt32LE(entry + 8);
+      const offset = ico.readUInt32LE(entry + 12);
+      expect(offset).toBeGreaterThanOrEqual(6 + count * 16);
+      expect(offset + size).toBeLessThanOrEqual(ico.length);
+      expectCompletePng(ico.subarray(offset, offset + size), width, height);
+      return width;
+    });
+    expect([...sizes].sort((a, b) => a - b)).toEqual([16, 24, 32, 48, 64, 128, 256]);
+  });
+
+  it('icon.png is a complete 512 by 512 PNG', () => {
+    expectCompletePng(readFileSync(join(root, 'assets', 'icon.png')), 512, 512);
+  });
+});

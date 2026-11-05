@@ -22,7 +22,7 @@ import { createRuntimeLocator } from './runtime-locator';
 import { supervisorSettings } from './supervisor-settings';
 import { hiddenMenuTemplate, themeOf, WINDOW_BACKGROUND } from './window-chrome';
 import { guardSession, guardWebContents } from './web-security';
-import { createWebPreferences } from './window-options';
+import { createWebPreferences, WINDOW_ICON_RELATIVE } from './window-options';
 
 const APP_NAME = 'AgentWorkflowGui';
 
@@ -63,6 +63,7 @@ function createWindow(): void {
     width: 1100,
     height: 720,
     title: APP_NAME,
+    icon: join(__dirname, WINDOW_ICON_RELATIVE),
     backgroundColor: WINDOW_BACKGROUND[theme],
     webPreferences: createWebPreferences(join(__dirname, '../preload/index.js')),
   });

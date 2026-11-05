@@ -1,5 +1,11 @@
 import type { WebPreferences } from 'electron';
 
+/**
+ * The window icon, relative to the bundled main file (`out/main/index.js`): the project root in development and the
+ * root of app.asar once packaged. electron-builder.yml lists it under `files` (T061).
+ */
+export const WINDOW_ICON_RELATIVE = '../../assets/icon.ico';
+
 export function createWebPreferences(preloadPath: string): WebPreferences {
   return {
     preload: preloadPath,
