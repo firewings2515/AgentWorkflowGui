@@ -41,6 +41,12 @@ export function scanSource(file: string, text: string) {
   const uses: string[] = [];
   const bypasses: string[] = [];
   const visit = (node: ts.Node) => {
+    // Literal rules: outside rules.ts the names of the raw ways in are not used at all, however they are reached
+    // (call, destructuring, alias, string key).
+    if (ts.isIdentifier(node) && node.text === 'addIssue') bypasses.push(`${file}: addIssue outside rules.ts`);
+    if (ts.isPropertyAccessExpression(node) && node.name.text === 'issues') bypasses.push(`${file}: .issues taken from a value`);
+    if (ts.isBindingElement(node) && [node.name, node.propertyName].some((n) => n !== undefined && ts.isIdentifier(n) && n.text === 'issues')) bypasses.push(`${file}: issues taken by destructuring`);
+    if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression) && ['addIssue', 'issues'].includes(node.argumentExpression.text)) bypasses.push(`${file}: addIssue/issues by string key`);
     if (ts.isCallExpression(node)) {
       const callee = node.expression;
       if (ts.isIdentifier(callee) && (RULE_HELPERS.has(callee.text) || wrappers.has(callee.text))) uses.push(...stringArgs(node));
@@ -54,10 +60,8 @@ export function scanSource(file: string, text: string) {
           const ok = options !== undefined && ts.isCallExpression(options) && ts.isIdentifier(options.expression) && options.expression.text === 'ruleIssue';
           if (!ok) bypasses.push(`${file}: refine without ruleIssue(...) options`);
         }
-        if (name === 'addIssue') bypasses.push(`${file}: addIssue outside rules.ts`);
         if (name === 'check') bypasses.push(`${file}: .check(...) adds issues without a code`);
         if (name === 'custom' && ts.isIdentifier(target) && target.text === 'z') bypasses.push(`${file}: z.custom(...) has no rule code`);
-        if (ts.isPropertyAccessExpression(target) && target.name.text === 'issues') bypasses.push(`${file}: issues.${name} writes an issue without a code`);
       }
     }
     ts.forEachChild(node, visit);
@@ -108,6 +112,11 @@ describe('the rule scanner', () => {
   it('fails the other ways of adding an issue', () => {
     expect(bypassesOf("s.superRefine((v, ctx) => { ctx.addIssue({ code: 'custom', message: 'm' }); });")).toHaveLength(1);
     expect(bypassesOf("s.superRefine((v, ctx) => { ctx.issues.push({ code: 'custom', message: 'm', input: v }); });")).toHaveLength(1);
+    expect(bypassesOf("s.superRefine((v, ctx) => { ctx['addIssue']({ code: 'custom', message: 'm' }); });")).toHaveLength(1);
+    expect(bypassesOf("s.superRefine((v, ctx) => { const { addIssue } = ctx; addIssue({ code: 'custom', message: 'm' }); });").length).toBeGreaterThan(0);
+    expect(bypassesOf("s.superRefine((v, ctx) => { const { addIssue: add } = ctx; add({ code: 'custom', message: 'm' }); });").length).toBeGreaterThan(0);
+    expect(bypassesOf("s.superRefine((v, ctx) => { const { issues } = ctx; issues.push({ code: 'custom', message: 'm', input: v }); });").length).toBeGreaterThan(0);
+    expect(bypassesOf("s.superRefine((v, ctx) => { const list = ctx.issues; list.push({ code: 'custom', message: 'm', input: v }); });")).toHaveLength(1);
     expect(bypassesOf('s.check((ctx) => { void ctx; });')).toHaveLength(1);
     expect(bypassesOf('const c = z.custom((v) => v !== undefined);')).toHaveLength(1);
   });

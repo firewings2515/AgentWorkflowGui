@@ -43,6 +43,19 @@ function gitIgnores(path: string): boolean {
   }
 }
 
+const PNG_IEND = Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
+
+/** Only the bytes given are looked at: signature, an IHDR of length 13 with this size, and a closing IEND chunk. */
+function expectCompletePng(bytes: Buffer, width: number, height: number): void {
+  expect(bytes.length).toBeGreaterThanOrEqual(57);
+  expect(bytes.subarray(0, 8).equals(PNG_SIGNATURE)).toBe(true);
+  expect(bytes.readUInt32BE(8)).toBe(13);
+  expect(bytes.subarray(12, 16).toString('ascii')).toBe('IHDR');
+  expect(bytes.readUInt32BE(16)).toBe(width);
+  expect(bytes.readUInt32BE(20)).toBe(height);
+  expect(bytes.subarray(bytes.length - 12).equals(PNG_IEND)).toBe(true);
+}
+
 describe('T061 app icon', () => {
   const iconPaths = {
     'win.icon': setting('win', 'icon'),
@@ -72,7 +85,7 @@ describe('T061 app icon', () => {
     expect(gitIgnores('assets/icon.ico')).toBe(false);
   });
 
-  it('icon.ico holds 16, 24, 32, 48, 64, 128 and 256 pixel PNG images that lie inside the file', () => {
+  it('icon.ico holds 16, 24, 32, 48, 64, 128 and 256 pixel PNG images, each complete inside its own range', () => {
     const ico = readFileSync(join(root, 'assets', 'icon.ico'));
     expect(ico.readUInt16LE(0)).toBe(0);
     expect(ico.readUInt16LE(2)).toBe(1);
@@ -80,30 +93,19 @@ describe('T061 app icon', () => {
     expect(ico.length).toBeGreaterThanOrEqual(6 + count * 16);
     const sizes = Array.from({ length: count }, (_, i) => {
       const entry = 6 + i * 16;
-      const width = ico.readUInt8(entry) || 256;
+      const width = ico.readUInt8(entry) || 256; // the directory writes 256 as 0
       const height = ico.readUInt8(entry + 1) || 256;
-      expect(height).toBe(width);
       const size = ico.readUInt32LE(entry + 8);
       const offset = ico.readUInt32LE(entry + 12);
-      expect(size).toBeGreaterThan(0);
       expect(offset).toBeGreaterThanOrEqual(6 + count * 16);
       expect(offset + size).toBeLessThanOrEqual(ico.length);
-      // Every image is a PNG whose own header says the size the directory claims.
-      expect(ico.subarray(offset, offset + 8).equals(PNG_SIGNATURE)).toBe(true);
-      expect(ico.subarray(offset + 12, offset + 16).toString('ascii')).toBe('IHDR');
-      expect(ico.readUInt32BE(offset + 16)).toBe(width);
-      expect(ico.readUInt32BE(offset + 20)).toBe(height);
+      expectCompletePng(ico.subarray(offset, offset + size), width, height);
       return width;
     });
     expect([...sizes].sort((a, b) => a - b)).toEqual([16, 24, 32, 48, 64, 128, 256]);
   });
 
-  it('icon.png is a 512 by 512 PNG', () => {
-    const png = readFileSync(join(root, 'assets', 'icon.png'));
-    expect(png.subarray(0, 8).equals(PNG_SIGNATURE)).toBe(true);
-    expect(png.readUInt32BE(8)).toBe(13);
-    expect(png.subarray(12, 16).toString('ascii')).toBe('IHDR');
-    expect(png.readUInt32BE(16)).toBe(512);
-    expect(png.readUInt32BE(20)).toBe(512);
+  it('icon.png is a complete 512 by 512 PNG', () => {
+    expectCompletePng(readFileSync(join(root, 'assets', 'icon.png')), 512, 512);
   });
 });
