@@ -1,5 +1,5 @@
-// "Bring the window to the front" for a clicked notification (U3 Q-15, T055). The renderer can only ask; it says nothing
-// about which window or how: the main process always acts on its own main window.
+// "Bring the window to the front" for a clicked notification (U3 Q-15, T055). Since T057 the main process does it itself
+// when Windows reports the click (escalation-notice.ts); the page has no call for it. It always acts on its own main window.
 
 /** The part of `BrowserWindow` this uses. */
 export interface FocusableWindow {

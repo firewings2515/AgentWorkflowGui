@@ -28,10 +28,16 @@ export interface AwgBridge {
    */
   folders?: { request(request: FolderRequest): Promise<FolderResult> };
   /**
-   * Brings the app window to the front (a clicked notification, T055). Takes no argument: the main process picks its own
-   * window. Present in the app; optional so a renderer without it (tests, an older preload) simply does not bring it forward.
+   * Asks for the system notification of one escalation (T057). Only its ID crosses: the main process checks that the
+   * escalation exists and is open, and writes the text itself. Resolves when handled, shown or not. Present in the app;
+   * optional so a renderer without it (tests, an older preload) shows no notification.
    */
-  focusWindow?(): Promise<void>;
+  showEscalationNotice?(escalationId: string): Promise<void>;
+  /**
+   * Subscribes to clicked notifications (T057): the listener gets the ID of the escalation to open. The returned function
+   * cancels the subscription. Optional like `showEscalationNotice`.
+   */
+  onEscalationActivated?(listener: (escalationId: string) => void): () => void;
 }
 
 /** One Snapshot read (T040 r3): `read` names it, so the renderer can say it took this one and no other. */

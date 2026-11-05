@@ -3,10 +3,10 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { APP_INFO_CHANNEL, COMMAND_CHANNEL, FOCUS_WINDOW_CHANNEL, FOLDER_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
+import { APP_INFO_CHANNEL, COMMAND_CHANNEL, ESCALATION_NOTICE_CHANNEL, FOLDER_CHANNEL, SNAPSHOT_CHANNEL } from '../preload/channels';
 import { guardHandler } from './ipc';
 import type { IpcSenderEvent, TrustedSender } from './ipc-guard';
-import { type GuardedContents, type GuardedSession, guardSession, guardWebContents, type NavigationEvent, type PermissionDetails } from './web-security';
+import { type GuardedContents, type GuardedSession, guardSession, guardWebContents, type NavigationEvent } from './web-security';
 import { createWebPreferences } from './window-options';
 
 vi.mock('electron', () => ({ ipcMain: { handle: () => undefined } }));
@@ -70,99 +70,6 @@ describe('T042 C2/C3/C6: the window never leaves its page', () => {
   });
 });
 
-describe('T055: the one permission, notifications for the app’s own main frame', () => {
-  type Contents = { getURL(): string } | null | undefined;
-  const appContents = { getURL: () => `${APP}#/settings` };
-  const main = { requestingUrl: APP, isMainFrame: true };
-  const rig = () => {
-    let request: ((wc: Contents, permission: string, cb: (granted: boolean) => void, details?: PermissionDetails) => void) | undefined;
-    let check: ((wc: Contents, permission: string, origin?: string, details?: PermissionDetails) => boolean) | undefined;
-    const session: GuardedSession = {
-      setPermissionRequestHandler: (h) => {
-        request = h;
-      },
-      setPermissionCheckHandler: (h) => {
-        check = h;
-      },
-      on: () => undefined,
-    };
-    guardSession(session, isTrustedUrl);
-    const asked = (permission: string, details?: PermissionDetails, opts: { contents?: Contents | undefined } = {}) => {
-      const cb = vi.fn();
-      request!('contents' in opts ? opts.contents : appContents, permission, cb, details);
-      return cb.mock.calls[0]![0] as boolean;
-    };
-    const checked = (permission: string, details?: PermissionDetails, opts: { contents?: Contents | undefined; origin?: string | undefined } = {}) =>
-      check!('contents' in opts ? opts.contents : appContents, permission, 'origin' in opts ? opts.origin : 'file:///', details);
-    return { asked, checked };
-  };
-
-  it('notifications are granted when every piece of evidence is the app’s own, in a request and in a check', () => {
-    const { asked, checked } = rig();
-    for (const details of [main, { requestingUrl: `${APP}#/settings`, isMainFrame: true }]) {
-      expect(asked('notifications', details)).toBe(true);
-      expect(checked('notifications', details)).toBe(true);
-    }
-    // Electron may write the origin of a file page with or without the slashes.
-    expect(checked('notifications', main, { origin: 'file://' })).toBe(true);
-  });
-
-  it('the development server’s page is granted by its own origin only', () => {
-    const dev = 'http://localhost:5173/';
-    const session = { handlers: {} as { check?: (...args: never[]) => boolean } };
-    guardSession({ setPermissionRequestHandler: () => undefined, setPermissionCheckHandler: (h) => { session.handlers.check = h; }, on: () => undefined },
-      (url) => URL.canParse(url) && new URL(url).origin === 'http://localhost:5173');
-    const call = session.handlers.check as unknown as (wc: Contents, p: string, origin: string, d: PermissionDetails) => boolean;
-    const page = { getURL: () => dev };
-    expect(call(page, 'notifications', 'http://localhost:5173', { requestingUrl: dev, isMainFrame: true })).toBe(true);
-    expect(call(page, 'notifications', 'http://localhost:5174', { requestingUrl: dev, isMainFrame: true })).toBe(false);
-  });
-
-  it.each([
-    ['another URL', { requestingUrl: 'https://example.com/', isMainFrame: true }],
-    ['a local file that is not the app', { requestingUrl: 'file:///C:/Windows/win.ini', isMainFrame: true }],
-    ['a sub-frame, even with the app’s URL', { requestingUrl: APP, isMainFrame: false }],
-    ['a request that does not say whether it is the main frame', { requestingUrl: APP }],
-    ['a request that names no URL', { isMainFrame: true }],
-    ['a request with no details', undefined],
-  ])('notifications are refused for %s', (_name, details) => {
-    const { asked, checked } = rig();
-    expect(asked('notifications', details)).toBe(false);
-    expect(checked('notifications', details)).toBe(false);
-  });
-
-  it.each([
-    ['no web contents (null)', null],
-    ['no web contents (undefined)', undefined],
-    ['a web contents that shows another page', { getURL: () => 'https://example.com/' }],
-    ['a web contents that shows a local file that is not the app', { getURL: () => 'file:///C:/Windows/win.ini' }],
-    ['a web contents that shows nothing', { getURL: () => '' }],
-  ])('notifications are refused with %s, even for the app’s URL', (_name, contents) => {
-    const { asked, checked } = rig();
-    expect(asked('notifications', main, { contents })).toBe(false);
-    expect(checked('notifications', main, { contents })).toBe(false);
-  });
-
-  it.each([
-    ['a different origin', 'https://example.com'],
-    ['the origin of another port', 'http://localhost:5173'],
-    ['an origin that is not written as one', 'not an origin'],
-    ['an empty origin', ''],
-    ['no origin', undefined],
-  ])('a check is refused with %s as the requesting origin', (_name, origin) => {
-    const { checked } = rig();
-    expect(checked('notifications', main, { origin })).toBe(false);
-  });
-
-  it('every other permission is refused for the app’s own page too', () => {
-    const { asked, checked } = rig();
-    for (const permission of ['media', 'geolocation', 'openExternal', 'clipboard-read', 'clipboard-sanitized-write', 'fullscreen', 'pointerLock', 'midi', 'Notifications']) {
-      expect(asked(permission, main), permission).toBe(false);
-      expect(checked(permission, main), permission).toBe(false);
-    }
-  });
-});
-
 describe('T042 F3/C5: no permission is ever granted', () => {
   it('every request and check is refused, and downloads are cancelled', () => {
     let request: Parameters<GuardedSession['setPermissionRequestHandler']>[0] | undefined;
@@ -185,7 +92,11 @@ describe('T042 F3/C5: no permission is ever granted', () => {
       request!(undefined, permission, cb);
       expect(cb, permission).toHaveBeenCalledWith(false);
     }
-    expect(check!(undefined, 'notifications')).toBe(false);
+    // T057: the main process shows the notifications, so the exception T055 made for the app's own page is gone too.
+    const own = vi.fn();
+    (request as unknown as (...args: unknown[]) => void)({ getURL: () => APP }, 'notifications', own, { requestingUrl: APP, isMainFrame: true });
+    expect(own).toHaveBeenCalledWith(false);
+    expect((check as unknown as (...args: unknown[]) => boolean)({ getURL: () => APP }, 'notifications', 'file:///', { requestingUrl: APP, isMainFrame: true })).toBe(false);
     const e = { preventDefault: vi.fn() };
     download!(e);
     expect(e.preventDefault).toHaveBeenCalled();
@@ -271,7 +182,7 @@ describe('T042 D1: IPC from anything but the app’s own page', () => {
   ];
 
   it.each(senders)('is refused on every channel from %s; the handler never sees the arguments', (_name, event) => {
-    for (const channel of [APP_INFO_CHANNEL, SNAPSHOT_CHANNEL, COMMAND_CHANNEL, FOLDER_CHANNEL, FOCUS_WINDOW_CHANNEL]) {
+    for (const channel of [APP_INFO_CHANNEL, SNAPSHOT_CHANNEL, COMMAND_CHANNEL, FOLDER_CHANNEL, ESCALATION_NOTICE_CHANNEL]) {
       const handler = vi.fn();
       const guarded = guardHandler(channel, () => trusted, handler);
       let message = '';
