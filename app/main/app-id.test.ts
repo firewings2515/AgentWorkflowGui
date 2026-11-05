@@ -2,23 +2,22 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { APP_USER_MODEL_ID, appIdentity, DEV_APP_USER_MODEL_ID, DEV_TOAST_ACTIVATOR_CLSID, TOAST_ACTIVATOR_CLSID } from './app-id';
+import { APP_USER_MODEL_ID, appIdentity, DEV_TOAST_ACTIVATOR_CLSID, TOAST_ACTIVATOR_CLSID } from './app-id';
 
 const GUID = /^\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\}$/;
 const root = join(__dirname, '../..');
 
 describe('T057 app identity', () => {
-  it('both classes are brace-wrapped GUIDs, and the two runs differ in ID and class', () => {
+  it('both classes are brace-wrapped GUIDs, and the two runs differ in class', () => {
     expect(TOAST_ACTIVATOR_CLSID).toMatch(GUID);
     expect(DEV_TOAST_ACTIVATOR_CLSID).toMatch(GUID);
     expect(DEV_TOAST_ACTIVATOR_CLSID).not.toBe(TOAST_ACTIVATOR_CLSID);
-    expect(DEV_APP_USER_MODEL_ID).not.toBe(APP_USER_MODEL_ID);
   });
 
-  it('a packaged app takes the installer’s ID (its appId) and class; a development run the .dev ones', () => {
+  it('both runs take the installer’s ID (its appId; a separate development ID was dropped by Windows, T057 live); the classes differ', () => {
     const yml = readFileSync(join(root, 'electron-builder.yml'), 'utf8');
     expect(appIdentity(true)).toEqual({ appUserModelId: /^appId:\s*(\S+)\s*$/m.exec(yml)?.[1], toastActivatorClsid: TOAST_ACTIVATOR_CLSID });
-    expect(appIdentity(false)).toEqual({ appUserModelId: `${APP_USER_MODEL_ID}.dev`, toastActivatorClsid: DEV_TOAST_ACTIVATOR_CLSID });
+    expect(appIdentity(false)).toEqual({ appUserModelId: APP_USER_MODEL_ID, toastActivatorClsid: DEV_TOAST_ACTIVATOR_CLSID });
   });
 
   it('the uninstaller removes exactly the installed app’s class key, named in full, and nothing else from the registry', () => {

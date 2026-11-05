@@ -80,9 +80,16 @@ export function activatedEscalationId(details: unknown): string | undefined {
   }
 }
 
+/** Electron's error text for the log: one line of at most 200 characters, cleaned; anything else is "unknown". */
+const errorText = (error: unknown): string => {
+  const text = typeof error === 'string' ? Array.from(clean(error)).slice(0, 200).join('') : '';
+  return text === '' ? 'unknown' : text;
+};
+
 /** The part of Electron's `Notification` used (a stand-in in tests). */
 export interface NoticeLike {
-  on(event: 'click' | 'close' | 'failed', listener: () => void): unknown;
+  /** `failed` passes Electron's error text second (after the event). */
+  on(event: 'click' | 'close' | 'failed' | 'show', listener: (event?: unknown, error?: unknown) => void): unknown;
   show(): void;
 }
 
@@ -187,7 +194,12 @@ export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationN
         void deliver(escalationId);
       });
       notice.on('close', forget);
-      notice.on('failed', forget);
+      // One line each, with no ID and no text of the escalation: Electron's own error text only (T057 live).
+      notice.on('show', () => deps.log?.('[notice] shown'));
+      notice.on('failed', (_event, error) => {
+        forget();
+        deps.log?.(`[notice] failed: ${errorText(error)}`);
+      });
       live.set(escalationId, notice);
       notice.show();
     } catch (error: unknown) {

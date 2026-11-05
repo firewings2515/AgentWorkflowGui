@@ -135,7 +135,7 @@ const notices = createEscalationNotices({
 app.setName(APP_NAME);
 if (process.platform === 'win32') {
   // Windows shows system notifications under this ID (T055), and calls this class when one is clicked (T057). The
-  // installed app and a development run each have their own (app-id.ts).
+  // installed app and a development run share the ID and have a class each (app-id.ts).
   const identity = appIdentity(app.isPackaged);
   app.setAppUserModelId(identity.appUserModelId);
   try {

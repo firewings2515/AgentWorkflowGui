@@ -12,14 +12,14 @@ import {
 } from './escalation-notice';
 
 class FakeNotice {
-  listeners = new Map<string, () => void>();
+  listeners = new Map<string, (event?: unknown, error?: unknown) => void>();
   show = vi.fn();
   constructor(readonly options: NoticeOptions) {}
-  on(event: string, listener: () => void) {
+  on(event: string, listener: (event?: unknown, error?: unknown) => void) {
     this.listeners.set(event, listener);
   }
-  fire(event: 'click' | 'close' | 'failed') {
-    this.listeners.get(event)?.();
+  fire(event: 'click' | 'close' | 'failed' | 'show', error?: unknown) {
+    this.listeners.get(event)?.({}, error);
   }
 }
 
@@ -200,6 +200,39 @@ describe('T057 when the main process shows a notification', () => {
     notices.stop();
     await notices.show('esc-1');
     expect(made).toHaveLength(0);
+  });
+});
+
+describe('T057 live: the log of a notification', () => {
+  it('a shown notification and a failed one each write one line, with no ID and no text of the escalation', async () => {
+    const lines: string[] = [];
+    const { notices, made } = rig([open('esc-secret-id', { title: 'SECRET-TITLE' }), open('esc-2')], { log: (line) => lines.push(line) });
+    await notices.show('esc-secret-id');
+    await notices.show('esc-2');
+    made[0]!.fire('show');
+    made[1]!.fire('failed', 'Toast Notification was dropped without being displayed to the user.');
+    expect(lines).toEqual(['[notice] shown', '[notice] failed: Toast Notification was dropped without being displayed to the user.']);
+    expect(lines.join('\n')).not.toMatch(/esc-|SECRET|參考資料/);
+  });
+
+  it('the error text is one cleaned line of at most 200 characters; anything but text is "unknown"', async () => {
+    const lines: string[] = [];
+    const { notices, made } = rig([open('esc-1'), open('esc-2'), open('esc-3')], { log: (line) => lines.push(line) });
+    for (const id of ['esc-1', 'esc-2', 'esc-3']) await notices.show(id);
+    made[0]!.fire('failed', `XML: Invalid XML\r\nERROR \u001b[31m${'x'.repeat(300)}`);
+    made[1]!.fire('failed', { message: 'object' });
+    made[2]!.fire('failed');
+    expect(lines[0]).toBe(`[notice] failed: XML: Invalid XML ERROR [31m${'x'.repeat(200 - 'XML: Invalid XML ERROR [31m'.length)}`);
+    expect(lines.slice(1)).toEqual(['[notice] failed: unknown', '[notice] failed: unknown']);
+  });
+
+  it('a failed notification is let go: a click event of it afterwards sends nothing', async () => {
+    const { notices, made, window } = rig();
+    await notices.show('esc-1');
+    made[0]!.fire('failed', 'dropped');
+    made[0]!.fire('click');
+    await flush();
+    expect(window.send).not.toHaveBeenCalled();
   });
 });
 

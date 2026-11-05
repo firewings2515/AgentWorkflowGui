@@ -45,8 +45,8 @@ vi.mock('./app-ipc', () => ({ registerAppIpc: vi.fn() }));
 vi.mock('./ipc', () => ({ handleTrusted: vi.fn() }));
 vi.mock('./runtime-locator', () => ({ createRuntimeLocator: hoisted.createRuntimeLocator }));
 
-describe('T057 the installed app and a development run have their own Windows ID and notification class', () => {
-  it.runIf(process.platform === 'win32')('packaged: the installer’s; development: the .dev ones', async () => {
+describe('T057 the installed app and a development run share the Windows ID and have their own notification class', () => {
+  it.runIf(process.platform === 'win32')('packaged: the installer’s class; development: its own; the ID is the same', async () => {
     const ids = await import('./app-id');
     for (const packaged of [true, false]) {
       vi.resetModules();
@@ -58,7 +58,7 @@ describe('T057 the installed app and a development run have their own Windows ID
       hoisted.isPackaged.value = packaged;
       await import('./index');
       await vi.waitFor(() => expect(hoisted.startBackend).toHaveBeenCalledTimes(1));
-      expect(hoisted.setAppUserModelId.mock.calls).toEqual([[packaged ? ids.APP_USER_MODEL_ID : ids.DEV_APP_USER_MODEL_ID]]);
+      expect(hoisted.setAppUserModelId.mock.calls).toEqual([[ids.APP_USER_MODEL_ID]]);
       expect(hoisted.setToastActivatorCLSID.mock.calls).toEqual([[packaged ? ids.TOAST_ACTIVATOR_CLSID : ids.DEV_TOAST_ACTIVATOR_CLSID]]);
     }
   });
