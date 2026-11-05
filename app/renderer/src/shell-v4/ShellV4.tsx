@@ -167,7 +167,10 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const unread = useMemo(() => unreadOf(times.replies, marked, visible), [times.replies, marked, visible]);
   // Q-16 / Q-14: both are written at most every 500 ms, and on page hide or unmount; a failed write is ignored.
   const [writers] = useState(() => ({ seen: createThrottledWriter(SEEN_KEY), panes: createThrottledWriter(PANES_KEY) }));
-  useEffect(() => { if (persist) writers.seen.schedule(serializeSeen(seen)); }, [persist, seen, writers]);
+  // Only sessions that still exist are written (T058): one that went away (a restored backup) is dropped at the next write.
+  const sessionKey = snapshot.sessions.map(session => session.id).join('\n');
+  const seenText = useMemo(() => serializeSeen(seen, new Set(sessionKey.split('\n'))), [seen, sessionKey]);
+  useEffect(() => { if (persist) writers.seen.schedule(seenText); }, [persist, seenText, writers]);
   // Drafts and reading positions are not kept, so typing or scrolling does not write.
   const layoutText = useMemo(() => JSON.stringify(serializeLayout(panes)), [panes]);
   useEffect(() => { if (persist) writers.panes.schedule(layoutText); }, [persist, layoutText, writers]);

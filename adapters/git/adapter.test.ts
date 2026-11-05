@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { WorktreeRef } from '../../core/ports/git';
 import { worktreePath } from './adapter';
+import { createGitRunner, type GitRunner } from './run';
 import { createSandbox, type Sandbox } from './testing/sandbox';
 
 vi.setConfig({ testTimeout: 180_000, hookTimeout: 60_000 });
@@ -43,6 +44,51 @@ const taskWith = async (repo: string, name: string, file: string, content: strin
   sandbox.write(ref.path, file, content);
   expect((await sandbox.adapter.commitAll(ref, `task ${name}`, [])).status).toBe('committed');
   return ref;
+};
+
+/** Plain git with stdin, for arranging (T058); like the sandbox's own git it reads no user or system configuration. */
+let arranger: GitRunner | undefined;
+const arrangeGit = async (cwd: string, args: string[], input?: string): Promise<string> => {
+  if (arranger === undefined) {
+    const config = join(sandbox.root, 'arrange.gitconfig');
+    writeFileSync(config, '');
+    arranger = createGitRunner({ env: { GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: '1' } });
+  }
+  const result = await arranger(args, input === undefined ? { cwd } : { cwd, input });
+  if (result.code !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+  return result.stdout;
+};
+
+let conflictRepos = 0;
+/**
+ * An integration worktree in the middle of a conflicting merge of `shared.txt`: the first task branch is merged, the
+ * second conflicts. T058: `main` (README, the optional .gitattributes, shared.txt) and the two task branches (one change of
+ * shared.txt each) are written by one `git fast-import`, so the repository takes 3 git processes instead of about 50; the
+ * integration worktree and both merges go through the adapter as before, which notes the conflict being judged.
+ */
+const conflictingMerge = async ([first, second]: readonly [string, string], attributes?: string) => {
+  const repo = join(sandbox.root, `conflict${String(++conflictRepos)}`);
+  mkdirSync(repo);
+  await arrangeGit(repo, ['init', '-q', '-b', 'main']);
+  const data = (text: string) => `data ${String(Buffer.byteLength(text))}\n${text}\n`;
+  let mark = 0;
+  const commit = (branch: string, message: string, file: string, content: string, from?: number) => {
+    mark += 1;
+    return `commit refs/heads/${branch}\nmark :${String(mark)}\ncommitter Test User <test@example.invalid> ${String(1_700_000_000 + mark)} +0000\n`
+      + `${data(message)}${from === undefined ? '' : `from :${String(from)}\n`}M 100644 inline ${file}\n${data(content)}\n`;
+  };
+  let stream = commit('main', 'initial', 'README.md', 'start\n');
+  if (attributes !== undefined) stream += commit('main', 'change .gitattributes', '.gitattributes', attributes);
+  stream += commit('main', 'change shared.txt', 'shared.txt', 'base\n');
+  const base = mark;
+  stream += commit(`task/${first}`, `task ${first}`, 'shared.txt', `from ${first}\n`, base);
+  stream += commit(`task/${second}`, `task ${second}`, 'shared.txt', `from ${second}\n`, base);
+  await arrangeGit(repo, ['fast-import', '--quiet'], stream);
+  await arrangeGit(repo, ['reset', '-q', '--hard']);
+  const int = await integration(repo);
+  await sandbox.adapter.merge(int, `task/${first}`, `merge ${first}`);
+  expect((await sandbox.adapter.merge(int, `task/${second}`, `merge ${second}`)).status).toBe('conflict');
+  return { repo, int };
 };
 
 /** A process whose working directory is `cwd`, which keeps that folder from being deleted. */
@@ -315,19 +361,9 @@ describe.concurrent('merge and abortMerge', () => {
   });
 });
 
-describe.concurrent('unresolved conflict markers are never committed', () => {
-  /** An integration worktree in the middle of a conflicting merge of `shared.txt`. */
-  const conflicting = async (attributes?: string) => {
-    const repo = await sandbox.newRepo();
-    if (attributes !== undefined) await sandbox.commitFile(repo, '.gitattributes', attributes);
-    await sandbox.commitFile(repo, 'shared.txt', 'base\n');
-    const a = await taskWith(repo, 'k1', 'shared.txt', 'from k1\n');
-    const b = await taskWith(repo, 'k2', 'shared.txt', 'from k2\n');
-    const int = await integration(repo);
-    await sandbox.adapter.merge(int, a.branch, 'merge k1');
-    expect((await sandbox.adapter.merge(int, b.branch, 'merge k2')).status).toBe('conflict');
-    return { repo, int };
-  };
+// T058: in order, not concurrent: with its many real git processes this suite timed out under the full run's load.
+describe('unresolved conflict markers are never committed', () => {
+  const conflicting = (attributes?: string) => conflictingMerge(['k1', 'k2'], attributes);
 
   it('refuses a conflict that was `git add`ed unresolved, then commits it once the markers are gone', async () => {
     const { int } = await conflicting();
@@ -1355,17 +1391,9 @@ describe.concurrent('createWorktree: intent, ownership and interruptions', () =>
   });
 });
 
-describe.concurrent('conflict checks that cannot read the staged content', () => {
-  const conflicting = async () => {
-    const repo = await sandbox.newRepo();
-    await sandbox.commitFile(repo, 'shared.txt', 'base\n');
-    const a = await taskWith(repo, 'e1', 'shared.txt', 'from e1\n');
-    const b = await taskWith(repo, 'e2', 'shared.txt', 'from e2\n');
-    const int = await integration(repo);
-    await sandbox.adapter.merge(int, a.branch, 'merge e1');
-    expect((await sandbox.adapter.merge(int, b.branch, 'merge e2')).status).toBe('conflict');
-    return { repo, int };
-  };
+// T058: in order, like the suite above.
+describe('conflict checks that cannot read the staged content', () => {
+  const conflicting = () => conflictingMerge(['e1', 'e2']);
 
   it('fails, committing nothing, when the staged blob cannot be read or the output was cut', async () => {
     for (const broken of [{ code: 128, stderr: 'fatal: bad object' }, { code: 0, stdout: '', truncated: true }]) {

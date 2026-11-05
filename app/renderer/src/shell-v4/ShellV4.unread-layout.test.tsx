@@ -222,6 +222,21 @@ describe('T054 unread dots (Q-14)', () => {
     expect(dotted(rowOf(research.id))).toBe(false);
   });
 
+  it('T058: a session that goes away while the app runs (a restored backup) is dropped from the record at the next write', async () => {
+    await setup('#/new');
+    settle();
+    expect(Object.keys(seenRecord().seen)).toEqual(expect.arrayContaining([plan.id, research.id]));
+    const gone = (id: string) => id === research.id;
+    fake.data.snapshot = { ...fixtureSnapshot, seq: seq + 1, sessions: fixtureSnapshot.sessions.filter(session => !gone(session.id)),
+      messages: fixtureSnapshot.messages.filter(item => !gone(item.sessionId)) };
+    emit({ type: 'snapshot.invalidated', reason: 'event-write-failed', at: at('13:00') });
+    await vi.waitFor(() => expect(document.querySelector(`.v4-sidebar [data-session-id="${research.id}"]`)).toBeNull());
+    settle();
+    expect(Object.keys(seenRecord().seen)).not.toContain(research.id);
+    expect(Object.keys(seenRecord().seen)).toContain(plan.id);
+    expect(seenRecord().since).toBe(FIXTURE_SINCE);
+  });
+
   it('r2: a v2 record that is broken JSON takes the baseline and lights nothing, like one with the wrong shape', async () => {
     for (const bad of ['{invalid JSON', JSON.stringify({ version: 2, since: at('08:00'), seen: [] })]) {
       cleanup(); localStorage.setItem(SEEN_KEY, bad);

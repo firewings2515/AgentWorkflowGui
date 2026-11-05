@@ -25,6 +25,15 @@ export const MAX_ESCALATION_ID = 256;
  * two units), so 256 units are at most 2304.
  */
 export const MAX_LAUNCH = LAUNCH_PREFIX.length + MAX_ESCALATION_ID * 9;
+/**
+ * Backpressure (T058, T057 r2 P2). The first 256 IDs waiting for a read share one Promise that settles after that read;
+ * IDs after them settle at once but are still checked by that read. With 4096 IDs waiting or being read, a new one is
+ * dropped (one log line, no ID). At most 4096 IDs of at most 256 characters: about 2 MiB at worst, however much the page asks.
+ */
+export const MAX_HELD_NOTICES = 256;
+export const MAX_QUEUED_NOTICES = 4096;
+/** Two Snapshot reads start at least this far apart: the page cannot make the backend be read more than 4 times a second. */
+export const MIN_READ_GAP_MS = 250;
 const LAUNCH = /^awg-escalation:([A-Za-z0-9\-_.!~*'()%]+)$/;
 
 // Line breaks and tabs become one space. Every other control character, the bidi controls, a lone surrogate and the two
@@ -113,6 +122,8 @@ export interface EscalationNoticeDeps {
   /** Windows: write the toast as XML with the `launch` argument. */
   readonly useToastXml: boolean;
   log?(message: string): void;
+  /** A monotonic clock in milliseconds for the read gap (default `performance.now`): setting the system time moves nothing. */
+  readonly now?: () => number;
 }
 
 export interface EscalationNotices {
@@ -122,6 +133,8 @@ export interface EscalationNotices {
   activate(details: unknown): Promise<void>;
   /** The app is quitting: nothing is shown or sent any more. */
   stop(): void;
+  /** Tests and diagnostics: IDs waiting for a read, and IDs held against a second notification (waiting or shown). */
+  stats(): { waiting: number; tracked: number };
 }
 
 export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationNotices {
@@ -129,11 +142,19 @@ export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationN
   const requested = new Set<string>();
   // Notifications on screen, by escalation: held so they are not collected, and so one click is handled once.
   const live = new Map<string, NoticeLike>();
-  // Requests waiting for the next Snapshot read, with what settles each (T057 r1 P1). Nothing is dropped: however many
-  // arrive while the backend is read, the next read checks them all, so the backend is read once per batch, never per
-  // request, and the page cannot make it read without end.
-  let waiting = new Map<string, () => void>();
+  // IDs waiting for the next Snapshot read (T057 r1 P1): however many arrive while the backend is read, the next read
+  // checks them all, so the backend is read once per batch, never per request. Bounded (T058): see MAX_QUEUED_NOTICES.
+  let waiting = new Set<string>();
+  // What the first MAX_HELD_NOTICES requests of the waiting batch wait for: one Promise for all of them.
+  let batch: { promise: Promise<void>; settle: () => void } | undefined;
+  // Requests dropped since the last read, the queue being full: logged once per batch.
+  let dropped = false;
   let reading = false;
+  // IDs of the read in progress: they count against MAX_QUEUED_NOTICES too.
+  let inFlight = 0;
+  let lastRead = -Infinity;
+  const now = deps.now ?? (() => performance.now());
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
 
   const bringForward = () => {
@@ -210,36 +231,67 @@ export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationN
   };
 
   /**
-   * Reads the Snapshot for every waiting request, one read at a time. A request that arrives during a read waits for the
-   * next one, so it is checked against data at least as new as the request.
+   * Reads the Snapshot for the waiting batch, one read at a time, the next no sooner than MIN_READ_GAP_MS after the start of
+   * the last. A request that arrives during a read (or the wait before one) waits for the next read, so it is checked
+   * against data at least as new as the request.
    */
+  const schedule = (): void => {
+    if (reading || timer !== undefined || stopped || waiting.size === 0) return;
+    // A monotonic clock (T058 r1 P2): a system time set forward or back neither skips nor stretches the gap.
+    const wait = Math.min(MIN_READ_GAP_MS, lastRead + MIN_READ_GAP_MS - now());
+    if (wait > 0) {
+      timer = setTimeout(() => {
+        timer = undefined;
+        void pump();
+      }, wait);
+      return;
+    }
+    void pump();
+  };
+
   const pump = async (): Promise<void> => {
-    if (reading) return;
     reading = true;
+    const ids = waiting;
+    const settle = batch?.settle;
+    waiting = new Set();
+    batch = undefined;
+    dropped = false;
+    inFlight = ids.size;
+    lastRead = now();
     try {
-      while (waiting.size > 0) {
-        const batch = waiting;
-        waiting = new Map();
-        const snapshot = stopped ? undefined : await read();
-        for (const [escalationId, settle] of batch) {
-          present(escalationId, snapshot);
-          settle();
-        }
-      }
+      const snapshot = stopped ? undefined : await read();
+      for (const escalationId of ids) present(escalationId, snapshot);
     } finally {
+      settle?.();
+      inFlight = 0;
       reading = false;
+      schedule();
     }
   };
 
   const show = (raw: unknown): Promise<void> => {
     const escalationId = escalationIdOf(raw);
     if (stopped || escalationId === undefined || requested.has(escalationId)) return Promise.resolve();
+    if (waiting.size + inFlight >= MAX_QUEUED_NOTICES) {
+      // Not taken: asked again once there is room, it is checked then.
+      if (!dropped) deps.log?.('[notice] warn: too many notices waiting; requests dropped until the next read');
+      dropped = true;
+      return Promise.resolve();
+    }
     // Taken before the wait, so two requests at once show one notification.
     requested.add(escalationId);
-    return new Promise<void>((settle) => {
-      waiting.set(escalationId, settle);
-      void pump();
-    });
+    waiting.add(escalationId);
+    let wait: Promise<void> = Promise.resolve();
+    if (waiting.size <= MAX_HELD_NOTICES) {
+      if (batch === undefined) {
+        let settle: () => void = () => undefined;
+        const promise = new Promise<void>((resolve) => { settle = resolve; });
+        batch = { promise, settle };
+      }
+      wait = batch.promise;
+    }
+    schedule();
+    return wait;
   };
 
   const activate = async (details: unknown): Promise<void> => {
@@ -258,6 +310,12 @@ export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationN
     stop: () => {
       stopped = true;
       live.clear();
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+      waiting = new Set();
+      batch?.settle();
+      batch = undefined;
     },
+    stats: () => ({ waiting: waiting.size, tracked: requested.size }),
   };
 }

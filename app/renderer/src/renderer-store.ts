@@ -308,7 +308,9 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
       .finally(() => { if (current === generation) loading = undefined; });
     return loading;
   };
-  const readOnlyBlocks = (type: Command['type']) => state.snapshot?.app.status === 'read-only' && type !== 'backup.restore' && type !== 'backup.cancelRestore';
+  // Read-only data (C-29) still allows a restore, its cancel, and re-detecting the runtimes, which writes no data (T058).
+  const readOnlyBlocks = (type: Command['type']) => state.snapshot?.app.status === 'read-only'
+    && type !== 'backup.restore' && type !== 'backup.cancelRestore' && type !== 'runtime.detect';
   const isBlocked = (type: Command['type'], target: string) => readOnlyBlocks(type) || !!state.blockedCommands[blockKey(type, target)]
     || (type === 'preferences.set' && !!preferencesWrite);
   /** An uncertain whole-record preferences write is checked against a read that started after its result (r3). */

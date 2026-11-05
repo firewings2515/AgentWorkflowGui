@@ -56,7 +56,16 @@ describe('T054 seen record at start-up', () => {
   });
 
   it('serializes as version 2', () => {
-    expect(JSON.parse(serializeSeen(record('2026-11-04T00:00:00.000Z', { a: '2026-11-04T01:00:00.000Z' })))).toEqual({ version: 2, since: '2026-11-04T00:00:00.000Z', seen: { a: '2026-11-04T01:00:00.000Z' } });
+    expect(JSON.parse(serializeSeen(record('2026-11-04T00:00:00.000Z', { a: '2026-11-04T01:00:00.000Z' }), new Set(['a'])))).toEqual({ version: 2, since: '2026-11-04T00:00:00.000Z', seen: { a: '2026-11-04T01:00:00.000Z' } });
+  });
+
+  it('T058: a write keeps only sessions that still exist, and since as it was', () => {
+    const seen = record('2026-11-04T00:00:00.000Z', { a: '2026-11-04T01:00:00.000Z', gone: '2026-11-04T01:30:00.000Z', b: '2026-11-04T02:00:00.000Z' });
+    expect(JSON.parse(serializeSeen(seen, new Set(['a', 'b', 'c'])))).toEqual({ version: 2, since: '2026-11-04T00:00:00.000Z', seen: { a: '2026-11-04T01:00:00.000Z', b: '2026-11-04T02:00:00.000Z' } });
+    expect(JSON.parse(serializeSeen(seen, new Set()))).toEqual({ version: 2, since: '2026-11-04T00:00:00.000Z', seen: {} });
+    // What is written reads back as the same record for the sessions there are.
+    const back = initialSeen(v2(JSON.parse(serializeSeen(seen, new Set(['a', 'b'])))), [{ id: 'a' }, { id: 'b' }], replies, last);
+    expect(back).toEqual(record('2026-11-04T00:00:00.000Z', { a: '2026-11-04T01:00:00.000Z', b: '2026-11-04T02:00:00.000Z' }));
   });
 });
 
