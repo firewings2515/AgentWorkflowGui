@@ -122,7 +122,7 @@ export function useEscalationNotice(store: NotifierOptions['store'] | undefined,
 /** Settings → General → Appearance: the checkbox for these notifications. Not a backend setting, so read-only mode does not matter. */
 export function NotifySetting() {
   const [enabled, setEnabled] = useState(readNotifyEnabled);
-  return <div className="v4-field"><label className="check-label">
+  return <div className="v4-field"><label className="v4-check">
     <input type="checkbox" checked={enabled} onChange={event => { setEnabled(event.target.checked); writeNotifyEnabled(event.target.checked); }} />
     有需要我處理的事時通知我
   </label><p className="v4-muted v4-field-hint">視窗不在前景時，有新的待處理升級就跳出系統通知；點通知會回到這個 App 並打開那個 session。</p></div>;
