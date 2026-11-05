@@ -326,6 +326,34 @@ describe('T058 backpressure of the notice queue', () => {
     expect(snapshot.mock.calls.length).toBeGreaterThanOrEqual(4);
   });
 
+  it('r1 P2: the gap holds when the system time jumps 60 seconds forward (or back) right after a read', async () => {
+    const { notices, snapshot } = rig([]);
+    await notices.show('missing-1');
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    const wall = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(wall + 60_000);
+    const second = tracked(notices.show('missing-2'));
+    await flush();
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    clock.mockReturnValue(wall - 60_000);
+    await vi.waitFor(() => expect(second.settled).toBe(true));
+    expect(snapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('r1 P2: the gap is measured on the injected monotonic clock', async () => {
+    const clock = { now: 1_000 };
+    const { notices, snapshot } = rig([], { now: () => clock.now });
+    await notices.show('missing-1');
+    clock.now += MIN_READ_GAP_MS - 1;
+    const second = tracked(notices.show('missing-2'));
+    expect(snapshot).toHaveBeenCalledTimes(1); // 1 ms short on that clock: it waits
+    await vi.waitFor(() => expect(second.settled).toBe(true));
+    expect(snapshot).toHaveBeenCalledTimes(2);
+    clock.now += MIN_READ_GAP_MS;
+    void notices.show('missing-3');
+    expect(snapshot).toHaveBeenCalledTimes(3); // a full gap on that clock: read right away
+  });
+
   it('one request after the other, each awaited: every one is checked against a read made after it, no faster than one per 250 ms', async () => {
     vi.useFakeTimers();
     const { notices, snapshot } = rig([]);

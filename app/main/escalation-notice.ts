@@ -122,6 +122,8 @@ export interface EscalationNoticeDeps {
   /** Windows: write the toast as XML with the `launch` argument. */
   readonly useToastXml: boolean;
   log?(message: string): void;
+  /** A monotonic clock in milliseconds for the read gap (default `performance.now`): setting the system time moves nothing. */
+  readonly now?: () => number;
 }
 
 export interface EscalationNotices {
@@ -151,6 +153,7 @@ export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationN
   // IDs of the read in progress: they count against MAX_QUEUED_NOTICES too.
   let inFlight = 0;
   let lastRead = -Infinity;
+  const now = deps.now ?? (() => performance.now());
   let timer: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
 
@@ -234,8 +237,8 @@ export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationN
    */
   const schedule = (): void => {
     if (reading || timer !== undefined || stopped || waiting.size === 0) return;
-    // Never longer than the gap, also when the clock was set back.
-    const wait = Math.min(MIN_READ_GAP_MS, lastRead + MIN_READ_GAP_MS - Date.now());
+    // A monotonic clock (T058 r1 P2): a system time set forward or back neither skips nor stretches the gap.
+    const wait = Math.min(MIN_READ_GAP_MS, lastRead + MIN_READ_GAP_MS - now());
     if (wait > 0) {
       timer = setTimeout(() => {
         timer = undefined;
@@ -254,7 +257,7 @@ export function createEscalationNotices(deps: EscalationNoticeDeps): EscalationN
     batch = undefined;
     dropped = false;
     inFlight = ids.size;
-    lastRead = Date.now();
+    lastRead = now();
     try {
       const snapshot = stopped ? undefined : await read();
       for (const escalationId of ids) present(escalationId, snapshot);
