@@ -37,6 +37,14 @@ const RULE_WRAPPERS: ReadonlySet<string> = new Set([
   'workflow.ts:Escalation:fail',
 ]);
 
+/** The name a property key spells, as an identifier, a string or a computed string: `a`, `'a'`, `['a']`. */
+const keyName = (key: ts.Node | undefined): string | undefined => {
+  if (key === undefined) return undefined;
+  if (ts.isIdentifier(key) || ts.isStringLiteralLike(key)) return key.text;
+  if (ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression)) return key.expression.text;
+  return undefined;
+};
+
 const stringArgs = (call: ts.CallExpression) => call.arguments.filter(ts.isStringLiteralLike).map((a) => a.text);
 
 /** The name of the top-level declaration a node sits in. */
@@ -56,13 +64,19 @@ export function scanSource(file: string, text: string, wrappers: ReadonlySet<str
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
   const uses: string[] = [];
   const wrapped = new Map<string, string[]>();
+  const declarations = new Map<string, number>();
   const bypasses: string[] = [];
   const visit = (node: ts.Node) => {
     // Literal rules: outside rules.ts the names of the raw ways in are not used at all, however they are reached
     // (call, destructuring, alias, string key).
     if (ts.isIdentifier(node) && node.text === 'addIssue') bypasses.push(`${file}: addIssue outside rules.ts`);
     if (ts.isPropertyAccessExpression(node) && node.name.text === 'issues') bypasses.push(`${file}: .issues taken from a value`);
-    if (ts.isBindingElement(node) && [node.name, node.propertyName].some((n) => n !== undefined && ts.isIdentifier(n) && n.text === 'issues')) bypasses.push(`${file}: issues taken by destructuring`);
+    if (ts.isBindingElement(node) && [node.name, node.propertyName].some((n) => keyName(n) === 'issues' || keyName(n) === 'addIssue')) bypasses.push(`${file}: issues/addIssue taken by destructuring`);
+    // How many declarations of a name each top-level declaration holds: a wrapper key must name exactly one.
+    if ((ts.isVariableDeclaration(node) || ts.isFunctionDeclaration(node)) && node.name !== undefined && ts.isIdentifier(node.name)) {
+      const declared = `${file}:${topLevelName(node)}:${node.name.text}`;
+      declarations.set(declared, (declarations.get(declared) ?? 0) + 1);
+    }
     if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression) && ['addIssue', 'issues'].includes(node.argumentExpression.text)) bypasses.push(`${file}: addIssue/issues by string key`);
     if (ts.isCallExpression(node)) {
       const callee = node.expression;
@@ -85,7 +99,12 @@ export function scanSource(file: string, text: string, wrappers: ReadonlySet<str
     ts.forEachChild(node, visit);
   };
   visit(source);
-  return { uses, wrapped, bypasses };
+  // Two scopes of one declaration that each hold a wrapper of the same name cannot be told apart by this scan.
+  const ambiguous = [...wrapped.keys()].filter((key) => {
+    const [fileName = '', top = '', callee = ''] = key.split(':');
+    return (declarations.get(`${fileName}:${top}:${callee.split('.')[0] ?? ''}`) ?? 0) > 1;
+  });
+  return { uses, wrapped, bypasses, ambiguous };
 }
 
 const scanned = files.map((file) => scanSource(file, readFileSync(join(dir, file), 'utf8')));
@@ -164,6 +183,10 @@ describe('contract rule codes', () => {
     expect(scanned.flatMap((s) => s.bypasses)).toEqual([]);
   });
 
+  it('each listed wrapper key names one declaration; rename or split a second wrapper of the same name', () => {
+    expect(scanned.flatMap((s) => s.ambiguous)).toEqual([]);
+  });
+
   it('every listed code is raised by some contract, through a helper or a listed wrapper', () => {
     const used = new Set([...scanned.flatMap((s) => s.uses), ...[...RULE_WRAPPERS].flatMap(wrappedCodes)]);
     expect(ContractRule.options.filter((rule) => !used.has(rule))).toEqual([]);
@@ -239,6 +262,32 @@ describe('the rule scanner', () => {
     expect(bypassesOf("s.superRefine((v, ctx) => { const list = ctx.issues; list.push({ code: 'custom', message: 'm', input: v }); });")).toHaveLength(1);
     expect(bypassesOf('s.check((ctx) => { void ctx; });')).toHaveLength(1);
     expect(bypassesOf('const c = z.custom((v) => v !== undefined);')).toHaveLength(1);
+  });
+
+  it('fails destructuring issues by identifier, string key or computed key', () => {
+    const body = (pattern: string) => `s.superRefine((v, ctx) => { const ${pattern} = ctx; list.push({ code: 'custom', message: 'm', input: v }); });`;
+    for (const pattern of ['{ issues }', "{ 'issues': list }", "{ ['issues']: list }", "{ 'addIssue': add }", "{ ['addIssue']: add }"]) {
+      expect(bypassesOf(body(pattern)).length, pattern).toBeGreaterThan(0);
+    }
+    expect(bypassesOf(body('{ other }'))).toEqual([]);
+  });
+
+  it('flags a wrapper name declared in two scopes of one declaration', () => {
+    const text = `export const DeliveryRecord = z
+      .strictObject({})
+      .superRefine((d, ctx) => {
+        const fail = (rule: ContractRule) => addRuleIssue(ctx, rule);
+        fail('delivery.sent-needs-evidence');
+      })
+      .superRefine((d, ctx) => {
+        const fail = (rule: ContractRule) => ruleIssue(rule);
+        fail('delivery.attempt-id-unique');
+      });`;
+    const scan = scanSource('delivery.ts', text, new Set(['delivery.ts:DeliveryRecord:fail']));
+    expect(scan.ambiguous).toEqual(['delivery.ts:DeliveryRecord:fail']);
+    const single = text.slice(0, text.indexOf('.superRefine', text.indexOf('.superRefine') + 1)) + ';';
+    const one = scanSource('delivery.ts', single, new Set(['delivery.ts:DeliveryRecord:fail']));
+    expect(one.ambiguous).toEqual([]);
   });
 
   it('does not count a code that is only a plain string or sits in a comment', () => {
