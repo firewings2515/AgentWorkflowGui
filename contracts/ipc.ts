@@ -81,6 +81,18 @@ export const Command = z.discriminatedUnion('type', [
   /** Rejected with `invalid_transition` while a workflow template or a session uses the Agent (C-01). */
   cmd('agent.delete', { agentId: AgentId, expectedRevision: Revision }),
   cmd('workflow.save', { workflow: WorkflowTemplate, expectedRevision: Revision.nullable() }),
+  /**
+   * Deletes a template (T063, 0.11). Refused with reason `template-in-use` while a run that is not completed or cancelled
+   * uses it, or while a `workflow.start` of it is under way. Ended runs keep their own copy of the template
+   * (`instance.template`) and still open. A repeat that finds it gone gets `not_found`. The views read the Snapshot again.
+   */
+  cmd('workflow.delete', { workflowId: WorkflowId, expectedRevision: Revision }),
+  /**
+   * Adds the starter set (T063, 0.11): the three Agents of STARTER_AGENT_IDS and the template STARTER_WORKFLOW_ID
+   * 「規劃 → 實作 → 審查」. What already exists under those IDs is kept as it is (an edited Agent is not overwritten), so a
+   * repeat adds nothing. The result's `revision` is the template's.
+   */
+  cmd('workflow.addStarter', {}),
   cmd('workflow.start', {
     instanceId: InstanceId,
     rootSessionId: SessionId,
@@ -186,8 +198,10 @@ export const ErrorCode = z.enum([
  * - `run-not-ended` (`invalid_transition`): the run is not completed or cancelled.
  * - `archived` (`invalid_transition`): the session (or the new parent of `session.reparent`, the parent of
  *   `session.create`, the source of `transfer.prepare`) is in an archived tree; unarchive it first.
+ * - `template-in-use` (`invalid_transition`, T063, 0.11): `workflow.delete` of a template that a run not completed or
+ *   cancelled uses (not retryable: end the run first), or while a `workflow.start` of it is under way (retryable).
  */
-export const CommandRefusal = z.enum(['not-top-level', 'workflow-session', 'turn-running', 'escalation-open', 'run-not-ended', 'archived']);
+export const CommandRefusal = z.enum(['not-top-level', 'workflow-session', 'turn-running', 'escalation-open', 'run-not-ended', 'archived', 'template-in-use']);
 export type CommandRefusal = z.infer<typeof CommandRefusal>;
 
 /** Receipt of what a command created; the IDs are the ones the command carried. */

@@ -28,6 +28,7 @@ export const REFUSAL_TEXT: Record<CommandRefusal, string> = {
   'escalation-open': '有待處理的項目，處理後才能封存。',
   'run-not-ended': '這次執行還沒結束，結束後才能封存。',
   archived: '這個對話已封存，請先取消封存。',
+  'template-in-use': '有還沒結束或正在開始的執行使用這個範本，請先完成或取消這些執行再刪除。',
 };
 /** The words for a reason; undefined for none or one this renderer does not know (the caller keeps its general words). */
 export const refusalText = (reason: unknown): string | undefined =>
@@ -37,6 +38,7 @@ export const blocksResubmit = (result: CommandResult) => !result.ok && (result.m
 /** What a code means for one operation, where the general words would leave the user without a way on (T046). */
 const byOperation: Partial<Record<string, Partial<Record<ErrorCode, string>>>> = {
   'agent.delete': { invalid_transition: 'Agent 仍被 Workflow 或 session 使用，無法刪除。' },
+  'workflow.delete': { stale_revision: '範本已有較新版本，請重新載入後再刪除。', not_found: '範本已不存在。' },
   'delivery.resolve': { runtime_unavailable: '重試已保存，但這個 session 現在接不回來，所以還沒有送出；下次啟動時會再試一次。要現在繼續，請另開一個新的 session。' },
   'session.send': { invalid_transition: '訊息沒有送出：這則訊息已經結束、不會再送，或這個 session 目前不能接收訊息（例如資料夾已不在，或 session 接不回來）。可以用新的訊息重送；session 接不回來時，請另開一個新的 session 繼續。' },
 };

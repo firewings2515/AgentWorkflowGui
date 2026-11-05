@@ -416,6 +416,23 @@ UPDATE project SET body = json_set(body, '$.schemaVersion', '0.10.0') WHERE json
 UPDATE workflow_instance SET body = json_set(body, '$.template.schemaVersion', '0.10.0') WHERE json_extract(body, '$.template.schemaVersion') = '0.9.0';
 `;
 
+// Contracts 0.11 (T063): the version, and the one-time marks. A database that already holds an Agent or a workflow template
+// is an install in use: it gets `starter-offered` at once, so the starter set is never added to it at start (only when the
+// user asks). An empty one gets no mark, and the next start adds the starter set once.
+const contracts11V14 = `
+UPDATE agent SET body = json_set(body, '$.schemaVersion', '0.11.0') WHERE json_extract(body, '$.schemaVersion') = '0.10.0';
+UPDATE workflow SET body = json_set(body, '$.schemaVersion', '0.11.0') WHERE json_extract(body, '$.schemaVersion') = '0.10.0';
+UPDATE project SET body = json_set(body, '$.schemaVersion', '0.11.0') WHERE json_extract(body, '$.schemaVersion') = '0.10.0';
+UPDATE workflow_instance SET body = json_set(body, '$.template.schemaVersion', '0.11.0') WHERE json_extract(body, '$.template.schemaVersion') = '0.10.0';
+CREATE TABLE app_marker (
+  name TEXT PRIMARY KEY,
+  at TEXT NOT NULL
+) STRICT;
+INSERT INTO app_marker (name, at)
+  SELECT 'starter-offered', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  WHERE EXISTS (SELECT 1 FROM agent) OR EXISTS (SELECT 1 FROM workflow);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
@@ -430,6 +447,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 11, name: 'contracts-0.8', sql: contracts08V11 },
   { version: 12, name: 'contracts-0.9', sql: contracts09V12 },
   { version: 13, name: 'contracts-0.10', sql: contracts10V13 },
+  { version: 14, name: 'contracts-0.11', sql: contracts11V14 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;

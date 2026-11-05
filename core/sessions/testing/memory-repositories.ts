@@ -194,6 +194,15 @@ export class MemoryRepositories implements AppRepositories {
     },
   };
 
+  readonly markerRecords = new Map<string, string>();
+  readonly markers = {
+    has: (name: string) => Promise.resolve(this.markerRecords.has(name)),
+    set: (name: string, at: string) => {
+      if (!this.markerRecords.has(name)) this.markerRecords.set(name, at);
+      return Promise.resolve();
+    },
+  };
+
   readonly claimRecords = new Map<SessionId, WorkFolderClaim>();
   readonly workFolders: WorkFolderClaimRepository = {
     get: (sessionId) => Promise.resolve(this.claimRecords.has(sessionId) ? copy(this.claimRecords.get(sessionId)!) : undefined),

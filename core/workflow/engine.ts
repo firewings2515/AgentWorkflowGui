@@ -38,6 +38,7 @@ import {
   type TurnState,
   type WorkflowInstance,
   type WorkflowTask,
+  type WorkflowId,
 } from '../../contracts';
 import type { DeliveryService } from '../delivery';
 import { type GuiHandoff, isResolverSession, resolverBriefing, TaskPipeline, type TaskPipelineOptions } from '../pipeline';
@@ -193,6 +194,8 @@ interface MergePlanned extends Omit<Planned, 'to'> {
 
 export class WorkflowEngine implements WorkflowHooks {
   private readonly queues = new Map<string, Promise<unknown>>();
+  /** `workflow.start` calls per template (T063): see `templateStarts`. */
+  private readonly templateStartCounts = new Map<WorkflowId, { active: number; generation: number }>();
   private readonly confirmations = new Map<EscalationId, PendingHandoff>();
   /** Open fan-out groups by (instance, task, source session). */
   private readonly groups = new Map<string, Group>();
@@ -255,7 +258,20 @@ export class WorkflowEngine implements WorkflowHooks {
    */
   start(command: CommandOf<'workflow.start'>): Promise<CommandResult> {
     if (this.options.sessions.isClosing()) return Promise.resolve(fail(command.requestId, 'runtime_unavailable', 'The application is closing'));
-    return this.serial(`instance:${command.instanceId}`, () => this.startNow(command));
+    // Counted before anything is awaited (T063): a `workflow.delete` of the template refuses while this start is under
+    // way, or when it began during the delete's checks (`generation`). Released when the start ends, however it ends.
+    const id = command.workflowId;
+    const starts = this.templateStartCounts.get(id) ?? { active: 0, generation: 0 };
+    this.templateStartCounts.set(id, { active: starts.active + 1, generation: starts.generation + 1 });
+    return this.serial(`instance:${command.instanceId}`, () => this.startNow(command)).finally(() => {
+      const now = this.templateStartCounts.get(id);
+      if (now !== undefined) this.templateStartCounts.set(id, { ...now, active: now.active - 1 });
+    });
+  }
+
+  /** The starts of a template (T063): under way now, and every one ever begun; read without waiting. */
+  templateStarts(workflowId: WorkflowId): { active: number; generation: number } {
+    return { ...(this.templateStartCounts.get(workflowId) ?? { active: 0, generation: 0 }) };
   }
 
   private async startNow(command: CommandOf<'workflow.start'>): Promise<CommandResult> {

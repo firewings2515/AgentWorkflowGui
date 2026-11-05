@@ -60,3 +60,9 @@
   .workflow-inspector { overflow: visible; border-left: 0; border-top: 1px solid var(--line); }
   .workflow-feedback-area { max-height: none; overflow: visible; }
 }
+/* T063: the empty templates page, notices and deleting a template. */
+.workflow-empty { margin: 48px auto; max-width: 520px; padding: 0 18px; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
+.workflow-empty h3 { margin: 0; font-size: 18px; }
+.workflow-empty p { margin: 0; }
+.workflow-notice { margin: 8px 18px; }
+.workflow-danger { color: var(--error); }

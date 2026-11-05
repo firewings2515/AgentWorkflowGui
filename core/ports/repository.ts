@@ -119,6 +119,16 @@ export interface PreferencesRepository {
   set(preferences: UiPreferences): Promise<UiPreferences>;
 }
 
+/**
+ * One-time marks of the app (T063), set once and never cleared: `starter-offered` says the starter set was added (or
+ * not needed) once, so a first start adds it only once. Kept in the database, so a restored backup carries its marks.
+ */
+export interface MarkerRepository {
+  has(name: string): Promise<boolean>;
+  /** A mark already set keeps its first time. */
+  set(name: string, at: Timestamp): Promise<void>;
+}
+
 export interface OwnedProcessRepository {
   record(process: OwnedProcess): Promise<void>;
   markEnded(pid: number, startedAt: Timestamp, at: Timestamp): Promise<void>;
@@ -228,5 +238,7 @@ export interface AppRepositories {
   projects: ProjectRepository;
   /** Which GUI-made work folder belongs to which session (T048). */
   workFolders: WorkFolderClaimRepository;
+  /** One-time marks (T063). */
+  markers: MarkerRepository;
   readSnapshotData(options?: SnapshotOptions): Promise<SnapshotData>;
 }

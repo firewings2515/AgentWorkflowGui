@@ -126,6 +126,8 @@ export function commandTarget(command: Command): string {
   if ('agent' in command) return `agent:${command.agent.id}`;
   if ('agentId' in command) return `agent:${command.agentId}`;
   if ('workflow' in command) return `workflow:${command.workflow.id}`;
+  if (command.type === 'workflow.delete') return `workflow:${command.workflowId}`;
+  if (command.type === 'workflow.addStarter') return 'workflow:starter';
   if ('instanceId' in command) return `instance:${command.instanceId}`;
   if ('transferId' in command) return `transfer:${command.transferId}`;
   if ('escalationId' in command) return `escalation:${command.escalationId}`;
@@ -393,7 +395,7 @@ export function createRendererStore(bridge: RendererBridge, timeoutMs = 15000) {
     // Creation can update the session again while provisioning. Read its latest revision
     // before exposing the composer, even if an earlier session.updated already arrived.
     const refresh = async (receipt: CommandResult) => {
-      if (receipt.ok && ['agent.save', 'agent.delete', 'workflow.save', 'project.save', 'session.create'].includes(command.type)) {
+      if (receipt.ok && ['agent.save', 'agent.delete', 'workflow.save', 'workflow.delete', 'workflow.addStarter', 'project.save', 'session.create'].includes(command.type)) {
         await loading;
         if (state.connection !== 'idle') await reconnect();
       }

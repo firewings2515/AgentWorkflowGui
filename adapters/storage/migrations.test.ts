@@ -37,6 +37,7 @@ describe('openDatabase', () => {
       const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map((r) => r.name);
       expect(tables).toEqual([
         'agent',
+        'app_marker',
         'artifact',
         'blob',
         'delivery',

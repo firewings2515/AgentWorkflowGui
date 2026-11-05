@@ -141,6 +141,8 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
   const [editTitle, setEditTitle] = useState<{ sessionId: string; nonce: number }>({ sessionId: '', nonce: 0 });
   const [firstNotSent, setFirstNotSent] = useState<ReadonlySet<string>>(new Set());
   const [notice, setNotice] = useState('');
+  /** T063: each new value asks the template editor for a new template. */
+  const [newTemplateRequest, setNewTemplateRequest] = useState(0);
   const [transfer, setTransfer] = useState<TransferPreview | null>(null);
   const progressFrom = useRef<string | undefined>(undefined);
   const [{ repository: workflowRepository, controls: workflowDemo }] = useState(() => store
@@ -524,7 +526,7 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
       onOpen={id => open(id, pane.id)} onProgress={id => { progressFrom.current = pane.id; go('progress', id); }} onNotice={setNotice} />;
   })}</div>;
   else if (page === 'settings') main = <SettingsV4 snapshot={snapshot} store={store} serviceStore={serviceStore} ipcState={ipcState} theme={theme} themeDisabled={themeDisabled} onTheme={changeTheme} />;
-  else if (page === 'workflow-start') main = <WorkflowStart snapshot={snapshot} store={store} ipcState={ipcState} onOpen={id => open(id)} />;
+  else if (page === 'workflow-start') main = <WorkflowStart snapshot={snapshot} store={store} ipcState={ipcState} onOpen={id => open(id)} {...(!readOnly && { onNewTemplate: () => { setNewTemplateRequest(value => value + 1); go('templates'); } })} />;
   else if (page === 'progress') main = <div className="v4-page v4-page-wide"><WorkflowProgress snapshot={snapshot} instanceId={route.id} store={store} ipcState={ipcState}
     onOpen={id => open(id, progressFrom.current)} onBack={() => { if (active) open(active.sessionId); else go('new'); }} /></div>;
   else if (page === 'missing') main = <section className="v4-page" aria-labelledby="v4-missing-heading"><div className="v4-page-column">
@@ -562,7 +564,8 @@ export function ShellV4({ snapshot, store, serviceStore, ipcState }: ShellProps)
       </div>
       <div className="v4-page v4-page-wide v4-editor-page" hidden={page !== 'templates'}>
         <WorkflowEditor readOnly={readOnly} repository={workflowRepository} demo={workflowDemo} agents={agents} models={snapshot.modelOptions} runtimes={snapshot.runtimes}
-          selectedId={page === 'templates' ? route.id : ''} visible={page === 'templates'} onSelect={id => navigate(routePath('templates', id))} />
+          selectedId={page === 'templates' ? route.id : ''} visible={page === 'templates'} onSelect={id => navigate(routePath('templates', id))}
+          instances={snapshot.instances} onOpenAgents={() => navigate(routePath('agents'))} newTemplateRequest={newTemplateRequest} />
       </div>
     </main>
     {notice && <div className="v4-notice" role="status"><span>{notice}</span><button type="button" className="v4-icon" aria-label="關閉提示" onClick={() => setNotice('')}>×</button></div>}

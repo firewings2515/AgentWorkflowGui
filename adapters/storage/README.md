@@ -84,3 +84,12 @@ migration v13 只把 agent／workflow／project 與 instance 內 template 的 `s
 寫入時 `checkRecord` 也會擋。自動封存要的「最後訊息時間」用 `ConversationRepository.latestMessageMs`：沿既有的
 `message_by_session (session_id, at_ms)` 從最新一筆往回找第一則使用者或助理、且不是子代理的訊息。備份是整個
 資料庫檔，封存標記跟著一起備份與還原。
+
+## v0.11（T063）
+
+migration v14 把 agent／workflow／project 與 instance 內 template 的 `schemaVersion` 從 0.10.0 改為 0.11.0，
+並加一張表 `app_marker (name, at)`：只寫一次、不刪除的標記（`MarkerRepository`）。`starter-offered` 表示起始範本
+已經放過（或不需要放）：migration 時資料庫裡已經有任何 agent 或 workflow，就直接寫入，所以既有的安裝不會在啟動時
+自動放入起始範本；空的資料庫不寫，下一次啟動放入一次後才寫。備份是整個資料庫檔，標記跟著一起備份與還原。
+`workflow.delete` 用既有的 `DefinitionRepository.delete`（compare-and-set）；instance 的 body 本來就存整份範本，
+刪掉範本不影響已結束的執行。
