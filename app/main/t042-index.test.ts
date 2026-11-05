@@ -1,12 +1,14 @@
 // T042 r1-P2-2: app/main/index.ts itself installs the guards. This starts index.ts against a fake Electron (as
 // index.runtimes.test.ts does), then hands it a web contents made after start, the way Electron's
 // `web-contents-created` does, and checks the guard is on it; and that the default session refuses permissions.
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { ESCALATION_ACTIVATED_CHANNEL, ESCALATION_NOTICE_CHANNEL } from '../preload/channels';
 import { APP_USER_MODEL_ID, TOAST_ACTIVATOR_CLSID } from './app-id';
 import { LAUNCH_PREFIX } from './escalation-notice';
+import { WINDOW_ICON_RELATIVE } from './window-options';
 
 const hoisted = vi.hoisted(() => ({
   appListeners: new Map<string, (...args: unknown[]) => void>(),
@@ -17,6 +19,8 @@ const hoisted = vi.hoisted(() => ({
   windows: [] as { webContents: { send: ReturnType<typeof vi.fn> }; isMinimized: ReturnType<typeof vi.fn>; restore: ReturnType<typeof vi.fn>; show: ReturnType<typeof vi.fn>; focus: ReturnType<typeof vi.fn> }[],
   handlers: new Map<string, (...args: unknown[]) => unknown>(),
   userModelIds: [] as string[],
+  // T061: the options every BrowserWindow is made with.
+  windowOptions: [] as Record<string, unknown>[],
   // T057: the toast activator, the activation callback and the notifications made.
   calls: [] as string[],
   activation: undefined as ((details: unknown) => void) | undefined,
@@ -37,7 +41,8 @@ vi.mock('electron', () => {
     restore = vi.fn();
     show = vi.fn();
     focus = vi.fn();
-    constructor() {
+    constructor(options: Record<string, unknown>) {
+      hoisted.windowOptions.push(options);
       hoisted.windows.push(this);
     }
   }
@@ -182,5 +187,15 @@ describe('T042 index.ts installs the guards', () => {
     hoisted.activation!({ type: 'click', arguments: '--some-flag' });
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(win.webContents.send).not.toHaveBeenCalled();
+  });
+
+  it('T061: the window is made with the app icon, an existing file of the project', async () => {
+    await import('./index');
+    await vi.waitFor(() => expect(hoisted.windowOptions.length).toBe(1));
+    const icon = hoisted.windowOptions[0]!['icon'];
+    // From app/main here, from out/main in the build: the same ../../assets/icon.ico.
+    expect(icon).toBe(join(__dirname, '../../assets/icon.ico'));
+    expect(existsSync(icon as string)).toBe(true);
+    expect(icon).toBe(join(__dirname, WINDOW_ICON_RELATIVE));
   });
 });
