@@ -56,7 +56,15 @@ export function initialSeen(stored: StoredRead, sessions: readonly { id: string 
   return { since: value.since, seen: prune(value.seen, sessions, replies) };
 }
 
-export const serializeSeen = (record: SeenRecord) => JSON.stringify({ version: 2, since: record.since, seen: record.seen });
+/**
+ * The record as written: only the entries of sessions that still exist (T058), so a session that went away while the app
+ * ran is not written back until the next start prunes it. The record in memory keeps them; they light nothing up.
+ */
+export function serializeSeen(record: SeenRecord, sessionIds: ReadonlySet<string>): string {
+  const seen: Record<string, string> = {};
+  for (const [id, time] of Object.entries(record.seen)) if (sessionIds.has(id)) seen[id] = time;
+  return JSON.stringify({ version: 2, since: record.since, seen });
+}
 
 const seenAt = (record: SeenRecord, id: string) => {
   const value = record.seen[id];

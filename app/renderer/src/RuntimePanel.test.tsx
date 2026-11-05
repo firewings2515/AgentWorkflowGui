@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, describe, expect, it } from 'vitest';
 import { Command, RequestId } from '../../../contracts';
 import type { RuntimeStatus, Snapshot } from '../../../contracts';
-import { fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
+import { fixtureReadOnlySnapshot, fixtureSnapshot } from '../../../contracts/fixtures/snapshot';
 import { App } from './App';
 import { createRendererStore } from './renderer-store';
 import type { RendererStore } from './renderer-store';
@@ -79,6 +79,18 @@ describe('T045 Runtime panel', () => {
     expect(within(card('Claude Code')).getByRole<HTMLButtonElement>('button', { name: '重新偵測 Claude Code' }).disabled).toBe(false);
     finish();
     await waitFor(() => expect(button.disabled).toBe(false));
+  });
+
+  it('T058: "重新偵測" works while the data is read-only (the backend allows runtime.detect then)', async () => {
+    const { fake } = await setup(fixtureReadOnlySnapshot);
+    fake.bridge.send.mockImplementation(command => Promise.resolve({ ok: true, requestId: RequestId.parse(command.requestId), created: [] }));
+    const button = within(card('Claude Code')).getByRole<HTMLButtonElement>('button', { name: '重新偵測 Claude Code' });
+    expect(button.disabled).toBe(false);
+    fireEvent.click(button);
+    await waitFor(() => expect(fake.bridge.send).toHaveBeenCalledTimes(1));
+    expect(Command.parse(fake.bridge.send.mock.calls[0]![0])).toMatchObject({ type: 'runtime.detect', runtime: 'claude' });
+    await waitFor(() => expect(button.disabled).toBe(false));
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('says so when a re-detection fails', async () => {

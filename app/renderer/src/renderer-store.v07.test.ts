@@ -138,4 +138,20 @@ describe('T041 event transport and read-only guards', () => {
     expect(await sending).toMatchObject({ ok: false, code: 'storage_read_only' });
     expect(live.bridge.send).not.toHaveBeenCalled(); liveStore.dispose();
   });
+  it('T058: runtime.detect is sent while read-only, also when the data turns read-only during dispatch; other writes stay blocked', async () => {
+    const accepted = (command: { requestId: string }) => Promise.resolve({ ok: true as const, requestId: RequestId.parse(command.requestId), created: [] });
+    const fake = fakeBridge(fixtureReadOnlySnapshot);
+    fake.bridge.send.mockImplementation(accepted);
+    const store = createRendererStore(fake.bridge); await store.start();
+    expect(await store.send({ type: 'runtime.detect', requestId: RequestId.parse('detect-ro'), runtime: 'codex' })).toMatchObject({ ok: true });
+    expect(await store.send({ type: 'preferences.set', requestId: RequestId.parse('prefs-ro'), preferences: fixtureSnapshot.preferences })).toMatchObject({ ok: false, code: 'storage_read_only' });
+    expect(fake.bridge.send.mock.calls.map(([command]) => (command as { type: string }).type)).toEqual(['runtime.detect']);
+    store.dispose();
+    const live = fakeBridge(); live.bridge.send.mockImplementation(accepted);
+    const liveStore = createRendererStore(live.bridge); await liveStore.start();
+    const sending = liveStore.send({ type: 'runtime.detect', requestId: RequestId.parse('detect-race') });
+    live.emit({ schemaVersion: fixtureSnapshot.schemaVersion, seq: fixtureSnapshot.seq + 1, event: { type: 'app.readOnly', reason: 'disk-full', location: 'data', at: fixtureSnapshot.messages[0]!.createdAt } });
+    expect(await sending).toMatchObject({ ok: true });
+    expect(live.bridge.send).toHaveBeenCalledTimes(1); liveStore.dispose();
+  });
 });

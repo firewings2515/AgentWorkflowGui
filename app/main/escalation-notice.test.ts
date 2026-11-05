@@ -2,13 +2,13 @@
 // T057: the main process shows the notification of an escalation (named by the page by its ID alone) and handles its
 // click, from the banner (the instance's `click`) or from the Windows Action Center (`Notification.handleActivation`).
 // `Notification` and the window are stand-ins; no system notification is shown and nothing is written to Windows.
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Escalation, Snapshot } from '../../contracts';
 import { fixtureSnapshot } from '../../contracts/fixtures/snapshot';
 import { ESCALATION_ACTIVATED_CHANNEL } from '../preload/channels';
 import {
-  activatedEscalationId, createEscalationNotices, type EscalationNoticeDeps, LAUNCH_PREFIX, launchArgument, MAX_ESCALATION_ID, MAX_LAUNCH, NOTICE_BODY_LIMIT,
-  NOTICE_TITLE, noticeBody, type NoticeOptions, type NoticeWindow,
+  activatedEscalationId, createEscalationNotices, type EscalationNoticeDeps, LAUNCH_PREFIX, launchArgument, MAX_ESCALATION_ID, MAX_HELD_NOTICES, MAX_LAUNCH,
+  MAX_QUEUED_NOTICES, MIN_READ_GAP_MS, NOTICE_BODY_LIMIT, NOTICE_TITLE, noticeBody, type NoticeOptions, type NoticeWindow,
 } from './escalation-notice';
 
 class FakeNotice {
@@ -200,6 +200,142 @@ describe('T057 when the main process shows a notification', () => {
     notices.stop();
     await notices.show('esc-1');
     expect(made).toHaveLength(0);
+  });
+});
+
+// T058 (T057 r2 P2): the queue is bounded and the backend is read at most 4 times a second, and no request that fits is lost.
+describe('T058 backpressure of the notice queue', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** A backend whose every read waits until the test answers it (or fails it). */
+  const slowBackend = () => {
+    const reads: { resolve: (snapshot: Snapshot) => void; reject: (error: Error) => void }[] = [];
+    const snapshot = () => new Promise<Snapshot>((resolve, reject) => reads.push({ resolve, reject }));
+    return { reads, snapshot };
+  };
+  const withEscalations = (escalations: Escalation[]): Snapshot => ({ ...structuredClone(fixtureSnapshot), escalations });
+  const tracked = (promise: Promise<void>) => { const state = { settled: false }; void promise.then(() => { state.settled = true; }); return state; };
+  const bodies = (ids: string[]) => ids.map(id => `${SESSION.title}：確認 ${id}`);
+
+  it('r2: 10,000 IDs while the first read hangs: at most 256 wait on a Promise and 4096 IDs are kept; every open one asked for in them shows', async () => {
+    const backend = slowBackend();
+    const lines: string[] = [];
+    const { notices, made } = rig([], { snapshot: backend.snapshot, log: (line) => lines.push(line) });
+    const ids = Array.from({ length: 10_000 }, (_, i) => `id-${String(i)}`);
+    const asked = ids.map(id => tracked(notices.show(id)));
+    await flush();
+    // id-0 is being read; 256 more wait for the next read on one Promise; the rest settled at once. With id-0, 4096 are kept.
+    expect(asked.filter(item => !item.settled)).toHaveLength(1 + MAX_HELD_NOTICES);
+    expect(asked.slice(1, 1 + MAX_HELD_NOTICES).every(item => !item.settled)).toBe(true);
+    expect(notices.stats()).toEqual({ waiting: MAX_QUEUED_NOTICES - 1, tracked: MAX_QUEUED_NOTICES });
+    expect(backend.reads).toHaveLength(1);
+    expect(lines).toEqual(['[notice] warn: too many notices waiting; requests dropped until the next read']);
+    // Past the bound nothing more is kept, however much more is asked.
+    const more = Array.from({ length: 10_000 }, (_, i) => notices.show(`more-${String(i)}`));
+    expect(notices.stats()).toEqual({ waiting: MAX_QUEUED_NOTICES - 1, tracked: MAX_QUEUED_NOTICES });
+    await Promise.all(more);
+    expect(lines).toHaveLength(1);
+    expect(lines.join('\n')).not.toMatch(/id-|more-/);
+
+    // Open: one being read, one held, one kept past the held ones, one dropped; one never asked for; one decided.
+    const data = withEscalations([open('id-0'), open('id-100'), open('id-4000'), open('id-5000'), open('esc-unasked'), decided(open('id-200'), 'resolved')]);
+    backend.reads[0]!.resolve(data);
+    await vi.waitFor(() => expect(backend.reads).toHaveLength(2));
+    expect(made.map(item => item.options.body)).toEqual(bodies(['id-0']));
+    backend.reads[1]!.resolve(data);
+    await vi.waitFor(() => expect(asked.every(item => item.settled)).toBe(true));
+    expect(made.map(item => item.options.body)).toEqual(bodies(['id-0', 'id-100', 'id-4000']));
+    // Only the shown ones are kept against a second notification; the rest may be asked for again.
+    expect(notices.stats()).toEqual({ waiting: 0, tracked: 3 });
+
+    // The dropped one, asked again now that there is room, shows; the one never asked for never does.
+    const again = notices.show('id-5000');
+    await vi.waitFor(() => expect(backend.reads).toHaveLength(3));
+    backend.reads[2]!.resolve(data);
+    await again;
+    expect(made.map(item => item.options.body)).toEqual(bodies(['id-0', 'id-100', 'id-4000', 'id-5000']));
+    expect(made.some(item => item.options.body.includes('esc-unasked'))).toBe(false);
+  });
+
+  it('an ID kept past the held ones that was not open yet is let go, and shows when asked again once it is', async () => {
+    const backend = slowBackend();
+    const { notices, made } = rig([], { snapshot: backend.snapshot });
+    const first = notices.show('esc-first');
+    for (let i = 0; i < MAX_HELD_NOTICES; i++) void notices.show(`filler-${String(i)}`);
+    await notices.show('esc-late'); // past the held ones: settles at once
+    backend.reads[0]!.resolve(withEscalations([]));
+    await first;
+    await vi.waitFor(() => expect(backend.reads).toHaveLength(2));
+    backend.reads[1]!.resolve(withEscalations([]));
+    await vi.waitFor(() => expect(notices.stats()).toEqual({ waiting: 0, tracked: 0 }));
+    const again = notices.show('esc-late');
+    await vi.waitFor(() => expect(backend.reads).toHaveLength(3));
+    backend.reads[2]!.resolve(withEscalations([open('esc-late')]));
+    await again;
+    expect(made.map(item => item.options.body)).toEqual(bodies(['esc-late']));
+  });
+
+  it('a failed read lets its batch go; the next batch, held and kept IDs alike, is read as usual', async () => {
+    const backend = slowBackend();
+    const { notices, made } = rig([], { snapshot: backend.snapshot });
+    const first = notices.show('esc-0');
+    const held = notices.show('esc-held');
+    for (let i = 0; i < MAX_HELD_NOTICES; i++) void notices.show(`filler-${String(i)}`);
+    await notices.show('esc-kept');
+    backend.reads[0]!.reject(new Error('busy'));
+    await first;
+    await vi.waitFor(() => expect(backend.reads).toHaveLength(2));
+    backend.reads[1]!.resolve(withEscalations([open('esc-0'), open('esc-held'), open('esc-kept')]));
+    await held;
+    // esc-0 was in the failed read: not shown (and free to be asked again); the next batch shows.
+    expect(made.map(item => item.options.body)).toEqual(bodies(['esc-held', 'esc-kept']));
+    expect(notices.stats()).toEqual({ waiting: 0, tracked: 2 });
+  });
+
+  it('stopped while a batch waits for its turn to read: it settles, and no read follows', async () => {
+    const backend = slowBackend();
+    const { notices, made } = rig([], { snapshot: backend.snapshot });
+    const first = notices.show('esc-1');
+    const second = tracked(notices.show('esc-2'));
+    const kept = Array.from({ length: MAX_HELD_NOTICES + 10 }, (_, i) => notices.show(`esc-k${String(i)}`));
+    backend.reads[0]!.resolve(withEscalations([open('esc-1'), open('esc-2')]));
+    await first;
+    // The next read waits for the gap; stop() in between.
+    notices.stop();
+    await vi.waitFor(() => expect(second.settled).toBe(true));
+    await Promise.all(kept);
+    await new Promise(resolve => setTimeout(resolve, MIN_READ_GAP_MS + 50));
+    expect(backend.reads).toHaveLength(1);
+    expect(made).toHaveLength(1);
+    expect(notices.stats().waiting).toBe(0);
+  });
+
+  it('reads start at least 250 ms apart: the first right away, a stream of unknown IDs at most 4 reads a second', async () => {
+    vi.useFakeTimers();
+    const { notices, snapshot } = rig([]);
+    void notices.show('missing-first');
+    expect(snapshot).toHaveBeenCalledTimes(1); // right away after a quiet time
+    await vi.advanceTimersByTimeAsync(MIN_READ_GAP_MS);
+    snapshot.mockClear();
+    // One request every 10 ms for a second, none waiting for the one before.
+    for (let i = 0; i < 100; i++) {
+      void notices.show(`missing-${String(i)}`);
+      await vi.advanceTimersByTimeAsync(10);
+    }
+    expect(snapshot.mock.calls.length).toBeLessThanOrEqual(5);
+    expect(snapshot.mock.calls.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('one request after the other, each awaited: every one is checked against a read made after it, no faster than one per 250 ms', async () => {
+    vi.useFakeTimers();
+    const { notices, snapshot } = rig([]);
+    const start = Date.now();
+    for (let i = 0; i < 20; i++) {
+      const state = tracked(notices.show(`missing-${String(i)}`));
+      while (!state.settled) await vi.advanceTimersByTimeAsync(5);
+    }
+    expect(snapshot).toHaveBeenCalledTimes(20);
+    expect(Date.now() - start).toBeGreaterThanOrEqual(19 * MIN_READ_GAP_MS);
   });
 });
 
