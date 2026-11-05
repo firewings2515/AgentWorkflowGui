@@ -13,6 +13,7 @@ electronLanguages: [en-US, zh-TW]
 files:
   - out/**
   - package.json
+  - assets/icon.ico
   - LICENSE
   - NOTICE
   - '!node_modules/react{,/**}'
@@ -42,6 +43,8 @@ extraResources:
     to: THIRD_PARTY_LICENSES.txt
 
 win:
+  # The app icon (docs/RELEASE.md): exe, shortcuts, taskbar. assets/ is tracked; build-resources/ is git-ignored.
+  icon: assets/icon.ico
   target:
     - target: nsis
       arch: [x64]
@@ -58,6 +61,8 @@ nsis:
   allowToChangeInstallationDirectory: false
   runAfterFinish: true
   include: installer/installer.nsh
+  installerIcon: assets/icon.ico
+  uninstallerIcon: assets/icon.ico
   # The finish page text is Chinese, so the whole installer is too.
   multiLanguageInstaller: false
   language: '1028'
