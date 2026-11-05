@@ -149,7 +149,17 @@ const sessionShape = {
  */
 export const LogicalSession = z.discriminatedUnion('kind', [
   /** An ordinary session needs no Agent (U-01, T048): without one the runtime gets no extra instructions. */
-  z.strictObject({ ...sessionShape, kind: z.literal('ordinary'), agent: SessionAgent.optional() }),
+  z.strictObject({
+    ...sessionShape,
+    kind: z.literal('ordinary'),
+    agent: SessionAgent.optional(),
+    /**
+     * When this conversation was archived (U4, 0.10), by the user or the auto-archive: only a mark, nothing is deleted or
+     * stopped. Only the top session of an ordinary tree carries it (its parent is absent or names no session); the
+     * sessions below it are archived with it and never carry it. Absent: not archived, and on sessions stored before 0.10.
+     */
+    archivedAt: Timestamp.optional(),
+  }),
   /** A workflow session always has its node's Agent (WB-02). */
   z.strictObject({ ...sessionShape, kind: z.literal('workflow'), agent: SessionAgent, workflow: WorkflowBinding }),
 ]);
@@ -219,6 +229,14 @@ export const Message = z
   .refine((m) => (originsByRole[m.role] as readonly string[]).includes(m.origin.kind), ruleIssue('message.origin-role'))
   .refine((m) => m.role === 'assistant' || m.observedModel === undefined, ruleIssue('message.model-only-assistant'));
 export type Message = z.infer<typeof Message>;
+
+/**
+ * Whether a message counts for a session's "last message" time (U3 Q-17): the user's (also peer, handoff and transfer)
+ * and the assistant's messages of the main conversation, not system notes nor a native sub-agent's. The sidebar order
+ * and the auto-archive (U4) go by it; a session without one goes by its createdAt.
+ */
+export const countsAsLastMessage = (message: Pick<Message, 'role'> & { nativeTaskId?: string | undefined }): boolean =>
+  (message.role === 'user' || message.role === 'assistant') && message.nativeTaskId === undefined;
 
 /**
  * A sub-agent spawned by the runtime itself, observed but not resumable as a GUI session (R-13).

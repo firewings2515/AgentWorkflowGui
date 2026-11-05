@@ -1,7 +1,7 @@
 // Contracts 0.9 (T050, U2, Q-9): the sidebar's pinned lists and renaming a run. Everything 0.8 stored still reads.
 import { describe, expect, it } from 'vitest';
 import type { z } from 'zod';
-import { AppEvent, Command, CONTRACTS_VERSION, PINNED_LIMIT, PinnedLists, pinnedOf, ruleMessage, Snapshot, UiPreferences, WorkflowInstance } from './index';
+import { AppEvent, Command, PINNED_LIMIT, PinnedLists, pinnedOf, ruleMessage, Snapshot, UiPreferences, WorkflowInstance } from './index';
 import { fixtureSnapshot, fixtureSnapshotInput } from './fixtures/snapshot';
 
 const ok = (schema: z.ZodType, input: unknown) => schema.safeParse(input).success;
@@ -12,10 +12,6 @@ const rulesOf = (schema: z.ZodType, input: unknown) => {
 };
 
 describe('contracts 0.9', () => {
-  it('is version 0.9.0', () => {
-    expect(CONTRACTS_VERSION).toBe('0.9.0');
-  });
-
   it('preferences saved before 0.9 have no pinned lists and read as both empty', () => {
     const old = UiPreferences.parse({ theme: 'light', supervisor: { idleCloseMinutes: 20, maxOpenRuntimes: 4 }, workFolderRoot: 'D:\\Work' });
     expect(old.pinned).toBeUndefined();

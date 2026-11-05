@@ -4,6 +4,7 @@ export { REDACTED, Redactor, tokenForms } from './redact';
 export { SessionRuntimes, type SessionRuntimesOptions } from './runtimes';
 export {
   type CommandOf,
+  ArchivedTreeError,
   SessionService,
   type SessionServiceOptions,
   type TransferCommand,
@@ -14,4 +15,5 @@ export {
   type WorkflowSession,
 } from './service';
 export { absolutePath, isAbsolutePath, WrittenPaths, type WrittenPathsOptions } from './written-paths';
+export { type AutoArchiveCheck, type AutoArchiveCommands, AutoArchiver, type AutoArchiverOptions, type AutoArchiveReport } from './archive';
 export { type Allocated, joinFolder, localDay, seqOf, workFolderName, WorkFolders, type WorkFolderOptions } from './work-folders';

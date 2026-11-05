@@ -83,6 +83,7 @@ const ruleMessages = {
   'instance.task-other-instance': 'a task belongs to another instance',
   'instance.task-invalid-dependency': 'a task depends on itself or on a missing task',
   'instance.ended-at': 'only a completed or cancelled run has endedAt',
+  'instance.archived-ended': 'only a completed or cancelled run is archived',
   'instance.ended-work-final': 'a run with endedAt has only final tasks and merge attempts',
   'instance.round-unique': 'one round per task, node and round number',
   'instance.unknown-task': 'a round or merge attempt names a missing task',

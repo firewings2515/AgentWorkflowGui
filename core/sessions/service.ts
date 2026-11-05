@@ -11,6 +11,7 @@ import {
   type AgentDefinition,
   type AppEvent,
   type Command,
+  type CommandRefusal,
   type CommandResult,
   DEFAULT_SESSION_TITLE,
   type DeliveryTarget,
@@ -37,6 +38,7 @@ import {
   type SessionItem,
   type TaskId,
   type Timestamp,
+  type TransferProposal,
   type Turn,
   type WaitForFileToolInput,
   type WaitForFileToolResult,
@@ -45,7 +47,22 @@ import {
   type WorkflowInstance,
   AttemptId,
   UiPreferences,
+  pinnedOf,
 } from '../../contracts';
+import {
+  type AutoArchiveCheck,
+  escalationOpenIn,
+  isTopLevel,
+  runEnded,
+  runLastMessageMs,
+  runPinned,
+  runSessionsOf,
+  topOf,
+  topOfStored,
+  treeLastMessageMs,
+  treeOf,
+  treePinned,
+} from './archive';
 import { DeliveryService, type DeliveryEscalation, type DispatchCall, type DispatchOutcome, type PayloadDelivery, type RecoveryReport } from '../delivery';
 import { type AbortLike, LockCoordinator, type LockCoordinatorOptions, type LockEscalation } from '../locks';
 import type {
@@ -256,7 +273,7 @@ const fail = (
   requestId: Failure['requestId'],
   code: Failure['code'],
   message: string,
-  flags: { retryable?: boolean; mayHaveSideEffects?: boolean } = {},
+  flags: { retryable?: boolean; mayHaveSideEffects?: boolean; reason?: CommandRefusal } = {},
 ): Failure => ({
   ok: false,
   requestId,
@@ -264,6 +281,7 @@ const fail = (
   message,
   retryable: flags.retryable ?? false,
   mayHaveSideEffects: flags.mayHaveSideEffects ?? false,
+  ...(flags.reason !== undefined && { reason: flags.reason }),
 });
 
 const errorName = (error: unknown) => (error instanceof Error ? error.name : 'non-error thrown');
@@ -301,6 +319,26 @@ const closingFailure = (requestId: Failure['requestId']) => fail(requestId, 'run
 const withoutAutoTitle = (s: LogicalSession): LogicalSession => {
   const next = { ...s };
   delete next.autoTitle;
+  return next;
+};
+/**
+ * The archive commit's queue (T059 r1): the preferences' own, so that saving preferences, storing a session, writing an
+ * escalation and an archive's last checks with its write never interleave. See `SessionService.commit`.
+ */
+const ARCHIVE_COMMIT = 'preferences';
+
+/** A session was to be stored below an archived conversation (U4, T059 r1 P1-3); refused as `archived`. */
+export class ArchivedTreeError extends Error {
+  constructor() {
+    super('the conversation is archived');
+    this.name = 'ArchivedTreeError';
+  }
+}
+
+/** An ordinary session without its archive mark (U4). */
+const withoutArchivedAt = (s: Extract<LogicalSession, { kind: 'ordinary' }>): LogicalSession => {
+  const next = { ...s };
+  delete next.archivedAt;
   return next;
 };
 /** Why a request of a released opening of its session is declined (T036 r3 P1-2). */
@@ -429,8 +467,13 @@ export class SessionService {
 
   constructor(private readonly options: SessionServiceOptions) {
     // Storage only through the write gate: once shutdown returned, nothing reaches it (r2-P1-4).
-    this.repos = gated(options.repositories, () => this.closed);
-    this.store = gated(options.store, () => this.closed);
+    this.repos = this.withArchiveCommit(gated(options.repositories, () => this.closed));
+    // A payload accepted for a session takes the archive commit too (T059 r2): one accepted before an archive's last
+    // check is seen there (`archiveRefusal`); one accepted after it comes after the mark (U4 ★D).
+    const gatedStore = gated(options.store, () => this.closed);
+    this.store = new Proxy(gatedStore, {
+      get: (target, key): unknown => (key === 'accept' ? (input: Parameters<DeliveryStore['accept']>[0]) => this.commit(() => target.accept(input)) : Reflect.get(target, key)),
+    });
     this.written = new WrittenPaths(options.written);
     if (options.workFolders !== undefined) {
       const { fs, defaultRoot, day } = options.workFolders;
@@ -878,6 +921,16 @@ export class SessionService {
         return queued(command.sessionId, () => this.setAgent(command));
       case 'session.reparent':
         return this.serial('tree', () => (this.closing ? Promise.resolve(closingFailure(command.requestId)) : this.reparent(command)));
+      // Archiving (U4, T059): the queues are taken inside, in the order archiveTree / archiveRun give.
+      case 'session.archive':
+        return this.archiveTree(command.requestId, command.sessionId, command.expectedRevision);
+      case 'session.unarchive':
+        // In `tree` as an archive is: a repeat sent at once finds the first one's result (CR-2).
+        return this.serial('tree', () => (this.closing ? Promise.resolve(closingFailure(command.requestId)) : this.unarchiveTree(command)));
+      case 'workflow.archive':
+        return this.archiveRun(command.requestId, command.instanceId, command.expectedRevision);
+      case 'workflow.unarchive':
+        return this.unarchiveRun(command);
       case 'nativeTask.stop':
         return this.stopNativeTask(command);
       case 'agent.save':
@@ -895,7 +948,8 @@ export class SessionService {
         return this.resolveDelivery(command);
       case 'preferences.set':
         // One at a time, in order (T048): the folder check reads what is saved before the next one writes.
-        return this.serial('preferences', () => (this.closing ? Promise.resolve(closingFailure(command.requestId)) : this.setPreferences(command)));
+        // In the archive commit too (T059 r1 P1-2): a pin saved before an archive's last check is seen by it.
+        return this.commit(() => (this.closing ? Promise.resolve(closingFailure(command.requestId)) : this.setPreferences(command)));
       case 'workflow.start':
         if (this.workflow !== undefined) return this.workflow.start(command);
         return fail(command.requestId, 'unsupported', `${command.type} is not available yet`);
@@ -935,6 +989,9 @@ export class SessionService {
     if (!(this.options.isRuntimeAvailable?.(model.runtime) ?? true))
       return fail(requestId, 'runtime_unavailable', `${model.runtime} is not available on this computer`);
     if (parentId !== undefined && (await repositories.sessions.get(parentId)) === undefined) return fail(requestId, 'not_found', 'Unknown parent session');
+    // U4: nothing new below an archived conversation; it is unarchived first.
+    if (parentId !== undefined && (await this.inArchivedTree(parentId)))
+      return fail(requestId, 'invalid_transition', 'That conversation is archived; unarchive it first', { reason: 'archived' });
     // A repeat of a create that went through (CR-2): said so before any folder is made for it.
     if ((await repositories.sessions.get(sessionId)) !== undefined) return fail(requestId, 'already_exists', 'A session with this ID already exists');
     if (this.closing) return closingFailure(requestId);
@@ -985,6 +1042,8 @@ export class SessionService {
       // write was refused (read-only data, r1 P1-3); the folder itself stays (r2). Only when it is not known whether the
       // session was stored does the claim stay; the next start's check settles it.
       if (made !== undefined && !(error instanceof CommitUncertainError) && (await this.storedOrUnknown(sessionId)) === 'absent') await this.releaseWorkFolder(sessionId, made);
+      // Its parent's tree was archived since the check above (U4, T059 r1 P1-3): refused where it is stored.
+      if (error instanceof ArchivedTreeError) return fail(requestId, 'invalid_transition', 'That conversation is archived; unarchive it first', { reason: 'archived' });
       throw error;
     }
     if (stored === 'exists') {
@@ -1119,6 +1178,13 @@ export class SessionService {
       return fail(requestId, 'invalid_transition', 'This message was cancelled and will not be sent');
     const written = await this.writeUserMessage(sessionId, messageId, text, existing?.acceptedAt ?? this.options.now());
     if (written === 'taken') return fail(requestId, 'invalid_request', 'This message ID was already used for another message');
+    // U4: the user writing to an archived conversation or run unarchives it, once the message is stored (T059 r1 P1-1:
+    // every refusal before, and a failed write, leave the archive as it was), in this session's queue (an archive of its
+    // tree or run waits for that queue, so it cannot come back in between).
+    const unarchived = await this.unarchiveForSend(session);
+    if (unarchived === 'stale')
+      return fail(requestId, 'stale_revision', 'The message is saved, but the conversation changed while it was unarchived; send it again', { retryable: true, mayHaveSideEffects: true });
+    if (unarchived === 'self') session = (await this.repos.sessions.get(sessionId)) ?? session;
     if (this.closing) return closingFailure(requestId);
     if (existing === undefined) {
       const provisioned = await this.ensureProvisioned(session);
@@ -1261,12 +1327,326 @@ export class SessionService {
         cursor = sessions.find((s) => s.id === above)?.parentId;
       }
     }
+    // U4: an archived tree keeps its shape: nothing of it is moved out (its top session neither), nothing moved in.
+    const byId = new Map(sessions.map((s) => [s.id, s]));
+    const lookup = (id: SessionId) => byId.get(id);
+    const archivedTree = (s: LogicalSession | undefined) => {
+      const top = s === undefined ? undefined : topOf(s, lookup);
+      return top?.kind === 'ordinary' && top.archivedAt !== undefined;
+    };
+    if (archivedTree(session)) return fail(requestId, 'invalid_transition', 'The conversation is archived; unarchive it first', { reason: 'archived' });
+    if (parentId !== null && archivedTree(lookup(parentId))) return fail(requestId, 'invalid_transition', 'That conversation is archived; unarchive it first', { reason: 'archived' });
     return this.updateFromCommand(requestId, sessionId, expectedRevision, (s) => {
       const next = { ...s };
       if (parentId === null) delete next.parentId;
       else next.parentId = parentId;
       return next;
     });
+  }
+
+  // ---- archive (U4, T059) ---------------------------------------------------------------------------
+
+  /**
+   * Whether a turn of this session runs now: running, waiting for the user, a file lock or a delivery's outcome, or a
+   * dispatch acked (or a handoff sent) whose turn was not seen to end yet. Such a tree or run is not archived.
+   */
+  turnRunning(session: LogicalSession): boolean {
+    return busy(session) || session.activity === 'reconciling' || (this.ackedTurns.get(session.id)?.size ?? 0) > 0 || this.handoffTurns.has(session.id);
+  }
+
+  /** Whether an ordinary session is in an archived conversation (`archived` refusals of create and transfer, U4). */
+  async inArchivedTree(sessionId: SessionId): Promise<boolean> {
+    const session = await this.repos.sessions.get(sessionId);
+    const top = session === undefined ? undefined : await topOfStored(session, (id) => this.repos.sessions.get(id));
+    return top?.kind === 'ordinary' && top.archivedAt !== undefined;
+  }
+
+  /**
+   * `session.archive` (U4), and the auto-archive's command with `auto`. Locks in a fixed order: `tree` (no reparent while
+   * it runs), then the queue of every session of the tree (no send, dispatch or runtime event of them in between), then
+   * the archive commit (ARCHIVE_COMMIT: no session stored, escalation written or preferences saved in between), then the
+   * top session's row. Every check is made again inside the commit and the mark written there, so what any of those
+   * writers stored before is seen and what they store after comes after the mark (T059 r1). `auto` adds the
+   * auto-archive's own conditions, so a message sent or a pin made after its scan makes it skip instead of archiving.
+   */
+  archiveTree(requestId: Success['requestId'], sessionId: SessionId, expectedRevision: number, auto?: AutoArchiveCheck): Promise<CommandResult> {
+    return this.serial('tree', async (): Promise<CommandResult> => {
+      if (this.closing) return closingFailure(requestId);
+      const listed = await this.repos.sessions.list();
+      const target = listed.find((s) => s.id === sessionId);
+      if (target === undefined) return fail(requestId, 'not_found', 'Unknown session');
+      if (target.kind === 'workflow') return fail(requestId, 'invalid_request', 'A workflow session is archived with its run', { reason: 'workflow-session' });
+      const listedById = new Map(listed.map((s) => [s.id, s]));
+      if (!isTopLevel(target, (id) => listedById.get(id))) return fail(requestId, 'invalid_request', 'Only the top session of a conversation is archived', { reason: 'not-top-level' });
+      const members = treeOf(sessionId, listed).map((s) => s.id);
+      return this.exclusive(members, () =>
+        this.commit(async (): Promise<CommandResult> => {
+          if (this.closing) return closingFailure(requestId);
+          const sessions = await this.repos.sessions.list();
+          const top = sessions.find((s) => s.id === sessionId);
+          if (top?.kind !== 'ordinary') return fail(requestId, 'not_found', 'Unknown session');
+          const tree = treeOf(sessionId, sessions);
+          const ids = new Set<string>(tree.map((s) => s.id));
+          // A repeat that finds it archived (CR-2): nothing written, whatever revision it names; a pin an earlier archive
+          // left goes now (H).
+          if (top.archivedAt !== undefined) {
+            await this.unpinNow('chat', ids);
+            return ok(requestId, { revision: top.revision });
+          }
+          if (top.revision !== expectedRevision) return fail(requestId, 'stale_revision', 'The conversation has changed since it was loaded', { retryable: true });
+          // A session stored below it before the commit (it held no queue of ours): its queue is not held, read again.
+          if (tree.length !== members.length || tree.some((s) => !members.includes(s.id)))
+            return fail(requestId, 'stale_revision', 'The conversation has changed since it was loaded', { retryable: true });
+          const refused = await this.archiveRefusal(requestId, tree, undefined);
+          if (refused !== undefined) return refused;
+          if (auto !== undefined) {
+            if ((await treeLastMessageMs(this.repos, tree)) >= auto.cutoffMs) return fail(requestId, 'invalid_transition', 'The conversation has a newer message');
+            if (treePinned(await this.repos.preferences.get(), tree)) return fail(requestId, 'invalid_transition', 'The conversation is pinned');
+          }
+          const at = this.options.now();
+          const saved = await this.updateSession(sessionId, (s) => (s.kind === 'ordinary' ? { ...s, archivedAt: at } : undefined), expectedRevision);
+          if (saved === undefined) return fail(requestId, 'not_found', 'Unknown session');
+          if (saved === 'stale') return fail(requestId, 'stale_revision', 'The conversation has changed since it was loaded', { retryable: true });
+          // Out of the pinned list in the same commit: a pin saved after it comes after the mark.
+          await this.unpinNow('chat', ids);
+          return ok(requestId, { revision: saved.revision });
+        }),
+      );
+    });
+  }
+
+  /**
+   * The archive commit (T059 r1): the preferences' queue, also taken by every session stored, escalation written and
+   * preferences saved through this service's storage (`withArchiveCommit`; the engine, the pipeline and the transfer
+   * service write through it too). Its holders wait for nothing but a session's row, so it never closes a cycle with the
+   * `tree` and session queues held before it.
+   */
+  private commit<T>(fn: () => Promise<T>): Promise<T> {
+    return this.serial(ARCHIVE_COMMIT, fn);
+  }
+
+  /**
+   * This service's storage with the archive commit around everything that adds to a conversation an archive must see
+   * (T059 r1, r2): writing an escalation; storing an ordinary session below another, a transfer's new session too
+   * (refused there when that tree is archived, ArchivedTreeError); storing a transfer proposal and writing its approval
+   * (refused there when its source's tree is archived). A session stored at the top joins no tree, and a workflow session
+   * no conversation: neither waits. Other transfer writes (progress, cancel) add nothing and do not wait.
+   */
+  private withArchiveCommit(repositories: AppRepositories): AppRepositories {
+    const stored = repositories.sessions;
+    /** Whether this session is in an archived conversation, as stored now. */
+    const archivedTree = async (sessionId: SessionId): Promise<boolean> => {
+      const session = await stored.get(sessionId);
+      const top = session === undefined ? undefined : await topOfStored(session, (id) => stored.get(id));
+      return top?.kind === 'ordinary' && top.archivedAt !== undefined;
+    };
+    const escalations = new Proxy(repositories.escalations, {
+      get: (target, key): unknown => (key === 'upsert' ? (escalation: Escalation) => this.commit(() => target.upsert(escalation)) : Reflect.get(target, key)),
+    });
+    const below = (session: LogicalSession) => session.kind === 'ordinary' && session.parentId !== undefined;
+    const sessions = new Proxy(stored, {
+      get: (target, key): unknown =>
+        key === 'create'
+          ? (session: LogicalSession) =>
+              !below(session)
+                ? target.create(session)
+                : this.commit(async () => {
+                    if (session.parentId !== undefined && (await archivedTree(session.parentId))) throw new ArchivedTreeError();
+                    return target.create(session);
+                  })
+          : Reflect.get(target, key),
+    });
+    const approval = (p: TransferProposal) => p.state === 'approved' && p.approvedRevision === p.revision;
+    const transfers = new Proxy(repositories.transfers, {
+      get: (target, key): unknown =>
+        key === 'create'
+          ? (proposal: TransferProposal) =>
+              this.commit(async () => {
+                if (await archivedTree(proposal.sourceSessionId)) throw new ArchivedTreeError();
+                return target.create(proposal);
+              })
+          : key === 'update'
+            ? (proposal: TransferProposal, expectedRevision: number) =>
+                !approval(proposal)
+                  ? target.update(proposal, expectedRevision)
+                  : this.commit(async () => {
+                      if (await archivedTree(proposal.sourceSessionId)) throw new ArchivedTreeError();
+                      return target.update(proposal, expectedRevision);
+                    })
+            : Reflect.get(target, key),
+    });
+    const views: Partial<Record<PropertyKey, unknown>> = { escalations, sessions, transfers };
+    return new Proxy(repositories, { get: (target, key): unknown => (key in views ? views[key] : Reflect.get(target, key)) });
+  }
+
+  /** `session.unarchive` (U4): the top session's mark cleared; nothing is pinned again. */
+  private async unarchiveTree(command: CommandOf<'session.unarchive'>): Promise<CommandResult> {
+    const { requestId, sessionId, expectedRevision } = command;
+    const sessions = await this.repos.sessions.list();
+    const byId = new Map(sessions.map((s) => [s.id, s]));
+    const session = byId.get(sessionId);
+    if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
+    if (session.kind === 'workflow') return fail(requestId, 'invalid_request', 'A workflow session is unarchived with its run', { reason: 'workflow-session' });
+    if (!isTopLevel(session, (id) => byId.get(id))) return fail(requestId, 'invalid_request', 'Only the top session of a conversation is unarchived', { reason: 'not-top-level' });
+    // A repeat that finds it unarchived (CR-2) succeeds and writes nothing; so does a write that finds it so in its row.
+    if (session.archivedAt === undefined) return ok(requestId, { revision: session.revision });
+    const saved = await this.updateSession(sessionId, (s) => (s.kind === 'ordinary' && s.archivedAt !== undefined ? withoutArchivedAt(s) : undefined), expectedRevision);
+    if (saved === undefined) return fail(requestId, 'not_found', 'Unknown session');
+    if (saved === 'stale') return fail(requestId, 'stale_revision', 'The conversation has changed since it was loaded', { retryable: true });
+    return ok(requestId, { revision: saved.revision });
+  }
+
+  /**
+   * `workflow.archive` (U4), and the auto-archive's with `auto`. The queues of the run's sessions are held (no send,
+   * dispatch or runtime event of them in between); the run itself is written by compare-and-set only. Not in the run's
+   * own queue: the engine may wait for a session's queue while holding it, and a send holds its session's queue while it
+   * unarchives the run.
+   */
+  archiveRun(requestId: Success['requestId'], instanceId: InstanceId, expectedRevision: number, auto?: AutoArchiveCheck): Promise<CommandResult> {
+    const nodesOf = async () => runSessionsOf(instanceId, await this.repos.sessions.list());
+    return nodesOf().then((listed) =>
+      this.exclusive(
+        listed.map((s) => s.id),
+        // The archive commit, as for a conversation (T059 r1): checked again and written there.
+        () =>
+          this.commit(async (): Promise<CommandResult> => {
+            if (this.closing) return closingFailure(requestId);
+            const instance = await this.repos.instances.get(instanceId);
+            if (instance === undefined) return fail(requestId, 'not_found', 'Unknown workflow run');
+            const nodes = await nodesOf();
+            const ids = new Set<string>([instanceId, ...nodes.map((s) => s.id)]);
+            if (instance.archivedAt !== undefined) {
+              await this.unpinNow('workflow', ids);
+              return ok(requestId, { revision: instance.revision });
+            }
+            if (instance.revision !== expectedRevision) return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
+            if (!runEnded(instance)) return fail(requestId, 'invalid_transition', 'Only an ended run is archived', { reason: 'run-not-ended' });
+            if (nodes.length !== listed.length || nodes.some((n) => !listed.some((l) => l.id === n.id)))
+              return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
+            const refused = await this.archiveRefusal(requestId, nodes, instanceId);
+            if (refused !== undefined) return refused;
+            if (auto !== undefined) {
+              if ((await runLastMessageMs(this.repos, instance, nodes)) >= auto.cutoffMs) return fail(requestId, 'invalid_transition', 'The run has a newer message');
+              if (runPinned(await this.repos.preferences.get(), instanceId, nodes)) return fail(requestId, 'invalid_transition', 'The run is pinned');
+            }
+            const written = await this.writeRun(requestId, { ...instance, revision: instance.revision + 1, archivedAt: this.options.now() }, instance.revision);
+            if (written.ok) await this.unpinNow('workflow', ids);
+            return written;
+          }),
+      ),
+    );
+  }
+
+  /** `workflow.unarchive` (U4): the run's mark cleared by compare-and-set; nothing is pinned again. */
+  private async unarchiveRun(command: CommandOf<'workflow.unarchive'>): Promise<CommandResult> {
+    const { requestId, instanceId, expectedRevision } = command;
+    const instance = await this.repos.instances.get(instanceId);
+    if (instance === undefined) return fail(requestId, 'not_found', 'Unknown workflow run');
+    if (instance.archivedAt === undefined) return ok(requestId, { revision: instance.revision });
+    if (instance.revision !== expectedRevision) return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
+    const next = { ...instance, revision: instance.revision + 1 };
+    delete next.archivedAt;
+    const written = await this.writeRun(requestId, next, instance.revision);
+    if (written.ok || written.code !== 'stale_revision') return written;
+    // Written in between: a repeat sent at once that finds the run unarchived by the first succeeds (CR-2).
+    const now = await this.repos.instances.get(instanceId);
+    return now !== undefined && now.archivedAt === undefined ? ok(requestId, { revision: now.revision }) : written;
+  }
+
+  private async writeRun(requestId: Success['requestId'], next: WorkflowInstance, expectedRevision: number): Promise<CommandResult> {
+    const saved = await this.repos.instances.update(next, expectedRevision);
+    if (saved.status === 'stale') return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
+    this.options.publish({ type: 'instance.updated', instance: saved.record });
+    return ok(requestId, { revision: saved.record.revision });
+  }
+
+  /** Why these sessions (a tree, or a run's with its ID) are not archived now; undefined when they may be. */
+  private async archiveRefusal(requestId: Success['requestId'], sessions: readonly LogicalSession[], instanceId: InstanceId | undefined): Promise<Failure | undefined> {
+    if (sessions.some((s) => this.turnRunning(s)))
+      return fail(requestId, 'invalid_transition', 'A session of it is running; archive it once it has finished', { retryable: true, reason: 'turn-running' });
+    const ids = new Set<string>(sessions.map((s) => s.id));
+    // A transfer of one of its sessions under way (T059 r1): its new session joins the tree and its payload goes there.
+    const transfers = (await this.repos.transfers.list()).filter((p) => ids.has(p.sourceSessionId) || (p.createdSessionId !== undefined && ids.has(p.createdSessionId)));
+    if (transfers.some((p) => p.state === 'draft' || (p.state === 'approved' && p.delivery?.state !== 'sent')))
+      return fail(requestId, 'invalid_transition', 'A transfer of it is under way; archive it once it has finished', { retryable: true, reason: 'turn-running' });
+    // A payload accepted for one of its sessions and not sent yet (T059 r2): a user's message that waits for its runtime, a
+    // peer message, a handoff, a notice or a retry queued behind the queues this archive holds. It would start a turn
+    // there. A delivery whose outcome stays unknown is reconciling (above) or has its escalation (below).
+    for (const session of sessions) {
+      const records = await this.store.listByTarget(session.id);
+      if (records.some((r) => r.kind !== 'provision' && r.outcome === undefined && r.delivery.state === 'pending'))
+        return fail(requestId, 'invalid_transition', 'A message to it is waiting to be sent; archive it once it has gone', { retryable: true, reason: 'turn-running' });
+    }
+    const open = await this.repos.escalations.list({ state: 'open' });
+    // A transfer waiting for the user's confirmation is answered first, as an escalation is.
+    if (escalationOpenIn(open, ids, instanceId) || transfers.some((p) => p.state === 'awaiting-confirmation'))
+      return fail(requestId, 'invalid_transition', 'It has an open escalation; answer it first', { reason: 'escalation-open' });
+    return undefined;
+  }
+
+  /**
+   * Takes these IDs out of one pinned list (U4: archived items are not pinned), when any is there; the caller holds the
+   * archive commit. Its own write after the archive's: when it fails, the archive stands and this is logged; the next
+   * archive of it, or the next auto-archive pass (`unpinArchived`), takes them out then.
+   */
+  private async unpinNow(list: 'chat' | 'workflow', ids: ReadonlySet<string>): Promise<void> {
+    try {
+      if (this.closing) return;
+      const preferences = await this.repos.preferences.get();
+      const pinned = pinnedOf(preferences);
+      const kept = pinned[list].filter((id) => !ids.has(id));
+      if (kept.length === pinned[list].length) return;
+      const saved = await this.repos.preferences.set({ ...preferences, pinned: { ...pinned, [list]: kept } });
+      this.options.publish({ type: 'preferences.updated', preferences: saved, at: this.options.now() });
+    } catch (error) {
+      this.log(`taking archived items out of the pinned list failed (${errorName(error)})`);
+    }
+  }
+
+  private unpin(list: 'chat' | 'workflow', ids: ReadonlySet<string>): Promise<void> {
+    return this.commit(() => this.unpinNow(list, ids));
+  }
+
+  /** Archived conversations and runs still pinned (an earlier unpin failed, H) are taken out of the pinned lists. */
+  async unpinArchived(): Promise<void> {
+    const sessions = await this.repos.sessions.list();
+    const chat = new Set<string>();
+    for (const top of sessions) if (top.kind === 'ordinary' && top.archivedAt !== undefined) for (const s of treeOf(top.id, sessions)) chat.add(s.id);
+    const workflow = new Set<string>();
+    for (const instance of await this.repos.instances.list()) {
+      if (instance.archivedAt === undefined) continue;
+      workflow.add(instance.id);
+      for (const s of runSessionsOf(instance.id, sessions)) workflow.add(s.id);
+    }
+    if (chat.size > 0) await this.unpin('chat', chat);
+    if (workflow.size > 0) await this.unpin('workflow', workflow);
+  }
+
+  /**
+   * A send to a session of an archived conversation or run clears the mark first (U4), by compare-and-set of the top
+   * session (or the run) as just read: another write in between (an activity change, the user's own unarchive) reads it
+   * again, a few times at most. `self` when the session itself was the one written.
+   */
+  private async unarchiveForSend(session: LogicalSession): Promise<'none' | 'self' | 'other' | 'stale'> {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (session.kind === 'workflow') {
+        const instance = await this.repos.instances.get(session.workflow.instanceId);
+        if (instance?.archivedAt === undefined) return 'none';
+        const next = { ...instance, revision: instance.revision + 1 };
+        delete next.archivedAt;
+        const saved = await this.repos.instances.update(next, instance.revision);
+        if (saved.status === 'stale') continue;
+        this.options.publish({ type: 'instance.updated', instance: saved.record });
+        return 'other';
+      }
+      const current = (await this.repos.sessions.get(session.id)) ?? session;
+      const top = await topOfStored(current, (id) => this.repos.sessions.get(id));
+      if (top?.kind !== 'ordinary' || top.archivedAt === undefined) return 'none';
+      const saved = await this.updateSession(top.id, (s) => (s.kind === 'ordinary' && s.archivedAt !== undefined ? withoutArchivedAt(s) : undefined), top.revision);
+      if (saved === 'stale') continue;
+      return top.id === session.id ? 'self' : 'other';
+    }
+    return 'stale';
   }
 
   private async stopNativeTask(command: CommandOf<'nativeTask.stop'>): Promise<CommandResult> {

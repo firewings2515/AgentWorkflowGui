@@ -106,6 +106,7 @@ export type PinnedLists = z.infer<typeof PinnedLists>;
  * Preferences saved before 0.7 have no `supervisor` and read with its defaults. `workFolderRoot` (T048, Q-1): where
  * new work folders are made, as the user wrote it; absent, the default location (`Snapshot.defaultWorkFolderRoot`).
  * `pinned` (U2, 0.9): absent on preferences saved before 0.9 or never pinned, read as both lists empty (`pinnedOf`).
+ * `autoArchiveDays` (U4, 0.10): see AUTO_ARCHIVE_DEFAULT_DAYS and `autoArchiveDaysOf`.
  * `preferences.set` replaces the whole record, so a sender keeps the fields it does not change.
  */
 export const UiPreferences = z.strictObject({
@@ -113,11 +114,22 @@ export const UiPreferences = z.strictObject({
   supervisor: SupervisorSettings.default({ idleCloseMinutes: 15, maxOpenRuntimes: 6 }),
   workFolderRoot: z.string().min(1).optional(),
   pinned: PinnedLists.optional(),
+  /**
+   * Days without a message after which a conversation or an ended run is archived by the main process (U4, 0.10):
+   * 1 to 365; `null` turns the auto-archive off. Absent (preferences saved before 0.10, or never set): 14.
+   */
+  autoArchiveDays: z.number().int().min(1).max(365).nullable().optional(),
 });
 export type UiPreferences = z.infer<typeof UiPreferences>;
 
 /** The pinned lists of saved preferences: both empty when none were saved. */
 export const pinnedOf = (preferences: UiPreferences): PinnedLists => preferences.pinned ?? { chat: [], workflow: [] };
+
+/** Days of no message before the auto-archive takes a conversation or an ended run, when the user set none (U4). */
+export const AUTO_ARCHIVE_DEFAULT_DAYS = 14;
+/** The auto-archive's days of saved preferences: AUTO_ARCHIVE_DEFAULT_DAYS when absent, `null` when turned off. */
+export const autoArchiveDaysOf = (preferences: UiPreferences): number | null =>
+  preferences.autoArchiveDays === undefined ? AUTO_ARCHIVE_DEFAULT_DAYS : preferences.autoArchiveDays;
 
 // Inferred types for schemas that are not typed next to their definition.
 export type TransferState = z.infer<typeof TransferState>;

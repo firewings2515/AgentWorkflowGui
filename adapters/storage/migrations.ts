@@ -407,6 +407,15 @@ UPDATE project SET body = json_set(body, '$.schemaVersion', '0.9.0') WHERE json_
 UPDATE workflow_instance SET body = json_set(body, '$.template.schemaVersion', '0.9.0') WHERE json_extract(body, '$.template.schemaVersion') = '0.8.0';
 `;
 
+// Contracts 0.10 (T059): only the version. `archivedAt` lives in the session and instance bodies (optional, absent before
+// 0.10) and `autoArchiveDays` in the preferences body; the compare-and-set updates rewrite them whole.
+const contracts10V13 = `
+UPDATE agent SET body = json_set(body, '$.schemaVersion', '0.10.0') WHERE json_extract(body, '$.schemaVersion') = '0.9.0';
+UPDATE workflow SET body = json_set(body, '$.schemaVersion', '0.10.0') WHERE json_extract(body, '$.schemaVersion') = '0.9.0';
+UPDATE project SET body = json_set(body, '$.schemaVersion', '0.10.0') WHERE json_extract(body, '$.schemaVersion') = '0.9.0';
+UPDATE workflow_instance SET body = json_set(body, '$.template.schemaVersion', '0.10.0') WHERE json_extract(body, '$.template.schemaVersion') = '0.9.0';
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
@@ -420,6 +429,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 10, name: 'storage-0.7-history', sql: pagingV10 },
   { version: 11, name: 'contracts-0.8', sql: contracts08V11 },
   { version: 12, name: 'contracts-0.9', sql: contracts09V12 },
+  { version: 13, name: 'contracts-0.10', sql: contracts10V13 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;

@@ -44,13 +44,11 @@ const v11 = () => {
 };
 
 describe('v12: data stored under contracts 0.8', () => {
-  it('reads every record as it was, the versioned ones at 0.9.0; the preferences have no pinned lists', async () => {
+  it('reads every record as it was, the versioned ones at the current version; the preferences have no pinned lists', async () => {
     const { session, instance } = v11();
     const db = openDatabase(path);
     try {
-      expect(db.prepare('SELECT max(version) AS v FROM schema_migration').get()?.v).toBe(12);
-      expect(latestVersion()).toBe(12);
-      expect(CONTRACTS_VERSION).toBe('0.9.0');
+      expect(db.prepare('SELECT max(version) AS v FROM schema_migration').get()?.v).toBe(latestVersion());
       const data = await createRepositories(db).readSnapshotData();
       expect(data.agents.map((a) => a.schemaVersion)).toEqual([CONTRACTS_VERSION]);
       expect(data.workflows.map((w) => w.schemaVersion)).toEqual([CONTRACTS_VERSION]);

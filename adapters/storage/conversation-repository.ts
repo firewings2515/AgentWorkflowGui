@@ -151,6 +151,17 @@ export class SqliteConversationRepository implements ConversationRepository {
     return value;
   }
 
+  latestMessageMs(sessionId: SessionId): Promise<number | undefined> {
+    return run(() => {
+      // Newest first on message_by_session (session_id, at_ms); the role and sub-agent checks are those of
+      // countsAsLastMessage (Q-17), so usually the first row read is the answer.
+      const row = this.historyStatement(`SELECT at_ms FROM message INDEXED BY message_by_session WHERE session_id = ?
+        AND json_extract(body, '$.role') IN ('user', 'assistant') AND json_extract(body, '$.nativeTaskId') IS NULL
+        ORDER BY at_ms DESC LIMIT 1`).get(sessionId) as { at_ms: number } | undefined;
+      return row?.at_ms;
+    });
+  }
+
   appendMessage(message: Message): Promise<void> {
     return run(() => {
       const k = KINDS.message;

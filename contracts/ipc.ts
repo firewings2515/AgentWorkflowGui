@@ -62,7 +62,20 @@ export const Command = z.discriminatedUnion('type', [
    * it. A repeat that finds the title already given changes nothing and succeeds (CR-2, 0.9).
    */
   cmd('session.rename', { sessionId: SessionId, expectedRevision: Revision, title: z.string() }),
+  /** Refused with reason `archived` when the session's tree or the new parent's tree is archived (U4, 0.10). */
   cmd('session.reparent', { sessionId: SessionId, expectedRevision: Revision, parentId: SessionId.nullable() }),
+  /**
+   * Archives a conversation (U4, 0.10): the top session of an ordinary tree, with every session below it; only a mark
+   * (`archivedAt` on that session), nothing is deleted, stopped or moved. `expectedRevision` is the top session's. Refused
+   * (CommandResult `reason`) for a session below another (`not-top-level`), a workflow session (`workflow-session`: archive
+   * its run), while a turn of the tree runs (`turn-running`) or an escalation of it is open (`escalation-open`). Its
+   * sessions leave the pinned list (`preferences.updated`). A repeat that finds it archived changes nothing and succeeds
+   * (CR-2). Announced with `session.updated`. `session.send` to a session of an archived tree unarchives it in the same
+   * command.
+   */
+  cmd('session.archive', { sessionId: SessionId, expectedRevision: Revision }),
+  /** Unarchives a conversation (U4, 0.10); its sessions are not pinned again. A repeat that finds it not archived succeeds. */
+  cmd('session.unarchive', { sessionId: SessionId, expectedRevision: Revision }),
   cmd('nativeTask.stop', { sessionId: SessionId, nativeTaskId: NativeTaskId }),
   cmd('agent.save', { agent: AgentDefinition, expectedRevision: Revision.nullable() }),
   /** Rejected with `invalid_transition` while a workflow template or a session uses the Agent (C-01). */
@@ -113,6 +126,14 @@ export const Command = z.discriminatedUnion('type', [
    */
   cmd('workflow.rename', { instanceId: InstanceId, expectedRevision: Revision, title: z.string() }),
   cmd('workflow.cancel', { instanceId: InstanceId, expectedRevision: Revision }),
+  /**
+   * Archives a run (U4, 0.10), as session.archive does a conversation: only an ended run (`run-not-ended`), not while a
+   * turn of its sessions runs or an escalation of it is open. The run and its node sessions leave the pinned list.
+   * Announced with `instance.updated`. `session.send` to one of its sessions unarchives it in the same command.
+   */
+  cmd('workflow.archive', { instanceId: InstanceId, expectedRevision: Revision }),
+  /** Unarchives a run (U4, 0.10); nothing is pinned again. A repeat that finds it not archived succeeds. */
+  cmd('workflow.unarchive', { instanceId: InstanceId, expectedRevision: Revision }),
   /** Retry removing a task's or a merge attempt's worktree recorded as `pending-cleanup` (SP-07). */
   cmd('task.retryCleanup', { instanceId: InstanceId, taskId: TaskId }),
   cmd('project.save', { project: ProjectSettings, expectedRevision: Revision.nullable() }),
@@ -153,6 +174,22 @@ export const ErrorCode = z.enum([
   'internal_error', // the main process failed or produced a result outside the contracts (C-02)
 ]);
 
+/**
+ * Why a command was refused, when its code alone does not say (U4, 0.10), so the renderer can explain it without reading
+ * the message. Every value and the code it comes with:
+ * - `not-top-level` (`invalid_request`): the session sits below another; only the top session of a tree is archived.
+ * - `workflow-session` (`invalid_request`): a workflow session; its run is archived instead (`workflow.archive`).
+ * - `turn-running` (`invalid_transition`, retryable): a turn of a session of the tree or run is running (or waits for the
+ *   user, a file lock or a delivery's outcome), or a transfer of one of its sessions is under way.
+ * - `escalation-open` (`invalid_transition`): an escalation of the tree or run is still open, or a transfer of one of its
+ *   sessions waits for the user's confirmation.
+ * - `run-not-ended` (`invalid_transition`): the run is not completed or cancelled.
+ * - `archived` (`invalid_transition`): the session (or the new parent of `session.reparent`, the parent of
+ *   `session.create`, the source of `transfer.prepare`) is in an archived tree; unarchive it first.
+ */
+export const CommandRefusal = z.enum(['not-top-level', 'workflow-session', 'turn-running', 'escalation-open', 'run-not-ended', 'archived']);
+export type CommandRefusal = z.infer<typeof CommandRefusal>;
+
 /** Receipt of what a command created; the IDs are the ones the command carried. */
 export const CreatedRef = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('session'), id: SessionId }),
@@ -172,6 +209,8 @@ export const CommandResult = z.discriminatedUnion('ok', [
     retryable: z.boolean(),
     /** True when a side effect may already have happened (do not blindly retry). */
     mayHaveSideEffects: z.boolean(),
+    /** Why, when the code alone does not say (CommandRefusal, 0.10); absent otherwise and on results before 0.10. */
+    reason: CommandRefusal.optional(),
   }),
 ]);
 export type CommandResult = z.infer<typeof CommandResult>;
