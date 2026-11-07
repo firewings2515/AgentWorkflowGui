@@ -124,6 +124,8 @@ const fail = (requestId: Failure['requestId'], code: Failure['code'], message: s
 const rejected = (reason: McpRejection['reason'], detail: string) => ({ status: 'rejected' as const, rejection: { reason, detail } });
 const SHUTTING_DOWN = rejected('shutting-down', 'the GUI is closing');
 const NOT_IN_WORKFLOW = rejected('not-in-workflow', 'this tool works in workflow sessions only');
+/** A report once its run has ended (T065 r3, root's too from T066): the caller is told, as for a handoff. */
+const RUN_ENDED = rejected('invalid-input', 'this workflow run has ended');
 const RESEND_MISMATCH = rejected('resend-mismatch', 'this operation carries another handoff');
 const NOT_OWNER = rejected('not-owner', 'this operation belongs to another call');
 const RESOLVER_ONLY = rejected('invalid-input', 'this session resolves a merge conflict: end your turn when it is resolved (or cannot be), and the GUI takes it from there');
@@ -1266,10 +1268,15 @@ export class WorkflowEngine implements WorkflowHooks {
 
     // Root reports to the user directly: nothing is delivered, only the question, named after the call so a
     // resend of it (even after a restart) finds the same one (r1-P1-7).
+    // Once the run has ended root is told so, as a node is (T066): no new question of an ended run. The same call again
+    // finds the question it opened before the end.
+    const over = instance.state === 'completed' || instance.state === 'cancelled';
     if (caller.id === rootId) {
-      if (!input.needsUserConfirmation) return { status: 'reported' };
+      if (!input.needsUserConfirmation) return over ? RUN_ENDED : { status: 'reported' };
       const digest = (await this.options.hashPayload(JSON.stringify([caller.id, ctx.sourceCallRef]))).slice('sha256:'.length, 'sha256:'.length + 40);
-      const escalation = await this.openReportQuestion(instance, caller.id, from, OperationIdSchema.parse(`report-root-${digest}`));
+      const operationId = OperationIdSchema.parse(`report-root-${digest}`);
+      if (over && (await this.repos.escalations.get(reportConfirmationId(operationId))) === undefined) return RUN_ENDED;
+      const escalation = await this.openReportQuestion(instance, caller.id, from, operationId);
       return { status: 'reported', escalationId: escalation.id };
     }
     // The same call again after a restart (CR2 §4): the report it made, with its question if it asked one
@@ -1285,7 +1292,7 @@ export class WorkflowEngine implements WorkflowHooks {
     }
     // In the run's queue, as its end is (T065 r3): once the end is committed no new report of the run is accepted, so none
     // is sent to root after it; the caller is told, as a handoff is. The same call again (above) still finds its report.
-    if (instance.state === 'completed' || instance.state === 'cancelled') return rejected('invalid-input', 'this workflow run has ended');
+    if (over) return RUN_ENDED;
     // Whether the report asks the user is part of its stored identity, so a restart can restore the question.
     const operationId = OperationIdSchema.parse(`${input.needsUserConfirmation ? REPORT_ASKING : REPORT}${this.options.uuid()}`);
     const peerMessageId = peerIdOf(operationId);
@@ -1497,6 +1504,11 @@ export class WorkflowEngine implements WorkflowHooks {
   /** `WorkflowHooks.beforeRecover` (T065 r3): the reports and notices to root of every ended run are closed first. */
   async beforeRecover(): Promise<void> {
     await this.pipeline?.closeEndedRuns();
+  }
+
+  /** `WorkflowHooks.inRunQueue` (T066): the run's own queue, where its end, its handoffs and its reports run. */
+  inRunQueue<T>(instanceId: InstanceId, fn: () => Promise<T>): Promise<T> {
+    return this.serial(`instance:${instanceId}`, fn);
   }
 
   /**
