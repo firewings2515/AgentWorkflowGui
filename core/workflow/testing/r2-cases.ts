@@ -42,13 +42,14 @@ export const r2Cases = (backend: string, make: (workflow?: WorkflowTemplate) => 
     it('r2-P1-1 a handoff queued before its task stopped at a limit is cancelled, not sent when the turn ends, nor after a restart', async () => {
       const w = await make(template({ reworkLimit: 1 }));
       const { impl, review } = await toReviewOnce(w);
-      // Implement is busy; review sends the task back (queued), then implement's own handoff goes over the limit.
+      // Implement is busy; review sends the task back (queued), then root sends it back once more: a second loop,
+      // over the limit (T064: one loop is one rework).
       w.holding.add(impl);
       w.emitTurn(impl, 'busy-1', 'running');
       await settle();
       const queued = await handoff(w, review, { ...rework, content: 'queued' }, { operationId: 'op-queued' });
       expect(queued).toMatchObject({ status: 'accepted', delivery: 'pending' });
-      expect(await handoff(w, impl, toReview)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
+      expect(await handoff(w, ROOT, toImpl)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
       expect((await instanceOf(w)).tasks[0]?.status).toBe('blocked');
       const stored = (await w.repositories.handoffs.listByInstance(INSTANCE)).find((h) => h.operationId === 'op-queued');
       expect(stored).toMatchObject({ delivery: { state: 'pending' }, outcome: { kind: 'cancelled' } });
@@ -73,7 +74,7 @@ export const r2Cases = (backend: string, make: (workflow?: WorkflowTemplate) => 
       await settle();
       await handoff(w, review, { ...rework, content: 'queued' }, { operationId: 'op-queued' });
       crashOnce(w.store, 'recordOutcome');
-      expect(await handoff(w, impl, toReview)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
+      expect(await handoff(w, ROOT, toImpl)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
       expect((await w.repositories.handoffs.listByInstance(INSTANCE)).find((h) => h.operationId === 'op-queued')?.outcome).toBeUndefined();
       const before = received(w, impl).length;
       w.emitTurn(impl, 'busy-1', 'completed');

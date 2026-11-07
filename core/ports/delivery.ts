@@ -69,9 +69,10 @@ export interface HandoffMeta {
   fromSessionId: SessionId;
   ruleId: string;
   /**
-   * Whether this handoff is rework (R-05): its target node already received a handoff of this task in this
-   * instance. Every return counts: plan → implement → review → implement → review is two reworks (the
-   * second implement and the second review). Decided by the caller at acceptance, stored with the handoff
+   * Whether this handoff is rework (R-05, T064): it raises the task's rework count, the most times the task
+   * came back to any one node in this instance. One loop counts once: plan → implement → review → implement →
+   * review is one rework (the second implement; the second review adds nothing). Handoffs stored before T064
+   * marked every return. Decided by the caller at acceptance, stored with the handoff
    * and shown as `Handoff.rework`; the same acceptance advances the task's rework count key, so the limit,
    * a restart (`WorkflowTask.reworkCount` is rebuilt from the handoffs) and the progress view agree.
    */
@@ -92,7 +93,7 @@ export interface PeerMeta {
 
 /**
  * One receive count checked and advanced in the acceptance transaction, once per operationId (R-04 step 3).
- * A handoff counts the target node's receipts of the task and, when it goes back to an earlier node, the
+ * A handoff counts the target node's receipts of the task and, when it is rework (`HandoffMeta.rework`), the
  * task's rework (R-05); `limit` absent means count only.
  */
 export interface ReceiveCount {

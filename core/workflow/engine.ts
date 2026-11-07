@@ -635,7 +635,7 @@ export class WorkflowEngine implements WorkflowHooks {
       if (this.pipeline?.heldPlanOf((await this.repos.instances.get(instance.id)) ?? instance, taskId) === undefined) await this.settleHeldNow(instance.id);
       return { status: 'accepted', handoffId, operationId: ctx.operationId, delivery: 'pending' };
     }
-    const reworkCount = accepted.counts?.find((c) => c.key === reworkKey(instance.id, taskId))?.count;
+    const reworkCount = this.reworkAfter(instance, handoffs, taskId, accepted.counts);
     // A task held at a blocked round stays held (the user decides it); one not started yet waits to start (T032).
     await this.updateTask(instance.id, taskId, (t) => ({
       ...t,
@@ -726,7 +726,7 @@ export class WorkflowEngine implements WorkflowHooks {
       case 'commit-uncertain':
         throw new Error('accepting the handoff could not be confirmed');
     }
-    const reworkCount = accepted.counts?.find((c) => c.key === reworkKey(instance.id, taskId))?.count;
+    const reworkCount = this.reworkAfter(instance, handoffs, taskId, accepted.counts);
     if (reworkCount !== undefined) await this.updateTask(instance.id, taskId, (t) => ({ ...t, reworkCount }));
     await pipeline.enqueue((await this.repos.instances.get(instance.id)) ?? instance, taskId, to, accepted.record.acceptedAt);
     await this.publishHandoff(handoffId);
@@ -801,7 +801,7 @@ export class WorkflowEngine implements WorkflowHooks {
         this.log(`the merge node's handoff of ${taskId} was not accepted (${accepted.status})`);
         return 'failed';
       }
-      const reworkCount = accepted.status === 'accepted' ? accepted.counts?.find((c) => c.key === reworkKey(instance.id, taskId))?.count : undefined;
+      const reworkCount = accepted.status === 'accepted' ? this.reworkAfter(instance, handoffs, taskId, accepted.counts) : undefined;
       if (reworkCount !== undefined) await this.updateTask(instance.id, taskId, (t) => ({ ...t, reworkCount }));
       await this.publishHandoff(handoffId);
       await this.syncSafely(instance.id);
@@ -1119,6 +1119,17 @@ export class WorkflowEngine implements WorkflowHooks {
       const reworkCount = taskProgress(after, taskId, (h) => this.counted(now, h)).reworkCount;
       await this.updateTask(instanceId, taskId, (t) => (t.reworkCount === reworkCount ? undefined : { ...t, reworkCount }));
     }
+  }
+
+  /**
+   * The task's rework count after an accepted handoff that counted rework (its `counts` have the rework key), else
+   * undefined (unchanged). Taken from the marked handoffs, as a restart rebuilds it (`recover`), not from the store's
+   * count of the key: held handoffs (G-11) are counted at the approval without reaching the store's count, so that
+   * number can be lower (T064 r1 P2-1). `handoffs`: the instance's handoffs before this one.
+   */
+  private reworkAfter(instance: WorkflowInstance, handoffs: readonly Handoff[], taskId: TaskId, counts: readonly { key: string }[] | undefined): number | undefined {
+    if (counts?.some((c) => c.key === reworkKey(instance.id, taskId)) !== true) return undefined;
+    return taskProgress(handoffs, taskId, (h) => this.counted(instance, h)).reworkCount + 1;
   }
 
   /**

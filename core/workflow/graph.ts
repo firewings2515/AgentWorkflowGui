@@ -39,13 +39,35 @@ export const receiveKey = (instanceId: InstanceId, taskId: TaskId, nodeId: NodeI
 export const reworkKey = (instanceId: InstanceId, taskId: TaskId): string => JSON.stringify(['rework', instanceId, taskId]);
 
 /**
- * Rework (R-05, `HandoffMeta.rework`): the target node already received a handoff of this task in this
- * instance. Every return counts: plan → implement → review → implement → review is two. A node that waits
- * for all upstream counts rounds (CR-4): with `round` given, only an earlier round is a return, never another
- * arrival of the same round.
+ * How many times a node received the task so far (R-04 step 3). A node that waits for all upstream receives
+ * rounds (`byRound`, CR-4): the arrivals of one round count once, those of `exceptRound` (the round arriving
+ * now) not at all; handoffs stored before T031 (round 0) count one by one, as T024 counted them (r1-P1-6).
+ */
+export const receivedCount = (handoffs: readonly Handoff[], taskId: TaskId, toNodeId: NodeId, byRound = false, exceptRound?: number): number => {
+  const received = handoffs.filter((h) => h.taskId === taskId && h.toNodeId === toNodeId && (exceptRound === undefined || h.round !== exceptRound));
+  return byRound ? new Set(received.filter((h) => h.round !== 0).map((h) => h.round)).size + received.filter((h) => h.round === 0).length : received.length;
+};
+
+/** The task's rework so far (R-05): its handoffs marked as rework, the one record the limit and the views count. */
+export const reworkSoFar = (handoffs: readonly Handoff[], taskId: TaskId): number => handoffs.filter((h) => h.taskId === taskId && h.rework).length;
+
+/**
+ * Rework (R-05, `HandoffMeta.rework`, T064). A task's rework count is how often it came back to one node, the
+ * most of any node: the maximum over the nodes of (receipts - 1). A handoff is rework when it raises that count:
+ * when its target already received the task more times than the count so far. So one loop counts once, whatever
+ * nodes it passes: plan → implement → review → plan → implement → review → plan is one (the second implement),
+ * and in that shape the report to root at the end, which root received fewer times than the loop's nodes, is
+ * none. It is no promise for every graph: with a limit of 0, root handing the task to A and B, each reporting to
+ * root, B's report is root's second receipt, more than the count of 0, so it is rework (T064 r1 P2-2).
+ * Marked this way, the handoffs marked as rework are always that maximum, so the limit, a restart
+ * (`taskProgress`) and the store's count of the rework key agree.
+ * Marks stored before T064 (every return was rework) stay: the count goes on from them and grows again only
+ * once a node's receipts pass it, so a run started before stops exactly where this count stops it.
+ * A node that waits for all upstream counts rounds (CR-4): with `round` given, its receipts are the earlier
+ * rounds, never another arrival of the same round.
  */
 export const isRework = (handoffs: readonly Handoff[], taskId: TaskId, toNodeId: NodeId, round?: number): boolean =>
-  handoffs.some((h) => h.taskId === taskId && h.toNodeId === toNodeId && (round === undefined || h.round !== round));
+  receivedCount(handoffs, taskId, toNodeId, round !== undefined, round) > reworkSoFar(handoffs, taskId);
 
 /** What a task's handoffs say about it: the rework count and where it went last (rebuilt after a restart). */
 export const taskProgress = (handoffs: readonly Handoff[], taskId: TaskId, counted: (handoff: Handoff) => boolean = () => true): { reworkCount: number; lastNodeId?: NodeId } => {
@@ -68,12 +90,10 @@ export interface HandoffCounts {
  */
 export const handoffCounts = (instance: WorkflowInstance, handoffs: readonly Handoff[], taskId: TaskId, toNode: WorkflowNode, rework: boolean, byRound = false): HandoffCounts => {
   const limit = receiveLimit(toNode);
-  const received = handoffs.filter((h) => h.taskId === taskId && h.toNodeId === toNode.id);
-  // Handoffs stored before T031 (round 0) count one by one, as T024 counted them (r1-P1-6).
-  const count = byRound ? new Set(received.filter((h) => h.round !== 0).map((h) => h.round)).size + received.filter((h) => h.round === 0).length : received.length;
+  const count = receivedCount(handoffs, taskId, toNode.id, byRound);
   const receive = { key: receiveKey(instance.id, taskId, toNode.id), count, ...(limit !== undefined && { limit }), what: 'receive' as const };
   const current: HandoffCounts['current'] = [receive];
-  if (rework) current.push({ key: reworkKey(instance.id, taskId), count: handoffs.filter((h) => h.taskId === taskId && h.rework).length, limit: instance.template.reworkLimit, what: 'rework' });
+  if (rework) current.push({ key: reworkKey(instance.id, taskId), count: reworkSoFar(handoffs, taskId), limit: instance.template.reworkLimit, what: 'rework' });
   return { counts: current.map((c) => ({ key: c.key, ...(c.limit !== undefined && { limit: c.limit }) })), current };
 };
 
@@ -157,7 +177,7 @@ export const briefing = (instance: WorkflowInstance, node: AgentNode, taskId: Ta
   }
   lines.push(
     '',
-    `The GUI counts every return of the task to a node that already had it: at most ${String(template.reworkLimit)} for this task. Past a limit the GUI does not hand off and asks the user instead.`,
+    `The GUI counts the rework of the task: a handoff counts once when its target node already received the task more times than the rework counted so far. So each time the task comes back to the same node counts once, and the other nodes of that loop usually add nothing. At most ${String(template.reworkLimit)} for this task. Past a limit the GUI does not hand off and asks the user instead.`,
     `Use \`report_to_root\` for progress or a question for the user (set needsUserConfirmation to ask the user).${pipelined ? '' : ' `create_tasks` is not available in this version.'}`,
   );
   return lines.join('\n');

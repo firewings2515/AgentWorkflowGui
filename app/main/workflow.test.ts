@@ -198,12 +198,13 @@ describe('the workflow engine in the backend (T024)', () => {
     const [instance] = snap.instances;
     expect(instance).toMatchObject({ id: INSTANCE, workflowRevision: 0, rootSessionId: ROOT, template: { reworkLimit: 2 } });
     expect(instance?.crossToolConsentAt).toBeDefined();
-    expect(instance?.tasks[0]).toMatchObject({ reworkCount: 2, currentNodeId: PLAN });
+    // One loop is one rework (T064): the second review adds nothing.
+    expect(instance?.tasks[0]).toMatchObject({ reworkCount: 1, currentNodeId: PLAN });
     expect(snap.handoffs.map((h) => [h.fromNodeId, h.toNodeId, h.rework, h.delivery.state])).toEqual([
       [PLAN, IMPL, false, 'sent'],
       [IMPL, REVIEW, false, 'sent'],
       [REVIEW, IMPL, true, 'sent'],
-      [IMPL, REVIEW, true, 'sent'],
+      [IMPL, REVIEW, false, 'sent'],
       [REVIEW, PLAN, false, 'sent'],
     ]);
     // One session per (node, task): three sessions, implement and review reused for the rework.

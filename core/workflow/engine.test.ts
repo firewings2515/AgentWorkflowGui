@@ -60,7 +60,9 @@ describe('workflow.start (R-11, R-06)', () => {
     // Root is told its rules and the rework limit at start (R-05).
     expect(w.claude.started[0]?.instructions).toContain('Planner instructions.');
     expect(w.claude.started[0]?.instructions).toContain('ruleId `to-impl`');
-    expect(w.claude.started[0]?.instructions).toContain('at most 2 for this task');
+    expect(w.claude.started[0]?.instructions).toContain('At most 2 for this task');
+    // One loop counts once (T064).
+    expect(w.claude.started[0]?.instructions).toContain('each time the task comes back to the same node counts once');
     expect(w.claude.started[0]?.cwd).toBe(CWD);
   });
 
@@ -93,7 +95,7 @@ describe('workflow.start (R-11, R-06)', () => {
 });
 
 describe('handoff (R-04 steps 1-7)', () => {
-  it('runs the template flow: plan → implement → review (sent back once) → implement → review → root, counting rework twice', async () => {
+  it('runs the template flow: plan → implement → review (sent back once) → implement → review → root, counting rework once (T064)', async () => {
     const w = await world();
     await started(w);
     // No implement session before the first handoff to it (R-06).
@@ -118,7 +120,8 @@ describe('handoff (R-04 steps 1-7)', () => {
       [PLAN, IMPL, false],
       [IMPL, REVIEW, false],
       [REVIEW, IMPL, true],
-      [IMPL, REVIEW, true],
+      // The second review is the same loop: no rework of its own (T064).
+      [IMPL, REVIEW, false],
       [REVIEW, PLAN, false],
     ]);
     // Rework goes back to the same session: one implement session, created once.
@@ -127,13 +130,13 @@ describe('handoff (R-04 steps 1-7)', () => {
     expect(w.codex.get(impl)?.started).toHaveLength(1);
     expect(handoffs[4]?.target.sessionId).toBe(ROOT);
     const instance = await instanceOf(w);
-    expect(instance.tasks[0]).toMatchObject({ reworkCount: 2, currentNodeId: PLAN, status: 'running' });
+    expect(instance.tasks[0]).toMatchObject({ reworkCount: 1, currentNodeId: PLAN, status: 'running' });
     // Each payload went through the delivery service once, marked as a handoff, never as the user (R-03).
     const sent = dispatches(w).filter((d) => d.origin?.kind === 'handoff');
     expect(sent).toHaveLength(5);
     expect(sent.every((d) => d.entry.kind === 'new-turn')).toBe(true);
     expect(w.events.some((e) => e.type === 'handoff.updated')).toBe(true);
-    expect(w.events.filter((e) => e.type === 'instance.updated').at(-1)).toMatchObject({ instance: { tasks: [{ reworkCount: 2 }] } });
+    expect(w.events.filter((e) => e.type === 'instance.updated').at(-1)).toMatchObject({ instance: { tasks: [{ reworkCount: 1 }] } });
   });
 
   it('a third return over the rework limit is not handed off: root gets a limit escalation and the task is blocked', async () => {
@@ -143,13 +146,17 @@ describe('handoff (R-04 steps 1-7)', () => {
     const impl = await sessionOf(w, IMPL);
     await handoff(w, impl, toReview);
     const review = await sessionOf(w, REVIEW);
-    await handoff(w, review, rework);
-    await handoff(w, impl, toReview);
+    // Sent back twice, each loop one rework (T064): within the limit of 2.
+    for (let i = 0; i < 2; i++) {
+      expect(await handoff(w, review, rework)).toMatchObject({ status: 'accepted' });
+      expect(await handoff(w, impl, toReview)).toMatchObject({ status: 'accepted' });
+    }
+    expect((await instanceOf(w)).tasks[0]?.reworkCount).toBe(2);
     const before = dispatches(w).length;
     const over = await handoff(w, review, rework);
     expect(over).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
     expect(dispatches(w)).toHaveLength(before);
-    expect(await w.repositories.handoffs.listByInstance(INSTANCE)).toHaveLength(4);
+    expect(await w.repositories.handoffs.listByInstance(INSTANCE)).toHaveLength(6);
     const [escalation] = await escalations(w);
     expect(escalation).toMatchObject({ kind: 'limit-exceeded', rootSessionId: ROOT, instanceId: INSTANCE, fromSessionId: review, state: 'open', ref: { kind: 'task' } });
     expect((await instanceOf(w)).tasks[0]?.status).toBe('blocked');
@@ -249,7 +256,10 @@ describe('handoff (R-04 steps 1-7)', () => {
     // Review wakes with no input from anyone, and its turn calls handoff again.
     turn(w, review, 'running', 'turn-wake');
     await settle();
-    expect(await handoff(w, impl, toReview)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
+    // The second review is the same loop (T064): no rework, and it waits for review's own turn.
+    expect(await handoff(w, impl, toReview)).toMatchObject({ status: 'accepted', delivery: 'pending' });
+    // The woken turn sends the task back again: a second loop, over the limit of 1.
+    expect(await handoff(w, review, rework)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
     expect((await w.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.rework)).toHaveLength(1);
   });
 
@@ -374,11 +384,15 @@ describe('restart', () => {
     expect(adapter?.dispatched).toHaveLength(1);
     expect(adapter?.dispatched[0]).toMatchObject({ origin: { kind: 'handoff', fromSessionId: review } });
     expect((await instanceOf(after)).tasks[0]).toMatchObject({ reworkCount: 1, currentNodeId: IMPL });
-    // Counting continues from the store after the restart: the next return is the second rework.
+    // Counting continues from the store after the restart: the second review is the same loop (T064), the
+    // next return is the second rework.
     const record = await after.store.get((await after.repositories.handoffs.listByInstance(INSTANCE)).at(-1)!.operationId);
     expect(record?.kind === 'handoff' && record.handoff?.rework).toBe(true);
     expect(await handoff(after, impl, toReview)).toMatchObject({ status: 'accepted' });
-    expect((await instanceOf(after)).tasks[0]).toMatchObject({ reworkCount: 2, currentNodeId: REVIEW });
+    expect((await instanceOf(after)).tasks[0]).toMatchObject({ reworkCount: 1, currentNodeId: REVIEW });
+    expect(await handoff(after, review, rework)).toMatchObject({ status: 'accepted' });
+    expect((await after.repositories.handoffs.listByInstance(INSTANCE)).at(-1)?.rework).toBe(true);
+    expect((await instanceOf(after)).tasks[0]).toMatchObject({ reworkCount: 2, currentNodeId: IMPL });
     expect(reworkKey(INSTANCE, (await instanceOf(after)).tasks[0]!.id)).toBe(JSON.stringify(['rework', INSTANCE, `${INSTANCE}:task`]));
   });
 
