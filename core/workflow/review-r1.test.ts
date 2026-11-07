@@ -41,12 +41,14 @@ describe('T024 review r1', () => {
     const w = await world(template({ reworkLimit: 1 }));
     const { impl, review } = await toReviewOnce(w);
     await handoff(w, review, rework);
-    expect(await handoff(w, impl, toReview)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
+    // One loop is one rework (T064): the second time back is over the limit of 1.
+    await handoff(w, impl, toReview);
+    expect(await handoff(w, review, rework)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
     const before = dispatches(w).length;
     const toRoot = await handoff(w, review, done);
     expect(toRoot).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
     expect(dispatches(w)).toHaveLength(before);
-    expect(await w.repositories.handoffs.listByInstance(INSTANCE)).toHaveLength(3);
+    expect(await w.repositories.handoffs.listByInstance(INSTANCE)).toHaveLength(4);
     expect((await instanceOf(w)).tasks[0]?.status).toBe('blocked');
     // The user seeing the escalation does not unblock it: there is no command for that yet.
     const id = toRoot.status === 'escalated' ? toRoot.escalationId : EscalationId.parse('x');

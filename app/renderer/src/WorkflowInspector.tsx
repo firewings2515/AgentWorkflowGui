@@ -25,17 +25,22 @@ function OutputDestination({ workflow, node, rule, ruleIndex, inputProps, choice
     {value !== current && <p className="muted">目的地尚未套用；切換節點會保留選擇，儲存前需套用或放棄。</p>}
   </>;
 }
-export function WorkflowField({ path, label, issues, children }: {
-  path: string; label: string; issues: WorkflowIssue[];
+export function WorkflowField({ path, label, hint, issues, children }: {
+  path: string; label: string; hint?: string; issues: WorkflowIssue[];
   children: (props: { id: string; 'aria-invalid': boolean; 'aria-describedby': string | undefined }) => ReactNode;
 }) {
   const errors = issues.filter(issue => issue.path === path || issue.path.startsWith(`${path}.`));
   const id = workflowFieldId(path);
+  const describedBy = [hint === undefined ? '' : `${id}-hint`, errors.length ? `${id}-error` : ''].filter(Boolean).join(' ');
   return <div className="workflow-field"><label htmlFor={id}>{label}</label>
-    {children({ id, 'aria-invalid': !!errors.length, 'aria-describedby': errors.length ? `${id}-error` : undefined })}
+    {children({ id, 'aria-invalid': !!errors.length, 'aria-describedby': describedBy || undefined })}
+    {hint !== undefined && <p id={`${id}-hint`} className="v4-muted v4-field-hint">{hint}</p>}
     {!!errors.length && <p id={`${id}-error`} className="field-error">{errors.map(issue => issue.message).join('；')}</p>}
   </div>;
 }
+
+/** How the GUI counts rework (R-05, T064), told next to the limit so it means what a run counts. */
+export const REWORK_LIMIT_HINT = 'task 每繞回同一個節點一次算 1 次；同一圈經過的其他節點不另外算，最後回報 root 也不算。超過上限就停止交接，交給你決定。';
 
 export function WorkflowSettings({ workflow, issues, onChange, onRoot }: {
   workflow: WorkflowTemplate; issues: WorkflowIssue[]; onChange: (value: WorkflowTemplate) => void; onRoot: (id: NodeId) => void;
@@ -49,7 +54,7 @@ export function WorkflowSettings({ workflow, issues, onChange, onRoot }: {
     <WorkflowField path="isolation" label="Task 隔離" issues={issues}>{props => <select {...props} value={workflow.isolation} onChange={event => onChange({ ...workflow, isolation: event.target.value === 'worktree' ? 'worktree' : 'same-folder' })}>
       {Object.entries(isolationLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
     </select>}</WorkflowField>
-    <WorkflowField path="reworkLimit" label="返工上限" issues={issues}>{props => <input {...props} type="number" min={0} step={1} value={Number.isNaN(workflow.reworkLimit) ? '' : workflow.reworkLimit} onChange={event => onChange({ ...workflow, reworkLimit: event.target.valueAsNumber })} />}</WorkflowField>
+    <WorkflowField path="reworkLimit" label="返工上限" hint={REWORK_LIMIT_HINT} issues={issues}>{props => <input {...props} type="number" min={0} step={1} value={Number.isNaN(workflow.reworkLimit) ? '' : workflow.reworkLimit} onChange={event => onChange({ ...workflow, reworkLimit: event.target.valueAsNumber })} />}</WorkflowField>
   </>;
 }
 

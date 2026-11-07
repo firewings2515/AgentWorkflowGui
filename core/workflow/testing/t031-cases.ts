@@ -35,7 +35,7 @@ import {
 } from './harness';
 import { hashOf } from '../../delivery/testing/fixtures';
 import type { AcceptInput, HandoffMeta } from '../../ports';
-import { handoffCounts, isRework, nodeOf } from '../graph';
+import { handoffCounts, nodeOf } from '../graph';
 import { crashOnce } from './r2-cases';
 
 export const RA = NodeId.parse('review-a');
@@ -117,7 +117,8 @@ const asBaseline = (w: World) => {
     const meta = input.handoff;
     const target = nodeOf(instance.template, meta.toNodeId)!;
     const handoffs = await w.repositories.handoffs.listByInstance(INSTANCE);
-    const rework = isRework(handoffs, meta.taskId, meta.toNodeId);
+    // T024 marked every return as rework (before T064).
+    const rework = handoffs.some((h) => h.taskId === meta.taskId && h.toNodeId === meta.toNodeId);
     const { counts } = handoffCounts(instance, handoffs, meta.taskId, target, rework);
     const payload = input.payload
       .split('\n')
@@ -280,14 +281,15 @@ export const t031Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       await settle();
       expect((await roundsOf(w)).map((r) => r.state)).toEqual(['ready', 'ready']);
       expect(received(w, join)).toEqual(['A1', 'B1', 'A2', 'B2']);
-      // The second round is rework of Verdict, counted once (with the two reviews' second handoffs, three).
+      // The second fan-out is one loop, one rework (T064): Review A's second handoff counts it; Review B's and
+      // Verdict's second round are the same loop and add nothing.
       expect((await arrivalsAt(w)).map((h) => [h.round, h.rework])).toEqual([
         [1, false],
-        [2, true],
+        [2, false],
         [1, false],
         [2, false],
       ]);
-      expect((await instanceOf(w)).tasks[0]?.reworkCount).toBe(3);
+      expect((await instanceOf(w)).tasks[0]?.reworkCount).toBe(1);
     });
 
     it('r1-P1-1 an arrival the user confirms later keeps the round of its call, not the work its sender got since', async () => {

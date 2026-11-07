@@ -422,7 +422,7 @@ export const Handoff = z
     toNodeId: NodeId,
     fromSessionId: SessionId,
     ruleId: z.string().min(1),
-    /** Rework (R-05): the target node already received a handoff of this task; see `HandoffMeta.rework`. */
+    /** Rework (R-05): this handoff raised the task's rework count (the task came back to a node once more); see `HandoffMeta.rework`. */
     rework: z.boolean().default(false),
     payload: z.string(),
     payloadHash: PayloadHash,
