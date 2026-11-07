@@ -366,7 +366,12 @@ interface Echo {
 interface LateCheck {
   sessionId: SessionId;
   attemptId: AttemptId;
+  /** Escalated at the limit while its turn still ran: the user's question now, no longer being confirmed (r1 P1-3). */
+  escalated: boolean;
   running?: Promise<void> | undefined;
+  runningCause?: 'turn-ended' | 'limit' | undefined;
+  /** The turn ended while the limit's reconcile ran: looked at again once that run is over. */
+  turnEndedMeanwhile?: boolean;
 }
 
 /** A delivery-unknown escalation is named after its attempt, so a restart never opens a second one. */
@@ -695,6 +700,9 @@ export class SessionService {
           return workflowSessions.has(record.spec.sessionId) && !withWork.has(record.spec.sessionId) ? 'skip' : {};
         }
         if (record.kind === 'transfer' && transfer !== undefined) return 'skip';
+        // A notice or report that ended apart from delivery (its run ended, T065 r1 P1-1) is never sent; one whose run
+        // ended without that written yet is refused right before its claim (`endedApart`).
+        if ((record.kind === 'system-notice' || record.kind === 'peer-message') && record.outcome !== undefined) return 'skip';
         // A formal handoff goes through the one queue of its target (T024 r1-P1-2), below.
         if (record.kind === 'handoff' && record.target.sessionId !== undefined) {
           handoffs.push({ operationId: record.operationId, sessionId: record.target.sessionId });
@@ -2634,6 +2642,26 @@ export class SessionService {
       throw error instanceof ResumeRefused ? error : new ResumeFailed(error instanceof Error ? error.message : String(error), { cause: error });
     }
     if (record.kind === 'transfer' && this.transfer !== undefined && !(await this.transfer.mayDispatch(record))) throw new Error('the transfer no longer sends this');
+    // Checked last, after every wait above and right before the claim (T065 r1 P1-1/P1-2): a notice or report whose run
+    // ended meanwhile (or that ended apart from delivery) is not sent, whichever path dispatches it (a restart included).
+    if (await this.endedApart(record)) throw new Error('it ended with its workflow run; it is not sent');
+  }
+
+  /**
+   * A notice or report that is not sent any more (T065): it ended apart from delivery (`outcome`), or its workflow run
+   * has ended (a notice to that run's session, a report to that run's root), its `outcome` perhaps not written yet.
+   */
+  private async endedApart(record: StoredDelivery): Promise<boolean> {
+    if (record.kind !== 'system-notice' && record.kind !== 'peer-message') return false;
+    const fresh = await this.store.get(record.operationId);
+    if (fresh?.outcome !== undefined) return true;
+    const sessionId = record.target.sessionId;
+    const session = sessionId === undefined ? undefined : await this.repos.sessions.get(sessionId);
+    if (session?.kind !== 'workflow') return false;
+    if (record.kind === 'peer-message' && record.peer?.instanceId !== session.workflow.instanceId) return false;
+    const instance = await this.repos.instances.get(session.workflow.instanceId);
+    if (instance === undefined || (instance.state !== 'completed' && instance.state !== 'cancelled')) return false;
+    return record.kind === 'system-notice' || instance.rootSessionId === sessionId;
   }
 
   /**
@@ -2822,7 +2850,10 @@ export class SessionService {
       this.expectEcho(sent, outcome.attemptId);
       await this.settled(operationId, outcome.attemptId);
     }
-    if (outcome.status === 'unknown' && outcome.deferred === true && record?.target.sessionId !== undefined) this.deferReconcile(operationId, record.target.sessionId, outcome.attemptId);
+    if (outcome.status === 'unknown' && outcome.deferred === true && record?.target.sessionId !== undefined) {
+      const attempt = (await this.store.get(operationId))?.delivery.attempts.find((a) => a.attemptId === outcome.attemptId);
+      this.deferReconcile(operationId, record.target.sessionId, outcome.attemptId, attempt?.dispatchStartedAt);
+    }
     return outcome;
   }
 
@@ -2833,15 +2864,30 @@ export class SessionService {
    * (`lateCheck`), or at `LATE_RECONCILE_LIMIT_MS` if the turn runs on. In memory only: after a restart `recover`
    * reconciles every unknown delivery, whose runtime ended with the last process.
    */
-  private deferReconcile(operationId: OperationId, sessionId: SessionId, attemptId: AttemptId): void {
-    const entry: LateCheck = { sessionId, attemptId };
+  private deferReconcile(operationId: OperationId, sessionId: SessionId, attemptId: AttemptId, dispatchStartedAt: Timestamp | undefined): void {
+    const entry: LateCheck = { sessionId, attemptId, escalated: false };
     this.lateChecks.set(operationId, entry);
-    // Core has no timers: without the main process's `sleep` (tests that do not give one) there is no limit.
-    if (this.options.sleep !== undefined)
-      void this.options.sleep(LATE_RECONCILE_LIMIT_MS).then(
-        () => (this.lateChecks.get(operationId) === entry ? this.lateCheck(operationId, 'limit') : undefined),
-        () => undefined,
-      );
+    // Its turn may be over already (r1 P1-3): the runtime exited, or no main turn of the session runs any more, while
+    // the dispatch waited for its ack. No event of that end comes again, so the reconcile starts now.
+    void this.turnAlreadyOver(sessionId).then(
+      (over) => (over && this.lateChecks.get(operationId) === entry ? this.lateCheck(operationId, 'turn-ended') : undefined),
+      () => undefined,
+    );
+    // Core has no timers: without the main process's `sleep` (tests that do not give one) there is no limit. The limit
+    // counts from the dispatch (r1 P2-5), not from the timeout that ended it.
+    if (this.options.sleep === undefined) return;
+    const since = dispatchStartedAt === undefined ? 0 : Date.parse(this.options.now()) - Date.parse(dispatchStartedAt);
+    void this.options.sleep(Math.max(0, LATE_RECONCILE_LIMIT_MS - (Number.isFinite(since) ? since : 0))).then(
+      () => (this.lateChecks.get(operationId) === entry ? this.lateCheck(operationId, 'limit') : undefined),
+      () => undefined,
+    );
+  }
+
+  /** Whether the session's main turn is over by what is known now: its runtime is not open, or no main turn runs. */
+  private async turnAlreadyOver(sessionId: SessionId): Promise<boolean> {
+    const ref = await this.binding(sessionId);
+    if (ref === undefined || !this.runtimes.isOpen(ref)) return true;
+    return runningMainTurn(await this.repos.conversations.get(sessionId)) === undefined;
   }
 
   /** Every late check of this session: its main turn ended, or its runtime exited (the transcript is final then). */
@@ -2850,28 +2896,36 @@ export class SessionService {
   }
 
   /**
-   * Reconciles a deferred insert read-only (CR-2: never sent again): after its turn, at each of
-   * `LATE_RECONCILE_DELAYS_MS`, escalating only at the last miss; at the limit, once and escalating. One run per
-   * delivery at a time; another trigger meanwhile joins it. Found sent: recorded, and an escalation the limit opened is
-   * closed (`settled`). Gone from unknown (a user retry, a reconcile elsewhere): dropped.
+   * Reconciles a deferred insert read-only (CR-2: never sent again). After its turn: at each of
+   * `LATE_RECONCILE_DELAYS_MS`, points in time counted from the turn's end (r1 P2-5), escalating only at the last miss;
+   * then it is done. At the limit: once, escalating; it is then no longer being confirmed (the user has the question),
+   * and only the turn's end looks again, which closes that question when it finds the payload (`settled`). One run
+   * per delivery at a time; a turn's end during the limit's run follows it. Found sent: recorded, its echo expected
+   * like a live ack's (r1 P2-4). Gone from unknown (a user retry, a reconcile elsewhere): dropped.
    */
   private lateCheck(operationId: OperationId, cause: 'turn-ended' | 'limit'): Promise<void> {
     const entry = this.lateChecks.get(operationId);
     if (entry === undefined) return Promise.resolve();
-    if (entry.running !== undefined) return entry.running;
-    const delays = cause === 'limit' ? [0] : LATE_RECONCILE_DELAYS_MS;
+    if (entry.running !== undefined) {
+      if (cause === 'turn-ended' && entry.runningCause === 'limit') entry.turnEndedMeanwhile = true;
+      return entry.running;
+    }
+    const points = cause === 'limit' ? [0] : LATE_RECONCILE_DELAYS_MS;
     const run = async (): Promise<void> => {
-      for (const [index, delay] of delays.entries()) {
-        if (delay > 0) await (this.options.sleep?.(delay) ?? Promise.resolve());
+      const from = Date.parse(this.options.now());
+      for (const [index, at] of points.entries()) {
+        const wait = at - (Date.parse(this.options.now()) - from);
+        if (wait > 0) await (this.options.sleep?.(wait) ?? Promise.resolve());
         // Closing: nothing is escalated now; the next start's `recover` reconciles it.
         if (this.closing || this.lateChecks.get(operationId) !== entry) return;
         const record = await this.store.get(operationId);
-        // A notice that ended apart from delivery (its run ended, T065) is looked at, never escalated.
-        const escalate = index === delays.length - 1 && record?.outcome === undefined;
+        // A payload that ended apart from delivery (its run ended, T065) is looked at, never escalated.
+        const escalate = index === points.length - 1 && record?.outcome === undefined;
         const outcome = await this.delivery.reconcile(operationId, { escalate });
         if (outcome.status === 'in-flight') return;
         if (outcome.status === 'sent') {
           this.lateChecks.delete(operationId);
+          this.expectEcho(await this.store.get(operationId), outcome.attemptId);
           await this.settled(operationId, outcome.attemptId);
           return;
         }
@@ -2879,18 +2933,25 @@ export class SessionService {
           this.lateChecks.delete(operationId);
           return;
         }
-        if (outcome.status === 'unknown' || index === delays.length - 1) {
-          // Escalated (or ended apart from delivery). A turn that ended is final; at the limit the turn still runs,
-          // so its end looks once more.
+        if (index === points.length - 1) {
+          // A turn that ended is final. At the limit the turn still runs: the question is the user's now, and its end
+          // looks once more.
           if (cause === 'turn-ended') this.lateChecks.delete(operationId);
+          else entry.escalated = true;
           return;
         }
       }
     };
+    entry.runningCause = cause;
     entry.running = run()
       .catch((error: unknown) => this.log(`a late reconcile of ${operationId} failed (${errorName(error)})`))
       .finally(() => {
         entry.running = undefined;
+        entry.runningCause = undefined;
+        if (entry.turnEndedMeanwhile === true) {
+          entry.turnEndedMeanwhile = false;
+          void this.lateCheck(operationId, 'turn-ended');
+        }
       });
     return entry.running;
   }
@@ -2900,7 +2961,8 @@ export class SessionService {
    * insert waiting for its turn's end to be reconciled. Unknown then, but nothing is asked of the user yet.
    */
   beingConfirmed(operationId: OperationId): boolean {
-    return this.dispatching.has(operationId) || this.lateChecks.has(operationId);
+    const late = this.lateChecks.get(operationId);
+    return this.dispatching.has(operationId) || (late !== undefined && !late.escalated);
   }
 
   /**

@@ -12,7 +12,7 @@ import { createTasks, pipelineTemplate, project } from '../../pipeline/testing/t
 import type { DispatchRequest, DispatchResult } from '../../ports';
 import { LATE_RECONCILE_DELAYS_MS, LATE_RECONCILE_LIMIT_MS } from '../../sessions/late-checks';
 import { FakeAdapter } from '../../sessions/testing/fake-adapter';
-import { handoff, IMPL, instanceOf, rid, ROOT, sessionOf, settle, started, type World } from './harness';
+import { advanceClock, handoff, IMPL, instanceOf, rid, ROOT, sessionOf, settle, started, type World } from './harness';
 
 const TIMEOUT: DispatchResult = { state: 'unknown', reason: 'timeout', written: true, detail: 'no reply frame echoed the uuid within the deadline' };
 const toImpl = { ruleId: 'to-impl', target: { kind: 'node' as const, nodeId: IMPL } };
@@ -32,25 +32,49 @@ const inserts = (w: World, answer: (request: DispatchRequest) => Promise<Dispatc
 /** What the runtime does once the turn takes an inserted payload in: it is in the transcript from then on. */
 const store = (w: World, request: DispatchRequest) => w.claude.history.set(request.attempt.clientMessageId, { ref: request.nativeSessionRef, text: request.text });
 
-/** The main process's `sleep`, under the test's hand: each wait ends when the test releases its length. */
+/**
+ * The main process's `sleep` on a virtual time the test moves (r1 P2-5): each wait ends when the time reaches its end,
+ * in order, and the harness clock (the service's `now`) moves with it, so the reconciles' points in time can be told.
+ */
 const sleeps = (w: World) => {
   const asked: number[] = [];
-  const waiting: { ms: number; resolve: () => void }[] = [];
+  let t = 0;
+  const waiting: { at: number; resolve: () => void }[] = [];
   (w.service as unknown as { options: { sleep?: (ms: number) => Promise<void> } }).options.sleep = (ms) => {
     asked.push(ms);
-    return new Promise<void>((resolve) => waiting.push({ ms, resolve }));
+    return new Promise<void>((resolve) => waiting.push({ at: t + ms, resolve }));
+  };
+  const reconciledAt: number[] = [];
+  const reconcile = w.claude.reconcile.bind(w.claude);
+  w.claude.reconcile = (request) => {
+    reconciledAt.push(t);
+    return reconcile(request);
   };
   return {
     asked,
-    release: async (ms: number) => {
-      for (const wait of waiting.filter((x) => x.ms === ms)) {
-        waiting.splice(waiting.indexOf(wait), 1);
-        wait.resolve();
+    /** The virtual time of each reconcile of the Claude runtime, in order. */
+    reconciledAt,
+    now: () => t,
+    /** Moves the virtual time on by `ms`, ending each wait due on the way in order. */
+    elapse: async (ms: number) => {
+      const to = t + ms;
+      for (;;) {
+        const next = waiting.filter((x) => x.at <= to).sort((x, y) => x.at - y.at)[0];
+        if (next === undefined) break;
+        waiting.splice(waiting.indexOf(next), 1);
+        advanceClock(next.at - t);
+        t = next.at;
+        next.resolve();
+        await settle();
       }
+      advanceClock(to - t);
+      t = to;
       await settle();
     },
   };
 };
+
+const LAST = LATE_RECONCILE_DELAYS_MS.at(-1)!;
 
 const unknownEscalations = async (w: World): Promise<Escalation[]> => (await w.repositories.escalations.list()).filter((e) => e.kind === 'delivery-unknown');
 const reconcilesOf = (w: World, request: DispatchRequest) => w.claude.reconciled.filter((r) => r.clientMessageId === request.attempt.clientMessageId).length;
@@ -80,6 +104,23 @@ const end = async (w: World, type: 'workflow.complete' | 'workflow.cancel') => {
 export type Make = (workflow: WorkflowTemplate) => Promise<World>;
 
 export const t065Cases = (backend: string, make: Make) => {
+  /** A run with impl working on task a, root in a turn of its own. */
+  const working = async () => {
+    const w = await make(pipelineTemplate());
+    await w.repositories.projects.save(project(), null);
+    w.holding.add(ROOT);
+    expect(await started(w)).toMatchObject({ ok: true });
+    await settle();
+    const created = await createTasks(w, [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }], 'call-report-tasks');
+    if (created.status !== 'created') throw new Error(created.status);
+    expect(await handoff(w, ROOT, { ...toImpl, taskId: created.tasks[0]!.taskId, content: 'build a' })).toMatchObject({ status: 'accepted' });
+    await settle();
+    const impl = await sessionOf(w, IMPL);
+    return { w, impl, taskId: created.tasks[0]!.taskId };
+  };
+  const report = (w: World, impl: SessionId, content: string, call = `call-${content}`) => w.engine.reportToRoot({ content, needsUserConfirmation: false }, { caller: impl, sourceCallRef: call });
+  const reportOf = async (w: World, content: string) => (await w.repositories.peerMessages.list()).find((p) => p.text.includes(content));
+
   describe(`T065 (${backend}): the notice of an approved task list, inserted into root's running turn`, () => {
     it('repro D: while its dispatch waits for the ack, the user\'s approval and root\'s handoff both go on; it is sent once', async () => {
       const { w, asked, notice } = await awaitingList(make);
@@ -130,18 +171,19 @@ export const t065Cases = (backend: string, make: Make) => {
       const clock = sleeps(w);
       const seen = inserts(w, () => Promise.resolve(TIMEOUT));
       await approve(w, asked.escalationId);
-      expect(clock.asked).toEqual([LATE_RECONCILE_LIMIT_MS]);
+      // The limit, counted from the dispatch.
+      expect(clock.asked).toHaveLength(1);
+      expect(clock.asked[0]).toBeGreaterThan(LATE_RECONCILE_LIMIT_MS - 1_000);
       await w.finishTurn(ROOT);
       expect(reconcilesOf(w, seen[0]!)).toBe(1);
-      await clock.release(LATE_RECONCILE_DELAYS_MS[1]!);
+      await clock.elapse(LATE_RECONCILE_DELAYS_MS[1]!);
       expect(reconcilesOf(w, seen[0]!)).toBe(2);
       // The runtime wrote it only now (the next turn took it in).
       store(w, seen[0]!);
-      await clock.release(LATE_RECONCILE_DELAYS_MS[2]!);
+      await clock.elapse(LATE_RECONCILE_DELAYS_MS[2]! - LATE_RECONCILE_DELAYS_MS[1]!);
       expect(reconcilesOf(w, seen[0]!)).toBe(3);
       expect((await w.store.get(notice))?.delivery.state).toBe('sent');
       expect(await unknownEscalations(w)).toEqual([]);
-      expect(clock.asked).toEqual([LATE_RECONCILE_LIMIT_MS, ...LATE_RECONCILE_DELAYS_MS.filter((d) => d > 0).slice(0, 2)]);
       expect(seen).toHaveLength(1);
     });
 
@@ -151,9 +193,11 @@ export const t065Cases = (backend: string, make: Make) => {
       const seen = inserts(w, () => Promise.resolve(TIMEOUT));
       await approve(w, asked.escalationId);
       await w.finishTurn(ROOT);
-      for (const delay of LATE_RECONCILE_DELAYS_MS.filter((d) => d > 0)) {
+      let previous = 0;
+      for (const at of LATE_RECONCILE_DELAYS_MS.filter((d) => d > 0)) {
         expect(await unknownEscalations(w)).toEqual([]);
-        await clock.release(delay);
+        await clock.elapse(at - previous);
+        previous = at;
       }
       expect(reconcilesOf(w, seen[0]!)).toBe(LATE_RECONCILE_DELAYS_MS.length);
       const escalations = await unknownEscalations(w);
@@ -177,7 +221,7 @@ export const t065Cases = (backend: string, make: Make) => {
       const clock = sleeps(w);
       const seen = inserts(w, () => Promise.resolve(TIMEOUT));
       await approve(w, asked.escalationId);
-      await clock.release(LATE_RECONCILE_LIMIT_MS);
+      await clock.elapse(LATE_RECONCILE_LIMIT_MS);
       const [question] = await unknownEscalations(w);
       expect(question).toMatchObject({ state: 'open' });
       store(w, seen[0]!);
@@ -255,7 +299,7 @@ export const t065Cases = (backend: string, make: Make) => {
       const seen = inserts(w, () => Promise.resolve(TIMEOUT));
       await approve(w, asked.escalationId);
       await w.finishTurn(ROOT);
-      for (const delay of LATE_RECONCILE_DELAYS_MS.filter((d) => d > 0)) await clock.release(delay);
+      await clock.elapse(LAST);
       const [question] = await unknownEscalations(w);
       expect(question).toMatchObject({ state: 'open' });
       expect(await end(w, type)).toMatchObject({ ok: true });
@@ -284,7 +328,7 @@ export const t065Cases = (backend: string, make: Make) => {
       await settle();
       expect((await w.store.get(notice))?.outcome).toMatchObject({ kind: 'cancelled' });
       await w.finishTurn(ROOT);
-      for (const delay of LATE_RECONCILE_DELAYS_MS.filter((d) => d > 0)) await clock.release(delay);
+      await clock.elapse(LAST);
       expect(await unknownEscalations(w)).toEqual([]);
       expect(seen).toHaveLength(1);
     });
@@ -322,22 +366,6 @@ export const t065Cases = (backend: string, make: Make) => {
   });
 
   describe(`T065 (${backend}): reports to root go outside the run's queue`, () => {
-    /** A run with impl working on task a, root in a turn of its own. */
-    const working = async () => {
-      const w = await make(pipelineTemplate());
-      await w.repositories.projects.save(project(), null);
-      w.holding.add(ROOT);
-      expect(await started(w)).toMatchObject({ ok: true });
-      await settle();
-      const created = await createTasks(w, [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }], 'call-report-tasks');
-      if (created.status !== 'created') throw new Error(created.status);
-      expect(await handoff(w, ROOT, { ...toImpl, taskId: created.tasks[0]!.taskId, content: 'build a' })).toMatchObject({ status: 'accepted' });
-      await settle();
-      const impl = await sessionOf(w, IMPL);
-      return { w, impl, taskId: created.tasks[0]!.taskId };
-    };
-    const report = (w: World, impl: SessionId, content: string, call = `call-${content}`) => w.engine.reportToRoot({ content, needsUserConfirmation: false }, { caller: impl, sourceCallRef: call });
-    const reportOf = async (w: World, content: string) => (await w.repositories.peerMessages.list()).find((p) => p.text.includes(content));
 
     it('while a report waits for its ack, root\'s own handoff is not held by it', async () => {
       const { w, impl, taskId } = await working();
@@ -412,7 +440,7 @@ export const t065Cases = (backend: string, make: Make) => {
       inserts(w, () => Promise.resolve(TIMEOUT));
       expect(await report(w, impl, 'lost report')).toMatchObject({ status: 'reported' });
       await w.finishTurn(ROOT);
-      for (const delay of LATE_RECONCILE_DELAYS_MS.filter((d) => d > 0)) await clock.release(delay);
+      await clock.elapse(LAST);
       expect(await unknownEscalations(w)).toHaveLength(1);
       for (const type of ['workflow.complete', 'workflow.cancel'] as const) {
         expect(await end(w, type)).toMatchObject({ ok: false, code: 'invalid_transition', message: 'A delivery of this run has an unknown outcome; decide it first' });
@@ -443,6 +471,178 @@ export const t065Cases = (backend: string, make: Make) => {
       expect(stored?.delivery.state).toBe('pending');
       expect((await w.service.idleFacts(ROOT))?.deliveries).toEqual({ pending: 0, unknown: 0 });
       expect((await w.repositories.escalations.list({ state: 'open' })).filter((e) => e.kind === 'delivery-unknown')).toEqual([]);
+    });
+  });
+  describe(`T065 r1 (${backend}): what the first review found`, () => {
+    const NOTICE_TEXT = 'Notice from the GUI';
+    /** Root's queue held by a message of the user's whose insert never answers: what comes for root waits behind it. */
+    const holdRoot = async (w: World, id: string) => {
+      const root = await w.repositories.sessions.get(ROOT);
+      void w.run({ type: 'session.send', requestId: rid(), sessionId: ROOT, messageId: MessageId.parse(id), expectedRevision: root!.revision, text: `hold ${id}`, attachments: [] });
+      await settle();
+    };
+    /** Root's runtime closed, and its next resume held: a delivery to root waits in its target's preparation. */
+    const closedRootHeld = async (w: World) => {
+      await w.finishTurn(ROOT);
+      await w.service.closeWorkflowRuntime(ROOT);
+      let release: () => void = () => undefined;
+      w.claude.resumeGate = new Promise<void>((resolve) => (release = resolve));
+      return () => {
+        w.claude.resumeGate = undefined;
+        release();
+      };
+    };
+    const noticesSent = (w: World) => w.claude.dispatched.filter((d) => d.text.includes(NOTICE_TEXT));
+
+    it('P1-1: a notice cancelled with its run while still pending is not sent by the next start', async () => {
+      const { w, asked, notice } = await awaitingList(make);
+      inserts(w, () => new Promise(() => undefined));
+      await holdRoot(w, 'm-r1-hold-notice');
+      await approve(w, asked.escalationId);
+      expect((await w.store.get(notice))?.delivery.state).toBe('pending');
+      expect(await end(w, 'workflow.cancel')).toMatchObject({ ok: true });
+      await settle();
+      expect((await w.store.get(notice))?.outcome).toMatchObject({ kind: 'cancelled' });
+      const r = await w.restart();
+      await settle();
+      expect(noticesSent(r)).toEqual([]);
+      expect(await r.store.get(notice)).toMatchObject({ delivery: { state: 'pending' }, outcome: { kind: 'cancelled' } });
+    });
+
+    it('P1-1: a report cancelled with its run while still queued is not sent by the next start', async () => {
+      const { w, impl } = await working();
+      inserts(w, () => new Promise(() => undefined));
+      await holdRoot(w, 'm-r1-hold-report');
+      void report(w, impl, 'report before restart');
+      await settle();
+      const queued = await reportOf(w, 'report before restart');
+      expect(queued?.delivery.state).toBe('pending');
+      expect(await end(w, 'workflow.cancel')).toMatchObject({ ok: true });
+      await settle();
+      const r = await w.restart();
+      await settle();
+      expect(r.claude.dispatched.filter((d) => d.text.includes('report before restart'))).toEqual([]);
+      expect(await r.store.get(queued!.operationId)).toMatchObject({ delivery: { state: 'pending' }, outcome: { kind: 'cancelled' } });
+    });
+
+    it('P1-2: a notice whose run is cancelled while its target is being prepared is not claimed or sent afterwards', async () => {
+      const { w, asked, notice } = await awaitingList(make);
+      const release = await closedRootHeld(w);
+      await approve(w, asked.escalationId);
+      // The notice is in its preparation (root resumes first): not claimed yet.
+      expect((await w.store.get(notice))?.delivery.attempts).toEqual([]);
+      expect(await end(w, 'workflow.cancel')).toMatchObject({ ok: true });
+      await settle();
+      release();
+      await settle();
+      expect(noticesSent(w)).toEqual([]);
+      expect(await w.store.get(notice)).toMatchObject({ delivery: { state: 'pending', attempts: [] }, outcome: { kind: 'cancelled' } });
+    });
+
+    it('P1-2: a report whose run completes while root is being prepared is not sent after the end', async () => {
+      const { w, impl } = await working();
+      const release = await closedRootHeld(w);
+      let reported: unknown;
+      void report(w, impl, 'report during prepare').then((r) => (reported = r));
+      await settle();
+      const record = await reportOf(w, 'report during prepare');
+      expect(record?.delivery.attempts).toEqual([]);
+      expect(await end(w, 'workflow.complete')).toMatchObject({ ok: true });
+      await settle();
+      release();
+      await settle();
+      expect(reported).toMatchObject({ status: 'reported' });
+      expect(w.claude.dispatched.filter((d) => d.text.includes('report during prepare'))).toEqual([]);
+      expect(await w.store.get(record!.operationId)).toMatchObject({ delivery: { state: 'pending', attempts: [] }, outcome: { kind: 'cancelled' } });
+    });
+
+    it("P1-3: root's runtime exits before the insert times out: reconciled at once, asked once, then no longer being confirmed", async () => {
+      const { w, impl } = await working();
+      const clock = sleeps(w);
+      let ack: (result: DispatchResult) => void = () => undefined;
+      inserts(w, () => new Promise((resolve) => (ack = resolve)));
+      const sending = report(w, impl, 'report before exit');
+      await settle();
+      w.claude.emit({ type: 'runtime.exited', runtime: 'claude', sessionIds: [ROOT], expected: false, code: 1, signal: null, at: '2026-10-29T01:00:00.000Z' });
+      await settle();
+      ack(TIMEOUT);
+      expect(await sending).toMatchObject({ status: 'reported' });
+      await settle();
+      const operationId = (await reportOf(w, 'report before exit'))!.operationId;
+      // No end of the turn comes any more: the reconcile started at once.
+      expect(clock.reconciledAt).toEqual([0]);
+      await clock.elapse(LAST);
+      expect(clock.reconciledAt).toHaveLength(LATE_RECONCILE_DELAYS_MS.length);
+      expect(await unknownEscalations(w)).toHaveLength(1);
+      expect(w.service.beingConfirmed(operationId)).toBe(false);
+      expect(await end(w, 'workflow.cancel')).toMatchObject({ ok: false, message: 'A delivery of this run has an unknown outcome; decide it first' });
+    });
+
+    it("P1-3: escalated at the limit, it is no longer being confirmed; the turn's later end still closes the question", async () => {
+      const { w, impl } = await working();
+      const clock = sleeps(w);
+      const seen = inserts(w, () => Promise.resolve(TIMEOUT));
+      expect(await report(w, impl, 'report past the limit')).toMatchObject({ status: 'reported' });
+      const operationId = (await reportOf(w, 'report past the limit'))!.operationId;
+      expect(w.service.beingConfirmed(operationId)).toBe(true);
+      await clock.elapse(LATE_RECONCILE_LIMIT_MS);
+      const [question] = await unknownEscalations(w);
+      expect(question).toMatchObject({ state: 'open' });
+      expect(w.service.beingConfirmed(operationId)).toBe(false);
+      expect(await end(w, 'workflow.cancel')).toMatchObject({ ok: false, message: 'A delivery of this run has an unknown outcome; decide it first' });
+      store(w, seen[0]!);
+      await w.finishTurn(ROOT);
+      expect((await w.store.get(operationId))?.delivery.state).toBe('sent');
+      expect(await w.repositories.escalations.get(question!.id)).toMatchObject({ state: 'resolved', resolvedBy: 'system' });
+      expect(await end(w, 'workflow.cancel')).toMatchObject({ ok: true });
+      expect(seen).toHaveLength(1);
+    });
+
+    it("P2-4: a user message found sent after its turn is not shown twice when the runtime's late echo comes", async () => {
+      const w = await make(pipelineTemplate());
+      await w.repositories.projects.save(project(), null);
+      w.holding.add(ROOT);
+      expect(await started(w)).toMatchObject({ ok: true });
+      await settle();
+      const seen = inserts(w, () => Promise.resolve(TIMEOUT));
+      const root = await w.repositories.sessions.get(ROOT);
+      const text = 'say it once';
+      await w.run({ type: 'session.send', requestId: rid(), sessionId: ROOT, messageId: MessageId.parse('m-r1-echo'), expectedRevision: root!.revision, text, attachments: [] });
+      store(w, seen[0]!);
+      await w.finishTurn(ROOT);
+      expect((await w.store.get('user-message:m-r1-echo' as never))?.delivery.state).toBe('sent');
+      // The runtime's own record of the prompt, under the attempt's clientMessageId.
+      w.claude.emit({
+        type: 'message.completed',
+        message: { id: MessageId.parse(seen[0]!.attempt.clientMessageId), sessionId: ROOT, role: 'user', origin: { kind: 'user' }, text, attachments: [], createdAt: '2026-10-29T01:00:05.000Z' },
+      });
+      await settle();
+      expect((await w.repositories.conversations.get(ROOT)).messages.filter((m) => m.text === text).map((m) => m.id)).toEqual(['m-r1-echo']);
+    });
+
+    it('P2-5: after the turn the reconciles fall at 0, 2, 5 and 10 s from its end; the limit counts from the dispatch', async () => {
+      const { w, asked } = await awaitingList(make);
+      const clock = sleeps(w);
+      // The ack is waited for 90 s before the dispatch times out.
+      const seen = inserts(w, () => {
+        advanceClock(90_000);
+        return Promise.resolve(TIMEOUT);
+      });
+      await approve(w, asked.escalationId);
+      expect(clock.asked).toHaveLength(1);
+      expect(clock.asked[0]).toBeLessThanOrEqual(LATE_RECONCILE_LIMIT_MS - 90_000);
+      expect(clock.asked[0]).toBeGreaterThan(LATE_RECONCILE_LIMIT_MS - 91_000);
+      await clock.elapse(1_000);
+      const ended = clock.now();
+      await w.finishTurn(ROOT);
+      await clock.elapse(LAST + 1_000);
+      const offsets = clock.reconciledAt.map((t) => t - ended);
+      expect(offsets).toHaveLength(LATE_RECONCILE_DELAYS_MS.length);
+      for (const [i, at] of LATE_RECONCILE_DELAYS_MS.entries()) {
+        expect(offsets[i]).toBeGreaterThanOrEqual(at - 50);
+        expect(offsets[i]).toBeLessThanOrEqual(at);
+      }
+      expect(seen).toHaveLength(1);
     });
   });
 };
