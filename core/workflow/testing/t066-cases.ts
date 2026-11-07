@@ -318,6 +318,64 @@ export const t066Cases = (backend: string, make: Make) => {
     });
   });
 
+  describe(`T066 r1 (${backend}): the known wait cycle (r1 P2, kept for its own task) ends right once the insert times out`, () => {
+    it("X's queue held by an insert's ack, root's handoff to X waiting for it, X's send_message(root) waiting for the run: after the timeout every part is right", async () => {
+      const { w, impl, taskId } = await working();
+      // impl (X) in a turn of its own.
+      w.holding.add(impl);
+      expect(await handoff(w, ROOT, { ...toImpl, taskId, content: 'second' })).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      await settle();
+      // Every insert into X waits; the test ends it as the adapter does at its deadline (the timeout result), no real wait.
+      const codex = w.codex.get(impl)!;
+      const original = codex.dispatchOnce.bind(codex);
+      const held: { request: DispatchRequest; end: (result: DispatchResult) => void }[] = [];
+      codex.dispatchOnce = (request) => (request.entry.kind === 'insert' ? new Promise<DispatchResult>((end) => held.push({ request, end })) : original(request));
+      // 1. Root's message into X's running turn: X's queue waits for its ack.
+      let note: unknown;
+      void w.service.sendMessage({ to: impl, content: 'note for impl' }, { caller: ROOT, operationId: OperationId.parse('op-cycle-note'), sourceCallRef: 'call-cycle-note' }).then((r) => (note = r));
+      await settle();
+      expect(held).toHaveLength(1);
+      // 2. Root hands X more work: in the run's queue, waiting for X's queue.
+      let handed: unknown;
+      void handoff(w, ROOT, { ...toImpl, taskId, content: 'third part' }).then((r) => (handed = r));
+      await settle();
+      // 3. X, in that turn, sends to root: it waits for the run's queue. The three wait for each other.
+      let spoke: unknown;
+      void message(w, impl, 'question from the cycle', 'op-cycle-root').then((r) => (spoke = r));
+      await settle();
+      expect({ note, handed, spoke }).toEqual({ note: undefined, handed: undefined, spoke: undefined });
+
+      // The insert's dispatch times out: it is left to the reconcile after X's turn (T065), and the waits end.
+      held[0]!.end({ state: 'unknown', reason: 'timeout', written: true, detail: 'no reply within the deadline' });
+      await settle();
+      expect(note).toMatchObject({ status: 'accepted', delivery: 'unknown' });
+      expect(handed).toMatchObject({ status: 'accepted', delivery: 'pending' });
+      expect(spoke).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      expect(w.service.beingConfirmed(OperationId.parse('op-cycle-note'))).toBe(true);
+
+      // X's turn took the note in and ends: the reconcile finds it (sent, nothing asked); the queued handoff goes once.
+      codex.history.set(held[0]!.request.attempt.clientMessageId, { ref: held[0]!.request.nativeSessionRef, text: held[0]!.request.text });
+      w.holding.delete(impl);
+      await w.finishTurn(impl);
+      await settle();
+      expect((await w.store.get(OperationId.parse('op-cycle-note')))?.delivery.state).toBe('sent');
+      expect(w.service.beingConfirmed(OperationId.parse('op-cycle-note'))).toBe(false);
+      expect((await w.repositories.escalations.list()).filter((e) => e.kind === 'delivery-unknown')).toEqual([]);
+      expect(held).toHaveLength(1);
+      expect(dispatchedText(w, 'third part')).toHaveLength(1);
+      const third = (await w.repositories.handoffs.listByInstance((await instanceOf(w)).id)).find((h) => h.payload.includes('third part'));
+      expect(third?.delivery.state).toBe('sent');
+      // 3. X's message reached root once, and is sent.
+      expect(dispatchedText(w, 'question from the cycle')).toHaveLength(1);
+      expect((await w.store.get(OperationId.parse('op-cycle-root')))?.delivery.state).toBe('sent');
+      // 4. The run ends as usual.
+      expect(await end(w)).toMatchObject({ ok: true });
+      await settle();
+      expect((await instanceOf(w)).state).toBe('completed');
+      expect((await w.repositories.escalations.list({ state: 'open' })).filter((e) => e.kind === 'delivery-unknown')).toEqual([]);
+    });
+  });
+
   describe(`T066 (${backend}): root's report_to_root after the end`, () => {
     it.each([false, true])('refused with a reason (asks the user: %s); no question is opened', async (needsUserConfirmation) => {
       const { w } = await working();
