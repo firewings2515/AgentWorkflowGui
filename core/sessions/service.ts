@@ -1989,9 +1989,14 @@ export class SessionService {
     const instanceId = p.instanceId;
     const workflow = this.workflow;
     if (instanceId === undefined || workflow?.inRunQueue === undefined) return undefined;
+    // Only a message to the run's root waits for the run's queue (T066 r1): read outside it, as a run's root never changes
+    // once the run is made. Anything else (to another node of the run, from root, a run not found) goes on as before,
+    // without waiting for the run's queue, which may wait for root's queue, which may wait for this caller's turn.
+    const run = await this.repos.instances.get(instanceId);
+    if (run === undefined || run.rootSessionId !== p.to) return undefined;
     return workflow.inRunQueue(instanceId, async (): Promise<SendMessageToolResult | undefined> => {
       const instance = await this.repos.instances.get(instanceId);
-      if (instance === undefined || instance.rootSessionId !== p.to) return undefined;
+      if (instance === undefined) return undefined;
       if ((await this.store.get(p.operationId)) !== undefined) return undefined;
       if (instance.state === 'completed' || instance.state === 'cancelled') return { status: 'rejected', rejection: RUN_ENDED };
       const target = await this.repos.sessions.get(p.to);

@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { OperationId, type SessionId, type WorkflowTemplate } from '../../../contracts';
 import { createTasks, pipelineTemplate, project } from '../../pipeline/testing/t032-cases';
 import type { DispatchRequest, DispatchResult } from '../../ports';
-import { handoff, IMPL, instanceOf, rid, ROOT, sessionOf, settle, started, type World } from './harness';
+import { handoff, IMPL, instanceOf, REVIEW, rid, ROOT, sessionOf, settle, started, template, type World } from './harness';
 
 export type Make = (workflow: WorkflowTemplate) => Promise<World>;
 
@@ -277,6 +277,44 @@ export const t066Cases = (backend: string, make: Make) => {
       await settle();
       expect(first).toMatchObject({ status: 'accepted', delivery: 'sent' });
       expect(second).toMatchObject({ status: 'accepted', delivery: 'sent' });
+    });
+  });
+
+  describe(`T066 r1 (${backend}): only a message to root waits for the run's queue`, () => {
+    it("Astra r1 P1: root's message to another node goes while the run's queue waits for root's queue (held by an insert's ack)", async () => {
+      // plan (root) → impl → review → root: review's handoff to root waits for root's queue in the run's queue.
+      const w = await make(template());
+      w.holding.add(ROOT);
+      expect(await started(w)).toMatchObject({ ok: true });
+      await settle();
+      expect(await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL } })).toMatchObject({ status: 'accepted' });
+      await settle();
+      const impl = await sessionOf(w, IMPL);
+      expect(await handoff(w, impl, { ruleId: 'to-review', target: { kind: 'node', nodeId: REVIEW } })).toMatchObject({ status: 'accepted' });
+      await settle();
+      const review = await sessionOf(w, REVIEW);
+      // 1. impl's message into root's running turn: its ack is held, and root's queue with it.
+      const root = insertsHeld(w);
+      let first: unknown;
+      void message(w, impl, 'question held', 'op-r1-held').then((r) => (first = r));
+      await settle();
+      expect(root.seen).toHaveLength(1);
+      // 2. review hands off to root: in the run's queue, waiting for root's queue.
+      let handed: unknown;
+      void handoff(w, review, { ruleId: 'done', target: { kind: 'root' } }).then((r) => (handed = r));
+      await settle();
+      expect(handed).toBeUndefined();
+      // 3. root, in that same running turn, sends to impl: it does not wait for the run's queue, so it returns (and root
+      //    can go on to take the first message in).
+      let aux: unknown;
+      void w.service.sendMessage({ to: impl, content: 'note for impl' }, { caller: ROOT, operationId: OperationId.parse('op-r1-aux'), sourceCallRef: 'call-op-r1-aux' }).then((r) => (aux = r));
+      await settle();
+      expect(aux).toMatchObject({ status: 'accepted' });
+      expect(first).toBeUndefined();
+      root.ack(0);
+      await settle();
+      expect(first).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      expect(handed).toMatchObject({ status: 'accepted' });
     });
   });
 
