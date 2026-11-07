@@ -1383,6 +1383,8 @@ export class TaskPipeline {
       );
       if (saved.status === 'stale') return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
       this.deps.publish({ type: 'instance.updated', instance: saved.record });
+      // Root's notices and reports end with the run before the command answers (T065 r2); a failure is finished by afterEnd.
+      await this.endDeliveries(saved.record).catch((error: unknown) => this.deps.log(`[pipeline] ending the deliveries of ${instanceId} failed (${errorText(error)})`));
       // Cleanup runs git; the command does not wait for it (nothing of an ended run is delivered any more).
       void this.afterEnd(saved.record).catch((error: unknown) => this.deps.log(`[pipeline] finishing the end of ${instanceId} failed (${errorText(error)})`));
       return ok(requestId, { revision: saved.record.revision });
@@ -1399,16 +1401,12 @@ export class TaskPipeline {
     return [...handoffs, ...peers].map((d) => d.operationId);
   }
 
-  /** What follows the end of a run, each part best effort (a restart's recover does it again). */
-  private async afterEnd(instance: WorkflowInstance): Promise<void> {
-    // Held handoffs of a list never decided end with the run (G-11).
-    await this.deps.host.settleHeld(instance.id);
-    for (const handoff of await this.repos.handoffs.listByInstance(instance.id)) {
-      if (handoff.delivery.state !== 'pending' || handoff.outcome !== undefined || toMerge(instance, handoff)) continue;
-      await this.store.recordOutcome(handoff.operationId, { kind: 'cancelled', detail: `the run was ${instance.state}`, at: this.deps.now() }).catch(() => undefined);
-      const stored = await this.repos.handoffs.get(handoff.id);
-      if (stored !== undefined) this.deps.publish({ type: 'handoff.updated', handoff: stored });
-    }
+  /**
+   * The notices and reports to root of a run that ended (T065): a report not dispatched yet is cancelled, and every notice
+   * not sent is closed by the system. Written right after the end's commit, before the command answers (T065 r2), so
+   * nothing of them is claimed after that: the store refuses to claim a delivery with an outcome.
+   */
+  private async endDeliveries(instance: WorkflowInstance): Promise<void> {
     // A report to root not dispatched yet (it goes outside the run's queue, T065) is not sent any more.
     for (const record of await this.store.listByTarget(instance.rootSessionId)) {
       if (record.kind !== 'peer-message' || record.peer?.instanceId !== instance.id || record.delivery.state !== 'pending' || record.outcome !== undefined) continue;
@@ -1424,6 +1422,20 @@ export class TaskPipeline {
         return [];
       });
     if (notices.length > 0) this.deps.log(`[pipeline] ${String(notices.length)} notice(s) to root of ${instance.id} left unconfirmed were closed with the run`);
+  }
+
+  /** What follows the end of a run, each part best effort (a restart's recover does it again). */
+  private async afterEnd(instance: WorkflowInstance): Promise<void> {
+    // Held handoffs of a list never decided end with the run (G-11).
+    await this.deps.host.settleHeld(instance.id);
+    for (const handoff of await this.repos.handoffs.listByInstance(instance.id)) {
+      if (handoff.delivery.state !== 'pending' || handoff.outcome !== undefined || toMerge(instance, handoff)) continue;
+      await this.store.recordOutcome(handoff.operationId, { kind: 'cancelled', detail: `the run was ${instance.state}`, at: this.deps.now() }).catch(() => undefined);
+      const stored = await this.repos.handoffs.get(handoff.id);
+      if (stored !== undefined) this.deps.publish({ type: 'handoff.updated', handoff: stored });
+    }
+    // Again here: a restart finishes what a crash after the end's commit cut short (T065).
+    await this.endDeliveries(instance);
     for (const escalation of await this.repos.escalations.list({ state: 'open' })) {
       if (escalation.instanceId !== instance.id) continue;
       if (escalation.kind === 'setup-failed' || escalation.kind === 'merge-failed' || escalation.ref?.kind === 'taskPlan') await this.deps.host.closeEscalation(escalation, 'resolved', 'system');

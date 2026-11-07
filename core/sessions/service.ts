@@ -700,8 +700,8 @@ export class SessionService {
           return workflowSessions.has(record.spec.sessionId) && !withWork.has(record.spec.sessionId) ? 'skip' : {};
         }
         if (record.kind === 'transfer' && transfer !== undefined) return 'skip';
-        // A notice or report that ended apart from delivery (its run ended, T065 r1 P1-1) is never sent; one whose run
-        // ended without that written yet is refused right before its claim (`endedApart`).
+        // A notice or report that ended apart from delivery (its run ended, T065 r1 P1-1) is not even prepared; the store's
+        // claim refuses any delivery with an outcome in the same atomic step (`ended`, T065 r2), whatever path dispatches it.
         if ((record.kind === 'system-notice' || record.kind === 'peer-message') && record.outcome !== undefined) return 'skip';
         // A formal handoff goes through the one queue of its target (T024 r1-P1-2), below.
         if (record.kind === 'handoff' && record.target.sessionId !== undefined) {
@@ -2642,26 +2642,6 @@ export class SessionService {
       throw error instanceof ResumeRefused ? error : new ResumeFailed(error instanceof Error ? error.message : String(error), { cause: error });
     }
     if (record.kind === 'transfer' && this.transfer !== undefined && !(await this.transfer.mayDispatch(record))) throw new Error('the transfer no longer sends this');
-    // Checked last, after every wait above and right before the claim (T065 r1 P1-1/P1-2): a notice or report whose run
-    // ended meanwhile (or that ended apart from delivery) is not sent, whichever path dispatches it (a restart included).
-    if (await this.endedApart(record)) throw new Error('it ended with its workflow run; it is not sent');
-  }
-
-  /**
-   * A notice or report that is not sent any more (T065): it ended apart from delivery (`outcome`), or its workflow run
-   * has ended (a notice to that run's session, a report to that run's root), its `outcome` perhaps not written yet.
-   */
-  private async endedApart(record: StoredDelivery): Promise<boolean> {
-    if (record.kind !== 'system-notice' && record.kind !== 'peer-message') return false;
-    const fresh = await this.store.get(record.operationId);
-    if (fresh?.outcome !== undefined) return true;
-    const sessionId = record.target.sessionId;
-    const session = sessionId === undefined ? undefined : await this.repos.sessions.get(sessionId);
-    if (session?.kind !== 'workflow') return false;
-    if (record.kind === 'peer-message' && record.peer?.instanceId !== session.workflow.instanceId) return false;
-    const instance = await this.repos.instances.get(session.workflow.instanceId);
-    if (instance === undefined || (instance.state !== 'completed' && instance.state !== 'cancelled')) return false;
-    return record.kind === 'system-notice' || instance.rootSessionId === sessionId;
   }
 
   /**
@@ -2992,6 +2972,12 @@ export class SessionService {
   private async escalateDelivery(item: DeliveryEscalation): Promise<void> {
     const sessionId = item.target.sessionId;
     if (sessionId === undefined) return;
+    // Read again here, in the escalations queue that `settled` also closes in (T065 r2 P2): an attempt found sent (or
+    // given up for a retry) since the reconcile that reported it is asked about no more. Either this runs first and
+    // `settled` closes the question after it, or `settled` ran first and this sees the attempt is no longer unknown.
+    const current = await this.store.get(item.operationId);
+    const attempt = current?.delivery.attempts.at(-1);
+    if (current === undefined || current.delivery.state !== 'unknown' || attempt?.attemptId !== item.attemptId || attempt.state !== 'unknown') return;
     // A transfer's own deliveries, and its target's creation, are shown at the source session (T023).
     const transferred = await this.transfer?.escalationFor(item);
     const ref: Escalation['ref'] = transferred
@@ -3057,8 +3043,12 @@ export class SessionService {
 
   /** An attempt turned out sent: its open delivery-unknown escalation, if any, is closed by the system. */
   private async settled(operationId: OperationId, attemptId: AttemptId): Promise<void> {
-    const escalation = await this.repos.escalations.get(deliveryEscalationId(`${operationId}/${attemptId}`));
-    if (escalation?.state === 'open') await this.closeEscalation(escalation, 'resolved');
+    // In the escalations queue, in order with the escalation of the same attempt (T065 r2 P2): one written before this is
+    // closed here, and one queued after this finds the attempt sent and is not written.
+    await this.serial('escalations', async () => {
+      const escalation = await this.repos.escalations.get(deliveryEscalationId(`${operationId}/${attemptId}`));
+      if (escalation?.state === 'open') await this.closeEscalation(escalation, 'resolved');
+    });
     const record: StoredDelivery | undefined = await this.store.get(operationId);
     const sessionId = record?.target.sessionId;
     if (record?.kind === 'user-message' && sessionId !== undefined) {

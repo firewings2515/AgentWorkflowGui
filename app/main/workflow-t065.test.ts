@@ -9,6 +9,7 @@ import { MessageId } from '../../contracts';
 import { createRepositories, openDatabase, SqliteDeliveryStore } from '../../adapters/storage';
 import { attempt, echo, REF as CLAUDE_REF, started as startedClaude, until } from '../../adapters/claude/testing/harness';
 import { ROOT, settle, started, template, worldOn } from '../../core/workflow/testing/harness';
+import { t065ClaimCases } from '../../core/delivery/testing/t065-cases';
 import { t065Cases } from '../../core/workflow/testing/t065-cases';
 
 const opened: { db: DatabaseSync; dir: string }[] = [];
@@ -24,6 +25,13 @@ t065Cases('SQLite', (workflow) => {
   const db = openDatabase(join(dir, 'awg.sqlite'));
   opened.push({ db, dir });
   return worldOn(createRepositories(db), new SqliteDeliveryStore(db), workflow);
+});
+
+t065ClaimCases('SQLite', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'awg-t065-'));
+  const db = openDatabase(join(dir, 'awg.sqlite'));
+  opened.push({ db, dir });
+  return new SqliteDeliveryStore(db);
 });
 
 describe('T065 on SQLite: the notice the Claude adapter acks is stored in root\'s conversation', () => {

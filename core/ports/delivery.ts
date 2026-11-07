@@ -195,11 +195,13 @@ export interface ClaimInput {
 
 /**
  * Only `claimed` may call the runtime (`dispatchOnce`, or the create call for a provision), and only after
- * this resolved: one conditional `pending → unknown` update decides the single caller.
+ * this resolved: one conditional `pending → unknown` update decides the single caller. `ended`: the operation ended
+ * apart from delivery (`recordOutcome`, e.g. its workflow run ended, T065 r2) and is never claimed; checked in the
+ * same atomic step, so an outcome written first always wins, whatever the caller read before.
  */
 export type ClaimResult =
   | { status: 'claimed'; attempt: Extract<DispatchAttempt, { state: 'unknown' }> }
-  | { status: 'not-found' | 'not-pending' | 'revision-changed' | 'target-changed' | 'target-not-ready' };
+  | { status: 'not-found' | 'not-pending' | 'revision-changed' | 'target-changed' | 'target-not-ready' | 'ended' };
 
 export type WriteResult = 'recorded' | 'stale';
 

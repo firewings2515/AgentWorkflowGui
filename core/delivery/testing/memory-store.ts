@@ -168,6 +168,8 @@ export class MemoryDeliveryStore implements DeliveryStore {
       const row = this.rows.get(input.operationId);
       if (row === undefined) return { value: { status: 'not-found' } };
       if (row.state !== 'pending') return { value: { status: 'not-pending' } };
+      // Ended apart from delivery: never claimed (T065 r2), in this same step.
+      if (row.outcome !== undefined) return { value: { status: 'ended' } };
       if (row.proposalRevision !== input.expectedProposalRevision) return { value: { status: 'revision-changed' } };
       const target = parse<DeliveryTarget>(row.target);
       const blocked = row.kind === 'provision' ? this.provisionBlocked(target, input) : this.payloadBlocked(row, target, input);

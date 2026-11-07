@@ -3,6 +3,8 @@
 // other dispatch is reconciled at once, as before.
 import { describe, expect, it } from 'vitest';
 import { OP, gui, payloadInput } from './testing/fixtures';
+import { MemoryDeliveryStore } from './testing/memory-store';
+import { t065ClaimCases } from './testing/t065-cases';
 
 const INSERT = { entry: { kind: 'insert' as const }, reconcileLater: true };
 
@@ -59,3 +61,5 @@ describe('T065: reconcileLater', () => {
     expect(g.codex.reconciled).toHaveLength(1);
   });
 });
+
+t065ClaimCases('memory', () => new MemoryDeliveryStore());

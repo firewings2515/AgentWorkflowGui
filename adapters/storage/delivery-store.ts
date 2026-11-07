@@ -222,6 +222,8 @@ export class SqliteDeliveryStore implements DeliveryStore {
         if (row === undefined) return unchanged({ status: 'not-found' });
         this.load(row);
         if (row.state !== 'pending') return unchanged({ status: 'not-pending' });
+        // Ended apart from delivery (`recordOutcome`): never claimed (T065 r2), inside the same transaction.
+        if (row.outcome !== null) return unchanged({ status: 'ended' });
         // Re-checked inside the transaction (R-04 step 5).
         if (row.proposal_revision !== input.expectedProposalRevision) return unchanged({ status: 'revision-changed' });
         const target = parse<DeliveryTarget>(row.target);
@@ -229,7 +231,9 @@ export class SqliteDeliveryStore implements DeliveryStore {
         if (blocked !== undefined) return unchanged({ status: blocked });
 
         // The single conditional update that decides the one dispatcher (CR2_DELIVERY_FIX §1 step 3).
-        const claimed = this.db.prepare("UPDATE delivery SET state = 'unknown' WHERE operation_id = ? AND state = 'pending' RETURNING operation_id").get(input.operationId);
+        const claimed = this.db
+          .prepare("UPDATE delivery SET state = 'unknown' WHERE operation_id = ? AND state = 'pending' AND outcome IS NULL RETURNING operation_id")
+          .get(input.operationId);
         if (claimed === undefined) return unchanged({ status: 'not-pending' });
         const seq = (this.db.prepare('SELECT coalesce(max(seq), 0) + 1 AS seq FROM dispatch_attempt WHERE operation_id = ?').get(input.operationId) as { seq: number }).seq;
         this.db

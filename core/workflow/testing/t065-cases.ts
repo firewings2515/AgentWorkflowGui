@@ -645,4 +645,76 @@ export const t065Cases = (backend: string, make: Make) => {
       expect(seen).toHaveLength(1);
     });
   });
+  describe(`T065 r2 (${backend}): what the second review found`, () => {
+    /**
+     * Holds every dispatch right after its target's preparation, the last wait before the store's claim (Astra r2: the
+     * cancel lands after every read the dispatch made). Released by the test.
+     */
+    const pauseBeforeClaim = (w: World) => {
+      const service = w.service as unknown as { prepareTarget: (record: unknown) => Promise<void> };
+      const prepare = service.prepareTarget.bind(w.service);
+      let release: () => void = () => undefined;
+      let paused = 0;
+      service.prepareTarget = async (record) => {
+        await prepare(record);
+        paused++;
+        await new Promise<void>((resolve) => (release = resolve));
+      };
+      return { paused: () => paused, release: () => release() };
+    };
+
+    it('P1: a notice whose run is cancelled after its last read before the claim is not claimed or sent', async () => {
+      const { w, asked, notice } = await awaitingList(make);
+      const seen = inserts(w, () => Promise.resolve(TIMEOUT));
+      const gate = pauseBeforeClaim(w);
+      await approve(w, asked.escalationId);
+      expect(gate.paused()).toBe(1);
+      expect(await end(w, 'workflow.cancel')).toMatchObject({ ok: true });
+      // The cancel answered with the notice's outcome already written.
+      expect((await w.store.get(notice))?.outcome).toMatchObject({ kind: 'cancelled' });
+      gate.release();
+      await settle();
+      expect(seen).toEqual([]);
+      expect(await w.store.get(notice)).toMatchObject({ delivery: { state: 'pending', attempts: [] }, outcome: { kind: 'cancelled' } });
+    });
+
+    it('P1: a report whose run completes after its last read before the claim is not claimed or sent', async () => {
+      const { w, impl } = await working();
+      const seen = inserts(w, () => Promise.resolve(TIMEOUT));
+      const gate = pauseBeforeClaim(w);
+      let reported: unknown;
+      void report(w, impl, 'report at the claim').then((r) => (reported = r));
+      await settle();
+      expect(gate.paused()).toBe(1);
+      expect(await end(w, 'workflow.complete')).toMatchObject({ ok: true });
+      gate.release();
+      await settle();
+      expect(reported).toMatchObject({ status: 'reported' });
+      expect(seen).toEqual([]);
+      const record = await reportOf(w, 'report at the claim');
+      expect(await w.store.get(record!.operationId)).toMatchObject({ delivery: { state: 'pending', attempts: [] }, outcome: { kind: 'cancelled' } });
+    });
+
+    it('P2: the limit\'s question written after the turn\'s end found the payload sent is not left open', async () => {
+      const { w, impl } = await working();
+      const clock = sleeps(w);
+      const seen = inserts(w, () => Promise.resolve(TIMEOUT));
+      expect(await report(w, impl, 'report at the limit and the end')).toMatchObject({ status: 'reported' });
+      const operationId = (await reportOf(w, 'report at the limit and the end'))!.operationId;
+      // The escalations queue is held, as Astra did: the limit's question waits in it.
+      let open: () => void = () => undefined;
+      void (w.service as unknown as { serial: (key: string, fn: () => Promise<void>) => Promise<void> }).serial('escalations', () => new Promise<void>((resolve) => (open = resolve)));
+      await clock.elapse(LATE_RECONCILE_LIMIT_MS);
+      expect(await unknownEscalations(w)).toEqual([]);
+      // Meanwhile the turn ends and the runtime has stored the payload: found sent.
+      store(w, seen[0]!);
+      await w.finishTurn(ROOT);
+      expect((await w.store.get(operationId))?.delivery.state).toBe('sent');
+      open();
+      await settle();
+      expect((await unknownEscalations(w)).filter((e) => e.state === 'open')).toEqual([]);
+      expect(await end(w, 'workflow.cancel')).toMatchObject({ ok: true });
+      expect(seen).toHaveLength(1);
+    });
+  });
 };
