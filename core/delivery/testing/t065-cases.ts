@@ -71,4 +71,44 @@ export const t065ClaimCases = (backend: string, open: () => DeliveryStore) =>
       expect(await service.dispatch(input.operationId, { origin: SYSTEM })).toMatchObject({ status: 'not-dispatched', reason: 'ended' });
       expect(codex.dispatched).toEqual([]);
     });
+
+    it('r3 endUnclaimed: none claimed: each pending one with no outcome is ended, and its claim then answers ended', async () => {
+      const store = open();
+      const a = inputs('end-a').handoff;
+      const b = inputs('end-b')['system-notice'];
+      for (const input of [a, b]) expect((await store.accept(input)).status).toBe('accepted');
+      expect(await store.endUnclaimed([a.operationId, b.operationId, op('end-missing')], CANCELLED)).toEqual({ status: 'ended', ended: [a.operationId, b.operationId] });
+      expect(await store.claim(claimOf(a, ++claims))).toEqual({ status: 'ended' });
+      expect(await store.get(b.operationId)).toMatchObject({ delivery: { state: 'pending', attempts: [] }, outcome: CANCELLED });
+      // Again: nothing more to end, nothing changes.
+      expect(await store.endUnclaimed([a.operationId, b.operationId], CANCELLED)).toEqual({ status: 'ended', ended: [] });
+    });
+
+    it('r3 endUnclaimed: one of the set claimed first: in-flight, and nothing of the set is written', async () => {
+      const store = open();
+      const a = inputs('flight-a').handoff;
+      const b = inputs('flight-b')['system-notice'];
+      for (const input of [a, b]) expect((await store.accept(input)).status).toBe('accepted');
+      expect(await store.claim(claimOf(b, ++claims))).toMatchObject({ status: 'claimed' });
+      expect(await store.endUnclaimed([a.operationId, b.operationId], CANCELLED)).toEqual({ status: 'in-flight', operationIds: [b.operationId] });
+      expect((await store.get(a.operationId))?.outcome).toBeUndefined();
+      expect((await store.get(b.operationId))?.outcome).toBeUndefined();
+      // The pending one can still be claimed: the end that met the claim wrote nothing.
+      expect(await store.claim(claimOf(a, ++claims))).toMatchObject({ status: 'claimed' });
+    });
+
+    it('r3 endUnclaimed: one with an outcome already, or sent, is left as it is', async () => {
+      const store = open();
+      const { service } = make(store);
+      const a = inputs('kept-a')['system-notice'];
+      const b = inputs('kept-b')['system-notice'];
+      for (const input of [a, b]) expect((await service.accept(input)).status).toBe('accepted');
+      const other = { ...CANCELLED, detail: 'given up before' };
+      expect(await store.recordOutcome(a.operationId, other)).toBe('recorded');
+      expect(await service.dispatch(b.operationId, { origin: SYSTEM })).toMatchObject({ status: 'sent' });
+      expect(await store.endUnclaimed([a.operationId, b.operationId], CANCELLED)).toEqual({ status: 'ended', ended: [] });
+      expect((await store.get(a.operationId))?.outcome).toEqual(other);
+      expect(await store.get(b.operationId)).toMatchObject({ delivery: { state: 'sent' } });
+      expect((await store.get(b.operationId))?.outcome).toBeUndefined();
+    });
   });

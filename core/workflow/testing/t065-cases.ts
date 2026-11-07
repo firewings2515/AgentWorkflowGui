@@ -717,4 +717,230 @@ export const t065Cases = (backend: string, make: Make) => {
       expect(seen).toHaveLength(1);
     });
   });
+
+  describe(`T065 r3 (${backend}): the run's deliveries to root are closed before its end is committed`, () => {
+    const SENT: DispatchResult = { state: 'sent', nativeRef: { sessionRef: 'unused' }, evidence: { kind: 'live-ack', at: '2026-10-29T00:00:00.000Z', detail: 'status frame' } };
+    const sentFor = (request: DispatchRequest): DispatchResult => ({ ...SENT, nativeRef: { sessionRef: request.nativeSessionRef } });
+    const BEING_SENT = 'A report to root is being sent; end the run once it has gone';
+
+    /** Holds every dispatch right after its target's preparation, the last wait before the store's claim. */
+    const holdBeforeClaim = (w: World) => {
+      const service = w.service as unknown as { prepareTarget: (record: unknown) => Promise<void> };
+      const prepare = service.prepareTarget.bind(w.service);
+      let release: () => void = () => undefined;
+      let paused = 0;
+      service.prepareTarget = async (record) => {
+        await prepare(record);
+        paused++;
+        await new Promise<void>((resolve) => (release = resolve));
+      };
+      return { paused: () => paused, release: () => release() };
+    };
+    /** Holds the first `endUnclaimed` of the store: the end has listed root's reports, its closing step not run yet (Astra r3). */
+    const holdClosingStep = (w: World) => {
+      const original = w.store.endUnclaimed.bind(w.store);
+      let release: () => void = () => undefined;
+      let paused = 0;
+      w.store.endUnclaimed = async (ids, outcome) => {
+        if (paused++ === 0) await new Promise<void>((resolve) => (release = resolve));
+        return original(ids, outcome);
+      };
+      return { paused: () => paused, release: () => release() };
+    };
+    /** Every insert dispatched records the run's state at that moment and waits for `ack`. */
+    const acked = (w: World) => {
+      const states: string[] = [];
+      const acks: ((result: DispatchResult) => void)[] = [];
+      const seen = inserts(w, async () => {
+        states.push((await instanceOf(w)).state);
+        return new Promise<DispatchResult>((resolve) => acks.push(resolve));
+      });
+      return { seen, states, ack: (i: number, result: DispatchResult) => acks[i]!(result) };
+    };
+    /** The end's commit fails once (the disk, say), after its closing step. */
+    const failCommitOnce = (w: World) => {
+      const repo = w.repositories.instances;
+      const update = repo.update.bind(repo);
+      let failed = false;
+      repo.update = (next, expected) => {
+        if (!failed && (next.state === 'completed' || next.state === 'cancelled')) {
+          failed = true;
+          return Promise.reject(new Error('disk I/O error'));
+        }
+        return update(next, expected);
+      };
+    };
+    const tryEnd = (w: World, type: 'workflow.complete' | 'workflow.cancel') => end(w, type).catch((error: unknown) => ({ ok: false as const, thrown: String(error) }));
+
+    it.each(['workflow.complete', 'workflow.cancel'] as const)(
+      'P1 %s: a report claimed after the end listed it is refused the end with nothing written; it is sent, then the run ends',
+      async (type) => {
+        const { w, impl } = await working();
+        const runtime = acked(w);
+        const gate = holdBeforeClaim(w);
+        let reported: unknown;
+        void report(w, impl, 'report in the end').then((r) => (reported = r));
+        await settle();
+        expect(gate.paused()).toBe(1);
+        const step = holdClosingStep(w);
+        let answer: unknown;
+        void end(w, type).then((r) => (answer = r));
+        await settle();
+        expect(step.paused()).toBe(1);
+        // The report is claimed and goes, while the end waits for its closing step.
+        gate.release();
+        await settle();
+        expect(runtime.seen).toHaveLength(1);
+        step.release();
+        await settle();
+        expect(answer).toMatchObject({ ok: false, code: 'invalid_transition', retryable: true, message: BEING_SENT });
+        const record = (await reportOf(w, 'report in the end'))!;
+        expect(await w.store.get(record.operationId)).toMatchObject({ delivery: { state: 'unknown' } });
+        expect((await w.store.get(record.operationId))?.outcome).toBeUndefined();
+        expect((await instanceOf(w)).state).toBe('running');
+        // Its result is written as it comes; the end goes then.
+        store(w, runtime.seen[0]!);
+        runtime.ack(0, sentFor(runtime.seen[0]!));
+        await settle();
+        expect(reported).toMatchObject({ status: 'reported' });
+        expect(await end(w, type)).toMatchObject({ ok: true });
+        await settle();
+        const after = await w.store.get(record.operationId);
+        expect(after?.delivery.state).toBe('sent');
+        expect(after?.outcome).toBeUndefined();
+        // Never dispatched once the run had ended.
+        expect(runtime.states).toEqual(['running']);
+      },
+    );
+
+    it('P1: the closing step first, then the claim: the report is not claimed or sent, and the run ends', async () => {
+      const { w, impl } = await working();
+      const runtime = acked(w);
+      const gate = holdBeforeClaim(w);
+      void report(w, impl, 'report after the step');
+      await settle();
+      const step = holdClosingStep(w);
+      let answer: unknown;
+      void end(w, 'workflow.complete').then((r) => (answer = r));
+      await settle();
+      step.release();
+      await settle();
+      expect(answer).toMatchObject({ ok: true });
+      gate.release();
+      await settle();
+      expect(runtime.seen).toEqual([]);
+      const record = (await reportOf(w, 'report after the step'))!;
+      expect(await w.store.get(record.operationId)).toMatchObject({ delivery: { state: 'pending', attempts: [] }, outcome: { kind: 'cancelled' } });
+    });
+
+    it('P1 restart: a run committed as ended with a report not closed (older code, a crash): the next start closes it first and sends nothing', async () => {
+      const { w, impl } = await working();
+      acked(w);
+      holdBeforeClaim(w);
+      void report(w, impl, 'report of an old end');
+      await settle();
+      // The end committed the way the code before r3 did: the run first, the report not closed yet.
+      const instance = await instanceOf(w);
+      const endedAt = '2026-10-29T02:00:00.000Z' as never;
+      const committed = { ...instance, revision: instance.revision + 1, state: 'completed' as const, endedAt, tasks: instance.tasks.map((t) => ({ ...t, status: 'completed' as const, completedAt: endedAt })) };
+      expect((await w.repositories.instances.update(committed, instance.revision)).status).toBe('saved');
+      const record = (await reportOf(w, 'report of an old end'))!;
+      expect((await w.store.get(record.operationId))?.outcome).toBeUndefined();
+      const r = await w.restart();
+      await settle();
+      expect(r.claude.dispatched.filter((d) => d.text.includes('report of an old end'))).toEqual([]);
+      expect(await r.store.get(record.operationId)).toMatchObject({ delivery: { state: 'pending', attempts: [] }, outcome: { kind: 'cancelled' } });
+    });
+
+    it('P1: closed, but the end\'s commit failed: logged by operation, the run still runs; after a restart nothing is sent and the run ends', async () => {
+      const { w, impl } = await working();
+      acked(w);
+      holdBeforeClaim(w);
+      void report(w, impl, 'secret report text');
+      await settle();
+      const record = (await reportOf(w, 'secret report text'))!;
+      failCommitOnce(w);
+      expect(await tryEnd(w, 'workflow.complete')).toMatchObject({ ok: false });
+      expect(await w.store.get(record.operationId)).toMatchObject({ delivery: { state: 'pending' }, outcome: { kind: 'cancelled' } });
+      expect((await instanceOf(w)).state).toBe('running');
+      const line = w.logs.find((l) => l.includes('stay closed'));
+      expect(line).toContain(record.operationId);
+      expect(line).not.toContain('secret report text');
+      const r = await w.restart();
+      await settle();
+      expect((await instanceOf(r)).state).toBe('running');
+      expect(r.claude.dispatched.filter((d) => d.text.includes('secret report text'))).toEqual([]);
+      expect(await end(r, 'workflow.complete')).toMatchObject({ ok: true });
+      expect(await r.store.get(record.operationId)).toMatchObject({ delivery: { state: 'pending', attempts: [] }, outcome: { kind: 'cancelled' } });
+    });
+
+    it.each(['timeout', 'sent'] as const)('a notice on its way when the run completes: the end goes on; it is not taken for cancelled, and comes back %s', async (comes) => {
+      const { w, asked, notice } = await awaitingList(make);
+      const runtime = acked(w);
+      await approve(w, asked.escalationId);
+      expect(runtime.seen).toHaveLength(1);
+      expect(w.service.beingConfirmed(notice)).toBe(true);
+      expect(await end(w, 'workflow.complete')).toMatchObject({ ok: true });
+      await settle();
+      expect((await w.store.get(notice))?.outcome).toBeUndefined();
+      if (comes === 'sent') store(w, runtime.seen[0]!);
+      runtime.ack(0, comes === 'sent' ? sentFor(runtime.seen[0]!) : TIMEOUT);
+      await settle();
+      const record = await w.store.get(notice);
+      if (comes === 'sent') {
+        expect(record?.delivery.state).toBe('sent');
+        expect(record?.outcome).toBeUndefined();
+      } else {
+        // Closed by the system once it came back unsent: no late reconcile, nothing asked.
+        expect(record).toMatchObject({ delivery: { state: 'unknown' }, outcome: { kind: 'cancelled' } });
+        expect(w.service.beingConfirmed(notice)).toBe(false);
+      }
+      expect((await unknownEscalations(w)).filter((e) => e.state === 'open')).toEqual([]);
+      expect(runtime.states).toEqual(['running']);
+    });
+
+    it('restart with a notice on its way, closed but the end not committed: the run still runs, the notice is reconciled as usual, the run ends', async () => {
+      const { w, asked, notice } = await awaitingList(make);
+      acked(w);
+      await approve(w, asked.escalationId);
+      failCommitOnce(w);
+      expect(await tryEnd(w, 'workflow.complete')).toMatchObject({ ok: false });
+      expect((await w.store.get(notice))?.outcome).toBeUndefined();
+      const r = await w.restart();
+      await settle();
+      expect((await instanceOf(r)).state).toBe('running');
+      // Not cancelled: an unknown notice of a running run, reconciled as any (not found: asked about).
+      expect(await r.store.get(notice)).toMatchObject({ delivery: { state: 'unknown' } });
+      expect((await r.store.get(notice))?.outcome).toBeUndefined();
+      expect(await end(r, 'workflow.complete')).toMatchObject({ ok: true });
+      await settle();
+      expect((await r.store.get(notice))?.outcome).toMatchObject({ kind: 'cancelled' });
+      expect((await unknownEscalations(r)).filter((e) => e.state === 'open')).toEqual([]);
+    });
+
+    it('restart with the end committed and a notice left unknown: closed before the recovery, which asks nothing about it', async () => {
+      const { w, asked, notice } = await awaitingList(make);
+      acked(w);
+      await approve(w, asked.escalationId);
+      expect(await end(w, 'workflow.complete')).toMatchObject({ ok: true });
+      await settle();
+      expect((await w.store.get(notice))?.outcome).toBeUndefined();
+      const r = await w.restart();
+      await settle();
+      expect((await r.store.get(notice))?.outcome).toMatchObject({ kind: 'cancelled' });
+      // Not even a question closed afterwards: none was written.
+      expect(await unknownEscalations(r)).toEqual([]);
+    });
+
+    it('a report made after the run ended is refused with a reason, and nothing is accepted or sent', async () => {
+      const { w, impl } = await working();
+      const runtime = acked(w);
+      expect(await end(w, 'workflow.complete')).toMatchObject({ ok: true });
+      await settle();
+      expect(await report(w, impl, 'report too late')).toEqual({ status: 'rejected', rejection: { reason: 'invalid-input', detail: 'this workflow run has ended' } });
+      await settle();
+      expect(await reportOf(w, 'report too late')).toBeUndefined();
+      expect(runtime.seen).toEqual([]);
+    });
+  });
 };

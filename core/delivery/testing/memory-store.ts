@@ -22,6 +22,7 @@ import {
   type ClaimResult,
   CommitUncertainError,
   type DeliveryStore,
+  type EndUnclaimedResult,
   type HandoffMeta,
   type PayloadContext,
   type PeerMeta,
@@ -30,7 +31,7 @@ import {
   type WriteResult,
 } from '../../ports';
 
-type Method = 'accept' | 'updateTarget' | 'claim' | 'recordSent' | 'recordResolution' | 'recordOutcome' | 'get' | 'findBySourceCallRef' | 'listByState' | 'listByTarget';
+type Method = 'accept' | 'updateTarget' | 'claim' | 'recordSent' | 'recordResolution' | 'recordOutcome' | 'endUnclaimed' | 'get' | 'findBySourceCallRef' | 'listByState' | 'listByTarget';
 
 /**
  * `error`: the transaction fails before COMMIT, nothing is applied. `uncertain`: COMMIT fails and was in
@@ -248,6 +249,22 @@ export class MemoryDeliveryStore implements DeliveryStore {
       if (row === undefined) return { value: 'stale' };
       if (row.outcome !== undefined) return { value: canonicalJson(row.outcome) === canonicalJson(outcome) ? 'recorded' : 'stale' };
       return { value: 'recorded', apply: () => (row.outcome = copy(outcome)) };
+    });
+  }
+
+  endUnclaimed(operationIds: OperationId[], outcome: OperationOutcome): Promise<EndUnclaimedResult> {
+    return this.run<EndUnclaimedResult>('endUnclaimed', () => {
+      const rows = operationIds.map((id) => this.rows.get(id)).filter((r): r is Row => r !== undefined);
+      // Claimed now (T065 r3): nothing of the set is written, in one step, as `claim` is one step.
+      const inFlight = rows.filter((r) => r.state === 'unknown' && r.outcome === undefined).map((r) => r.operationId);
+      if (inFlight.length > 0) return { value: { status: 'in-flight', operationIds: inFlight } };
+      const open = rows.filter((r) => r.state === 'pending' && r.outcome === undefined);
+      return {
+        value: { status: 'ended', ended: open.map((r) => r.operationId) },
+        apply: () => {
+          for (const r of open) r.outcome = copy(outcome);
+        },
+      };
     });
   }
 

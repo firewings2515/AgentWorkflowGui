@@ -1272,6 +1272,9 @@ export class WorkflowEngine implements WorkflowHooks {
       if (known.delivery.state === 'pending') sends.push(this.sendReport(known.operationId, rootId));
       return { status: 'reported', ...(question !== undefined && { escalationId: question.id }) };
     }
+    // In the run's queue, as its end is (T065 r3): once the end is committed no new report of the run is accepted, so none
+    // is sent to root after it; the caller is told, as a handoff is. The same call again (above) still finds its report.
+    if (instance.state === 'completed' || instance.state === 'cancelled') return rejected('invalid-input', 'this workflow run has ended');
     // Whether the report asks the user is part of its stored identity, so a restart can restore the question.
     const operationId = OperationIdSchema.parse(`${input.needsUserConfirmation ? REPORT_ASKING : REPORT}${this.options.uuid()}`);
     const peerMessageId = peerIdOf(operationId);
@@ -1478,6 +1481,11 @@ export class WorkflowEngine implements WorkflowHooks {
     if (record.kind !== 'peer-message' || !record.operationId.startsWith(REPORT) || record.peer?.instanceId === undefined) return undefined;
     const instance = await this.repos.instances.get(record.peer.instanceId);
     return instance !== undefined && record.target.sessionId === instance.rootSessionId && record.peer.toSessionId === instance.rootSessionId ? 'insert-if-busy' : undefined;
+  }
+
+  /** `WorkflowHooks.beforeRecover` (T065 r3): the reports and notices to root of every ended run are closed first. */
+  async beforeRecover(): Promise<void> {
+    await this.pipeline?.closeEndedRuns();
   }
 
   /**

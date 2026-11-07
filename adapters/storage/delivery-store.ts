@@ -25,6 +25,7 @@ import type {
   ClaimInput,
   ClaimResult,
   DeliveryStore,
+  EndUnclaimedResult,
   ProvisionSpec,
   StoredDelivery,
   WriteResult,
@@ -343,6 +344,23 @@ export class SqliteDeliveryStore implements DeliveryStore {
       this.db.prepare('UPDATE delivery SET outcome = ? WHERE operation_id = ? AND outcome IS NULL').run(text, operationId);
       return committed('recorded');
     }));
+  }
+
+  endUnclaimed(operationIds: OperationId[], outcome: OperationOutcome): Promise<EndUnclaimedResult> {
+    return this.run(() =>
+      writeTransaction<EndUnclaimedResult>(this.db, () => {
+        const text = canonicalJson(checkRecord(OutcomeSchema, 'delivery', outcome));
+        const rows = operationIds.map((id) => this.row(id)).filter((r): r is DeliveryRow => r !== undefined);
+        for (const row of rows) this.load(row);
+        // Claimed now (T065 r3): nothing of the set is written, inside the same transaction as any claim.
+        const inFlight = rows.filter((r) => r.state === 'unknown' && r.outcome === null).map((r) => r.operation_id as OperationId);
+        if (inFlight.length > 0) return unchanged({ status: 'in-flight', operationIds: inFlight });
+        const ended: OperationId[] = [];
+        const write = this.db.prepare("UPDATE delivery SET outcome = ? WHERE operation_id = ? AND state = 'pending' AND outcome IS NULL");
+        for (const row of rows) if (write.run(text, row.operation_id).changes === 1) ended.push(row.operation_id as OperationId);
+        return ended.length === 0 ? unchanged({ status: 'ended', ended }) : committed({ status: 'ended', ended });
+      }),
+    );
   }
 
   findBySourceCallRef(sourceCallRef: string): Promise<StoredDelivery | undefined> {
