@@ -56,7 +56,9 @@ export const reworkSoFar = (handoffs: readonly Handoff[], taskId: TaskId): numbe
  * most of any node: the maximum over the nodes of (receipts - 1). A handoff is rework when it raises that count:
  * when its target already received the task more times than the count so far. So one loop counts once, whatever
  * nodes it passes: plan → implement → review → plan → implement → review → plan is one (the second implement),
- * and the report to root at the end, which root always received fewer times than the loop's nodes, is none.
+ * and in that shape the report to root at the end, which root received fewer times than the loop's nodes, is
+ * none. It is no promise for every graph: with a limit of 0, root handing the task to A and B, each reporting to
+ * root, B's report is root's second receipt, more than the count of 0, so it is rework (T064 r1 P2-2).
  * Marked this way, the handoffs marked as rework are always that maximum, so the limit, a restart
  * (`taskProgress`) and the store's count of the rework key agree.
  * Marks stored before T064 (every return was rework) stay: the count goes on from them and grows again only
@@ -175,7 +177,7 @@ export const briefing = (instance: WorkflowInstance, node: AgentNode, taskId: Ta
   }
   lines.push(
     '',
-    `The GUI counts the rework of the task: each time the task comes back to the same node counts once, and the other nodes of that loop add nothing (handing the result back to root at the end is no rework). At most ${String(template.reworkLimit)} for this task. Past a limit the GUI does not hand off and asks the user instead.`,
+    `The GUI counts the rework of the task: a handoff counts once when its target node already received the task more times than the rework counted so far. So each time the task comes back to the same node counts once, and the other nodes of that loop usually add nothing. At most ${String(template.reworkLimit)} for this task. Past a limit the GUI does not hand off and asks the user instead.`,
     `Use \`report_to_root\` for progress or a question for the user (set needsUserConfirmation to ask the user).${pipelined ? '' : ' `create_tasks` is not available in this version.'}`,
   );
   return lines.join('\n');

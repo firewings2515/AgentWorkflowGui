@@ -1,34 +1,45 @@
 // T064: one send-back is one rework. A task's rework count is how often it came back to one node (the most of any
-// node), so a loop counts once, whatever nodes it passes, and the report to root at the end is no rework. On the
-// harness (memory ports, fake adapters, real restarts): the starter template's shape, implement ⇄ review, a waiting
-// node, a restart and handoffs marked before T064.
+// node), so a loop counts once, whatever nodes it passes; in the starter template the report to root at the end is no
+// rework. On the harness (memory ports, fake adapters, real restarts): the starter set's own template, implement ⇄
+// review, a waiting node, a restart, handoffs marked before T064, held handoffs and reports to root.
 import { describe, expect, it } from 'vitest';
-import { type Handoff, HandoffId, InstanceId, NodeId, OperationId, SessionId, TaskId, type WorkflowTemplate } from '../../contracts';
+import { type Handoff, HandoffId, InstanceId, NodeId, OperationId, SessionId, TaskId } from '../../contracts';
 import type { AcceptInput, HandoffMeta } from '../ports';
 import { handoffCounts, isRework, nodeOf, receivedCount, reworkSoFar, taskProgress } from './graph';
 import { starterSet } from './starter';
-import { handoff, IMPL, INSTANCE, instanceOf, PLAN, REVIEW, ROOT, sessionOf, settle, started, template, world, type World } from './testing/harness';
+import { until } from '../pipeline/testing/t032-cases';
+import { handoff, IMPL, INSTANCE, instanceOf, PLAN, REVIEW, rid, ROOT, sessionOf, settle, started, template, world, type World } from './testing/harness';
 import { fanTemplate, JOIN, RA, RB } from './testing/t031-cases';
 
 const toImpl = { ruleId: 'to-impl', target: { kind: 'node' as const, nodeId: IMPL } };
 const toReview = { ruleId: 'to-review', target: { kind: 'node' as const, nodeId: REVIEW } };
-const toPlan = { ruleId: 'review-plan', target: { kind: 'node' as const, nodeId: PLAN } };
 const rework = { ruleId: 'rework', target: { kind: 'node' as const, nodeId: IMPL } };
 const done = { ruleId: 'done', target: { kind: 'root' as const } };
 
-const STARTER_LIMIT = starterSet([], '2026-11-07T00:00:00.000Z').workflow.reworkLimit;
+/** The starter set itself (T063): its Agents and its template, nodes, rules and edges as a first start adds them. */
+const STARTER_SET = starterSet([], '2026-11-07T00:00:00.000Z');
+const STARTER_TEMPLATE = STARTER_SET.workflow;
+const [SP, SI, SR] = STARTER_TEMPLATE.nodes.map((n) => n.id) as [NodeId, NodeId, NodeId];
+const ruleTo = (from: NodeId, to: NodeId) => {
+  const rule = STARTER_TEMPLATE.nodes.find((n) => n.id === from)?.outputRules.find((r) => r.target.kind === 'node' && r.target.nodeId === to);
+  if (rule === undefined) throw new Error(`no rule ${from} → ${to}`);
+  return { ruleId: rule.id, target: { kind: 'node' as const, nodeId: to } };
+};
+const sToImpl = ruleTo(SP, SI);
+const sToReview = ruleTo(SI, SR);
+const sToPlan = ruleTo(SR, SP);
 
-/** The starter template's shape (T063): plan (root) → implement → review → plan, every verdict back to plan. */
-const starterShape = (): WorkflowTemplate =>
-  template(
-    { reworkLimit: STARTER_LIMIT, edges: [{ source: PLAN, target: IMPL }, { source: IMPL, target: REVIEW }, { source: REVIEW, target: PLAN }] },
-    { review: { outputRules: [{ id: 'review-plan', condition: 'the review is done', payload: 'the verdict', target: { kind: 'node', nodeId: PLAN }, requiresUserConfirmation: false }] } },
-  );
+/** A world with the starter set saved, as a first start leaves it. */
+const starterWorld = async () => {
+  const w = await world(STARTER_TEMPLATE);
+  for (const a of STARTER_SET.agents) await w.repositories.agents.save(a, null);
+  return w;
+};
 
 const flags = async (w: World) => (await w.repositories.handoffs.listByInstance(INSTANCE)).map((h) => [h.fromNodeId, h.toNodeId, h.rework]);
 const limitEscalations = async (w: World) => (await w.repositories.escalations.list({ state: 'open' })).filter((e) => e.kind === 'limit-exceeded');
 
-/** plan → implement → review. */
+/** plan → implement → review in the harness template. */
 const firstLoop = async (w: World) => {
   await started(w);
   expect(await handoff(w, ROOT, toImpl)).toMatchObject({ status: 'accepted' });
@@ -37,61 +48,70 @@ const firstLoop = async (w: World) => {
   return { impl, review: await sessionOf(w, REVIEW) };
 };
 
-/** In the starter shape: review sends the task back to plan and plan gives it to implement again; then implement hands it to review. */
+/** 規劃 → 實作 → 審查 in the starter template. */
+const starterFirstLoop = async (w: World) => {
+  expect(await started(w, { workflowId: STARTER_TEMPLATE.id })).toMatchObject({ ok: true });
+  expect(await handoff(w, ROOT, sToImpl)).toMatchObject({ status: 'accepted' });
+  const impl = await sessionOf(w, SI);
+  expect(await handoff(w, impl, sToReview)).toMatchObject({ status: 'accepted' });
+  return { impl, review: await sessionOf(w, SR) };
+};
+
+/** In the starter template: review sends the task back to plan and plan gives it to implement again; then implement hands it to review. */
 const starterSendBack = async (w: World, impl: SessionId, review: SessionId) => {
-  expect(await handoff(w, review, { ...toPlan, content: 'needs work' })).toMatchObject({ status: 'accepted' });
-  const again = await handoff(w, ROOT, toImpl);
+  expect(await handoff(w, review, { ...sToPlan, content: 'needs work' })).toMatchObject({ status: 'accepted' });
+  const again = await handoff(w, ROOT, sToImpl);
   if (again.status !== 'accepted') return again;
-  expect(await handoff(w, impl, toReview)).toMatchObject({ status: 'accepted' });
+  expect(await handoff(w, impl, sToReview)).toMatchObject({ status: 'accepted' });
   return again;
 };
 
 describe('T064 the starter template: one send-back is one rework', () => {
   it('the starter set keeps a limit that allows two send-backs', () => {
-    expect(STARTER_LIMIT).toBe(2);
+    expect(STARTER_TEMPLATE.reworkLimit).toBe(2);
   });
 
   it.each([0, 1, 2])('sent back %i time(s), the passing review reaches root, within the limit', async (times) => {
-    const w = await world(starterShape());
-    const { impl, review } = await firstLoop(w);
+    const w = await starterWorld();
+    const { impl, review } = await starterFirstLoop(w);
     for (let i = 0; i < times; i++) expect(await starterSendBack(w, impl, review)).toMatchObject({ status: 'accepted' });
     expect((await instanceOf(w)).tasks[0]?.reworkCount).toBe(times);
     // The report to root: root received the task fewer times than implement, so it is no rework.
-    const passed = await handoff(w, review, { ...toPlan, content: 'approved' });
+    const passed = await handoff(w, review, { ...sToPlan, content: 'approved' });
     expect(passed).toMatchObject({ status: 'accepted', delivery: 'sent' });
-    expect((await w.repositories.handoffs.listByInstance(INSTANCE)).at(-1)).toMatchObject({ toNodeId: PLAN, rework: false });
-    expect((await instanceOf(w)).tasks[0]).toMatchObject({ status: 'running', reworkCount: times, currentNodeId: PLAN });
+    expect((await w.repositories.handoffs.listByInstance(INSTANCE)).at(-1)).toMatchObject({ toNodeId: SP, rework: false });
+    expect((await instanceOf(w)).tasks[0]).toMatchObject({ status: 'running', reworkCount: times, currentNodeId: SP });
     expect(await limitEscalations(w)).toEqual([]);
   });
 
   it('every handoff of two send-backs and a pass: only implement coming back counts', async () => {
-    const w = await world(starterShape());
-    const { impl, review } = await firstLoop(w);
+    const w = await starterWorld();
+    const { impl, review } = await starterFirstLoop(w);
     await starterSendBack(w, impl, review);
     await starterSendBack(w, impl, review);
-    await handoff(w, review, { ...toPlan, content: 'approved' });
+    await handoff(w, review, { ...sToPlan, content: 'approved' });
     expect(await flags(w)).toEqual([
-      [PLAN, IMPL, false],
-      [IMPL, REVIEW, false],
-      [REVIEW, PLAN, false],
-      [PLAN, IMPL, true],
-      [IMPL, REVIEW, false],
-      [REVIEW, PLAN, false],
-      [PLAN, IMPL, true],
-      [IMPL, REVIEW, false],
-      [REVIEW, PLAN, false],
+      [SP, SI, false],
+      [SI, SR, false],
+      [SR, SP, false],
+      [SP, SI, true],
+      [SI, SR, false],
+      [SR, SP, false],
+      [SP, SI, true],
+      [SI, SR, false],
+      [SR, SP, false],
     ]);
   });
 
   it('a third send-back is stopped when plan gives the task to implement again: escalated (limit-exceeded), the task blocked', async () => {
-    const w = await world(starterShape());
-    const { impl, review } = await firstLoop(w);
+    const w = await starterWorld();
+    const { impl, review } = await starterFirstLoop(w);
     await starterSendBack(w, impl, review);
     await starterSendBack(w, impl, review);
     // The send-back itself still reaches plan; giving the task to implement a fourth time is over the limit.
     const over = await starterSendBack(w, impl, review);
     expect(over).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
-    expect((await w.repositories.handoffs.listByInstance(INSTANCE)).at(-1)).toMatchObject({ fromNodeId: REVIEW, toNodeId: PLAN, rework: false });
+    expect((await w.repositories.handoffs.listByInstance(INSTANCE)).at(-1)).toMatchObject({ fromNodeId: SR, toNodeId: SP, rework: false });
     expect((await instanceOf(w)).tasks[0]).toMatchObject({ status: 'blocked', blockedReason: 'limit-exceeded', reworkCount: 2 });
     expect(await limitEscalations(w)).toEqual([expect.objectContaining({ fromSessionId: ROOT, detail: expect.stringContaining('rework limit of 2') as unknown })]);
   });
@@ -169,8 +189,8 @@ describe('T064 a node that waits for all upstream', () => {
 
 describe('T064 restart and handoffs marked before T064', () => {
   it('a restart rebuilds the count of the new rule from the handoffs, and counting goes on from it', async () => {
-    const w = await world(starterShape());
-    const { impl, review } = await firstLoop(w);
+    const w = await starterWorld();
+    const { impl, review } = await starterFirstLoop(w);
     await starterSendBack(w, impl, review);
     await starterSendBack(w, impl, review);
     // A crash after acceptance, before the task record caught up.
@@ -178,7 +198,7 @@ describe('T064 restart and handoffs marked before T064', () => {
     await w.repositories.instances.update({ ...instance, revision: instance.revision + 1, tasks: instance.tasks.map((t) => ({ ...t, reworkCount: 0 })) }, instance.revision);
     const after = await w.restart();
     await settle();
-    expect((await instanceOf(after)).tasks[0]).toMatchObject({ reworkCount: 2, currentNodeId: REVIEW });
+    expect((await instanceOf(after)).tasks[0]).toMatchObject({ reworkCount: 2, currentNodeId: SR });
     // Counting goes on from the store: a third send-back is stopped.
     expect(await starterSendBack(after, impl, review)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
     expect((await instanceOf(after)).tasks[0]).toMatchObject({ status: 'blocked', blockedReason: 'limit-exceeded', reworkCount: 2 });
@@ -204,17 +224,17 @@ describe('T064 restart and handoffs marked before T064', () => {
 
   /** A run sent back once before T064 (marked twice, the count at the limit of 2), then updated and restarted. */
   const sentBackBeforeT064 = async () => {
-    const w = await world(starterShape());
+    const w = await starterWorld();
     const end = asBeforeT064(w);
-    const { impl, review } = await firstLoop(w);
+    const { impl, review } = await starterFirstLoop(w);
     await starterSendBack(w, impl, review);
     end();
     expect(await flags(w)).toEqual([
-      [PLAN, IMPL, false],
-      [IMPL, REVIEW, false],
-      [REVIEW, PLAN, false],
-      [PLAN, IMPL, true],
-      [IMPL, REVIEW, true],
+      [SP, SI, false],
+      [SI, SR, false],
+      [SR, SP, false],
+      [SP, SI, true],
+      [SI, SR, true],
     ]);
     // The update: the stored marks are read as they are, and a restart rebuilds the count from them.
     const after = await w.restart();
@@ -226,8 +246,8 @@ describe('T064 restart and handoffs marked before T064', () => {
   it('a run sent back once before T064 (marked twice) reads as it was, and its passing review now reaches root', async () => {
     const { after, review } = await sentBackBeforeT064();
     // Before T064 this handoff was stopped (a third rework over the limit of 2).
-    expect(await handoff(after, review, { ...toPlan, content: 'approved' })).toMatchObject({ status: 'accepted', delivery: 'sent' });
-    expect((await instanceOf(after)).tasks[0]).toMatchObject({ status: 'running', reworkCount: 2, currentNodeId: PLAN });
+    expect(await handoff(after, review, { ...sToPlan, content: 'approved' })).toMatchObject({ status: 'accepted', delivery: 'sent' });
+    expect((await instanceOf(after)).tasks[0]).toMatchObject({ status: 'running', reworkCount: 2, currentNodeId: SP });
   });
 
   it('a run sent back once before T064 gets no sudden stop and no extra allowance: a second send-back goes and passes', async () => {
@@ -235,7 +255,7 @@ describe('T064 restart and handoffs marked before T064', () => {
     // Implement's third receipt is not past the count of 2: no rework, the count stays.
     expect(await starterSendBack(after, impl, review)).toMatchObject({ status: 'accepted' });
     expect((await after.repositories.handoffs.listByInstance(INSTANCE)).slice(-3).map((h) => h.rework)).toEqual([false, false, false]);
-    expect(await handoff(after, review, { ...toPlan, content: 'approved' })).toMatchObject({ status: 'accepted' });
+    expect(await handoff(after, review, { ...sToPlan, content: 'approved' })).toMatchObject({ status: 'accepted' });
     expect((await instanceOf(after)).tasks[0]).toMatchObject({ status: 'running', reworkCount: 2 });
   });
 
@@ -244,6 +264,57 @@ describe('T064 restart and handoffs marked before T064', () => {
     expect(await starterSendBack(after, impl, review)).toMatchObject({ status: 'accepted' });
     expect(await starterSendBack(after, impl, review)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
     expect((await instanceOf(after)).tasks[0]).toMatchObject({ status: 'blocked', blockedReason: 'limit-exceeded', reworkCount: 2 });
+  });
+});
+
+describe('T064 r1: held handoffs and reports to root', () => {
+  it('P2-1 a task list the user approves later: the shown count follows the marks, live as after a restart', async () => {
+    const w = await starterWorld();
+    expect(await started(w, { workflowId: STARTER_TEMPLATE.id })).toMatchObject({ ok: true });
+    const asked = await w.engine.createTasks({ ruleId: 'plan-tasks', tasks: [{ key: 'a', title: 'A', dependsOn: [], dependsOnExisting: [] }] }, { caller: ROOT, sourceCallRef: 'call-tasks' });
+    if (asked.status !== 'awaiting-confirmation') throw new Error(`not asked: ${JSON.stringify(asked)}`);
+    const a = TaskId.parse(`${asked.taskPlanId}:a`);
+    // Root gives the task to implement twice while its list waits for the user: held, counted at the approval.
+    for (const n of [1, 2]) expect(await handoff(w, ROOT, { ...sToImpl, taskId: a, content: `try ${String(n)}` })).toMatchObject({ status: 'accepted' });
+    await w.run({ type: 'escalation.respond', requestId: rid(), escalationId: asked.escalationId, decision: 'approve' });
+    const taskA = async (x: World) => (await instanceOf(x)).tasks.find((t) => t.id === a);
+    await until(async () => (await taskA(w))?.status === 'running', 'task A running');
+    const marks = async (x: World) => (await x.repositories.handoffs.listByInstance(INSTANCE)).filter((h) => h.taskId === a && h.rework).length;
+    expect(await marks(w)).toBe(1);
+    expect((await taskA(w))?.reworkCount).toBe(1);
+    // One more loop: implement coming back a third time is the second rework. The store never counted the held
+    // one, so its count of the key is 1; the task shows the marks, 2, as a restart rebuilds it.
+    const node = async (nodeId: NodeId) => (await w.repositories.instances.findNodeSession({ instanceId: INSTANCE, nodeId, taskId: a }))!;
+    const impl = await node(SI);
+    expect(await handoff(w, impl, { ...sToReview, taskId: a })).toMatchObject({ status: 'accepted' });
+    const review = await node(SR);
+    expect(await handoff(w, review, { ...sToPlan, taskId: a, content: 'needs work' })).toMatchObject({ status: 'accepted' });
+    expect(await handoff(w, ROOT, { ...sToImpl, taskId: a, content: 'try 3' })).toMatchObject({ status: 'accepted' });
+    expect(await marks(w)).toBe(2);
+    expect((await taskA(w))?.reworkCount).toBe(2);
+    const after = await w.restart();
+    await settle();
+    expect((await taskA(after))?.reworkCount).toBe(2);
+  });
+
+  it('P2-2 a report to root is rework when root already received the task more times than the count: no promise that it never is', async () => {
+    const report = { id: 'done', condition: 'done', payload: '', target: { kind: 'root' as const }, requiresUserConfirmation: false };
+    const w = await world(
+      template(
+        { reworkLimit: 0, edges: [{ source: PLAN, target: IMPL }, { source: PLAN, target: REVIEW }] },
+        {
+          plan: { outputRules: [{ ...report, id: 'to-impl', target: { kind: 'node', nodeId: IMPL } }, { ...report, id: 'to-review', target: { kind: 'node', nodeId: REVIEW } }] },
+          impl: { outputRules: [report] },
+          review: { outputRules: [report] },
+        },
+      ),
+    );
+    await started(w);
+    await handoff(w, ROOT, toImpl);
+    await handoff(w, ROOT, toReview);
+    expect(await handoff(w, await sessionOf(w, IMPL), done)).toMatchObject({ status: 'accepted' });
+    // Root's second receipt is more than the count of 0: rework, over the limit of 0.
+    expect(await handoff(w, await sessionOf(w, REVIEW), done)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
   });
 });
 

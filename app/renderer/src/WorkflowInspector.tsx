@@ -40,7 +40,7 @@ export function WorkflowField({ path, label, hint, issues, children }: {
 }
 
 /** How the GUI counts rework (R-05, T064), told next to the limit so it means what a run counts. */
-export const REWORK_LIMIT_HINT = 'task 每繞回同一個節點一次算 1 次；同一圈經過的其他節點不另外算，最後回報 root 也不算。超過上限就停止交接，交給你決定。';
+export const REWORK_LIMIT_HINT = 'task 每繞回同一個節點一次算 1 次：交接時，目標節點收過這個 task 的次數比目前的返工次數多，才算 1 次，所以同一圈經過的其他節點通常不另外算。超過上限就停止交接，交給你決定。';
 
 export function WorkflowSettings({ workflow, issues, onChange, onRoot }: {
   workflow: WorkflowTemplate; issues: WorkflowIssue[]; onChange: (value: WorkflowTemplate) => void; onRoot: (id: NodeId) => void;
