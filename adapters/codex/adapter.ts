@@ -1236,7 +1236,8 @@ export class CodexAdapter implements RuntimeAdapter {
       const opened = unwrap(message.text);
       const dispatched = item.clientId ? this.origins.get(item.clientId) : undefined;
       const origin = dispatched ?? opened?.origin ?? this.options.userOrigin?.({ sessionId: p.sessionId, clientMessageId: item.clientId ?? null }) ?? { kind: 'user' };
-      return { ...message, origin, text: opened?.text ?? message.text };
+      // The GUI's own notice is a system message (contracts message.origin-role, T065).
+      return { ...message, role: origin.kind === 'system' ? 'system' : 'user', origin, text: opened?.text ?? message.text };
     }
     return undefined;
   }

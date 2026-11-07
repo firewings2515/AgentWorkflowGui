@@ -815,7 +815,7 @@ export class WorkflowEngine implements WorkflowHooks {
    * the delivery service like a report (it joins a running turn, SP-05). The operation is named by the caller, so a
    * second call (a restart, two paths at once) is the same operation: one record, one dispatch (CR-2); a pending one
    * goes on, an unknown one stays with its escalation. Called in the instance's queue (the pipeline holds it), so not
-   * queued again here.
+   * queued again here; the dispatch itself is not waited for in that queue (T065, `sendNotice`).
    */
   private async noticeRoot(instanceId: InstanceId, operationId: OperationId, text: string): Promise<'accepted' | 'duplicate' | 'failed'> {
     const instance = await this.repos.instances.get(instanceId);
@@ -824,7 +824,7 @@ export class WorkflowEngine implements WorkflowHooks {
     const known = await this.store.get(operationId);
     if (known !== undefined) {
       if (known.kind !== 'system-notice') return 'failed';
-      if (known.delivery.state === 'pending') await this.options.sessions.deliverWorkflow(operationId, rootId, 'insert-if-busy');
+      if (known.delivery.state === 'pending') this.sendNotice(operationId, rootId);
       return 'duplicate';
     }
     const target = await this.options.sessions.payloadTarget(rootId);
@@ -845,8 +845,20 @@ export class WorkflowEngine implements WorkflowHooks {
       this.log(`a notice to root of ${instanceId} was not accepted (${accepted.status})`);
       return 'failed';
     }
-    await this.options.sessions.deliverWorkflow(operationId, rootId, 'insert-if-busy');
+    this.sendNotice(operationId, rootId);
     return accepted.status;
+  }
+
+  /**
+   * Dispatches a notice in root's own queue, entered here (so notices and reports keep their order) but not waited for
+   * in the instance's queue (T065): its ack comes only once root's running turn takes the notice in, after that turn's
+   * tool calls return, and those calls (a handoff, a report) wait for the instance's queue. A notice of a run that ends
+   * first is never sent: the run's end records it as cancelled, and the session service sends none with an outcome.
+   */
+  private sendNotice(operationId: OperationId, rootId: SessionId): void {
+    void this.options.sessions
+      .deliverWorkflow(operationId, rootId, 'insert-if-busy')
+      .catch((error: unknown) => this.log(`a notice to root ${rootId} could not be dispatched (${errorName(error)})`));
   }
 
   /** Every node with a concurrency limit: its waiting handoffs are tried again (T032, after a merge ended). */
@@ -1230,14 +1242,19 @@ export class WorkflowEngine implements WorkflowHooks {
       if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
       const caller = await this.repos.sessions.get(ctx.caller);
       if (caller?.kind !== 'workflow') return NOT_IN_WORKFLOW;
-      return await this.serial(`instance:${caller.workflow.instanceId}`, () => this.reportNow(caller, input, ctx));
+      // The report enters root's queue inside the run's queue (so reports keep their order) and is waited for outside it
+      // (T065): its ack comes once root's running turn takes it in, after that turn's tool calls, which wait for the run's queue.
+      const sends: Promise<void>[] = [];
+      const result = await this.serial(`instance:${caller.workflow.instanceId}`, () => this.reportNow(caller, input, ctx, sends));
+      await Promise.all(sends);
+      return result;
     } catch (error) {
       if (this.options.sessions.isClosing() || isClosedError(error)) return SHUTTING_DOWN;
       throw error;
     }
   }
 
-  private async reportNow(caller: WorkflowSession, input: ReportToRootToolInput, ctx: ReportCallContext): Promise<ReportToRootToolResult> {
+  private async reportNow(caller: WorkflowSession, input: ReportToRootToolInput, ctx: ReportCallContext, sends: Promise<void>[]): Promise<ReportToRootToolResult> {
     const instance = await this.repos.instances.get(caller.workflow.instanceId);
     if (instance === undefined) return rejected('unknown-target', 'no such workflow run');
     const from = nodeOf(instance.template, caller.workflow.nodeId);
@@ -1263,9 +1280,12 @@ export class WorkflowEngine implements WorkflowHooks {
       if (known.payloadHash !== hash) return rejected('resend-mismatch', 'this call carried another report');
       const question = asksConfirmation(known.operationId) ? await this.openReportQuestion(instance, caller.id, from, known.operationId) : undefined;
       // A report accepted but not delivered yet goes on now (r2-P1-5).
-      if (known.delivery.state === 'pending') await this.deliverReport(known.operationId, rootId);
+      if (known.delivery.state === 'pending') sends.push(this.sendReport(known.operationId, rootId));
       return { status: 'reported', ...(question !== undefined && { escalationId: question.id }) };
     }
+    // In the run's queue, as its end is (T065 r3): once the end is committed no new report of the run is accepted, so none
+    // is sent to root after it; the caller is told, as a handoff is. The same call again (above) still finds its report.
+    if (instance.state === 'completed' || instance.state === 'cancelled') return rejected('invalid-input', 'this workflow run has ended');
     // Whether the report asks the user is part of its stored identity, so a restart can restore the question.
     const operationId = OperationIdSchema.parse(`${input.needsUserConfirmation ? REPORT_ASKING : REPORT}${this.options.uuid()}`);
     const peerMessageId = peerIdOf(operationId);
@@ -1293,8 +1313,16 @@ export class WorkflowEngine implements WorkflowHooks {
     const escalation = input.needsUserConfirmation ? await this.openReportQuestion(instance, caller.id, from, operationId) : undefined;
     // A branch of a fan-out that reported instead of handing on may leave its round waiting for nothing (CR-4).
     this.requestSync(instance.id);
-    await this.deliverReport(operationId, rootId);
+    sends.push(this.sendReport(operationId, rootId));
     return { status: 'reported', ...(escalation !== undefined && { escalationId: escalation.id }) };
+  }
+
+  /** `deliverReport` entered now (root's queue keeps the order), its end waited for by the caller outside the run's queue (T065). */
+  private sendReport(operationId: OperationId, rootId: SessionId): Promise<void> {
+    const sending = this.deliverReport(operationId, rootId);
+    // Seen as handled until the caller awaits it after the run's queue: a throw there still reaches the caller.
+    sending.catch(() => undefined);
+    return sending;
   }
 
   /** A report to root: not a formal handoff, so it joins a running turn (SP-05). */
@@ -1464,6 +1492,11 @@ export class WorkflowEngine implements WorkflowHooks {
     if (record.kind !== 'peer-message' || !record.operationId.startsWith(REPORT) || record.peer?.instanceId === undefined) return undefined;
     const instance = await this.repos.instances.get(record.peer.instanceId);
     return instance !== undefined && record.target.sessionId === instance.rootSessionId && record.peer.toSessionId === instance.rootSessionId ? 'insert-if-busy' : undefined;
+  }
+
+  /** `WorkflowHooks.beforeRecover` (T065 r3): the reports and notices to root of every ended run are closed first. */
+  async beforeRecover(): Promise<void> {
+    await this.pipeline?.closeEndedRuns();
   }
 
   /**

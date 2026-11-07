@@ -196,13 +196,21 @@ export interface ClaimInput {
 
 /**
  * Only `claimed` may call the runtime (`dispatchOnce`, or the create call for a provision), and only after
- * this resolved: one conditional `pending → unknown` update decides the single caller.
+ * this resolved: one conditional `pending → unknown` update decides the single caller. `ended`: the operation ended
+ * apart from delivery (`recordOutcome`, e.g. its workflow run ended, T065 r2) and is never claimed; checked in the
+ * same atomic step, so an outcome written first always wins, whatever the caller read before.
  */
 export type ClaimResult =
   | { status: 'claimed'; attempt: Extract<DispatchAttempt, { state: 'unknown' }> }
-  | { status: 'not-found' | 'not-pending' | 'revision-changed' | 'target-changed' | 'target-not-ready' };
+  | { status: 'not-found' | 'not-pending' | 'revision-changed' | 'target-changed' | 'target-not-ready' | 'ended' };
 
 export type WriteResult = 'recorded' | 'stale';
+
+/**
+ * `endUnclaimed` (T065 r3): `ended` names the operations it gave the outcome; `in-flight` the ones of the set claimed now
+ * (unknown with no outcome: their one runtime call may be on its way), and then nothing of the set was written.
+ */
+export type EndUnclaimedResult = { status: 'ended'; ended: OperationId[] } | { status: 'in-flight'; operationIds: OperationId[] };
 
 export interface DeliveryStore {
   accept(input: AcceptInput): Promise<AcceptResult>;
@@ -230,6 +238,15 @@ export interface DeliveryStore {
    * outcome is `stale`. The delivery record is not touched (a later reconcile as sent is still recorded).
    */
   recordOutcome(operationId: OperationId, outcome: OperationOutcome): Promise<WriteResult>;
+  /**
+   * Ends a set of operations not claimed yet apart from delivery, as one atomic step (T065 r3: a workflow run's
+   * reports and notices to root, before the run's end is committed). When any of them is claimed now (`unknown` with no
+   * outcome) nothing is written and `in-flight` names those. Otherwise each `pending` one with no outcome gets
+   * `outcome`; one already with an outcome, or sent, is left as it is. Exclusive with `claim`: both need the record
+   * pending with no outcome, so either the claim comes first (and this answers `in-flight`) or this does (and the claim
+   * answers `ended`).
+   */
+  endUnclaimed(operationIds: OperationId[], outcome: OperationOutcome): Promise<EndUnclaimedResult>;
   get(operationId: OperationId): Promise<StoredDelivery | undefined>;
   /**
    * The operation a tool call with this native identity created (C-08), so a resend after a GUI restart is

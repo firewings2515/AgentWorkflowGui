@@ -46,6 +46,7 @@ import type {
   NotDispatchedReason,
   PayloadDelivery,
   ProvisionDelivery,
+  ReconcileOptions,
   ReconcileOutcome,
   RecoverOptions,
   RecoveryReport,
@@ -408,10 +409,13 @@ export class DeliveryService {
     return record.kind === 'provision' ? this.dispatchProvision(record, options) : this.dispatchPayload(record, options);
   }
 
-  /** Read-only reconciliation of the live unknown attempt (CR2 §2): only a positive match records sent. */
-  async reconcile(operationId: OperationId): Promise<ReconcileOutcome> {
+  /**
+   * Read-only reconciliation of the live unknown attempt (CR2 §2): only a positive match records sent. With
+   * `escalate: false` (T065) an attempt still unknown is answered `unconfirmed` and nothing is escalated.
+   */
+  async reconcile(operationId: OperationId, options: ReconcileOptions = {}): Promise<ReconcileOutcome> {
     if (this.inFlight.has(operationId)) return { status: 'in-flight' };
-    return this.reconcileLive(operationId);
+    return this.reconcileLive(operationId, undefined, undefined, options.escalate ?? true);
   }
 
   /**
@@ -514,6 +518,7 @@ export class DeliveryService {
 
     // Claimed and committed: the payload may now leave the GUI, once (CR2 §1 step 4).
     let result: DispatchResult | DispatchFailure;
+    const entry = options.entry ?? record.context.entry;
     this.inFlight.add(record.operationId);
     try {
       const timeoutMs = options.timeoutMs ?? this.options.dispatchTimeoutMs;
@@ -522,7 +527,7 @@ export class DeliveryService {
         attempt: claim,
         // The persisted payload, never a caller's copy.
         text: record.payload,
-        entry: options.entry ?? record.context.entry,
+        entry,
         // The caller's origin, else the one stored at acceptance (C-01), else, for anything but a user message,
         // "not the user" (T020 r1 P1-4): the copy checked above, never read from the caller again.
         ...(chosen !== undefined && { origin: chosen }),
@@ -535,6 +540,10 @@ export class DeliveryService {
     }
     if ('state' in result && result.state === 'unknown') {
       result = { reason: result.reason, written: result.written, detail: result.detail };
+    }
+    // T065: an insert that timed out is taken into the turn only at its next step; it is reconciled after the turn.
+    if (options.reconcileLater === true && entry.kind === 'insert' && !('state' in result) && result.reason === 'timeout') {
+      return { status: 'unknown', attemptId: claim.attemptId, failure: result, deferred: true };
     }
     return this.settle(record.operationId, claim, result);
   }
@@ -672,14 +681,16 @@ export class DeliveryService {
    * Reads the stored record (its payload, target, cwd and clientMessageId, never a caller's copy) and
    * asks the runtime's read-only `reconcile`. Only a positive match the store accepts becomes sent.
    */
-  private async reconcileLive(operationId: OperationId, attemptId?: AttemptId, failure?: DispatchFailure): Promise<ReconcileOutcome> {
+  private async reconcileLive(operationId: OperationId, attemptId?: AttemptId, failure?: DispatchFailure, escalate = true): Promise<ReconcileOutcome> {
     const record = await this.options.store.get(operationId);
     const live = record === undefined ? undefined : liveUnknown(record);
     if (record === undefined || live === undefined || (attemptId !== undefined && live.attemptId !== attemptId)) {
       return { status: 'not-unknown', ...(record !== undefined && { state: record.delivery.state }) };
     }
-    const unknown = (reason: UnknownReason, detail: string, matches: Extract<ReconcileResult, { state: 'unknown' }>['matches'] = []) =>
-      this.escalate(record, live, { reason, detail, matches, ...(failure !== undefined && { failure }) });
+    const unknown = async (reason: UnknownReason, detail: string, matches: Extract<ReconcileResult, { state: 'unknown' }>['matches'] = []): Promise<ReconcileOutcome> =>
+      escalate
+        ? this.escalate(record, live, { reason, detail, matches, ...(failure !== undefined && { failure }) })
+        : { status: 'unconfirmed', attemptId: live.attemptId, reason, detail };
 
     if (record.kind === 'provision') {
       return unknown('provision-unverifiable', 'whether the target session was created cannot be confirmed read-only; it is not created again without the user');

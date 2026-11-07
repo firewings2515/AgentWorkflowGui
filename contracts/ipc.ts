@@ -128,7 +128,9 @@ export const Command = z.discriminatedUnion('type', [
   /**
    * The user ends a run (C-22; D-17: the user, not an agent, decides the work is done). `complete` marks every
    * task not yet final `completed`; `cancel` marks them `cancelled`. Both stop further handoffs and are
-   * refused with `invalid_transition` while a merge is active or a delivery's outcome is unknown.
+   * refused with `invalid_transition` while a merge is active or a delivery's outcome is unknown. The GUI's own notices
+   * to root (`system-notice`, C-31) are the exception: they never hold the end, and one still unknown then is closed by
+   * the system with the run (T065).
    */
   cmd('workflow.complete', { instanceId: InstanceId, expectedRevision: Revision }),
   /**

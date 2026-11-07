@@ -32,7 +32,7 @@ import {
   type WorkflowTask,
   activeMergeStates,
 } from '../../contracts';
-import type { AppRepositories, CleanupResult, DeliveryStore, GitPort, WorktreeRef } from '../ports';
+import type { AppRepositories, CleanupResult, DeliveryStore, EndUnclaimedResult, GitPort, WorktreeRef } from '../ports';
 import type { CommandOf, SessionService, WorkflowSession } from '../sessions';
 import { type AgentNode, nodeOf, rootNode } from '../workflow/graph';
 import { peerIdOf } from '../workflow/ids';
@@ -1358,25 +1358,50 @@ export class TaskPipeline {
       if (instance.revision !== expectedRevision) return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
       if (ended(instance)) return fail(requestId, 'invalid_transition', 'The run has already ended');
       if (instance.mergeQueue.some((m) => activeMergeStates.includes(m.state))) return fail(requestId, 'invalid_transition', 'A merge is in progress; end the run once it has finished', { retryable: true });
-      if (await this.unknownDeliveries(instance)) return fail(requestId, 'invalid_transition', 'A delivery of this run has an unknown outcome; decide it first', { retryable: true });
+      const unknown = await this.unknownDeliveries(instance);
+      // Still being found out (T065): on its way to the runtime, or an insert reconciled once root's turn ended. No
+      // question is open for it yet, so the user is told to try again rather than to decide.
+      if (unknown.length > 0 && unknown.every((op) => this.deps.sessions.beingConfirmed(op)))
+        return fail(requestId, 'invalid_transition', 'A delivery of this run is still being confirmed; try again in a moment', { retryable: true });
+      if (unknown.length > 0) return fail(requestId, 'invalid_transition', 'A delivery of this run has an unknown outcome; decide it first', { retryable: true });
+      // Closed before the end is committed (T065 r3): root's reports and notices not claimed yet end with the run, in a
+      // step exclusive with their claim, so none is claimed once the run has ended. Every refusal above wrote nothing; a
+      // report claimed meanwhile (on its way to root) refuses the end with nothing written, and its result is kept.
+      const reports = await this.endReports(instance, finish, 'together');
+      if (reports.status === 'in-flight') return fail(requestId, 'invalid_transition', 'A report to root is being sent; end the run once it has gone', { retryable: true });
+      const closed = [...reports.ended, ...(await this.endNotices(instance, finish))];
+      // Left closed when the commit fails (an outcome is set once, and an outcome written first always wins over a claim):
+      // the run stays running and nothing waits on them. Named in the log, not their content.
+      const unsaved = (why: string) => {
+        if (closed.length > 0) this.deps.log(`[pipeline] ending ${instanceId} ${why}; its deliveries ${closed.join(', ')} closed for it stay closed`);
+      };
       const at = this.deps.now();
-      const saved = await this.repos.instances.update(
-        {
-          ...instance,
-          revision: instance.revision + 1,
-          state: finish,
-          endedAt: at,
-          tasks: instance.tasks.map((t): WorkflowTask => {
-            if (isFinal(t)) return t;
-            const next: WorkflowTask = finish === 'completed' ? { ...t, status: 'completed', completedAt: at } : { ...t, status: 'cancelled' };
-            delete next.blockedReason;
-            return next;
-          }),
-          mergeQueue: instance.mergeQueue.map((m) => (m.state === 'queued' ? { ...m, state: 'cancelled', endedAt: at, detail: `the run was ${finish}` } : m)),
-        },
-        instance.revision,
-      );
-      if (saved.status === 'stale') return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
+      let saved: Awaited<ReturnType<AppRepositories['instances']['update']>>;
+      try {
+        saved = await this.repos.instances.update(
+          {
+            ...instance,
+            revision: instance.revision + 1,
+            state: finish,
+            endedAt: at,
+            tasks: instance.tasks.map((t): WorkflowTask => {
+              if (isFinal(t)) return t;
+              const next: WorkflowTask = finish === 'completed' ? { ...t, status: 'completed', completedAt: at } : { ...t, status: 'cancelled' };
+              delete next.blockedReason;
+              return next;
+            }),
+            mergeQueue: instance.mergeQueue.map((m) => (m.state === 'queued' ? { ...m, state: 'cancelled', endedAt: at, detail: `the run was ${finish}` } : m)),
+          },
+          instance.revision,
+        );
+      } catch (error) {
+        unsaved(`failed (${errorText(error)})`);
+        throw error;
+      }
+      if (saved.status === 'stale') {
+        unsaved('found the run changed');
+        return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
+      }
       this.deps.publish({ type: 'instance.updated', instance: saved.record });
       // Cleanup runs git; the command does not wait for it (nothing of an ended run is delivered any more).
       void this.afterEnd(saved.record).catch((error: unknown) => this.deps.log(`[pipeline] finishing the end of ${instanceId} failed (${errorText(error)})`));
@@ -1384,9 +1409,79 @@ export class TaskPipeline {
     });
   }
 
-  private async unknownDeliveries(instance: WorkflowInstance): Promise<boolean> {
-    if ((await this.repos.handoffs.listByInstance(instance.id)).some((h) => h.delivery.state === 'unknown' && h.outcome === undefined)) return true;
-    return (await this.repos.peerMessages.list()).some((p) => p.instanceId === instance.id && p.delivery.state === 'unknown');
+  /**
+   * The handoffs and peer messages (reports) of the run whose outcome is unknown: these hold its end (D-12, a retry may
+   * deliver twice). The GUI's own notices to root are not among them (T065): they never hold the end, which closes them.
+   */
+  private async unknownDeliveries(instance: WorkflowInstance): Promise<OperationId[]> {
+    const handoffs = (await this.repos.handoffs.listByInstance(instance.id)).filter((h) => h.delivery.state === 'unknown' && h.outcome === undefined);
+    const peers = (await this.repos.peerMessages.list()).filter((p) => p.instanceId === instance.id && p.delivery.state === 'unknown');
+    return [...handoffs, ...peers].map((d) => d.operationId);
+  }
+
+  /**
+   * The run's reports to root not claimed yet are cancelled (T065 r3), by the store's `endUnclaimed`, exclusive with their
+   * claim. `together` (the end, before its commit): one step for all of them, and none is written when one is claimed
+   * now (`in-flight`). `each` (after the commit, or at a restart): one by one, so a report left unknown (only reconciled
+   * now, never sent again) does not keep the others open. Reports are accepted in the run's queue, as the end runs, so no
+   * report of the run is accepted between the listing and the step.
+   */
+  private async endReports(instance: WorkflowInstance, state: 'completed' | 'cancelled', mode: 'together' | 'each'): Promise<EndUnclaimedResult> {
+    const ids = (await this.store.listByTarget(instance.rootSessionId))
+      .filter((r) => r.kind === 'peer-message' && r.peer?.instanceId === instance.id && r.outcome === undefined && r.delivery.state !== 'sent')
+      .map((r) => r.operationId);
+    const outcome = { kind: 'cancelled' as const, detail: `the run was ${state}`, at: this.deps.now() };
+    let result: EndUnclaimedResult;
+    if (mode === 'together') result = await this.store.endUnclaimed(ids, outcome);
+    else {
+      const ended: OperationId[] = [];
+      for (const id of ids) {
+        const one = await this.store.endUnclaimed([id], outcome).catch(() => undefined);
+        if (one?.status === 'ended') ended.push(...one.ended);
+      }
+      result = { status: 'ended', ended };
+    }
+    if (result.status === 'ended') for (const id of result.ended) await this.publishPeer(id);
+    return result;
+  }
+
+  private async publishPeer(operationId: OperationId): Promise<void> {
+    const stored = await this.repos.peerMessages.get(peerIdOf(operationId)).catch(() => undefined);
+    if (stored !== undefined) this.deps.publish({ type: 'peerMessage.updated', message: stored });
+  }
+
+  /** The GUI's own notices to root not confirmed are closed by the system (T065); they never hold the end. */
+  private async endNotices(instance: WorkflowInstance, state: 'completed' | 'cancelled'): Promise<OperationId[]> {
+    const notices = await this.deps.sessions
+      .closeUnconfirmedNotices(instance.rootSessionId, `the run was ${state} before the GUI's notice to root was confirmed`)
+      .catch((error: unknown) => {
+        this.deps.log(`[pipeline] closing the notices of ${instance.id} failed (${errorText(error)})`);
+        return [];
+      });
+    if (notices.length > 0) this.deps.log(`[pipeline] ${String(notices.length)} notice(s) to root of ${instance.id} left unconfirmed were closed with the run`);
+    return notices;
+  }
+
+  /**
+   * The notices and reports to root of a run that ended (T065): closed before its end's commit (`end`), and again after
+   * it and at a restart, before anything is recovered (`closeEndedRuns`), for a run whose end was committed by older
+   * code or whose closing a crash cut short. Doing it again changes nothing.
+   */
+  private async endDeliveries(instance: WorkflowInstance): Promise<void> {
+    const state = instance.state === 'completed' ? 'completed' : 'cancelled';
+    await this.endReports(instance, state, 'each');
+    await this.endNotices(instance, state);
+  }
+
+  /**
+   * At a restart, before the session service recovers any delivery (T065 r3, `WorkflowHooks.beforeRecover`): the
+   * notices and reports to root of every ended run are closed, so none of them is dispatched by the recovery.
+   */
+  async closeEndedRuns(): Promise<void> {
+    for (const instance of await this.repos.instances.list()) {
+      if (!ended(instance)) continue;
+      await this.endDeliveries(instance).catch((error: unknown) => this.deps.log(`[pipeline] closing the deliveries of ${instance.id} failed (${errorText(error)})`));
+    }
   }
 
   /** What follows the end of a run, each part best effort (a restart's recover does it again). */
@@ -1399,6 +1494,8 @@ export class TaskPipeline {
       const stored = await this.repos.handoffs.get(handoff.id);
       if (stored !== undefined) this.deps.publish({ type: 'handoff.updated', handoff: stored });
     }
+    // Again here: a restart finishes what a crash after the end's commit cut short (T065).
+    await this.endDeliveries(instance);
     for (const escalation of await this.repos.escalations.list({ state: 'open' })) {
       if (escalation.instanceId !== instance.id) continue;
       if (escalation.kind === 'setup-failed' || escalation.kind === 'merge-failed' || escalation.ref?.kind === 'taskPlan') await this.deps.host.closeEscalation(escalation, 'resolved', 'system');

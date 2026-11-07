@@ -51,7 +51,7 @@ import type {
   SessionSettings,
   StartSessionOptions,
 } from '../../core/ports';
-import { INTERRUPT_MARKER, isCompacted, mapTranscript, payloadRecords, rebuildNativeTasks, recordedCwd, turnOfMessage } from './history';
+import { INTERRUPT_MARKER, isCompacted, mapTranscript, payloadRecords, promptRole, rebuildNativeTasks, recordedCwd, turnOfMessage } from './history';
 import { InputQueue } from './input-queue';
 import {
   closeOpenItem,
@@ -1113,14 +1113,16 @@ export class ClaudeAdapter implements RuntimeAdapter {
       s.acks.delete(uuid);
       s.unacked = s.unacked.filter((u) => u !== uuid);
       const turnId = s.turn?.turn.id;
+      const origin = this.userOrigin(s.sessionId, uuid);
       this.emit({
         type: 'message.completed',
         message: {
           id: MessageId.parse(uuid),
           sessionId: s.sessionId,
           ...opt('turnId', turnId),
-          role: 'user',
-          origin: this.userOrigin(s.sessionId, uuid),
+          // The GUI's own notice is a system message (T065): as a user one it could not be stored.
+          role: promptRole(origin),
+          origin,
           text: pending.text,
           attachments: [],
           createdAt: this.now(),
