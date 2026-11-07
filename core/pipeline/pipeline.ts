@@ -1364,12 +1364,16 @@ export class TaskPipeline {
       if (unknown.length > 0 && unknown.every((op) => this.deps.sessions.beingConfirmed(op)))
         return fail(requestId, 'invalid_transition', 'A delivery of this run is still being confirmed; try again in a moment', { retryable: true });
       if (unknown.length > 0) return fail(requestId, 'invalid_transition', 'A delivery of this run has an unknown outcome; decide it first', { retryable: true });
-      // Closed before the end is committed (T065 r3): root's reports and notices not claimed yet end with the run, in a
-      // step exclusive with their claim, so none is claimed once the run has ended. Every refusal above wrote nothing; a
-      // report claimed meanwhile (on its way to root) refuses the end with nothing written, and its result is kept.
-      const reports = await this.endReports(instance, finish, 'together');
-      if (reports.status === 'in-flight') return fail(requestId, 'invalid_transition', 'A report to root is being sent; end the run once it has gone', { retryable: true });
-      const closed = [...reports.ended, ...(await this.endNotices(instance, finish))];
+      // Closed before the end is committed (T065 r3, T066): the run's handoffs and root's reports and notices not claimed yet
+      // end with the run, handoffs and reports in one step exclusive with their claim, so none is claimed once the run has
+      // ended. Every refusal above wrote nothing; one claimed meanwhile (on its way) refuses the end with nothing written,
+      // and its result is kept (D-12: a handoff or report whose outcome is unknown then holds the end, as above).
+      const closing = await this.endUnclaimedOf(instance, finish, 'together');
+      if (closing.result.status === 'in-flight') {
+        const handoff = closing.result.operationIds.some((id) => closing.handoffs.has(id));
+        return fail(requestId, 'invalid_transition', handoff ? 'A handoff of this run is being sent; end the run once it has gone' : 'A report to root is being sent; end the run once it has gone', { retryable: true });
+      }
+      const closed = [...closing.result.ended, ...(await this.endNotices(instance, finish))];
       // Left closed when the commit fails (an outcome is set once, and an outcome written first always wins over a claim):
       // the run stays running and nothing waits on them. Named in the log, not their content.
       const unsaved = (why: string) => {
@@ -1420,16 +1424,23 @@ export class TaskPipeline {
   }
 
   /**
-   * The run's reports to root not claimed yet are cancelled (T065 r3), by the store's `endUnclaimed`, exclusive with their
-   * claim. `together` (the end, before its commit): one step for all of them, and none is written when one is claimed
-   * now (`in-flight`). `each` (after the commit, or at a restart): one by one, so a report left unknown (only reconciled
-   * now, never sent again) does not keep the others open. Reports are accepted in the run's queue, as the end runs, so no
-   * report of the run is accepted between the listing and the step.
+   * The run's handoffs (T066) and its reports to root (T065 r3: `report_to_root`, and `send_message` of the run to root)
+   * not claimed yet are cancelled, by the store's `endUnclaimed`, exclusive with their claim. A handoff to the merge node is
+   * never delivered and is left alone. `together` (the end, before its commit): one step for all of them, and none is
+   * written when one is claimed now (`in-flight`). `each` (after the commit, or at a restart): one by one, so one left
+   * unknown (only reconciled now, never sent again) does not keep the others open. Handoffs and reports are accepted in the
+   * run's queue, as the end runs, so none of the run is accepted between the listing and the step; one claimed between
+   * them is listed still (only a sent one or one with an outcome is not), so the step finds it in flight.
    */
-  private async endReports(instance: WorkflowInstance, state: 'completed' | 'cancelled', mode: 'together' | 'each'): Promise<EndUnclaimedResult> {
-    const ids = (await this.store.listByTarget(instance.rootSessionId))
+  private async endUnclaimedOf(instance: WorkflowInstance, state: 'completed' | 'cancelled', mode: 'together' | 'each'): Promise<{ result: EndUnclaimedResult; handoffs: Map<OperationId, Handoff> }> {
+    const reports = (await this.store.listByTarget(instance.rootSessionId))
       .filter((r) => r.kind === 'peer-message' && r.peer?.instanceId === instance.id && r.outcome === undefined && r.delivery.state !== 'sent')
       .map((r) => r.operationId);
+    const handoffs = new Map<OperationId, Handoff>();
+    for (const h of await this.repos.handoffs.listByInstance(instance.id)) {
+      if (h.outcome === undefined && h.delivery.state !== 'sent' && !toMerge(instance, h)) handoffs.set(h.operationId, h);
+    }
+    const ids = [...handoffs.keys(), ...reports];
     const outcome = { kind: 'cancelled' as const, detail: `the run was ${state}`, at: this.deps.now() };
     let result: EndUnclaimedResult;
     if (mode === 'together') result = await this.store.endUnclaimed(ids, outcome);
@@ -1441,8 +1452,19 @@ export class TaskPipeline {
       }
       result = { status: 'ended', ended };
     }
-    if (result.status === 'ended') for (const id of result.ended) await this.publishPeer(id);
-    return result;
+    if (result.status === 'ended') {
+      for (const id of result.ended) {
+        const handoff = handoffs.get(id);
+        if (handoff === undefined) await this.publishPeer(id);
+        else await this.publishHandoff(handoff.id);
+      }
+    }
+    return { result, handoffs };
+  }
+
+  private async publishHandoff(handoffId: Handoff['id']): Promise<void> {
+    const stored = await this.repos.handoffs.get(handoffId).catch(() => undefined);
+    if (stored !== undefined) this.deps.publish({ type: 'handoff.updated', handoff: stored });
   }
 
   private async publishPeer(operationId: OperationId): Promise<void> {
@@ -1463,19 +1485,20 @@ export class TaskPipeline {
   }
 
   /**
-   * The notices and reports to root of a run that ended (T065): closed before its end's commit (`end`), and again after
-   * it and at a restart, before anything is recovered (`closeEndedRuns`), for a run whose end was committed by older
-   * code or whose closing a crash cut short. Doing it again changes nothing.
+   * The handoffs (T066) and the notices and reports to root of a run that ended (T065): closed before its end's commit
+   * (`end`), and again after it and at a restart, before anything is recovered (`closeEndedRuns`), for a run whose end was
+   * committed by older code or whose closing a crash cut short. Doing it again changes nothing.
    */
   private async endDeliveries(instance: WorkflowInstance): Promise<void> {
     const state = instance.state === 'completed' ? 'completed' : 'cancelled';
-    await this.endReports(instance, state, 'each');
+    await this.endUnclaimedOf(instance, state, 'each');
     await this.endNotices(instance, state);
   }
 
   /**
    * At a restart, before the session service recovers any delivery (T065 r3, `WorkflowHooks.beforeRecover`): the
-   * notices and reports to root of every ended run are closed, so none of them is dispatched by the recovery.
+   * handoffs (T066) and the notices and reports to root of every ended run are closed, so none of them is
+   * dispatched by the recovery.
    */
   async closeEndedRuns(): Promise<void> {
     for (const instance of await this.repos.instances.list()) {
@@ -1488,13 +1511,8 @@ export class TaskPipeline {
   private async afterEnd(instance: WorkflowInstance): Promise<void> {
     // Held handoffs of a list never decided end with the run (G-11).
     await this.deps.host.settleHeld(instance.id);
-    for (const handoff of await this.repos.handoffs.listByInstance(instance.id)) {
-      if (handoff.delivery.state !== 'pending' || handoff.outcome !== undefined || toMerge(instance, handoff)) continue;
-      await this.store.recordOutcome(handoff.operationId, { kind: 'cancelled', detail: `the run was ${instance.state}`, at: this.deps.now() }).catch(() => undefined);
-      const stored = await this.repos.handoffs.get(handoff.id);
-      if (stored !== undefined) this.deps.publish({ type: 'handoff.updated', handoff: stored });
-    }
-    // Again here: a restart finishes what a crash after the end's commit cut short (T065).
+    // Again here: a restart finishes what a crash after the end's commit cut short (T065); the run's handoffs not claimed
+    // are among them (T066), each closed only while unclaimed, so one sent or on its way never gets an outcome.
     await this.endDeliveries(instance);
     for (const escalation of await this.repos.escalations.list({ state: 'open' })) {
       if (escalation.instanceId !== instance.id) continue;

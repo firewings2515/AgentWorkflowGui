@@ -153,6 +153,13 @@ export interface WorkflowHooks {
    * and notices to root) is ended apart from delivery, so the recovery dispatches none of it.
    */
   beforeRecover?(): Promise<void>;
+  /**
+   * Runs `fn` in the run's queue (T066), in order with the run's end and its handoffs, after everything queued there. A
+   * `send_message` of the run to its root is accepted there, as a report is, so the end's closing step lists every one
+   * accepted before it and none is accepted after the end. `fn` must not wait for a session's queue or an `op:` queue
+   * (both are entered after the run's queue, never before it). Absent: `fn` is not run in any queue.
+   */
+  inRunQueue?<T>(instanceId: InstanceId, fn: () => Promise<T>): Promise<T>;
 }
 
 export type TransferCommand = CommandOf<'transfer.prepare' | 'transfer.confirm' | 'transfer.cancel'>;
@@ -327,6 +334,8 @@ const peerIdOf = (operationId: OperationId) => PeerMessageId.parse(`peer-${opera
 type Refusal = { reason: 'invalid-input' | 'not-owner' | 'resend-mismatch'; detail: string };
 const NOT_OWNER: Refusal = { reason: 'not-owner', detail: 'this operation belongs to another call' };
 const RESEND_MISMATCH: Refusal = { reason: 'resend-mismatch', detail: 'this operation carries another message' };
+/** A message of a run to its root once the run has ended (T066), worded as a report's (T065). */
+const RUN_ENDED: Refusal = { reason: 'invalid-input', detail: 'this workflow run has ended' };
 /** One queue per session for its commands and its runtime events (r1-P1-4). */
 const sessionKey = (sessionId: SessionId) => `session:${sessionId}`;
 const closingFailure = (requestId: Failure['requestId']) => fail(requestId, 'runtime_unavailable', 'The application is closing');
@@ -1964,7 +1973,31 @@ export class SessionService {
       }
       return { status: 'awaiting-confirmation', escalationId: id };
     }
+    const refused = await this.acceptInRun(pending);
+    if (refused !== undefined) return refused;
     return this.deliverPeer(pending);
+  }
+
+  /**
+   * A message of a run to its root (T066), accepted in the run's queue, as a report is: the end's closing step then lists
+   * every one accepted before it, and none is accepted once the end is committed (the caller is told, as for a report).
+   * The order of the queues is op → run → root's session, as for a report (run → session): the run's step only accepts,
+   * never waits for root's queue or for the message's dispatch, which goes on in `deliverPeer` after it. A resend finds its
+   * operation and is answered there. Undefined when it goes on to `deliverPeer`.
+   */
+  private async acceptInRun(p: PendingConfirmation): Promise<SendMessageToolResult | undefined> {
+    const instanceId = p.instanceId;
+    const workflow = this.workflow;
+    if (instanceId === undefined || workflow?.inRunQueue === undefined) return undefined;
+    return workflow.inRunQueue(instanceId, async (): Promise<SendMessageToolResult | undefined> => {
+      const instance = await this.repos.instances.get(instanceId);
+      if (instance === undefined || instance.rootSessionId !== p.to) return undefined;
+      if ((await this.store.get(p.operationId)) !== undefined) return undefined;
+      if (instance.state === 'completed' || instance.state === 'cancelled') return { status: 'rejected', rejection: RUN_ENDED };
+      const target = await this.repos.sessions.get(p.to);
+      if (target === undefined) return { status: 'rejected', rejection: { reason: 'unknown-target', detail: 'no such session' } };
+      return this.acceptPeer(p, target);
+    });
   }
 
   private async confirm(requestId: Success['requestId'], escalation: Escalation, decision: 'approve' | 'decline'): Promise<CommandResult> {
@@ -2032,60 +2065,15 @@ export class SessionService {
     const shuttingDown: SendMessageToolResult = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } };
     let record = await this.store.get(p.operationId);
     if (record === undefined) {
-      if (this.closing) return shuttingDown;
-      // A closed target whose folder is gone is not resumed anywhere (R-06, T036): refused before it is accepted (C-30 `folder-missing`).
-      const closed = await this.closedRefusal(target);
-      if (closed !== undefined) return { status: 'rejected', rejection: { reason: 'folder-missing', detail: 'the target session is closed and its folder no longer exists' } };
-      const provisioned = await this.ensureProvisioned(target);
-      if (this.closing) return shuttingDown;
-      const provision = await this.store.get(provisionOp(target.id));
-      // Not started yet: the message waits for the target's provision (CR2 §3) instead of being refused.
-      const bound = provisioned.ok
-        ? {
-            sessionId: target.id,
-            nativeSessionRef: provisioned.nativeSessionRef,
-          }
-        : provision?.target.provision !== undefined
-          ? { sessionId: target.id, provision: provision.target.provision }
-          : undefined;
-      if (bound === undefined)
-        return {
-          status: 'rejected',
-          rejection: {
-            reason: 'unknown-target',
-            detail: 'the target session cannot be started',
-          },
-        };
-      const accepted = await this.delivery.accept({
-        kind: 'peer-message',
-        operationId: p.operationId,
-        sourceCallRef: p.sourceCallRef,
-        payloadHash: await this.options.hashPayload(p.content),
-        payload: p.content,
-        proposalRevision: 0,
-        target: bound,
-        at: this.options.now(),
-        context: {
-          runtime: target.requestedModel.runtime,
-          cwd: target.cwd,
-          entry: { kind: 'new-turn' },
-          session: await this.settingsOf(target),
-          // C-01: a restarted GUI dispatches it as from the peer again, never as the user.
-          origin,
-        },
-        peer: { peerMessageId: peerIdOf(p.operationId), fromSessionId: p.from, toSessionId: p.to, ...(p.instanceId !== undefined && { instanceId: p.instanceId }) },
-      });
-      if (accepted.status === 'conflict') return { status: 'rejected', rejection: RESEND_MISMATCH };
-      if (accepted.status === 'invalid') return { status: 'rejected', rejection: { reason: 'invalid-input', detail: 'the message cannot be accepted' } };
-      // Thrown, so the MCP server answers with a generic error and a resend tries the same operation again.
-      if (accepted.status !== 'accepted' && accepted.status !== 'duplicate') throw new Error(`accepting the peer message ended ${accepted.status}`);
-      // Only the call that created the operation owns it; a duplicate is checked below like any resend.
-      if (accepted.status === 'accepted') this.owners.set(p.operationId, p.from);
+      const refused = await this.acceptPeer(p, target);
+      if (refused !== undefined) return refused;
       record = await this.store.get(p.operationId);
     }
     // Checked again here, inside the target's queue, with the record this call will use (r2-P1-3).
     const mismatch: Refusal | undefined = record === undefined ? { reason: 'invalid-input', detail: 'this operation is not a message' } : await this.recordMismatch(record, p);
     if (mismatch !== undefined || record?.kind !== 'peer-message') return { status: 'rejected', rejection: mismatch ?? { reason: 'invalid-input', detail: 'this operation is not a message' } };
+    // Closed with its run before it went (T065, T066): never sent, and a resend is told so, as a new message would be.
+    if (record.delivery.state === 'pending' && record.outcome !== undefined) return { status: 'rejected', rejection: RUN_ENDED };
     this.origins.set(p.operationId, origin);
     const fresh = record.delivery.state === 'pending';
     if (fresh) {
@@ -2105,6 +2093,64 @@ export class SessionService {
       operationId: p.operationId,
       delivery: record.delivery.state,
     };
+  }
+
+  /**
+   * Accepts the message (its target provisioned or its provision recorded first); undefined once it is stored. In the
+   * target's queue (`deliverPeerNow`), or in the run's for a message of a run to its root (`acceptInRun`, T066).
+   */
+  private async acceptPeer(p: PendingConfirmation, target: LogicalSession): Promise<SendMessageToolResult | undefined> {
+    const shuttingDown: SendMessageToolResult = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } };
+    if (this.closing) return shuttingDown;
+    // A closed target whose folder is gone is not resumed anywhere (R-06, T036): refused before it is accepted (C-30 `folder-missing`).
+    const closed = await this.closedRefusal(target);
+    if (closed !== undefined) return { status: 'rejected', rejection: { reason: 'folder-missing', detail: 'the target session is closed and its folder no longer exists' } };
+    const provisioned = await this.ensureProvisioned(target);
+    if (this.closing) return shuttingDown;
+    const provision = await this.store.get(provisionOp(target.id));
+    // Not started yet: the message waits for the target's provision (CR2 §3) instead of being refused.
+    const bound = provisioned.ok
+      ? {
+          sessionId: target.id,
+          nativeSessionRef: provisioned.nativeSessionRef,
+        }
+      : provision?.target.provision !== undefined
+        ? { sessionId: target.id, provision: provision.target.provision }
+        : undefined;
+    if (bound === undefined)
+      return {
+        status: 'rejected',
+        rejection: {
+          reason: 'unknown-target',
+          detail: 'the target session cannot be started',
+        },
+      };
+    const accepted = await this.delivery.accept({
+      kind: 'peer-message',
+      operationId: p.operationId,
+      sourceCallRef: p.sourceCallRef,
+      payloadHash: await this.options.hashPayload(p.content),
+      payload: p.content,
+      proposalRevision: 0,
+      target: bound,
+      at: this.options.now(),
+      context: {
+        runtime: target.requestedModel.runtime,
+        cwd: target.cwd,
+        entry: { kind: 'new-turn' },
+        session: await this.settingsOf(target),
+        // C-01: a restarted GUI dispatches it as from the peer again, never as the user.
+        origin: { kind: 'peer', fromSessionId: p.from, peerMessageId: peerIdOf(p.operationId) },
+      },
+      peer: { peerMessageId: peerIdOf(p.operationId), fromSessionId: p.from, toSessionId: p.to, ...(p.instanceId !== undefined && { instanceId: p.instanceId }) },
+    });
+    if (accepted.status === 'conflict') return { status: 'rejected', rejection: RESEND_MISMATCH };
+    if (accepted.status === 'invalid') return { status: 'rejected', rejection: { reason: 'invalid-input', detail: 'the message cannot be accepted' } };
+    // Thrown, so the MCP server answers with a generic error and a resend tries the same operation again.
+    if (accepted.status !== 'accepted' && accepted.status !== 'duplicate') throw new Error(`accepting the peer message ended ${accepted.status}`);
+    // Only the call that created the operation owns it; a duplicate is checked by the caller like any resend.
+    if (accepted.status === 'accepted') this.owners.set(p.operationId, p.from);
+    return undefined;
   }
 
   /** Who a payload comes from: as dispatched in this process, else as stored at acceptance (C-01), else not the user. */
