@@ -90,6 +90,13 @@ export interface DispatchOptions {
   origin?: MessageOrigin;
   /** Filled in when the target's preparation fails in this call (see DispatchCall). */
   call?: DispatchCall;
+  /**
+   * T065: a payload inserted into a running turn that times out without its ack is not reconciled at once. The
+   * runtime takes such a payload into the turn only at its next step and stores it then, so a read right away finds
+   * nothing: the outcome is `unknown` with `deferred` and no escalation, and the caller reconciles once the turn has
+   * ended (`reconcile` with `escalate: false` first). Any other failure is reconciled at once as before.
+   */
+  reconcileLater?: boolean;
 }
 
 /** Why the runtime was not called. The delivery is unchanged unless `commit-uncertain` says otherwise. */
@@ -136,7 +143,7 @@ export type DispatchOutcome =
    * resent; `escalation` is absent only when the attempt was resolved meanwhile or the store could not
    * be read (recovery escalates it then).
    */
-  | { status: 'unknown'; attemptId: AttemptId; failure: DispatchFailure; escalation?: DeliveryEscalation }
+  | { status: 'unknown'; attemptId: AttemptId; failure: DispatchFailure; escalation?: DeliveryEscalation; deferred?: true }
   | { status: 'not-dispatched'; reason: NotDispatchedReason; detail: string; provisionState?: DeliveryState };
 
 /** Why an unknown attempt is still unknown after reconciling. */
@@ -186,7 +193,15 @@ export type ReconcileOutcome =
   /** Nothing to reconcile: no such delivery, not unknown, or not this attempt any more. */
   | { status: 'not-unknown'; state?: DeliveryState }
   /** This process is still inside the attempt's runtime call; reconcile after it returns. */
-  | { status: 'in-flight' };
+  | { status: 'in-flight' }
+  /** Still unknown when asked with `escalate: false` (T065): nothing was escalated; the caller looks again or escalates. */
+  | { status: 'unconfirmed'; attemptId: AttemptId; reason: UnknownReason; detail: string };
+
+/** How `DeliveryService.reconcile` treats an attempt it still cannot confirm (T065). */
+export interface ReconcileOptions {
+  /** False: an attempt still unknown is answered `unconfirmed` and not escalated. Default true. */
+  escalate?: boolean;
+}
 
 /** The user's answer to a `delivery-unknown` item (contracts `delivery.resolve`). */
 export interface ResolveInput {

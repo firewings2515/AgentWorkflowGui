@@ -40,6 +40,12 @@ import type { WireSessionMessage, WireTranscriptEntry } from './wire';
 
 /** Text the CLI stores when the user interrupts a turn or a tool call. */
 export const INTERRUPT_MARKER = '[Request interrupted by user';
+
+/**
+ * The role of a prompt the GUI sent, by its origin (contracts `message.origin-role`): the GUI's own notice (C-31) is a
+ * `system` message, everything else a `user` one (T065: a notice as a user message could not be stored).
+ */
+export const promptRole = (origin: MessageOrigin): 'user' | 'system' => (origin.kind === 'system' ? 'system' : 'user');
 /** The CLI's error result for a call the PreToolUse hook denied or did not answer in time. */
 const HOOK_REFUSAL = /^PreToolUse(:\S+)? hook (error|did not respond)/;
 /** Output of CLI-local commands (e.g. the model switch of setModel) is stored as user text but is no prompt. */
@@ -192,11 +198,12 @@ export const mapTranscript = (messages: readonly WireSessionMessage[], ctx: Tran
         }
         // A sub-agent's prompt is written by its parent agent; contracts have no agent origin for the user
         // role, so it is kept as the task's user-role message.
+        const origin: MessageOrigin = ctx.nativeTaskId !== undefined ? { kind: 'user' } : ctx.userOrigin(m.uuid);
         const message: Message = {
           id: MessageId.parse(m.uuid),
           ...placed(placement()),
-          role: 'user',
-          origin: ctx.nativeTaskId !== undefined ? { kind: 'user' } : ctx.userOrigin(m.uuid),
+          role: promptRole(origin),
+          origin,
           text,
           attachments: [],
           createdAt: at,

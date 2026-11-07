@@ -1358,7 +1358,12 @@ export class TaskPipeline {
       if (instance.revision !== expectedRevision) return fail(requestId, 'stale_revision', 'The run has changed since it was loaded', { retryable: true });
       if (ended(instance)) return fail(requestId, 'invalid_transition', 'The run has already ended');
       if (instance.mergeQueue.some((m) => activeMergeStates.includes(m.state))) return fail(requestId, 'invalid_transition', 'A merge is in progress; end the run once it has finished', { retryable: true });
-      if (await this.unknownDeliveries(instance)) return fail(requestId, 'invalid_transition', 'A delivery of this run has an unknown outcome; decide it first', { retryable: true });
+      const unknown = await this.unknownDeliveries(instance);
+      // Still being found out (T065): on its way to the runtime, or an insert reconciled once root's turn ended. No
+      // question is open for it yet, so the user is told to try again rather than to decide.
+      if (unknown.length > 0 && unknown.every((op) => this.deps.sessions.beingConfirmed(op)))
+        return fail(requestId, 'invalid_transition', 'A delivery of this run is still being confirmed; try again in a moment', { retryable: true });
+      if (unknown.length > 0) return fail(requestId, 'invalid_transition', 'A delivery of this run has an unknown outcome; decide it first', { retryable: true });
       const at = this.deps.now();
       const saved = await this.repos.instances.update(
         {
@@ -1384,9 +1389,14 @@ export class TaskPipeline {
     });
   }
 
-  private async unknownDeliveries(instance: WorkflowInstance): Promise<boolean> {
-    if ((await this.repos.handoffs.listByInstance(instance.id)).some((h) => h.delivery.state === 'unknown' && h.outcome === undefined)) return true;
-    return (await this.repos.peerMessages.list()).some((p) => p.instanceId === instance.id && p.delivery.state === 'unknown');
+  /**
+   * The handoffs and peer messages (reports) of the run whose outcome is unknown: these hold its end (D-12, a retry may
+   * deliver twice). The GUI's own notices to root are not among them (T065): they never hold the end, which closes them.
+   */
+  private async unknownDeliveries(instance: WorkflowInstance): Promise<OperationId[]> {
+    const handoffs = (await this.repos.handoffs.listByInstance(instance.id)).filter((h) => h.delivery.state === 'unknown' && h.outcome === undefined);
+    const peers = (await this.repos.peerMessages.list()).filter((p) => p.instanceId === instance.id && p.delivery.state === 'unknown');
+    return [...handoffs, ...peers].map((d) => d.operationId);
   }
 
   /** What follows the end of a run, each part best effort (a restart's recover does it again). */
@@ -1399,6 +1409,21 @@ export class TaskPipeline {
       const stored = await this.repos.handoffs.get(handoff.id);
       if (stored !== undefined) this.deps.publish({ type: 'handoff.updated', handoff: stored });
     }
+    // A report to root not dispatched yet (it goes outside the run's queue, T065) is not sent any more.
+    for (const record of await this.store.listByTarget(instance.rootSessionId)) {
+      if (record.kind !== 'peer-message' || record.peer?.instanceId !== instance.id || record.delivery.state !== 'pending' || record.outcome !== undefined) continue;
+      await this.store.recordOutcome(record.operationId, { kind: 'cancelled', detail: `the run was ${instance.state}`, at: this.deps.now() }).catch(() => undefined);
+      const stored = record.peer === undefined ? undefined : await this.repos.peerMessages.get(record.peer.peerMessageId);
+      if (stored !== undefined) this.deps.publish({ type: 'peerMessage.updated', message: stored });
+    }
+    // The GUI's own notices to root that stayed unconfirmed are closed by the system, with their record (T065).
+    const notices = await this.deps.sessions
+      .closeUnconfirmedNotices(instance.rootSessionId, `the run was ${instance.state} before the GUI's notice to root was confirmed`)
+      .catch((error: unknown) => {
+        this.deps.log(`[pipeline] closing the notices of ${instance.id} failed (${errorText(error)})`);
+        return [];
+      });
+    if (notices.length > 0) this.deps.log(`[pipeline] ${String(notices.length)} notice(s) to root of ${instance.id} left unconfirmed were closed with the run`);
     for (const escalation of await this.repos.escalations.list({ state: 'open' })) {
       if (escalation.instanceId !== instance.id) continue;
       if (escalation.kind === 'setup-failed' || escalation.kind === 'merge-failed' || escalation.ref?.kind === 'taskPlan') await this.deps.host.closeEscalation(escalation, 'resolved', 'system');
