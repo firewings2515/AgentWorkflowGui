@@ -3,7 +3,7 @@ import { request } from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { type Mock, afterEach, describe, expect, it, vi } from 'vitest';
-import type { HandoffId, HandoffToolResult, SessionId } from '../../contracts';
+import type { HandoffId, HandoffToolResult, PeerMessageId, SessionId } from '../../contracts';
 import type { McpMount } from '../../core/ports';
 import { GuiMcpServer, type GuiMcpServerOptions } from './server';
 import type { McpToolHandlers } from './tools';
@@ -194,6 +194,32 @@ describe('GuiMcpServer', () => {
     expect(claimed.isError).toBe(true);
     expect(resultOf(claimed)).toMatchObject({ status: 'rejected', rejection: { reason: 'invalid-input' } });
     expect(handlers.report_to_root).toHaveBeenCalledTimes(2);
+  });
+
+  // T069: a message answered before its delivery is confirmed comes with a fixed line telling the agent not to resend it.
+  it('adds the line "being confirmed" after a send_message answered pending or unknown, and only then', async () => {
+    const answers: Awaited<ReturnType<McpToolHandlers['send_message']>>[] = [];
+    const handlers = makeHandlers({
+      send_message: vi.fn<McpToolHandlers['send_message']>((_input, ctx) => {
+        const delivery = (['pending', 'unknown', 'sent'] as const)[answers.length % 3]!;
+        const answer = { status: answers.length < 3 ? ('accepted' as const) : ('duplicate' as const), peerMessageId: `peer-${ctx.operationId}` as PeerMessageId, operationId: ctx.operationId, delivery };
+        answers.push(answer);
+        return Promise.resolve(answer);
+      }),
+    });
+    const server = await startServer(handlers);
+    const a = await connect(server.mount(A));
+    const texts: string[][] = [];
+    for (let i = 0; i < 6; i++) {
+      const answer = await a.client.callTool({ name: 'send_message', arguments: { to: B, content: `secret ${String(i)}` } });
+      expect(resultOf(answer)).toEqual(answers[i]);
+      texts.push((answer.content as { text: string }[]).slice(1).map((c) => c.text));
+    }
+    const line = 'The message was handed over and its delivery is being confirmed. Do not send it again; a reply, if any, comes later as a new message.';
+    expect(texts).toEqual([[line], [line], [], [line], [line], []]);
+    // Another tool's result gets no such line.
+    const reported = await a.client.callTool({ name: 'report_to_root', arguments: { content: 'r' } });
+    expect(reported.content).toHaveLength(1);
   });
 
   it('does not find one session\'s MCP session under another session\'s token', async () => {

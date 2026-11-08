@@ -14,7 +14,7 @@ import type { McpMount } from '../../core/ports';
 import { CallRunner, sourceCallRefOf } from './calls';
 import { RequestIds, requestKeyOf } from './request-ids';
 import { SessionTokens, type TokenGrant, bearerToken } from './tokens';
-import { type McpToolHandlers, toolListings } from './tools';
+import { type McpToolHandlers, type McpToolResult, toolListings } from './tools';
 
 const MCP_PATH = '/mcp';
 const SERVER_INFO = { name: 'agent-workflow-gui', version: '0.1.0' };
@@ -285,7 +285,10 @@ export class GuiMcpServer {
       const outcome = await this.#runner.run(caller, tool.data, args, sourceCallRef, extra.signal);
       if (outcome.kind === 'failed') return errorResult('The GUI could not complete this call. Nothing more is known; do not resend it.');
       if (outcome.kind === 'refused') return errorResult('The GUI is keeping too many calls from this session and did not run this one.');
-      return { content: [{ type: 'text', text: JSON.stringify(outcome.result) }], isError: outcome.result.status === 'rejected' };
+      const content: CallToolResult['content'] = [{ type: 'text', text: JSON.stringify(outcome.result) }];
+      const hint = resultHint(tool.data, outcome.result);
+      if (hint !== undefined) content.push({ type: 'text', text: hint });
+      return { content, isError: outcome.result.status === 'rejected' };
     });
     return server;
   }
@@ -352,6 +355,16 @@ const readJsonBody = (req: IncomingMessage, max: number): Promise<BodyRead> =>
 const strictUtf8 = new TextDecoder('utf-8', { fatal: true });
 
 const errorResult = (text: string): CallToolResult => ({ content: [{ type: 'text', text }], isError: true });
+
+/**
+ * A fixed line after a result whose meaning an agent may miss (T069): a message the GUI answered before its delivery was
+ * confirmed (its call waits only a moment for the ack) is not to be sent again. Never anything of the call's content.
+ */
+const SEND_BEING_CONFIRMED = 'The message was handed over and its delivery is being confirmed. Do not send it again; a reply, if any, comes later as a new message.';
+const resultHint = (tool: McpToolName, result: McpToolResult): string | undefined => {
+  if (tool !== 'send_message' || (result.status !== 'accepted' && result.status !== 'duplicate')) return undefined;
+  return 'delivery' in result && (result.delivery === 'pending' || result.delivery === 'unknown') ? SEND_BEING_CONFIRMED : undefined;
+};
 
 /** A JSON-RPC error body with a fixed message; never anything from the request but its own ID. */
 const reply = (res: ServerResponse, status: number, message: string, code = -32000, id: string | number | null = null): void => {

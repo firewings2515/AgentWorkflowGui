@@ -269,8 +269,10 @@ export interface SessionServiceOptions {
   onSessionClosed?(sessionId: SessionId): Promise<void> | void;
   dispatchTimeoutMs?: number;
   /**
-   * How long a message of a run to a node waits for the run's queue before its caller is told the run is busy (T068 r2,
-   * `IN_RUN_WAIT_MS` by default). Counted with `sleep`: without it there is no limit.
+   * How long one GUI tool call waits for what may wait on another tool call (T068 r2, T069; `IN_RUN_WAIT_MS` by default):
+   * one deadline per call, from its start (`toolDeadline`). Past it, a call still waiting for its run's queue is told the
+   * run is busy (nothing of it recorded), and a message or report already accepted is answered as it stands (its delivery
+   * being confirmed) while its dispatch goes on. Counted with `sleep`: without it there is no limit.
    */
   inRunWaitMs?: number;
   /** Resolves after `ms`; bounds the wait for running work on exit (R-14). Without it, exit waits for all of it. */
@@ -345,6 +347,43 @@ const RUN_ENDED: Refusal = { reason: 'invalid-input', detail: 'this workflow run
 const RUN_BUSY = { reason: 'busy' as const, detail: 'this workflow run is busy; send the message again in a moment' };
 /** The default of `SessionServiceOptions.inRunWaitMs`. */
 export const IN_RUN_WAIT_MS = 5000;
+
+/** A tool call's deadline (`SessionService.toolDeadline`, T069): resolves once it has passed; undefined for no limit. */
+export type ToolDeadline = Promise<void> | undefined;
+
+/**
+ * `fn` as a step of a queue (`enqueue`), waited for at most until `deadline` before it begins (T068 r2, T069 L6): past it,
+ * `busy` is answered and the step, once its turn comes, does nothing (`fn` never runs, so nothing of it is written). Once
+ * begun it is waited for to its end. `phase` leaves `waiting` once, synchronously, either when the step begins or when
+ * the deadline passes; both read and write it with no wait in between, so only the first of them finds `waiting`.
+ */
+export function gatedStep<T, B>(enqueue: (step: () => Promise<T | B>) => Promise<T | B>, fn: () => Promise<T>, deadline: ToolDeadline, busy: B): Promise<T | B> {
+  let phase: 'waiting' | 'started' | 'given-up' = 'waiting';
+  const step = enqueue(async () => {
+    if (phase === 'given-up') return busy;
+    phase = 'started';
+    return fn();
+  });
+  if (deadline === undefined) return step;
+  // Seen as handled until it is raced: a throw of a step that began still reaches the caller.
+  step.catch(() => undefined);
+  const limit = deadline.then((): { busy: B } | undefined => {
+    if (phase !== 'waiting') return undefined;
+    phase = 'given-up';
+    return { busy };
+  });
+  return Promise.race([step, limit.then((given) => (given === undefined ? step : given.busy))]);
+}
+
+/**
+ * Waits for `sending` until `deadline` (T069 L2): `done` once it ended in time (a throw of it then reaches the caller),
+ * `passed` when the deadline came first; `sending` goes on, and the caller sees to what follows it.
+ */
+export async function boundedSend(sending: Promise<unknown>, deadline: ToolDeadline): Promise<'done' | 'passed'> {
+  const done = sending.then(() => 'done' as const);
+  if (deadline === undefined) return done;
+  return Promise.race([done, deadline.then(() => 'passed' as const)]);
+}
 /** One queue per session for its commands and its runtime events (r1-P1-4). */
 const sessionKey = (sessionId: SessionId) => `session:${sessionId}`;
 /**
@@ -369,6 +408,12 @@ interface UserSend {
 /** What a step of a session's queue leaves to wait for outside it (T067): the lane's dispatch, then what follows it. */
 interface Sending<T> {
   sending: Promise<T>;
+}
+/** Whether a call accepted its peer message itself (`fresh`) or found it accepted before (`resend`, answered `duplicate`). */
+type PeerAcceptance = 'fresh' | 'resend';
+/** A peer message's dispatch in its target's lane; `resend` when an earlier call accepted it (T069: answered `duplicate`). */
+interface PeerSending extends Sending<void> {
+  resend?: true;
 }
 /** A user message on its way (`session.send`, T067): `finish` runs in the session's queue once its dispatch is over. */
 interface UserSending extends Sending<'sent' | 'unknown' | 'pending'> {
@@ -545,6 +590,12 @@ export class SessionService {
    * `beforeRecover` closes a notice of an ended run left unknown.
    */
   private readonly closeAfterDispatch = new Map<OperationId, string>();
+  /**
+   * The dispatch of a peer message entered into its target's send lane and not over yet (T069): a resend that comes while
+   * it runs (its first call answered at its deadline) waits for this one instead of entering another. Removed once it is
+   * over however it ends (sent, unknown, thrown, closing). In memory only: at a restart nothing is on its way.
+   */
+  private readonly peerSending = new Map<OperationId, Promise<void>>();
   /**
    * The user message each session's send lane is dispatching now (T067), from before its claim until what follows its
    * result (`expectEcho`) is done: the runtime's echo of it is applied only after that, so it is recognised as an echo.
@@ -2003,8 +2054,10 @@ export class SessionService {
    * confirms first (R-11).
    */
   async sendMessage(input: SendMessageToolInput, ctx: { caller: SessionId; operationId: OperationId; sourceCallRef: string }): Promise<SendMessageToolResult> {
+    // The call's one deadline (T069), from its start: for its run's queue and for its dispatch's ack.
+    const deadline = this.toolDeadline();
     try {
-      return await this.sendMessageGuarded(input, ctx);
+      return await this.sendMessageGuarded(input, ctx, deadline);
     } catch (error) {
       // A call that ran into the exit (the write gate, or anything after closing began) is answered as such (r3-P2-2).
       if (this.closing || error instanceof ServiceClosedError) return { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } };
@@ -2012,7 +2065,7 @@ export class SessionService {
     }
   }
 
-  private async sendMessageGuarded(input: SendMessageToolInput, ctx: { caller: SessionId; operationId: OperationId; sourceCallRef: string }): Promise<SendMessageToolResult> {
+  private async sendMessageGuarded(input: SendMessageToolInput, ctx: { caller: SessionId; operationId: OperationId; sourceCallRef: string }, deadline: ToolDeadline): Promise<SendMessageToolResult> {
     const rejected = (reason: 'unknown-target' | 'invalid-input' | 'shutting-down', detail: string): SendMessageToolResult => ({
       status: 'rejected',
       rejection: { reason, detail },
@@ -2034,10 +2087,10 @@ export class SessionService {
     };
     // One call per operation at a time, so two calls racing for the same ID are checked against each other
     // (r2-P1-3); the target's part then runs in the target's queue.
-    return this.serial(`op:${ctx.operationId}`, () => this.sendMessageNow(caller, target, pending));
+    return this.serial(`op:${ctx.operationId}`, () => this.sendMessageNow(caller, target, pending, deadline));
   }
 
-  private async sendMessageNow(caller: LogicalSession, target: LogicalSession, pending: PendingConfirmation): Promise<SendMessageToolResult> {
+  private async sendMessageNow(caller: LogicalSession, target: LogicalSession, pending: PendingConfirmation, deadline: ToolDeadline): Promise<SendMessageToolResult> {
     const rejected = (reason: Refusal['reason'] | 'shutting-down', detail: string): SendMessageToolResult => ({ status: 'rejected', rejection: { reason, detail } });
     if (this.closing) return rejected('shutting-down', 'the GUI is closing');
     // A resend or a `retryOf` names an operation that already exists: it must be the same message from the
@@ -2078,9 +2131,10 @@ export class SessionService {
       }
       return { status: 'awaiting-confirmation', escalationId: id };
     }
-    const refused = await this.acceptInRun(pending);
-    if (refused !== undefined) return refused;
-    return this.deliverPeer(pending);
+    const inRun = await this.acceptInRun(pending, deadline);
+    if (inRun === undefined) return this.deliverPeer(pending, deadline);
+    if ('accepted' in inRun) return this.deliverPeer(pending, deadline, inRun.accepted);
+    return inRun;
   }
 
   /**
@@ -2091,24 +2145,34 @@ export class SessionService {
    * after it; undefined then. To any other session of the run (a node, from a node or from root, T068): op → run → the
    * target's session, as a handoff is (`deliverInRun`), and the whole answer is given. A resend finds its operation and is
    * answered as before. Undefined too for a message of no run, and for a run not found.
+   * To root, the wait for the run's queue is bounded by the call's deadline as a node's is (T069 L6, `gatedStep`): past it
+   * before the step began, the caller is told the run is busy and nothing is accepted. `accepted` then says whether this
+   * call accepted it (`fresh`) or found it accepted before (`resend`), for the wait for its dispatch (`deliverPeer`).
    */
-  private async acceptInRun(p: PendingConfirmation): Promise<SendMessageToolResult | undefined> {
+  private async acceptInRun(p: PendingConfirmation, deadline: ToolDeadline): Promise<SendMessageToolResult | { accepted: PeerAcceptance } | undefined> {
     const instanceId = p.instanceId;
     const workflow = this.workflow;
     if (instanceId === undefined || workflow?.inRunQueue === undefined) return undefined;
     // Which way is read outside the run's queue (T066 r1), as a run's root never changes once the run is made.
     const run = await this.repos.instances.get(instanceId);
     if (run === undefined) return undefined;
-    if (run.rootSessionId !== p.to) return this.deliverInRun(p, instanceId, workflow.inRunQueue.bind(workflow));
-    return workflow.inRunQueue(instanceId, async (): Promise<SendMessageToolResult | undefined> => {
-      const instance = await this.repos.instances.get(instanceId);
-      if (instance === undefined) return undefined;
-      if ((await this.store.get(p.operationId)) !== undefined) return undefined;
-      if (instance.state === 'completed' || instance.state === 'cancelled') return { status: 'rejected', rejection: RUN_ENDED };
-      const target = await this.repos.sessions.get(p.to);
-      if (target === undefined) return { status: 'rejected', rejection: { reason: 'unknown-target', detail: 'no such session' } };
-      return this.acceptPeer(p, target);
-    });
+    const inRunQueue = workflow.inRunQueue.bind(workflow);
+    if (run.rootSessionId !== p.to) return this.deliverInRun(p, instanceId, inRunQueue, deadline);
+    const busy: SendMessageToolResult = { status: 'rejected', rejection: RUN_BUSY };
+    return gatedStep(
+      (step) => inRunQueue(instanceId, step),
+      async (): Promise<SendMessageToolResult | { accepted: PeerAcceptance } | undefined> => {
+        const instance = await this.repos.instances.get(instanceId);
+        if (instance === undefined) return undefined;
+        if ((await this.store.get(p.operationId)) !== undefined) return { accepted: 'resend' };
+        if (instance.state === 'completed' || instance.state === 'cancelled') return { status: 'rejected', rejection: RUN_ENDED };
+        const target = await this.repos.sessions.get(p.to);
+        if (target === undefined) return { status: 'rejected', rejection: { reason: 'unknown-target', detail: 'no such session' } };
+        return (await this.acceptPeer(p, target)) ?? { accepted: 'fresh' };
+      },
+      deadline,
+      busy,
+    );
   }
 
   private async confirm(requestId: Success['requestId'], escalation: Escalation, decision: 'approve' | 'decline'): Promise<CommandResult> {
@@ -2156,10 +2220,16 @@ export class SessionService {
 
   /**
    * The target's part runs in its queue, in order with its commands and events; the dispatch then waits in the target's
-   * send lane, outside that queue (T067), and the answer is read once it is over.
+   * send lane, outside that queue (T067), and the answer is read once it is over. A tool call's `deadline` bounds that wait
+   * (T069 L2): past it, the call is answered from the record as it stands (`pending` in the lane, `unknown` on its way to
+   * the runtime) while the dispatch goes on. `accepted` is given when the run's step accepted it (T066): the wait for the
+   * target's queue then counts too. Otherwise the message is accepted only in the target's queue, which is waited for to
+   * the end of its step first (no answer before it is accepted; L5). `confirm()` passes no deadline: the user's command
+   * waits as before.
    */
-  private async deliverPeer(p: PendingConfirmation): Promise<SendMessageToolResult> {
-    return this.peerAnswer(p, await this.peerStep(p));
+  private async deliverPeer(p: PendingConfirmation, deadline?: ToolDeadline, accepted?: PeerAcceptance): Promise<SendMessageToolResult> {
+    const step = this.peerStep(p, accepted === 'fresh');
+    return this.peerAnswer(p, accepted === undefined ? await step : step, deadline, accepted);
   }
 
   /**
@@ -2172,10 +2242,11 @@ export class SessionService {
    * target's queue there, without waiting for it, so messages to one target go in the order they were accepted (C-07); that
    * part (the send lane, T067) is waited for outside both. A resend of one accepted before the end is answered as before.
    * The wait for the run's queue is bounded (T068 r2): a node's tool call must not wait for a run's queue held by a handoff
-   * that waits for a session's queue that `exclusive()` holds until an ack that waits for that tool call (L6). Past
-   * `inRunWaitMs` before its step began, the caller is told the run is busy and the step, once its turn comes, does nothing.
+   * that waits for a session's queue that `exclusive()` holds until an ack that waits for that tool call (L6). Past the
+   * call's deadline before its step began, the caller is told the run is busy and the step, once its turn comes, does
+   * nothing (`gatedStep`). The same deadline then bounds the wait for the target's part and its dispatch (T069 L2).
    */
-  private async deliverInRun(p: PendingConfirmation, instanceId: InstanceId, inRunQueue: NonNullable<WorkflowHooks['inRunQueue']>): Promise<SendMessageToolResult> {
+  private async deliverInRun(p: PendingConfirmation, instanceId: InstanceId, inRunQueue: NonNullable<WorkflowHooks['inRunQueue']>, deadline: ToolDeadline): Promise<SendMessageToolResult> {
     const shuttingDown: SendMessageToolResult = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } };
     // 1. Provisioned in the target's queue, not holding the run's: only for a new message to a target not bound yet, and
     //    not for a run read as ended (the run's step refuses it; this read only spares an ended run's node a start).
@@ -2187,69 +2258,93 @@ export class SessionService {
       });
     }
     // 2. Accepted in the run's queue; the target's part is entered into its queue in this same step and waited for after it.
-    //    `phase` leaves `waiting` once, synchronously, either when the step begins or when the wait's limit passes; both
-    //    read and write it with no wait in between, so only the first of them finds `waiting` (one thread).
-    let phase: 'waiting' | 'started' | 'given-up' = 'waiting';
-    const step = inRunQueue(instanceId, async (): Promise<SendMessageToolResult | { next: Promise<SendMessageToolResult | Sending<void>> }> => {
-      // Given up: its caller was told the run is busy. Nothing is accepted, stored or entered.
-      if (phase === 'given-up') return { status: 'rejected', rejection: RUN_BUSY };
-      phase = 'started';
-      if (this.closing) return shuttingDown;
-      if ((await this.store.get(p.operationId)) === undefined) {
-        const instance = await this.repos.instances.get(instanceId);
-        if (instance !== undefined && runEnded(instance)) return { status: 'rejected', rejection: RUN_ENDED };
-        const target = await this.repos.sessions.get(p.to);
-        if (target === undefined) return { status: 'rejected', rejection: { reason: 'unknown-target', detail: 'no such session' } };
-        const refused = await this.acceptPeer(p, target, 'bound-only');
-        if (refused !== undefined) return refused;
-      }
-      // `peerStep` enters the target's queue before its first wait, so in this step.
-      const next = this.peerStep(p);
-      next.catch(() => undefined);
-      return { next };
-    });
-    let accepted: Awaited<typeof step>;
-    if (this.options.sleep === undefined) accepted = await step;
-    else {
-      step.catch(() => undefined);
-      // Once the step began, the limit no longer counts: its sleep ends unwatched (it never rejects; a timer the main
-      // process does not wait for at exit, `unref`).
-      const limit = this.options.sleep(this.options.inRunWaitMs ?? IN_RUN_WAIT_MS).then(
-        (): SendMessageToolResult | undefined => {
-          if (phase !== 'waiting') return undefined;
-          phase = 'given-up';
-          return { status: 'rejected', rejection: RUN_BUSY };
-        },
-        () => undefined,
-      );
-      accepted = await Promise.race([step, limit.then((busy) => busy ?? step)]);
-    }
-    // 3. The target's part and its dispatch, outside the run's queue.
+    //    Given up at the deadline (its caller told the run is busy), the step accepts, stores and enters nothing.
+    const busy: SendMessageToolResult = { status: 'rejected', rejection: RUN_BUSY };
+    const accepted = await gatedStep(
+      (step) => inRunQueue(instanceId, step),
+      async (): Promise<SendMessageToolResult | { next: Promise<SendMessageToolResult | PeerSending>; accepted: PeerAcceptance }> => {
+        if (this.closing) return shuttingDown;
+        let fresh = false;
+        if ((await this.store.get(p.operationId)) === undefined) {
+          const instance = await this.repos.instances.get(instanceId);
+          if (instance !== undefined && runEnded(instance)) return { status: 'rejected', rejection: RUN_ENDED };
+          const target = await this.repos.sessions.get(p.to);
+          if (target === undefined) return { status: 'rejected', rejection: { reason: 'unknown-target', detail: 'no such session' } };
+          const refused = await this.acceptPeer(p, target, 'bound-only');
+          if (refused !== undefined) return refused;
+          fresh = true;
+        }
+        // `peerStep` enters the target's queue before its first wait, so in this step.
+        const next = this.peerStep(p, fresh);
+        next.catch(() => undefined);
+        return { next, accepted: fresh ? 'fresh' : 'resend' };
+      },
+      deadline,
+      busy,
+    );
+    // 3. The target's part and its dispatch, outside the run's queue, within the same deadline.
     if (!('next' in accepted)) return accepted;
-    return this.peerAnswer(p, await accepted.next);
+    return this.peerAnswer(p, accepted.next, deadline, accepted.accepted);
   }
 
   /** The target's part of a message, in its queue: an answer, or its dispatch entered into the target's send lane. */
-  private async peerStep(p: PendingConfirmation): Promise<SendMessageToolResult | Sending<void>> {
+  private async peerStep(p: PendingConfirmation, fresh = false): Promise<SendMessageToolResult | PeerSending> {
     const step = await this.serial(sessionKey(p.to), () =>
-      this.closing ? Promise.resolve<SendMessageToolResult>({ status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } }) : this.deliverPeerNow(p),
+      this.closing ? Promise.resolve<SendMessageToolResult>({ status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } }) : this.deliverPeerNow(p, fresh),
     );
     // Seen as handled until the caller awaits it (after the run's queue too, `deliverInRun`): a throw still reaches it.
     if (isSending<void>(step)) step.sending.catch(() => undefined);
     return step;
   }
 
-  /** The answer once the dispatch entered by `peerStep` is over, read from the record. */
-  private async peerAnswer(p: PendingConfirmation, step: SendMessageToolResult | Sending<void>): Promise<SendMessageToolResult> {
-    if (!isSending<void>(step)) return step;
-    await step.sending;
+  /**
+   * The answer to a message's call: once the dispatch entered by `peerStep` is over, read from the record; or, past the
+   * call's deadline (T069 L2), the record as it stands while the dispatch goes on (what it ends with is published then,
+   * and a throw is logged, never the message's content). `step` is still to come only when the call knows the message
+   * was accepted (`accepted`): it is then waited for within the deadline too.
+   */
+  private async peerAnswer(
+    p: PendingConfirmation,
+    step: SendMessageToolResult | PeerSending | Promise<SendMessageToolResult | PeerSending>,
+    deadline: ToolDeadline,
+    accepted?: PeerAcceptance,
+  ): Promise<SendMessageToolResult> {
+    if (!(step instanceof Promise) && !isSending<void>(step)) return step;
+    const whole = Promise.resolve(step).then(async (s) => {
+      if (isSending<void>(s)) await s.sending;
+      return s;
+    });
+    if ((await boundedSend(whole, deadline)) === 'done') {
+      const s = await whole;
+      if (!isSending<void>(s)) return s;
+      return this.peerAnswerNow(p, s.resend === true || accepted === 'resend' ? 'duplicate' : 'accepted');
+    }
+    void whole
+      .then(async (s) => {
+        if (!isSending<void>(s)) return;
+        const record = await this.store.get(p.operationId);
+        if (record?.kind === 'peer-message') this.publishPeer(record, p);
+      })
+      .catch((error: unknown) => this.log(`[sessions] message ${p.operationId}: its dispatch went on past its call's deadline and failed (${errorName(error)})`));
+    const resend = accepted === 'resend' || (!(step instanceof Promise) && step.resend === true);
+    return this.peerAnswerNow(p, resend ? 'duplicate' : 'accepted');
+  }
+
+  /** The call's answer from the message's record as it stands now, announced as such. */
+  private async peerAnswerNow(p: PendingConfirmation, status: 'accepted' | 'duplicate'): Promise<SendMessageToolResult> {
     const record = await this.store.get(p.operationId);
     if (record?.kind !== 'peer-message') throw new Error('the peer message record changed kind');
     this.publishPeer(record, p);
-    return { status: 'accepted', peerMessageId: peerIdOf(p.operationId), operationId: p.operationId, delivery: record.delivery.state };
+    return { status, peerMessageId: peerIdOf(p.operationId), operationId: p.operationId, delivery: record.delivery.state };
   }
 
-  private async deliverPeerNow(p: PendingConfirmation): Promise<SendMessageToolResult | Sending<void>> {
+  /**
+   * In the target's queue: the message accepted when no call did yet (`fresh`: the run's step accepted it for this call),
+   * then its dispatch entered into the target's send lane while it is pending. A call that did not accept it is a resend,
+   * answered `duplicate` (T069, CR-2); while a dispatch an earlier call entered is still on its way (that call answered at
+   * its deadline), the resend waits for that one rather than entering another.
+   */
+  private async deliverPeerNow(p: PendingConfirmation, fresh = false): Promise<SendMessageToolResult | PeerSending> {
     const target = await this.repos.sessions.get(p.to);
     if (target === undefined)
       return {
@@ -2262,11 +2357,13 @@ export class SessionService {
       peerMessageId: peerIdOf(p.operationId),
     };
     const shuttingDown: SendMessageToolResult = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } };
+    let accepted = fresh;
     let record = await this.store.get(p.operationId);
     if (record === undefined) {
       const refused = await this.acceptPeer(p, target);
       if (refused !== undefined) return refused;
       record = await this.store.get(p.operationId);
+      accepted = true;
     }
     // Checked again here, inside the target's queue, with the record this call will use (r2-P1-3).
     const mismatch: Refusal | undefined = record === undefined ? { reason: 'invalid-input', detail: 'this operation is not a message' } : await this.recordMismatch(record, p);
@@ -2276,8 +2373,16 @@ export class SessionService {
     this.origins.set(p.operationId, origin);
     if (record.delivery.state === 'pending') {
       if (this.closing) return shuttingDown;
+      const resend = accepted ? {} : { resend: true as const };
+      const running = this.peerSending.get(p.operationId);
+      if (running !== undefined) return { sending: running, ...resend };
       // A busy target gets the message inside its running turn (SP-05), as it is when the lane dispatches it (T067).
-      return { sending: this.sendLane(p.to, async () => void (await this.dispatchPending(p.operationId, { origin, entry: await this.entryNow(p.to) }))) };
+      // Off the list once over, however it ends (sent, unknown, thrown, closing).
+      const sending: Promise<void> = this.sendLane(p.to, async () => void (await this.dispatchPending(p.operationId, { origin, entry: await this.entryNow(p.to) }))).finally(() => {
+        if (this.peerSending.get(p.operationId) === sending) this.peerSending.delete(p.operationId);
+      });
+      this.peerSending.set(p.operationId, sending);
+      return { sending, ...resend };
     }
     this.publishPeer(record, p);
     return {
@@ -3289,6 +3394,16 @@ export class SessionService {
    * Whether this delivery's outcome is still being found out (T065): its one runtime call is running now, or it is an
    * insert waiting for its turn's end to be reconciled. Unknown then, but nothing is asked of the user yet.
    */
+  /**
+   * The deadline of a GUI tool call starting now (T069, `SessionServiceOptions.inRunWaitMs`): one per call, from its start,
+   * for its wait for its run's queue and for its message's or report's dispatch. Undefined without `sleep` (no limit).
+   */
+  toolDeadline(): ToolDeadline {
+    if (this.options.sleep === undefined) return undefined;
+    // A sleep that fails is no limit: the call waits as it did before.
+    return this.options.sleep(this.options.inRunWaitMs ?? IN_RUN_WAIT_MS).catch(() => new Promise<void>(() => undefined));
+  }
+
   beingConfirmed(operationId: OperationId): boolean {
     const late = this.lateChecks.get(operationId);
     return this.dispatching.has(operationId) || (late !== undefined && !late.escalated);
