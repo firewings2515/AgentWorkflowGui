@@ -32,7 +32,7 @@ import {
   type WorkflowTask,
   activeMergeStates,
 } from '../../contracts';
-import type { AppRepositories, CleanupResult, DeliveryStore, EndUnclaimedResult, GitPort, WorktreeRef } from '../ports';
+import type { AppRepositories, CleanupResult, DeliveryStore, EndUnclaimedResult, GitPort, StoredDelivery, WorktreeRef } from '../ports';
 import type { CommandOf, SessionService, WorkflowSession } from '../sessions';
 import { type AgentNode, nodeOf, rootNode } from '../workflow/graph';
 import { peerIdOf } from '../workflow/ids';
@@ -1370,8 +1370,9 @@ export class TaskPipeline {
       // and its result is kept (D-12: a handoff or report whose outcome is unknown then holds the end, as above).
       const closing = await this.endUnclaimedOf(instance, finish, 'together');
       if (closing.result.status === 'in-flight') {
-        const handoff = closing.result.operationIds.some((id) => closing.handoffs.has(id));
-        return fail(requestId, 'invalid_transition', handoff ? 'A handoff of this run is being sent; end the run once it has gone' : 'A report to root is being sent; end the run once it has gone', { retryable: true });
+        const ids = closing.result.operationIds;
+        const what = ids.some((id) => closing.handoffs.has(id)) ? 'A handoff of this run' : ids.some((id) => closing.toRoot.has(id)) ? 'A report to root' : 'A message of this run';
+        return fail(requestId, 'invalid_transition', `${what} is being sent; end the run once it has gone`, { retryable: true });
       }
       const closed = [...closing.result.ended, ...(await this.endNotices(instance, finish))];
       // Left closed when the commit fails (an outcome is set once, and an outcome written first always wins over a claim):
@@ -1424,18 +1425,35 @@ export class TaskPipeline {
   }
 
   /**
-   * The run's handoffs (T066) and its reports to root (T065 r3: `report_to_root`, and `send_message` of the run to root)
-   * not claimed yet are cancelled, by the store's `endUnclaimed`, exclusive with their claim. A handoff to the merge node is
+   * The run's handoffs (T066) and its messages (T065 r3: `report_to_root`; `send_message` of the run, to root T066, between
+   * any two of its sessions T068; the GUI's message to a conflict's resolver) not claimed yet are cancelled, by the store's
+   * `endUnclaimed`, exclusive with their claim. A handoff to the merge node is
    * never delivered and is left alone. `together` (the end, before its commit): one step for all of them, and none is
    * written when one is claimed now (`in-flight`). `each` (after the commit, or at a restart): one by one, so one left
-   * unknown (only reconciled now, never sent again) does not keep the others open. Handoffs and reports are accepted in the
+   * unknown (only reconciled now, never sent again) does not keep the others open. Handoffs and messages are accepted in the
    * run's queue, as the end runs, so none of the run is accepted between the listing and the step; one claimed between
    * them is listed still (only a sent one or one with an outcome is not), so the step finds it in flight.
    */
-  private async endUnclaimedOf(instance: WorkflowInstance, state: 'completed' | 'cancelled', mode: 'together' | 'each'): Promise<{ result: EndUnclaimedResult; handoffs: Map<OperationId, Handoff> }> {
-    const reports = (await this.store.listByTarget(instance.rootSessionId))
-      .filter((r) => r.kind === 'peer-message' && r.peer?.instanceId === instance.id && r.outcome === undefined && r.delivery.state !== 'sent')
-      .map((r) => r.operationId);
+  private async endUnclaimedOf(
+    instance: WorkflowInstance,
+    state: 'completed' | 'cancelled',
+    mode: 'together' | 'each',
+  ): Promise<{ result: EndUnclaimedResult; handoffs: Map<OperationId, Handoff>; toRoot: Set<OperationId> }> {
+    // Every message of the run not sent (pending, or claimed now: unknown with no outcome), whatever its target (T068). Read
+    // by target (T068 r1): a message has one target session from its acceptance on, and each target's records are read in
+    // one step, so one moving between pending and unknown meanwhile (claimed, then retried) is listed still; a read by state
+    // and then another could miss it. Every target is a session of the run (its root, its nodes, a conflict's resolver;
+    // archived ones too: archiving only marks them), and the run's messages are accepted in its queue, where this runs.
+    const targets = new Set<SessionId>([instance.rootSessionId]);
+    for (const s of await this.repos.sessions.list()) if (s.kind === 'workflow' && s.workflow.instanceId === instance.id) targets.add(s.id);
+    const messages: StoredDelivery[] = [];
+    for (const sessionId of targets) {
+      for (const r of await this.store.listByTarget(sessionId)) {
+        if (r.kind === 'peer-message' && r.peer?.instanceId === instance.id && r.outcome === undefined && r.delivery.state !== 'sent') messages.push(r);
+      }
+    }
+    const reports = messages.map((r) => r.operationId);
+    const toRoot = new Set(messages.filter((r) => r.target.sessionId === instance.rootSessionId).map((r) => r.operationId));
     const handoffs = new Map<OperationId, Handoff>();
     for (const h of await this.repos.handoffs.listByInstance(instance.id)) {
       if (h.outcome === undefined && h.delivery.state !== 'sent' && !toMerge(instance, h)) handoffs.set(h.operationId, h);
@@ -1459,7 +1477,7 @@ export class TaskPipeline {
         else await this.publishHandoff(handoff.id);
       }
     }
-    return { result, handoffs };
+    return { result, handoffs, toRoot };
   }
 
   private async publishHandoff(handoffId: Handoff['id']): Promise<void> {
@@ -1715,7 +1733,9 @@ export class TaskPipeline {
     for (const handoff of await this.repos.handoffs.listByInstance(instanceId)) {
       if (handoff.taskId !== taskId || handoff.delivery.state !== 'pending' || handoff.outcome !== undefined) continue;
       if (instance !== undefined && toMerge(instance, handoff)) continue;
-      await this.store.recordOutcome(handoff.operationId, { kind: 'cancelled', detail: 'the task was given up', at: this.deps.now() }).catch(() => undefined);
+      // Only while not claimed (T068): one claimed since it was listed is on its way, and its delivery tells how it went.
+      const closed = await this.store.endUnclaimed([handoff.operationId], { kind: 'cancelled', detail: 'the task was given up', at: this.deps.now() }).catch(() => undefined);
+      if (closed?.status === 'in-flight') this.deps.log(`[pipeline] handoff ${handoff.id} of the task given up is on its way; it is not cancelled`);
       const stored = await this.repos.handoffs.get(handoff.id);
       if (stored !== undefined) this.deps.publish({ type: 'handoff.updated', handoff: stored });
     }

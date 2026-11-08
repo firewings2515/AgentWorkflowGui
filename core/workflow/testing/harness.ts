@@ -163,7 +163,15 @@ const peerOf = (r: StoredDelivery): PeerMessage | undefined => {
   };
 };
 
-const all = async (store: DeliveryStore) => [...(await store.listByState('pending')), ...(await store.listByState('unknown')), ...(await store.listByState('sent'))];
+/**
+ * Every record in one snapshot (T068 r1), as the SQLite projections read them in one statement: three reads in turn let a
+ * record moving between them (claimed, then retried) be in none. In the order they had: by state, then by acceptance.
+ */
+const STATES = ['pending', 'unknown', 'sent'] as const;
+const all = async (store: MemoryDeliveryStore) => {
+  const records = await store.listAll();
+  return STATES.flatMap((state) => records.filter((r) => r.delivery.state === state));
+};
 
 /** Memory repositories whose handoffs and peer messages are the delivery store's records (C-12). */
 export class WorkflowRepositories extends MemoryRepositories {

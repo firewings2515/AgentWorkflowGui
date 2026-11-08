@@ -291,6 +291,16 @@ export class MemoryDeliveryStore implements DeliveryStore {
     }));
   }
 
+  /**
+   * Every record, in acceptance order, read in one step (T068 r1): a snapshot, as one SQLite statement is, for the test
+   * repositories' projections. Counted as a `listByState` call (its faults included).
+   */
+  listAll(): Promise<StoredDelivery[]> {
+    return this.run('listByState', () => ({
+      value: [...this.rows.values()].sort((a, b) => (a.acceptedAt < b.acceptedAt ? -1 : a.acceptedAt > b.acceptedAt ? 1 : 0)).map((r) => this.load(r)),
+    }));
+  }
+
   listByTarget(sessionId: SessionId): Promise<StoredDelivery[]> {
     return this.run('listByTarget', () => ({
       value: [...this.rows.values()]

@@ -1116,7 +1116,8 @@ export const t032Cases = (backend: string, make: (workflow?: WorkflowTemplate) =
       const a = `${asked.taskPlanId}:a` as TaskId;
       for (const n of [1, 2]) await handoff(w, ROOT, { ruleId: 'to-impl', target: { kind: 'node', nodeId: IMPL }, taskId: a, content: `try ${String(n)}` });
       // The GUI goes down at the first cancellation: the stop itself is already written.
-      hangOnce(w.store, 'recordOutcome');
+      // The first cancellation's write (an `endUnclaimed` of the handoff since T068, only while it is not claimed).
+      hangOnce(w.store, 'endUnclaimed', (_ids, outcome) => (outcome as { detail?: string }).detail === 'the task stopped at a handoff limit');
       void respond(w, asked.escalationId, 'approve');
       await until(async () => (await instanceOf(w)).tasks.some((t) => t.id === a && t.status === 'blocked'), 'stopped');
       const r = await w.restart();
