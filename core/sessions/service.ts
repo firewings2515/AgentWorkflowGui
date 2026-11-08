@@ -350,6 +350,11 @@ interface UserSend {
   runtime: Runtime;
   text: string;
   clientMessageId?: string;
+  /**
+   * Codex only (T067 r1): the turn its echo can be in, as known before the dispatch. An insert goes into the main turn
+   * running then (`into`); a new turn is none of the turns known then (`known`).
+   */
+  turns?: { into: string } | { known: ReadonlySet<string> };
   done: Promise<void>;
 }
 /** What a step of a session's queue leaves to wait for outside it (T067): the lane's dispatch, then what follows it. */
@@ -360,7 +365,12 @@ interface Sending<T> {
 interface UserSending extends Sending<'sent' | 'unknown' | 'pending'> {
   finish(outcome: 'sent' | 'unknown' | 'pending'): Promise<CommandResult>;
 }
-const isSending =<T>(step: unknown): step is Sending<T> => typeof step === 'object' && step !== null && 'sending' in step;
+/** Whether a message may be the echo by its turn (T067 r1): any turn when it names none or nothing is known. */
+const inEchoTurn = (message: Message, turns: UserSend['turns']): boolean => {
+  if (message.turnId === undefined || turns === undefined) return true;
+  return 'into' in turns ? message.turnId === turns.into : !turns.known.has(message.turnId);
+};
+const isSending = <T>(step: unknown): step is Sending<T> => typeof step === 'object' && step !== null && 'sending' in step;
 const closingFailure = (requestId: Failure['requestId']) => fail(requestId, 'runtime_unavailable', 'The application is closing');
 /** The session with its title fixed: no `autoTitle` any more. */
 const withoutAutoTitle = (s: LogicalSession): LogicalSession => {
@@ -1318,11 +1328,29 @@ export class SessionService {
     if (this.closing) return closingFailure(requestId);
     const call: DispatchCall = {};
     // Entered into the lane now, in this queue's order; dispatched there, its ack waited for outside this queue (T067).
-    const sending = this.sendLane(sessionId, async () =>
-      this.dispatchPending(operationId, { origin: { kind: 'user' }, entry: await this.entryNow(sessionId), call }),
-    );
+    const sending = this.sendLane(sessionId, async () => {
+      const outcome = await this.dispatchPending(operationId, { origin: { kind: 'user' }, entry: await this.entryNow(sessionId), call });
+      // Refused (its folder went): ended here, in the lane, before the next dispatch of it (T067 r1 P1).
+      if (outcome === 'pending') await this.endRefusedUserMessage(operationId, call);
+      return outcome;
+    });
     const revision = session.revision;
     return { sending, finish: (outcome) => this.userMessageSent(requestId, sessionId, messageId, text, call, revision, outcome) };
+  }
+
+  /**
+   * A user message whose session could not be resumed (its folder went, T036) is told it is not sent, so it is never sent
+   * later either (T046): no restart's recovery sends it unseen. Except a message the user chose to retry: that retry was
+   * told it goes at the next start, and still does (r4 P1); read again here, as a retry may have been decided while this
+   * send ran. In the lane, right after its dispatch (T067 r1 P1): no later dispatch of it runs between, and the outcome
+   * goes only on a delivery still pending and unclaimed (`endUnclaimed`), never on one sent or on its way.
+   */
+  private async endRefusedUserMessage(operationId: OperationId, call: DispatchCall): Promise<void> {
+    const notTaken = notTakenOf(call);
+    if (notTaken === undefined || !('refused' in notTaken)) return;
+    const now = await this.store.get(operationId);
+    if (now?.delivery.attempts.some((a) => a.resolution?.decision === 'retry') === true) return;
+    await this.store.endUnclaimed([operationId], { kind: 'cancelled', detail: 'its session could not be resumed, so it was not sent', at: this.options.now() });
   }
 
   /** What a user message's dispatch result changes (T067: in the session's queue again, once the lane's dispatch is over). */
@@ -1345,6 +1373,9 @@ export class SessionService {
         return ok(requestId, { revision: named ?? revision, created });
       case 'unknown':
         await this.setActivity(sessionId, 'reconciling');
+        // Written after the dispatch's result, in this queue (T067 r1): a reconcile that found it sent meanwhile left no
+        // `reconciling` to undo then, so it is looked at again now.
+        await this.leaveReconciling(sessionId, await this.binding(sessionId));
         return fail(requestId, 'unknown_outcome', 'It is not known whether the message reached the session; it is not sent again', {
           mayHaveSideEffects: true,
         });
@@ -1352,16 +1383,11 @@ export class SessionService {
         // Its folder went while the message was on its way (T036): said plainly, never resumed elsewhere.
         const notTaken = notTakenOf(call);
         const refused = notTaken !== undefined && 'refused' in notTaken ? notTaken.refused : undefined;
-        if (refused !== undefined) {
-          // Told it is not sent, so it is never sent later either (T046): no restart's recovery sends it unseen. Except a
-          // message the user chose to retry: that retry was told it goes at the next start, and still does (r4 P1). Read
-          // again here, not the record from before the dispatch: a retry may have been decided while this send ran.
-          const now = await this.store.get(operationId);
-          const retriedByUser = now?.delivery.attempts.some((a) => a.resolution?.decision === 'retry') === true;
-          if (!retriedByUser)
-            await this.store.recordOutcome(operationId, { kind: 'cancelled', detail: 'its session could not be resumed, so it was not sent', at: this.options.now() });
-          return fail(requestId, 'invalid_transition', refused);
-        }
+        // Its outcome was written in the lane (`endRefusedUserMessage`).
+        if (refused !== undefined) return fail(requestId, 'invalid_transition', refused);
+        // Ended meanwhile by an earlier send of the same message that was refused (T067 r1 P1): said so, as a send after it is.
+        const ended = (await this.store.get(operationId))?.outcome;
+        if (ended !== undefined) return fail(requestId, 'invalid_transition', `This message was not sent and will not be: ${ended.detail}`);
         return fail(requestId, 'runtime_unavailable', 'The message is saved but could not be handed to the session yet', { retryable: true });
       }
     }
@@ -1951,9 +1977,12 @@ export class SessionService {
     }
     const origin = await this.originOf(operationId);
     const dispatch = () => this.dispatchPending(operationId, { origin, ...(call !== undefined && { call }) });
-    // In its session's send lane, in order with every other dispatch to it (T067).
     const target = record?.target.sessionId;
-    return target === undefined ? dispatch() : this.sendLane(target, dispatch);
+    if (target === undefined) return dispatch();
+    // Entered into its session's send lane in a step of the session's queue, in order with every other dispatch to it,
+    // and waited for outside that queue (T067 r1).
+    const step = await this.serial(sessionKey(target), () => Promise.resolve<Sending<'sent' | 'unknown' | 'pending'>>({ sending: this.sendLane(target, dispatch) }));
+    return step.sending;
   }
 
   // ---- MCP send_message -----------------------------------------------------------------------------
@@ -2431,6 +2460,8 @@ export class SessionService {
     if (this.handoffTurns.has(sessionId)) return 'queued';
     const conversation = await this.repos.conversations.get(sessionId);
     if (runningMainTurn(conversation) !== undefined) return 'queued';
+    // A turn an ack named and not seen to end (T067 r1): running, though its `running` may not be applied yet.
+    if (this.turnAcked(sessionId)) return 'queued';
     const waiting = (await this.store.listByState('pending'))
       .filter((r) => r.kind === 'handoff' && r.target.sessionId === sessionId && r.outcome === undefined)
       .sort((a, b) => (a.acceptedAt < b.acceptedAt ? -1 : a.acceptedAt > b.acceptedAt ? 1 : a.operationId < b.operationId ? -1 : 1));
@@ -2449,12 +2480,11 @@ export class SessionService {
     // The caller's call only for its own delivery: another one the gate sends instead is not what it asked about.
     const own = next.operationId === operationId && call !== undefined ? { call } : {};
     const chosen = next;
-    const acked = new Set(this.ackedTurns.get(sessionId) ?? []);
     // In the lane, after what was entered before it, and waited for here (T067): the session's own turn is not running,
     // so nothing ahead of it waits for one of its tool calls. A payload ahead of it may have started a turn meanwhile: its
     // ack named one not seen to end, whose events are behind this step. The handoff then waits for that turn's end.
     const state = await this.sendLane(sessionId, async () =>
-      this.turnAckedSince(sessionId, acked) ? ('queued' as const) : this.dispatchPending(chosen.operationId, { origin: await this.originOf(chosen.operationId), entry: { kind: 'new-turn' }, ...own }),
+      this.turnAcked(sessionId) ? ('queued' as const) : this.dispatchPending(chosen.operationId, { origin: await this.originOf(chosen.operationId), entry: { kind: 'new-turn' }, ...own }),
     );
     if (state === 'queued') {
       if (this.handoffTurns.get(sessionId) === mark) this.handoffTurns.delete(sessionId);
@@ -2471,10 +2501,13 @@ export class SessionService {
     return next.operationId === operationId ? state : 'queued';
   }
 
-  /** Whether an ack named a turn of the session, not seen to end, that was not followed yet when `before` was taken (T067). */
-  private turnAckedSince(sessionId: SessionId, before: ReadonlySet<string>): boolean {
-    for (const turn of this.ackedTurns.get(sessionId) ?? []) if (!before.has(turn)) return true;
-    return false;
+  /**
+   * Whether an ack named a turn of the session that is not seen to end (T067 r1): it runs, whether or not its `running`
+   * is applied yet. Only its end (`turnSeenEnded`, which then lets queued handoffs go through `turnEnded`), the
+   * runtime's exit or a restart clears one (`ackedTurns`).
+   */
+  private turnAcked(sessionId: SessionId): boolean {
+    return (this.ackedTurns.get(sessionId)?.size ?? 0) > 0;
   }
 
   /** The user's own message written under its ID before anything else is stored about it (a workflow's first message). */
@@ -2632,11 +2665,10 @@ export class SessionService {
       if (this.closing || session === undefined) return 'pending';
       const provisioned = await this.ensureProvisioned(session);
       if (!provisioned.ok || this.closing) return 'pending';
-      if (runningMainTurn(await this.repos.conversations.get(sessionId)) !== undefined) return 'queued';
+      if (runningMainTurn(await this.repos.conversations.get(sessionId)) !== undefined || this.turnAcked(sessionId)) return 'queued';
       // In the lane, waited for here as a handoff is (T067, `dispatchHandoff`): a turn a payload ahead of it started holds it.
-      const acked = new Set(this.ackedTurns.get(sessionId) ?? []);
       return this.sendLane(sessionId, async () =>
-        this.turnAckedSince(sessionId, acked)
+        this.turnAcked(sessionId)
           ? ('queued' as const)
           : this.dispatchPending(operationId, { origin: await this.originOf(operationId), entry: { kind: 'new-turn' }, ...(call !== undefined && { call }) }),
       );
@@ -3013,9 +3045,15 @@ export class SessionService {
       record?.kind === 'user-message' && sessionId !== undefined
         ? { operationId, runtime: record.context.runtime, text: record.payload, done: new Promise<void>((resolve) => (doneSending = resolve)) }
         : undefined;
-    if (userSend !== undefined && sessionId !== undefined) this.userSends.set(sessionId, userSend);
     let result: DispatchOutcome | undefined;
     try {
+      if (userSend !== undefined && sessionId !== undefined) {
+        if (userSend.runtime === 'codex') {
+          const turns = await this.echoTurns(sessionId, options.entry ?? (record?.kind === 'user-message' ? record.context.entry : undefined));
+          if (turns !== undefined) userSend.turns = turns;
+        }
+        this.userSends.set(sessionId, userSend);
+      }
       const outcome = await this.delivery.dispatch(operationId, { ...options, reconcileLater: true });
       result = outcome;
       if (outcome.status === 'sent') {
@@ -3660,8 +3698,18 @@ export class SessionService {
     if (message.role !== 'user' || message.origin.kind !== 'user' || message.nativeTaskId !== undefined) return undefined;
     const send = this.userSends.get(message.sessionId);
     if (send === undefined) return undefined;
-    const echo = send.runtime === 'codex' ? message.text === send.text : send.clientMessageId !== undefined && message.id === send.clientMessageId;
+    const echo = send.runtime === 'codex' ? message.text === send.text && inEchoTurn(message, send.turns) : send.clientMessageId !== undefined && message.id === send.clientMessageId;
     return echo ? send.done : undefined;
+  }
+
+  /** The turn a Codex user message's echo can be in (`UserSend.turns`), by the session's stored turns now; undefined when not known. */
+  private async echoTurns(sessionId: SessionId, entry: DispatchEntry | undefined): Promise<UserSend['turns']> {
+    const conversation = await this.repos.conversations.get(sessionId);
+    if (entry?.kind === 'insert') {
+      const running = runningMainTurn(conversation);
+      return running === undefined ? undefined : { into: running.id };
+    }
+    return { known: new Set(conversation.turns.filter((t) => t.nativeTaskId === undefined).map((t) => t.id)) };
   }
 
   /**

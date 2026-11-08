@@ -353,7 +353,16 @@ export const t067Cases = (backend: string, make: Make) => {
       });
       await settle();
       expect(await userMessagesOf(w, impl, 'another prompt')).toHaveLength(1);
-      const turnRef = 'turn-t067-steered';
+      // T067 r1: the same text in another turn (one of the turns before this dispatch) is not its echo: applied at once.
+      const earlier = (await w.repositories.conversations.get(impl)).turns.find((t) => t.state !== 'running')!.id;
+      codex.emit({
+        type: 'message.completed',
+        message: { id: MessageId.parse('t067-item-same-text'), sessionId: impl, turnId: earlier, role: 'user', origin: { kind: 'user' }, text: 'to impl, echoed', attachments: [], createdAt: '2026-10-29T01:00:00.000Z' },
+      });
+      await settle();
+      expect((await w.repositories.conversations.get(impl)).messages.some((m) => m.id === MessageId.parse('t067-item-same-text'))).toBe(true);
+      // Its echo is in the turn it was steered into: the one running.
+      const turnRef = w.open.get(impl)!;
       codex.emit({
         type: 'message.completed',
         message: { id: MessageId.parse('t067-item-echo'), sessionId: impl, turnId: turnRef as never, role: 'user', origin: { kind: 'user' }, text: 'to impl, echoed', attachments: [], createdAt: '2026-10-29T01:00:00.000Z' },
@@ -361,7 +370,103 @@ export const t067Cases = (backend: string, make: Make) => {
       ack(codex, held[0]!, turnRef);
       await settle();
       expect(done).toMatchObject({ ok: true });
-      expect(await userMessagesOf(w, impl, 'to impl, echoed')).toHaveLength(1);
+      // The GUI's own copy and the earlier turn's message, never the echo.
+      expect((await userMessagesOf(w, impl, 'to impl, echoed')).map((m) => m.id).sort()).toEqual([message.messageId, MessageId.parse('t067-item-same-text')].sort());
+    });
+  });
+
+  describe(`T067 r1 (${backend}): Astra r1`, () => {
+    it("P1: a refused send's end comes late, after a repeat of the same message: never sent and cancelled; both are told it is not sent", async () => {
+      const { w } = await working();
+      await w.finishTurn(ROOT);
+      await w.service.closeWorkflowRuntime(ROOT);
+      await settle();
+      // The first resume's check waits, then refuses (its folder went); every other check is the real one.
+      const service = w.service as unknown as { resumeRefusal: (session: unknown, cwd: string) => Promise<string | undefined> };
+      const original = service.resumeRefusal.bind(w.service);
+      const refusal = gate();
+      let resumes = 0;
+      service.resumeRefusal = async (session, cwd) => {
+        if (new Error().stack?.includes('resumeNow') === true && resumes++ === 0) {
+          await refusal.wait();
+          return 'the folder of this session is gone (test)';
+        }
+        return original(session, cwd);
+      };
+      const root = await w.repositories.sessions.get(ROOT);
+      const messageId = MessageId.parse('t067-r1-p1');
+      const send = () => w.run({ type: 'session.send', requestId: rid(), sessionId: ROOT, messageId, expectedRevision: root!.revision, text: 'sent twice', attachments: [] });
+      // 1. The first send waits in its resume's check.
+      const first = send();
+      await settle();
+      expect(resumes).toBe(1);
+      // 2. The same message again: it enters the lane behind the first.
+      const second = send();
+      await settle();
+      // 3. Root's queue held; the first's check refuses; the second's dispatch comes next in the lane.
+      const queue = holdQueue(w, ROOT);
+      refusal.open();
+      await settle();
+      // 4. The queue goes on: the first's end runs.
+      queue.open();
+      await settle();
+      expect(await first).toMatchObject({ ok: false, code: 'invalid_transition' });
+      expect(await second).toMatchObject({ ok: false, code: 'invalid_transition' });
+      const record = await w.store.get(OperationId.parse(`user-message:${messageId}`));
+      expect(record?.delivery).toMatchObject({ state: 'pending', attempts: [] });
+      expect(record?.outcome?.kind).toBe('cancelled');
+      expect(dispatchedText(w, 'sent twice')).toHaveLength(0);
+    });
+
+    it('P2: a handoff behind a turn an earlier ack named (its `running` not applied yet) waits for that turn, then goes once', async () => {
+      const { w, impl, taskId } = await working();
+      // impl idle; a message starts its next turn, whose events do not come yet (the ack names it).
+      w.silent.add(impl);
+      expect(await peer(w, ROOT, impl, 'starts a turn')).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      await settle();
+      const turn = w.open.get(impl)!;
+      expect(await w.service.mainTurnRunning(impl)).toBe(true);
+      // The handoff now: its gate holds it for that turn, as the lane's check does.
+      expect(await handoff(w, ROOT, { ...toImpl, taskId, content: 'after the turn' })).toMatchObject({ status: 'accepted', delivery: 'pending' });
+      await settle();
+      expect(dispatchedText(w, 'after the turn')).toHaveLength(0);
+      // The turn is reported, then ends: the handoff goes, once.
+      w.silent.delete(impl);
+      w.open.delete(impl);
+      w.emitTurn(impl, turn, 'running');
+      await settle();
+      expect(dispatchedText(w, 'after the turn')).toHaveLength(0);
+      w.emitTurn(impl, turn, 'completed');
+      await settle();
+      expect(dispatchedText(w, 'after the turn')).toHaveLength(1);
+      const sent = (await w.repositories.handoffs.listByInstance((await instanceOf(w)).id)).find((h) => h.payload.includes('after the turn'));
+      expect(sent?.delivery.state).toBe('sent');
+    });
+
+    it('P2: a user retry of a pending message is entered into the lane in a step of its session\'s queue', async () => {
+      const { w, impl, codex, held } = await implRunning();
+      void peer(w, ROOT, impl, 'ahead of the retry');
+      await settle();
+      expect(held).toHaveLength(1);
+      // impl's queue held: a retry's entry into the lane waits for it (a step of that queue), never enters meanwhile.
+      const service = w.service as unknown as { retryPending: (operationId: OperationId) => Promise<unknown> };
+      const queue = holdQueue(w, impl);
+      const accepted = await w.store.get(OperationId.parse(`op-t067-${String(ops)}`));
+      expect(accepted?.delivery.state).toBe('unknown');
+      let lanes = 0;
+      const lane = (w.service as unknown as { sendLane: (id: SessionId, fn: () => Promise<unknown>) => Promise<unknown> }).sendLane.bind(w.service);
+      (w.service as unknown as { sendLane: typeof lane }).sendLane = (id, fn) => {
+        lanes++;
+        return lane(id, fn);
+      };
+      void service.retryPending(OperationId.parse(`op-t067-${String(ops)}`));
+      await settle();
+      expect(lanes).toBe(0);
+      queue.open();
+      await settle();
+      expect(lanes).toBe(1);
+      ack(codex, held[0]!);
+      await settle();
     });
   });
 

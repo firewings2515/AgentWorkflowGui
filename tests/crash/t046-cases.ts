@@ -472,12 +472,16 @@ export const noHistoryCases = (name: string, makeSup: MakeSup, makeFlow: MakeFlo
       const messageId = first.record.operationId.slice('user-message:'.length);
       const resent = r.run({ type: 'session.send', requestId: supRid(), sessionId: a, messageId: messageId as never, expectedRevision: (await r.repositories.sessions.get(a))!.revision, text: 'first', attachments: [] });
       await supSettle();
-      // Meanwhile the user retries it: saved, told it goes at the next start (this session cannot be resumed now).
-      const retried = await r.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: first.escalation.id, decision: 'retry', acceptDuplicateRisk: true });
-      expect(retried).toMatchObject({ ok: false, code: 'runtime_unavailable', mayHaveSideEffects: true });
+      // Meanwhile the user retries it: the retry is saved now; its own dispatch enters the session's send lane in a step of
+      // the session's queue (T067 r1), so it waits behind the send. It is told it goes at the next start (this session
+      // cannot be resumed now).
+      const retrying = r.run({ type: 'delivery.resolve', requestId: supRid(), escalationId: first.escalation.id, decision: 'retry', acceptDuplicateRisk: true });
+      await supSettle();
+      expect((await r.store.get(first.record.operationId))?.delivery.attempts.at(-1)?.resolution?.decision).toBe('retry');
       held.open();
       // The send goes on with what it read before the retry: its dispatch is refused, but it does not undo the retry.
       expect(await resent).toMatchObject({ ok: false, code: 'invalid_transition' });
+      expect(await retrying).toMatchObject({ ok: false, code: 'runtime_unavailable', mayHaveSideEffects: true });
       await supSettle();
       const kept = (await r.store.get(first.record.operationId))!;
       expect(kept.outcome).toBeUndefined();
