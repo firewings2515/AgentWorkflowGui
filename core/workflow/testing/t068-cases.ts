@@ -8,6 +8,8 @@ import { describe, expect, it } from 'vitest';
 import { type Escalation, OperationId, type OperationOutcome, SessionId, type TaskId, type WorkflowTemplate } from '../../../contracts';
 import { createTasks, pipelineTemplate, project } from '../../pipeline/testing/t032-cases';
 import type { DispatchRequest, DispatchResult } from '../../ports';
+import { IN_RUN_WAIT_MS } from '../../sessions/service';
+import { peerIdOf } from '../ids';
 import { CWD, handoff, IMPL, INSTANCE, instanceOf, REVIEW, rid, ROOT, sessionOf, settle, started, template, type World } from './harness';
 
 export type Make = (workflow: WorkflowTemplate) => Promise<World>;
@@ -538,6 +540,126 @@ export const t068Cases = (backend: string, make: Make) => {
         .filter((t) => t.includes('message '))
         .map((t) => (t.includes('message one') ? 1 : t.includes('message two') ? 2 : 3));
       expect(order).toEqual([1, 2, 3]);
+    });
+  });
+
+  describe(`T068 r2 (${backend}): a node's message waits for its run's queue at most inRunWaitMs`, () => {
+    /** The service's `sleep`: the wait for the run's queue sleeps until the test lets that time pass; nothing else ends. */
+    const timeControl = (w: World) => {
+      const options = (w.service as unknown as { options: { sleep?: (ms: number) => Promise<void> } }).options;
+      const limits: (() => void)[] = [];
+      options.sleep = (ms) => (ms === IN_RUN_WAIT_MS ? new Promise<void>((resolve) => limits.push(resolve)) : new Promise<void>(() => undefined));
+      // `pass` of a limit never asked for does nothing (when the code under test asks for none).
+      return { asked: () => limits.length, pass: (i: number) => limits[i]?.() };
+    };
+    /**
+     * Astra r2's order (L6): Y (impl) runs a turn and an insert into it waits for its ack (never ending by itself); a
+     * cleanup's exclusive() holds Y's queue and waits for Y's lane; root's handoff to Y holds the run's queue and waits for
+     * Y's queue; Y, in its turn, sends to review: its message waits for the run's queue.
+     */
+    const l6 = async () => {
+      const { w, impl, review } = await nodes();
+      const time = timeControl(w);
+      w.holding.add(impl);
+      expect(await handoff(w, ROOT, { ...toImpl, content: 'second' })).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      await settle();
+      const codex = w.codex.get(impl)!;
+      const original = codex.dispatchOnce.bind(codex);
+      const held: { request: DispatchRequest; end: (result: DispatchResult) => void }[] = [];
+      codex.dispatchOnce = (request) => (request.entry.kind === 'insert' ? new Promise<DispatchResult>((done) => held.push({ request, end: done })) : original(request));
+      const ack = () => {
+        const { request, end: done } = held[0]!;
+        codex.history.set(request.attempt.clientMessageId, { ref: request.nativeSessionRef, text: request.text });
+        done({ state: 'sent', nativeRef: { sessionRef: request.nativeSessionRef }, evidence: { kind: 'live-ack', at: '2026-10-29T00:00:00.000Z', detail: 'status frame' } });
+      };
+      // 1. An insert into Y waits for its ack in Y's send lane.
+      let first: unknown;
+      void send(w, review, impl, 'first note', 'op-l6-first').then((r) => (first = r));
+      await settle();
+      expect(held).toHaveLength(1);
+      // 2. A cleanup's exclusive() takes Y's queue, then waits for Y's lane.
+      let cleaned = false;
+      void w.service.exclusive([impl], () => {
+        cleaned = true;
+        return Promise.resolve();
+      });
+      await settle();
+      // 3. Root hands Y more work: in the run's queue, waiting for Y's queue.
+      let handed: unknown;
+      void handoff(w, ROOT, { ...toImpl, content: 'third part' }).then((r) => (handed = r));
+      await settle();
+      expect(handed).toBeUndefined();
+      // 4. Y sends to review: its message waits for the run's queue, its limit not passed yet.
+      const asked = time.asked();
+      let spoke: unknown;
+      void send(w, impl, review, 'note from Y', 'op-l6-y').then((r) => (spoke = r));
+      await settle();
+      expect(spoke).toBeUndefined();
+      return { w, impl, review, time, limit: asked, ack, held, results: () => ({ first, cleaned, handed, spoke }) };
+    };
+
+    it("Astra r2: Y's send_message to review is told the run is busy once its wait's limit passes, before the ack; once the ack comes all goes on", async () => {
+      const { w, impl, time, limit, ack, held, results } = await l6();
+      time.pass(limit);
+      await settle();
+      expect(results().spoke).toEqual({ status: 'rejected', rejection: { reason: 'busy', detail: 'this workflow run is busy; send the message again in a moment' } });
+      expect(results().first).toBeUndefined();
+      // Y's tool call returned, so its runtime takes the insert in: the cleanup, the handoff and the first note go on.
+      ack();
+      await settle();
+      expect(results().first).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      expect(results().cleaned).toBe(true);
+      expect(results().handed).toMatchObject({ status: 'accepted', delivery: 'pending' });
+      w.holding.delete(impl);
+      await w.finishTurn(impl);
+      await settle();
+      expect(dispatchedText(w, 'third part')).toHaveLength(1);
+      expect(held).toHaveLength(1);
+      expect(await end(w)).toMatchObject({ ok: true });
+      expect(await openOf(w, 'delivery-unknown')).toEqual([]);
+    });
+
+    it('the step given up, run once its turn in the run\'s queue comes: nothing is accepted, stored or sent', async () => {
+      const { w, time, limit, ack, results } = await l6();
+      time.pass(limit);
+      await settle();
+      expect(results().spoke).toMatchObject({ status: 'rejected', rejection: { reason: 'busy' } });
+      // The run's queue is free again (the handoff answered): the given-up step has had its turn.
+      ack();
+      await settle();
+      expect(results().handed).toMatchObject({ status: 'accepted' });
+      await settle();
+      expect(await w.store.get(op('op-l6-y'))).toBeUndefined();
+      expect(await w.repositories.peerMessages.get(peerIdOf(op('op-l6-y')))).toBeUndefined();
+      expect(dispatchedText(w, 'note from Y')).toEqual([]);
+    });
+
+    it('told busy, the same operation sent again is accepted and sent once', async () => {
+      const { w, impl, review, time, limit, ack } = await l6();
+      time.pass(limit);
+      await settle();
+      ack();
+      await settle();
+      expect(await send(w, impl, review, 'note from Y', 'op-l6-y')).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      expect(await send(w, impl, review, 'note from Y', 'op-l6-y')).toMatchObject({ status: 'duplicate', delivery: 'sent' });
+      await settle();
+      expect(dispatchedText(w, 'note from Y')).toHaveLength(1);
+      expect((await w.store.get(op('op-l6-y')))?.delivery.attempts).toHaveLength(1);
+    });
+
+    it('a free run queue: the message goes at once, its limit never needed', async () => {
+      const { w, impl, review } = await nodes();
+      const time = timeControl(w);
+      expect(await send(w, review, impl, 'note at once', 'op-free-1')).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      expect(await send(w, ROOT, review, 'note at once too', 'op-free-2')).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      // Each asked for its limit, and neither waited for it (the test never let that time pass).
+      expect(time.asked()).toBe(2);
+      // Passing it afterwards changes nothing.
+      time.pass(0);
+      time.pass(1);
+      await settle();
+      expect(dispatchedText(w, 'note at once')).toHaveLength(2);
+      expect((await w.store.get(op('op-free-1')))?.delivery.state).toBe('sent');
     });
   });
 

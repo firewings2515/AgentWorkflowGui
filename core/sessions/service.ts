@@ -268,6 +268,11 @@ export interface SessionServiceOptions {
   onSessionOpened?(sessionId: SessionId, cwd: string): void;
   onSessionClosed?(sessionId: SessionId): Promise<void> | void;
   dispatchTimeoutMs?: number;
+  /**
+   * How long a message of a run to a node waits for the run's queue before its caller is told the run is busy (T068 r2,
+   * `IN_RUN_WAIT_MS` by default). Counted with `sleep`: without it there is no limit.
+   */
+  inRunWaitMs?: number;
   /** Resolves after `ms`; bounds the wait for running work on exit (R-14). Without it, exit waits for all of it. */
   sleep?(ms: number): Promise<void>;
   written?: WrittenPathsOptions;
@@ -336,6 +341,10 @@ const NOT_OWNER: Refusal = { reason: 'not-owner', detail: 'this operation belong
 const RESEND_MISMATCH: Refusal = { reason: 'resend-mismatch', detail: 'this operation carries another message' };
 /** A message of a run to its root once the run has ended (T066), worded as a report's (T065). */
 const RUN_ENDED: Refusal = { reason: 'invalid-input', detail: 'this workflow run has ended' };
+/** A node's message that waited too long for its run's queue (T068 r2): nothing of it was stored, so it may be sent again. */
+const RUN_BUSY = { reason: 'busy' as const, detail: 'this workflow run is busy; send the message again in a moment' };
+/** The default of `SessionServiceOptions.inRunWaitMs`. */
+export const IN_RUN_WAIT_MS = 5000;
 /** One queue per session for its commands and its runtime events (r1-P1-4). */
 const sessionKey = (sessionId: SessionId) => `session:${sessionId}`;
 /**
@@ -2162,6 +2171,9 @@ export class SessionService {
    * step only accepts (binding the target as it is, never dispatching a provision) and enters the target's part into the
    * target's queue there, without waiting for it, so messages to one target go in the order they were accepted (C-07); that
    * part (the send lane, T067) is waited for outside both. A resend of one accepted before the end is answered as before.
+   * The wait for the run's queue is bounded (T068 r2): a node's tool call must not wait for a run's queue held by a handoff
+   * that waits for a session's queue that `exclusive()` holds until an ack that waits for that tool call (L6). Past
+   * `inRunWaitMs` before its step began, the caller is told the run is busy and the step, once its turn comes, does nothing.
    */
   private async deliverInRun(p: PendingConfirmation, instanceId: InstanceId, inRunQueue: NonNullable<WorkflowHooks['inRunQueue']>): Promise<SendMessageToolResult> {
     const shuttingDown: SendMessageToolResult = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } };
@@ -2175,7 +2187,13 @@ export class SessionService {
       });
     }
     // 2. Accepted in the run's queue; the target's part is entered into its queue in this same step and waited for after it.
-    const accepted = await inRunQueue(instanceId, async (): Promise<SendMessageToolResult | { next: Promise<SendMessageToolResult | Sending<void>> }> => {
+    //    `phase` leaves `waiting` once, synchronously, either when the step begins or when the wait's limit passes; both
+    //    read and write it with no wait in between, so only the first of them finds `waiting` (one thread).
+    let phase: 'waiting' | 'started' | 'given-up' = 'waiting';
+    const step = inRunQueue(instanceId, async (): Promise<SendMessageToolResult | { next: Promise<SendMessageToolResult | Sending<void>> }> => {
+      // Given up: its caller was told the run is busy. Nothing is accepted, stored or entered.
+      if (phase === 'given-up') return { status: 'rejected', rejection: RUN_BUSY };
+      phase = 'started';
       if (this.closing) return shuttingDown;
       if ((await this.store.get(p.operationId)) === undefined) {
         const instance = await this.repos.instances.get(instanceId);
@@ -2190,6 +2208,22 @@ export class SessionService {
       next.catch(() => undefined);
       return { next };
     });
+    let accepted: Awaited<typeof step>;
+    if (this.options.sleep === undefined) accepted = await step;
+    else {
+      step.catch(() => undefined);
+      // Once the step began, the limit no longer counts: its sleep ends unwatched (it never rejects; a timer the main
+      // process does not wait for at exit, `unref`).
+      const limit = this.options.sleep(this.options.inRunWaitMs ?? IN_RUN_WAIT_MS).then(
+        (): SendMessageToolResult | undefined => {
+          if (phase !== 'waiting') return undefined;
+          phase = 'given-up';
+          return { status: 'rejected', rejection: RUN_BUSY };
+        },
+        () => undefined,
+      );
+      accepted = await Promise.race([step, limit.then((busy) => busy ?? step)]);
+    }
     // 3. The target's part and its dispatch, outside the run's queue.
     if (!('next' in accepted)) return accepted;
     return this.peerAnswer(p, await accepted.next);
