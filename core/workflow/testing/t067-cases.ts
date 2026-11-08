@@ -470,6 +470,36 @@ export const t067Cases = (backend: string, make: Make) => {
     });
   });
 
+  describe(`T067 r2 (${backend}): Astra r2`, () => {
+    it('P2: Codex, an insert that lands in a turn begun after its dispatch began: its echo there, before the ack, is still told; kept once', async () => {
+      const { w, impl, codex, held } = await implRunning();
+      const before = w.open.get(impl)!;
+      // M is dispatched while turn A runs: what the service knew then.
+      const message = await userSend(w, impl, 'lands in the next turn');
+      let done: unknown;
+      void message.sent.then((r) => (done = r));
+      await settle();
+      expect(held).toHaveLength(1);
+      // Before the runtime takes it: A ends, B begins, and the insert goes into B.
+      w.open.delete(impl);
+      w.emitTurn(impl, before, 'completed');
+      await settle();
+      const next = 'turn-t067-r2-b';
+      w.emitTurn(impl, next, 'running');
+      await settle();
+      // Its echo in B comes before the ack.
+      codex.emit({
+        type: 'message.completed',
+        message: { id: MessageId.parse('t067-r2-echo'), sessionId: impl, turnId: next as never, role: 'user', origin: { kind: 'user' }, text: 'lands in the next turn', attachments: [], createdAt: '2026-10-29T01:00:00.000Z' },
+      });
+      await settle();
+      ack(codex, held[0]!, next);
+      await settle();
+      expect(done).toMatchObject({ ok: true });
+      expect((await userMessagesOf(w, impl, 'lands in the next turn')).map((m) => m.id)).toEqual([message.messageId]);
+    });
+  });
+
   describe(`T067 (${backend}): a dispatch in the send lane never waits for a session's queue`, () => {
     it('a sent user message (its echo expected, its question closed): the lane finishes while the session\'s queue is held', async () => {
       const { w } = await working();

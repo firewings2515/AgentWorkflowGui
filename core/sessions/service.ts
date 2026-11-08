@@ -351,10 +351,10 @@ interface UserSend {
   text: string;
   clientMessageId?: string;
   /**
-   * Codex only (T067 r1): the turn its echo can be in, as known before the dispatch. An insert goes into the main turn
-   * running then (`into`); a new turn is none of the turns known then (`known`).
+   * Codex only (T067 r1, r2): the main turns already ended before the dispatch, which its echo cannot be in. Whatever turn it
+   * goes into (the one running then, one that started since, or a new one), that turn had not ended then.
    */
-  turns?: { into: string } | { known: ReadonlySet<string> };
+  endedBefore?: ReadonlySet<string>;
   done: Promise<void>;
 }
 /** What a step of a session's queue leaves to wait for outside it (T067): the lane's dispatch, then what follows it. */
@@ -365,11 +365,12 @@ interface Sending<T> {
 interface UserSending extends Sending<'sent' | 'unknown' | 'pending'> {
   finish(outcome: 'sent' | 'unknown' | 'pending'): Promise<CommandResult>;
 }
-/** Whether a message may be the echo by its turn (T067 r1): any turn when it names none or nothing is known. */
-const inEchoTurn = (message: Message, turns: UserSend['turns']): boolean => {
-  if (message.turnId === undefined || turns === undefined) return true;
-  return 'into' in turns ? message.turnId === turns.into : !turns.known.has(message.turnId);
-};
+/**
+ * Whether a message may be the echo by its turn (T067 r1, r2): unless it is in a turn that had ended before the dispatch,
+ * any turn may be the echo's, so it is waited for (rather a wait than a message twice).
+ */
+const inEchoTurn = (message: Message, endedBefore: UserSend['endedBefore']): boolean =>
+  message.turnId === undefined || endedBefore === undefined || !endedBefore.has(message.turnId);
 const isSending = <T>(step: unknown): step is Sending<T> => typeof step === 'object' && step !== null && 'sending' in step;
 const closingFailure = (requestId: Failure['requestId']) => fail(requestId, 'runtime_unavailable', 'The application is closing');
 /** The session with its title fixed: no `autoTitle` any more. */
@@ -3049,8 +3050,7 @@ export class SessionService {
     try {
       if (userSend !== undefined && sessionId !== undefined) {
         if (userSend.runtime === 'codex') {
-          const turns = await this.echoTurns(sessionId, options.entry ?? (record?.kind === 'user-message' ? record.context.entry : undefined));
-          if (turns !== undefined) userSend.turns = turns;
+          userSend.endedBefore = await this.turnsEnded(sessionId);
         }
         this.userSends.set(sessionId, userSend);
       }
@@ -3698,18 +3698,14 @@ export class SessionService {
     if (message.role !== 'user' || message.origin.kind !== 'user' || message.nativeTaskId !== undefined) return undefined;
     const send = this.userSends.get(message.sessionId);
     if (send === undefined) return undefined;
-    const echo = send.runtime === 'codex' ? message.text === send.text && inEchoTurn(message, send.turns) : send.clientMessageId !== undefined && message.id === send.clientMessageId;
+    const echo = send.runtime === 'codex' ? message.text === send.text && inEchoTurn(message, send.endedBefore) : send.clientMessageId !== undefined && message.id === send.clientMessageId;
     return echo ? send.done : undefined;
   }
 
-  /** The turn a Codex user message's echo can be in (`UserSend.turns`), by the session's stored turns now; undefined when not known. */
-  private async echoTurns(sessionId: SessionId, entry: DispatchEntry | undefined): Promise<UserSend['turns']> {
+  /** The session's main turns stored as ended now (`UserSend.endedBefore`): no payload dispatched from now on goes into one. */
+  private async turnsEnded(sessionId: SessionId): Promise<ReadonlySet<string>> {
     const conversation = await this.repos.conversations.get(sessionId);
-    if (entry?.kind === 'insert') {
-      const running = runningMainTurn(conversation);
-      return running === undefined ? undefined : { into: running.id };
-    }
-    return { known: new Set(conversation.turns.filter((t) => t.nativeTaskId === undefined).map((t) => t.id)) };
+    return new Set(conversation.turns.filter((t) => t.nativeTaskId === undefined && t.state !== 'running').map((t) => t.id));
   }
 
   /**
