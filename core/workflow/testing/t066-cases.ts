@@ -299,11 +299,12 @@ export const t066Cases = (backend: string, make: Make) => {
       void message(w, impl, 'question held', 'op-r1-held').then((r) => (first = r));
       await settle();
       expect(root.seen).toHaveLength(1);
-      // 2. review hands off to root: in the run's queue, waiting for root's queue.
+      // 2. review hands off to root: in the run's queue. Root's queue no longer waits for the ack (T067, the ack waits in
+      //    root's send lane), so it finds root's turn running and the handoff waits for its end, answered at once.
       let handed: unknown;
       void handoff(w, review, { ruleId: 'done', target: { kind: 'root' } }).then((r) => (handed = r));
       await settle();
-      expect(handed).toBeUndefined();
+      expect(handed).toMatchObject({ status: 'accepted', delivery: 'pending' });
       // 3. root, in that same running turn, sends to impl: it does not wait for the run's queue, so it returns (and root
       //    can go on to take the first message in).
       let aux: unknown;
@@ -318,57 +319,59 @@ export const t066Cases = (backend: string, make: Make) => {
     });
   });
 
-  describe(`T066 r1 (${backend}): the known wait cycle (r1 P2, kept for its own task) ends right once the insert times out`, () => {
-    it("X's queue held by an insert's ack, root's handoff to X waiting for it, X's send_message(root) waiting for the run: after the timeout every part is right", async () => {
+  describe(`T066 r1 (${backend}): the former wait cycle (r1 P2) waits for no timeout any more (T067)`, () => {
+    it("X's insert waits for its ack in X's send lane: root's handoff to X and X's send_message(root) both return before that ack; every part is right", async () => {
       const { w, impl, taskId } = await working();
       // impl (X) in a turn of its own.
       w.holding.add(impl);
       expect(await handoff(w, ROOT, { ...toImpl, taskId, content: 'second' })).toMatchObject({ status: 'accepted', delivery: 'sent' });
       await settle();
-      // Every insert into X waits; the test ends it as the adapter does at its deadline (the timeout result), no real wait.
+      // Every insert into X waits for the test: its ack comes only once X's tool call has returned, as Claude's does.
       const codex = w.codex.get(impl)!;
       const original = codex.dispatchOnce.bind(codex);
       const held: { request: DispatchRequest; end: (result: DispatchResult) => void }[] = [];
       codex.dispatchOnce = (request) => (request.entry.kind === 'insert' ? new Promise<DispatchResult>((end) => held.push({ request, end })) : original(request));
-      // 1. Root's message into X's running turn: X's queue waits for its ack.
+      // 1. Root's message into X's running turn: its ack waits in X's send lane, not in X's queue.
       let note: unknown;
       void w.service.sendMessage({ to: impl, content: 'note for impl' }, { caller: ROOT, operationId: OperationId.parse('op-cycle-note'), sourceCallRef: 'call-cycle-note' }).then((r) => (note = r));
       await settle();
       expect(held).toHaveLength(1);
-      // 2. Root hands X more work: in the run's queue, waiting for X's queue.
+      // 2. Root hands X more work: in the run's queue, it finds X's turn running in X's queue and waits for that turn's end.
       let handed: unknown;
       void handoff(w, ROOT, { ...toImpl, taskId, content: 'third part' }).then((r) => (handed = r));
       await settle();
-      // 3. X, in that turn, sends to root: it waits for the run's queue. The three wait for each other.
+      expect(handed).toMatchObject({ status: 'accepted', delivery: 'pending' });
+      // 3. X, in that turn, sends to root: the run's queue is free, so it goes and X's tool call returns.
       let spoke: unknown;
       void message(w, impl, 'question from the cycle', 'op-cycle-root').then((r) => (spoke = r));
       await settle();
-      expect({ note, handed, spoke }).toEqual({ note: undefined, handed: undefined, spoke: undefined });
-
-      // The insert's dispatch times out: it is left to the reconcile after X's turn (T065), and the waits end.
-      held[0]!.end({ state: 'unknown', reason: 'timeout', written: true, detail: 'no reply within the deadline' });
-      await settle();
-      expect(note).toMatchObject({ status: 'accepted', delivery: 'unknown' });
-      expect(handed).toMatchObject({ status: 'accepted', delivery: 'pending' });
       expect(spoke).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      // Only root's call still waits: for the ack of the note, which X's runtime gives once that tool call returned.
+      expect(note).toBeUndefined();
       expect(w.service.beingConfirmed(OperationId.parse('op-cycle-note'))).toBe(true);
 
-      // X's turn took the note in and ends: the reconcile finds it (sent, nothing asked); the queued handoff goes once.
-      codex.history.set(held[0]!.request.attempt.clientMessageId, { ref: held[0]!.request.nativeSessionRef, text: held[0]!.request.text });
+      // X's turn takes the note in: its ack, not its timeout.
+      const request = held[0]!.request;
+      codex.history.set(request.attempt.clientMessageId, { ref: request.nativeSessionRef, text: request.text });
+      held[0]!.end({ state: 'sent', nativeRef: { sessionRef: request.nativeSessionRef }, evidence: { kind: 'live-ack', at: '2026-10-29T00:00:00.000Z', detail: 'status frame' } });
+      await settle();
+      expect(note).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      expect(w.service.beingConfirmed(OperationId.parse('op-cycle-note'))).toBe(false);
+
+      // X's turn ends: the queued handoff goes once.
       w.holding.delete(impl);
       await w.finishTurn(impl);
       await settle();
       expect((await w.store.get(OperationId.parse('op-cycle-note')))?.delivery.state).toBe('sent');
-      expect(w.service.beingConfirmed(OperationId.parse('op-cycle-note'))).toBe(false);
       expect((await w.repositories.escalations.list()).filter((e) => e.kind === 'delivery-unknown')).toEqual([]);
       expect(held).toHaveLength(1);
       expect(dispatchedText(w, 'third part')).toHaveLength(1);
       const third = (await w.repositories.handoffs.listByInstance((await instanceOf(w)).id)).find((h) => h.payload.includes('third part'));
       expect(third?.delivery.state).toBe('sent');
-      // 3. X's message reached root once, and is sent.
+      // X's message reached root once, and is sent.
       expect(dispatchedText(w, 'question from the cycle')).toHaveLength(1);
       expect((await w.store.get(OperationId.parse('op-cycle-root')))?.delivery.state).toBe('sent');
-      // 4. The run ends as usual.
+      // The run ends as usual.
       expect(await end(w)).toMatchObject({ ok: true });
       await settle();
       expect((await instanceOf(w)).state).toBe('completed');

@@ -338,6 +338,29 @@ const RESEND_MISMATCH: Refusal = { reason: 'resend-mismatch', detail: 'this oper
 const RUN_ENDED: Refusal = { reason: 'invalid-input', detail: 'this workflow run has ended' };
 /** One queue per session for its commands and its runtime events (r1-P1-4). */
 const sessionKey = (sessionId: SessionId) => `session:${sessionId}`;
+/**
+ * The send lane of a session (T067): every dispatch to it, one at a time in the order they were entered (C-07, CR-2), so
+ * one waits for the ack of the one before it here, never in the session's queue. A step of the session's queue may wait
+ * for its lane; a job of the lane never waits for a session's queue (`exclusive` takes the queues, then the lanes).
+ */
+const laneKey = (sessionId: SessionId) => `send:${sessionId}`;
+/** A user message a send lane is dispatching (T067, `userSends`). */
+interface UserSend {
+  operationId: OperationId;
+  runtime: Runtime;
+  text: string;
+  clientMessageId?: string;
+  done: Promise<void>;
+}
+/** What a step of a session's queue leaves to wait for outside it (T067): the lane's dispatch, then what follows it. */
+interface Sending<T> {
+  sending: Promise<T>;
+}
+/** A user message on its way (`session.send`, T067): `finish` runs in the session's queue once its dispatch is over. */
+interface UserSending extends Sending<'sent' | 'unknown' | 'pending'> {
+  finish(outcome: 'sent' | 'unknown' | 'pending'): Promise<CommandResult>;
+}
+const isSending =<T>(step: unknown): step is Sending<T> => typeof step === 'object' && step !== null && 'sending' in step;
 const closingFailure = (requestId: Failure['requestId']) => fail(requestId, 'runtime_unavailable', 'The application is closing');
 /** The session with its title fixed: no `autoTitle` any more. */
 const withoutAutoTitle = (s: LogicalSession): LogicalSession => {
@@ -503,6 +526,12 @@ export class SessionService {
    */
   private readonly closeAfterDispatch = new Map<OperationId, string>();
   /**
+   * The user message each session's send lane is dispatching now (T067), from before its claim until what follows its
+   * result (`expectEcho`) is done: the runtime's echo of it is applied only after that, so it is recognised as an echo.
+   * `clientMessageId` once its claim committed.
+   */
+  private readonly userSends = new Map<SessionId, UserSend>();
+  /**
    * A formal handoff dispatched to a session whose turn has not been seen to end yet (SP-05, T024 r1-P1-2/3):
    * the main turns the session had before the dispatch, and the new one once it started. A replayed old turn
    * is in `known` and never ends the wait; until it ends, no other handoff goes to that session.
@@ -600,8 +629,12 @@ export class SessionService {
     const claimGuarded = new Proxy(store, {
       get: (target, key): unknown =>
         key === 'claim'
-          ? (input: ClaimInput): Promise<ClaimResult> =>
-              this.transfer !== undefined && !this.transfer.claimAllowed(input.operationId) ? Promise.resolve({ status: 'revision-changed' }) : target.claim(input)
+          ? (input: ClaimInput): Promise<ClaimResult> => {
+              if (this.transfer !== undefined && !this.transfer.claimAllowed(input.operationId)) return Promise.resolve({ status: 'revision-changed' });
+              // A user message's attempt is known before the runtime is called (T067): its echo is told by it.
+              for (const send of this.userSends.values()) if (send.operationId === input.operationId) send.clientMessageId = input.clientMessageId;
+              return target.claim(input);
+            }
           : key === 'recordSent'
             ? (...args: Parameters<DeliveryStore['recordSent']>) => this.recordSentFollowing(target, ...args)
             : Reflect.get(target, key),
@@ -744,7 +777,8 @@ export class SessionService {
       const sessionId = (await this.store.get(operationId))?.target.sessionId;
       if (sessionId === undefined) continue;
       try {
-        const outcome = await this.serial(sessionKey(sessionId), () => this.dispatchOne(operationId, { origin: { kind: 'user' } }));
+        // In its session's queue as before (nothing runs yet at a start), through its send lane like every dispatch (T067).
+        const outcome = await this.serial(sessionKey(sessionId), () => this.sendLane(sessionId, () => this.dispatchOne(operationId, { origin: { kind: 'user' } })));
         if (outcome !== undefined) report.dispatched.push({ operationId, outcome });
       } catch (error) {
         report.failed.push({ operationId, detail: errorName(error) });
@@ -964,7 +998,7 @@ export class SessionService {
       case 'session.rename':
         return queued(command.sessionId, () => this.rename(command));
       case 'session.send':
-        return queued(command.sessionId, () => this.send(command));
+        return this.sendCommand(command);
       case 'session.interrupt':
         return this.interrupt(command);
       case 'session.setModel':
@@ -1201,7 +1235,20 @@ export class SessionService {
     return undefined;
   }
 
-  private async send(command: CommandOf<'session.send'>): Promise<CommandResult> {
+  /**
+   * `session.send` (T067): checked, stored and accepted in the session's queue; its dispatch then waits in the session's
+   * send lane, outside that queue (an insert's ack comes only once the running turn's tool call returns, which may wait for
+   * this session's queue). What its result changes is written back in the queue, in order with the session's events.
+   */
+  private async sendCommand(command: CommandOf<'session.send'>): Promise<CommandResult> {
+    const key = sessionKey(command.sessionId);
+    const step = await this.serial(key, () => (this.closing ? Promise.resolve(closingFailure(command.requestId)) : this.send(command)));
+    if (!isSending<'sent' | 'unknown' | 'pending'>(step)) return step;
+    const outcome = await step.sending;
+    return this.serial(key, () => step.finish(outcome));
+  }
+
+  private async send(command: CommandOf<'session.send'>): Promise<CommandResult | UserSending> {
     const { requestId, sessionId, messageId, expectedRevision, text, attachments } = command;
     const session = await this.repos.sessions.get(sessionId);
     if (session === undefined) return fail(requestId, 'not_found', 'Unknown session');
@@ -1219,7 +1266,7 @@ export class SessionService {
   }
 
   /** The user's message to a session, written under its ID and sent once through the delivery service. */
-  private async sendUserMessage(requestId: Success['requestId'], session: LogicalSession, messageId: MessageId, text: string): Promise<CommandResult> {
+  private async sendUserMessage(requestId: Success['requestId'], session: LogicalSession, messageId: MessageId, text: string): Promise<CommandResult | UserSending> {
     const sessionId = session.id;
     const operationId = userMessageOp(messageId);
     const existing = await this.store.get(operationId);
@@ -1270,17 +1317,32 @@ export class SessionService {
     }
     if (this.closing) return closingFailure(requestId);
     const call: DispatchCall = {};
-    const outcome = await this.dispatchPending(operationId, {
-      origin: { kind: 'user' },
-      call,
-    });
+    // Entered into the lane now, in this queue's order; dispatched there, its ack waited for outside this queue (T067).
+    const sending = this.sendLane(sessionId, async () =>
+      this.dispatchPending(operationId, { origin: { kind: 'user' }, entry: await this.entryNow(sessionId), call }),
+    );
+    const revision = session.revision;
+    return { sending, finish: (outcome) => this.userMessageSent(requestId, sessionId, messageId, text, call, revision, outcome) };
+  }
+
+  /** What a user message's dispatch result changes (T067: in the session's queue again, once the lane's dispatch is over). */
+  private async userMessageSent(
+    requestId: Success['requestId'],
+    sessionId: SessionId,
+    messageId: MessageId,
+    text: string,
+    call: DispatchCall,
+    revision: number,
+    outcome: 'sent' | 'unknown' | 'pending',
+  ): Promise<CommandResult> {
+    const operationId = userMessageOp(messageId);
     const created = [{ kind: 'message' as const, id: messageId }];
     // Sent (or perhaps sent), so the session is named by it (T048), also on a repeat whose first try stopped before
     // that. Not while it only waits (the runtime not usable now): a repeat of the same message keeps its revision.
     const named = outcome === 'sent' || outcome === 'unknown' ? await this.nameFromFirstMessage(sessionId, text) : undefined;
     switch (outcome) {
       case 'sent':
-        return ok(requestId, { revision: named ?? session.revision, created });
+        return ok(requestId, { revision: named ?? revision, created });
       case 'unknown':
         await this.setActivity(sessionId, 'reconciling');
         return fail(requestId, 'unknown_outcome', 'It is not known whether the message reached the session; it is not sent again', {
@@ -1887,7 +1949,11 @@ export class SessionService {
     if (record?.kind === 'peer-message' && record.target.sessionId !== undefined && (await this.workflow?.retryEntry?.(record)) === 'insert-if-busy') {
       return this.deliverWorkflow(operationId, record.target.sessionId, 'insert-if-busy', call);
     }
-    return this.dispatchPending(operationId, { origin: await this.originOf(operationId), ...(call !== undefined && { call }) });
+    const origin = await this.originOf(operationId);
+    const dispatch = () => this.dispatchPending(operationId, { origin, ...(call !== undefined && { call }) });
+    // In its session's send lane, in order with every other dispatch to it (T067).
+    const target = record?.target.sessionId;
+    return target === undefined ? dispatch() : this.sendLane(target, dispatch);
   }
 
   // ---- MCP send_message -----------------------------------------------------------------------------
@@ -2048,14 +2114,23 @@ export class SessionService {
     return undefined;
   }
 
-  /** The target's part runs in its queue, in order with its commands and events. */
-  private deliverPeer(p: PendingConfirmation): Promise<SendMessageToolResult> {
-    return this.serial(sessionKey(p.to), () =>
+  /**
+   * The target's part runs in its queue, in order with its commands and events; the dispatch then waits in the target's
+   * send lane, outside that queue (T067), and the answer is read once it is over.
+   */
+  private async deliverPeer(p: PendingConfirmation): Promise<SendMessageToolResult> {
+    const step = await this.serial(sessionKey(p.to), () =>
       this.closing ? Promise.resolve<SendMessageToolResult>({ status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } }) : this.deliverPeerNow(p),
     );
+    if (!isSending<void>(step)) return step;
+    await step.sending;
+    const record = await this.store.get(p.operationId);
+    if (record?.kind !== 'peer-message') throw new Error('the peer message record changed kind');
+    this.publishPeer(record, p);
+    return { status: 'accepted', peerMessageId: peerIdOf(p.operationId), operationId: p.operationId, delivery: record.delivery.state };
   }
 
-  private async deliverPeerNow(p: PendingConfirmation): Promise<SendMessageToolResult> {
+  private async deliverPeerNow(p: PendingConfirmation): Promise<SendMessageToolResult | Sending<void>> {
     const target = await this.repos.sessions.get(p.to);
     if (target === undefined)
       return {
@@ -2080,20 +2155,14 @@ export class SessionService {
     // Closed with its run before it went (T065, T066): never sent, and a resend is told so, as a new message would be.
     if (record.delivery.state === 'pending' && record.outcome !== undefined) return { status: 'rejected', rejection: RUN_ENDED };
     this.origins.set(p.operationId, origin);
-    const fresh = record.delivery.state === 'pending';
-    if (fresh) {
+    if (record.delivery.state === 'pending') {
       if (this.closing) return shuttingDown;
-      // A busy target gets the message inside its running turn (SP-05).
-      await this.dispatchPending(p.operationId, {
-        origin,
-        entry: (await this.inMainTurn(target)) ? { kind: 'insert' } : { kind: 'new-turn' },
-      });
-      record = (await this.store.get(p.operationId)) ?? record;
+      // A busy target gets the message inside its running turn (SP-05), as it is when the lane dispatches it (T067).
+      return { sending: this.sendLane(p.to, async () => void (await this.dispatchPending(p.operationId, { origin, entry: await this.entryNow(p.to) }))) };
     }
-    if (record.kind !== 'peer-message') throw new Error('the peer message record changed kind');
     this.publishPeer(record, p);
     return {
-      status: fresh ? 'accepted' : 'duplicate',
+      status: 'duplicate',
       peerMessageId: peerIdOf(p.operationId),
       operationId: p.operationId,
       delivery: record.delivery.state,
@@ -2306,20 +2375,47 @@ export class SessionService {
    * provision first when needed. `after-turn` (a formal handoff) leaves it pending while the session's own
    * turn runs (SP-05), answering `queued`; `insert-if-busy` joins that turn.
    */
-  deliverWorkflow(operationId: OperationId, sessionId: SessionId, entry: WorkflowEntry, call?: DispatchCall): Promise<DeliveryState | 'queued'> {
-    return this.serial(sessionKey(sessionId), async (): Promise<DeliveryState | 'queued'> => {
+  async deliverWorkflow(operationId: OperationId, sessionId: SessionId, entry: WorkflowEntry, call?: DispatchCall): Promise<DeliveryState | 'queued'> {
+    const step = await this.serial(sessionKey(sessionId), async (): Promise<DeliveryState | 'queued' | Sending<DeliveryState>> => {
       const record = await this.store.get(operationId);
       if (record === undefined || record.delivery.state !== 'pending') return record?.delivery.state ?? 'pending';
       const session = await this.repos.sessions.get(sessionId);
       if (this.closing || session === undefined) return 'pending';
       const provisioned = await this.ensureProvisioned(session);
       if (!provisioned.ok || this.closing) return 'pending';
+      // A formal handoff is only ever a new turn, at the session's turn boundary: it waits for the lane here (T067).
       if (entry === 'after-turn') return this.dispatchHandoff(operationId, sessionId, call);
-      const origin = await this.originOf(operationId);
-      const current = (await this.repos.sessions.get(sessionId)) ?? session;
-      const inTurn = await this.inMainTurn(current);
-      return this.dispatchPending(operationId, { origin, entry: inTurn ? { kind: 'insert' } : { kind: 'new-turn' }, ...(call !== undefined && { call }) });
+      // Anything that may join the running turn waits for its ack in the lane, outside this queue (T067).
+      return {
+        sending: this.sendLane(sessionId, async () =>
+          this.dispatchPending(operationId, { origin: await this.originOf(operationId), entry: await this.entryNow(sessionId), ...(call !== undefined && { call }) }),
+        ),
+      };
     });
+    return isSending<DeliveryState>(step) ? step.sending : step;
+  }
+
+  /** How a payload enters the session now (SP-05): inside its running main turn, else as a new turn. Read by the lane right before its dispatch. */
+  private async entryNow(sessionId: SessionId): Promise<DispatchEntry> {
+    const session = await this.repos.sessions.get(sessionId);
+    return session !== undefined && (await this.inMainTurn(session)) ? { kind: 'insert' } : { kind: 'new-turn' };
+  }
+
+  /** `fn` in the session's send lane (T067, `laneKey`): after every dispatch entered there before it. Never waits for a session's queue. */
+  private sendLane<T>(sessionId: SessionId, fn: () => Promise<T>): Promise<T> {
+    const key = laneKey(sessionId);
+    if (this.queues.has(key)) return this.serial(key, fn);
+    // An idle lane starts it at once, as the dispatch did before it had a lane, and holds what comes after it.
+    const run = fn();
+    const settled = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.queues.set(key, settled);
+    void settled.then(() => {
+      if (this.queues.get(key) === settled) this.queues.delete(key);
+    });
+    return run;
   }
 
   /**
@@ -2352,7 +2448,18 @@ export class SessionService {
     this.handoffTurns.set(sessionId, mark);
     // The caller's call only for its own delivery: another one the gate sends instead is not what it asked about.
     const own = next.operationId === operationId && call !== undefined ? { call } : {};
-    const state = await this.dispatchPending(next.operationId, { origin: await this.originOf(next.operationId), entry: { kind: 'new-turn' }, ...own });
+    const chosen = next;
+    const acked = new Set(this.ackedTurns.get(sessionId) ?? []);
+    // In the lane, after what was entered before it, and waited for here (T067): the session's own turn is not running,
+    // so nothing ahead of it waits for one of its tool calls. A payload ahead of it may have started a turn meanwhile: its
+    // ack named one not seen to end, whose events are behind this step. The handoff then waits for that turn's end.
+    const state = await this.sendLane(sessionId, async () =>
+      this.turnAckedSince(sessionId, acked) ? ('queued' as const) : this.dispatchPending(chosen.operationId, { origin: await this.originOf(chosen.operationId), entry: { kind: 'new-turn' }, ...own }),
+    );
+    if (state === 'queued') {
+      if (this.handoffTurns.get(sessionId) === mark) this.handoffTurns.delete(sessionId);
+      return 'queued';
+    }
     // Nothing crossed the boundary: no turn to wait for. Sent or unknown: its turn is waited for.
     if (state === 'pending' && this.handoffTurns.get(sessionId) === mark) this.handoffTurns.delete(sessionId);
     // The runtime's ack names the turn it started (Claude's frame, Codex's turn/start): only that turn's end
@@ -2362,6 +2469,12 @@ export class SessionService {
       if (sent?.state === 'sent' && sent.nativeRef.turnRef !== undefined) mark.expected = sent.nativeRef.turnRef;
     }
     return next.operationId === operationId ? state : 'queued';
+  }
+
+  /** Whether an ack named a turn of the session, not seen to end, that was not followed yet when `before` was taken (T067). */
+  private turnAckedSince(sessionId: SessionId, before: ReadonlySet<string>): boolean {
+    for (const turn of this.ackedTurns.get(sessionId) ?? []) if (!before.has(turn)) return true;
+    return false;
   }
 
   /** The user's own message written under its ID before anything else is stored about it (a workflow's first message). */
@@ -2462,7 +2575,9 @@ export class SessionService {
    * queues are taken in a fixed order (two callers cannot wait on each other).
    */
   exclusive<T>(sessionIds: readonly SessionId[], fn: () => Promise<T>): Promise<T> {
-    const keys = [...new Set(sessionIds)].map(sessionKey).sort();
+    // Their send lanes too (T067), after every queue: a step of a queue may wait for its lane, a lane never for a queue.
+    const ids = [...new Set(sessionIds)].sort();
+    const keys = [...ids.map(sessionKey), ...ids.map(laneKey)];
     const hold = (i: number): Promise<T> => (i >= keys.length ? fn() : this.serial(keys[i]!, () => hold(i + 1)));
     return hold(0);
   }
@@ -2518,7 +2633,13 @@ export class SessionService {
       const provisioned = await this.ensureProvisioned(session);
       if (!provisioned.ok || this.closing) return 'pending';
       if (runningMainTurn(await this.repos.conversations.get(sessionId)) !== undefined) return 'queued';
-      return this.dispatchPending(operationId, { origin: await this.originOf(operationId), entry: { kind: 'new-turn' }, ...(call !== undefined && { call }) });
+      // In the lane, waited for here as a handoff is (T067, `dispatchHandoff`): a turn a payload ahead of it started holds it.
+      const acked = new Set(this.ackedTurns.get(sessionId) ?? []);
+      return this.sendLane(sessionId, async () =>
+        this.turnAckedSince(sessionId, acked)
+          ? ('queued' as const)
+          : this.dispatchPending(operationId, { origin: await this.originOf(operationId), entry: { kind: 'new-turn' }, ...(call !== undefined && { call }) }),
+      );
     });
   }
 
@@ -2885,6 +3006,14 @@ export class SessionService {
     // Still counted as on its way until what follows its result is done too (T065 r3): a run ending meanwhile then
     // leaves the notice to be closed below, never to a gap between the result and its late reconcile.
     this.dispatching.add(operationId);
+    // A user message's echo waits for what follows its result (T067, `echoOfSending`): its result and `expectEcho` below.
+    const sessionId = record?.target.sessionId;
+    let doneSending: () => void = () => undefined;
+    const userSend: UserSend | undefined =
+      record?.kind === 'user-message' && sessionId !== undefined
+        ? { operationId, runtime: record.context.runtime, text: record.payload, done: new Promise<void>((resolve) => (doneSending = resolve)) }
+        : undefined;
+    if (userSend !== undefined && sessionId !== undefined) this.userSends.set(sessionId, userSend);
     let result: DispatchOutcome | undefined;
     try {
       const outcome = await this.delivery.dispatch(operationId, { ...options, reconcileLater: true });
@@ -2893,6 +3022,8 @@ export class SessionService {
         const sent = await this.store.get(operationId);
         // Its ack's turn was followed before `sent` was written, if its opening can still report it (T036 r1/r2).
         this.expectEcho(sent, outcome.attemptId);
+        // Its echo may be told now (T067): what follows does not hold it.
+        doneSending();
         await this.settled(operationId, outcome.attemptId);
       }
       if (outcome.status === 'unknown' && outcome.deferred === true && record?.target.sessionId !== undefined) {
@@ -2901,6 +3032,10 @@ export class SessionService {
       }
       return outcome;
     } finally {
+      if (userSend !== undefined && sessionId !== undefined) {
+        if (this.userSends.get(sessionId) === userSend) this.userSends.delete(sessionId);
+        doneSending();
+      }
       this.dispatching.delete(operationId);
       // A notice whose run ended while it was on its way (T065 r3): its result is kept; one that came back unsent is closed.
       const why = this.closeAfterDispatch.get(operationId);
@@ -3373,6 +3508,12 @@ export class SessionService {
       case 'message.completed':
         // The user's own message was stored by session.send under the renderer's ID; its echo is not kept.
         // A native sub-agent's prompt is a user message too, and is kept (R-13).
+        // The echo of the user message the lane dispatches now is told once its result is followed (T067).
+        // Awaited only then: anything else is counted as written in this same step, as before (T023 r3-P1).
+        {
+          const sending = this.echoOfSending(event.message);
+          if (sending !== undefined) await sending;
+        }
         if (this.isEcho(event.message)) return;
         this.contentWrite(event.message.sessionId);
         await conversations.appendMessage(event.message);
@@ -3505,6 +3646,22 @@ export class SessionService {
     };
     // A few per session: an echo that never comes must not keep the list growing.
     this.echoes.set(sessionId, [...(this.echoes.get(sessionId) ?? []), echo].slice(-20));
+  }
+
+  /**
+   * T067: a user message dispatched outside its session's queue may be echoed before its result is followed
+   * (`expectEcho`): Claude emits the echo on the frame that acks it, right before the ack's answer. Such an echo waits
+   * here, in the session's queue, until the dispatch's result is followed, and only that: by Claude it is told by its ID,
+   * the attempt's clientMessageId, which is on no other message, and it comes with the ack, so it never waits for an ack
+   * that has not come. By Codex (its echo has the runtime's item ID) by the same text; Codex acks with the answer to its
+   * request, which waits for no tool call. Any other message is applied at once.
+   */
+  private echoOfSending(message: Message): Promise<void> | undefined {
+    if (message.role !== 'user' || message.origin.kind !== 'user' || message.nativeTaskId !== undefined) return undefined;
+    const send = this.userSends.get(message.sessionId);
+    if (send === undefined) return undefined;
+    const echo = send.runtime === 'codex' ? message.text === send.text : send.clientMessageId !== undefined && message.id === send.clientMessageId;
+    return echo ? send.done : undefined;
   }
 
   /**
