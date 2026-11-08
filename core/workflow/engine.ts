@@ -43,7 +43,7 @@ import {
 import type { DeliveryService } from '../delivery';
 import { type GuiHandoff, isResolverSession, resolverBriefing, TaskPipeline, type TaskPipelineOptions } from '../pipeline';
 import { type AppRepositories, CommitUncertainError, type DeliveryStore, type HandoffMeta, type PayloadContext, type StoredDelivery, type WorkFolderClaim } from '../ports';
-import type { CommandOf, SessionService, WorkflowHooks, WorkflowSession } from '../sessions';
+import { boundedSend, type CommandOf, gatedStep, type SessionService, type WorkflowHooks, type WorkflowSession } from '../sessions';
 import { type AgentNode, agentNodes, briefing, handoffCounts, handoffText, hasEdge, isRework, nodeOf, reportText, reworkKey, rootNode, runtimesOf, sameTarget, taskProgress } from './graph';
 import {
   firstMessageIdOf,
@@ -128,6 +128,11 @@ const NOT_IN_WORKFLOW = rejected('not-in-workflow', 'this tool works in workflow
 const RUN_ENDED = rejected('invalid-input', 'this workflow run has ended');
 const RESEND_MISMATCH = rejected('resend-mismatch', 'this operation carries another handoff');
 const NOT_OWNER = rejected('not-owner', 'this operation belongs to another call');
+/**
+ * A tool call that waited for its run's queue past its deadline (T069 L6, as a node's message T068 r2): nothing of it was
+ * recorded, so it may be made again.
+ */
+const RUN_BUSY = rejected('busy', 'this workflow run is busy; nothing was recorded; call again in a moment');
 const RESOLVER_ONLY = rejected('invalid-input', 'this session resolves a merge conflict: end your turn when it is resolved (or cannot be), and the GUI takes it from there');
 
 /** Report operation IDs say whether the report asked for the user's confirmation (r1-P1-7). */
@@ -482,6 +487,8 @@ export class WorkflowEngine implements WorkflowHooks {
    * is what its checks see; the store's counts decide in the end.
    */
   async handoff(input: HandoffToolInput, ctx: HandoffCallContext): Promise<HandoffToolResult> {
+    // The call's deadline (T069 L6): its wait for the run's queue is bounded; past it nothing of it is recorded (`gatedStep`).
+    const deadline = this.options.sessions.toolDeadline();
     // Counted before anything is awaited: while a call of the session is on its way, the end of its turn
     // closes none of its fan-outs, so every handoff of one turn stays in one group (r1-P1-2).
     this.inFlight.set(ctx.caller, (this.inFlight.get(ctx.caller) ?? 0) + 1);
@@ -494,7 +501,7 @@ export class WorkflowEngine implements WorkflowHooks {
       const caller = await this.repos.sessions.get(ctx.caller);
       if (caller?.kind !== 'workflow') return NOT_IN_WORKFLOW;
       if (isResolverSession(caller.id)) return RESOLVER_ONLY;
-      return await this.serial(`instance:${caller.workflow.instanceId}`, () => this.handoffNow(caller, input, ctx, { turnAtCall }));
+      return await this.inRunTool(caller, () => this.handoffNow(caller, input, ctx, { turnAtCall }), deadline);
     } catch (error) {
       if (this.options.sessions.isClosing() || isClosedError(error)) return SHUTTING_DOWN;
       throw error;
@@ -1241,6 +1248,8 @@ export class WorkflowEngine implements WorkflowHooks {
    * running turn), within the run's consent (R-11). `needsUserConfirmation` opens a question for the user.
    */
   async reportToRoot(input: ReportToRootToolInput, ctx: ReportCallContext): Promise<ReportToRootToolResult> {
+    // The call's one deadline (T069), from its start: for the run's queue (L6) and for the report's dispatch (L2).
+    const deadline = this.options.sessions.toolDeadline();
     try {
       if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
       const caller = await this.repos.sessions.get(ctx.caller);
@@ -1248,8 +1257,13 @@ export class WorkflowEngine implements WorkflowHooks {
       // The report enters root's queue inside the run's queue (so reports keep their order) and is waited for outside it
       // (T065): its ack comes once root's running turn takes it in, after that turn's tool calls, which wait for the run's queue.
       const sends: Promise<void>[] = [];
-      const result = await this.serial(`instance:${caller.workflow.instanceId}`, () => this.reportNow(caller, input, ctx, sends));
-      await Promise.all(sends);
+      const result = await this.inRunTool(caller, () => this.reportNow(caller, input, ctx, sends), deadline);
+      const sending = Promise.all(sends);
+      // Past the deadline (T069 L2) the report is answered as made (`reported`: the GUI has it) while it goes on to root; a
+      // throw then is logged, never the report's content. Its end, as any delivery's, holds the end of the run (D-12).
+      if ((await boundedSend(sending, deadline)) === 'passed') {
+        sending.catch((error: unknown) => this.log(`a report of ${ctx.caller} went on to root past its call's deadline and failed (${errorName(error)})`));
+      }
       return result;
     } catch (error) {
       if (this.options.sessions.isClosing() || isClosedError(error)) return SHUTTING_DOWN;
@@ -1325,6 +1339,17 @@ export class WorkflowEngine implements WorkflowHooks {
     return { status: 'reported', ...(escalation !== undefined && { escalationId: escalation.id }) };
   }
 
+  /**
+   * A tool call's step in its run's queue (`handoff`, `report_to_root`, `create_tasks`), waited for at most until the
+   * call's deadline before it begins (T069 L6, as a node's message T068 r2): the run's queue may be held by a step (a
+   * handoff, an approval, a round, a held handoff, a pipeline decision) that waits for a session's queue that `exclusive()`
+   * holds until an ack that waits for this very call. Past it the caller is told the run is busy, and the step, once its
+   * turn comes, does nothing: `fn` never runs, so nothing of the call is written. Once begun it is waited for to its end.
+   */
+  private inRunTool<T>(caller: WorkflowSession, fn: () => Promise<T>, deadline: ReturnType<SessionService['toolDeadline']>): Promise<T | typeof RUN_BUSY> {
+    return gatedStep((step) => this.serial(`instance:${caller.workflow.instanceId}`, step), fn, deadline, RUN_BUSY);
+  }
+
   /** `deliverReport` entered now (root's queue keeps the order), its end waited for by the caller outside the run's queue (T065). */
   private sendReport(operationId: OperationId, rootId: SessionId): Promise<void> {
     const sending = this.deliverReport(operationId, rootId);
@@ -1342,13 +1367,14 @@ export class WorkflowEngine implements WorkflowHooks {
 
   /** `create_tasks` (T032, R-06, O-07): root splits the work into tasks; the user confirms first when root's rule says so. */
   async createTasks(input: CreateTasksToolInput, ctx: { caller: SessionId; sourceCallRef: string }): Promise<CreateTasksToolResult> {
+    const deadline = this.options.sessions.toolDeadline();
     try {
       if (this.options.sessions.isClosing()) return SHUTTING_DOWN;
       const caller = await this.repos.sessions.get(ctx.caller).catch(() => undefined);
       if (caller?.kind !== 'workflow') return NOT_IN_WORKFLOW;
       const pipeline = this.pipeline;
       if (pipeline === undefined) return rejected('unsupported', 'create_tasks is not available in this version: a run carries one task');
-      return await this.serial(`instance:${caller.workflow.instanceId}`, () => pipeline.createTasks(caller, input, ctx.sourceCallRef));
+      return await this.inRunTool(caller, () => pipeline.createTasks(caller, input, ctx.sourceCallRef), deadline);
     } catch (error) {
       if (this.options.sessions.isClosing() || isClosedError(error)) return SHUTTING_DOWN;
       throw error;

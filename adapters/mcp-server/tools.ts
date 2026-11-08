@@ -77,7 +77,8 @@ export const toolSpecs: Record<McpToolName, ToolSpec> = {
       'The GUI checks the edge, limits and task dependencies and delivers the content; the result says ' +
       'whether it was accepted, escalated or rejected, not whether it was read. To retry an earlier handoff, ' +
       'pass its operationId as retryOf with the same content. Root may hand off a task of a list that waits for ' +
-      'the user (taskId <taskPlanId>:<key>): the GUI holds it until the user decides, then delivers it or cancels it.',
+      'the user (taskId <taskPlanId>:<key>): the GUI holds it until the user decides, then delivers it or cancels it. ' +
+      'busy means the workflow run is busy for a moment and nothing was recorded: call again shortly.',
     input: HandoffToolInput,
     result: HandoffToolResult,
     delivers: true,
@@ -88,7 +89,8 @@ export const toolSpecs: Record<McpToolName, ToolSpec> = {
       'in this call, dependsOnExisting lists task IDs that already exist. The user usually confirms first: then ' +
       'the result is awaiting-confirmation with a taskPlanId, and each task\'s ID will be <taskPlanId>:<key>. Hand ' +
       'the tasks off right away with those IDs; the GUI holds them until the user approves the list (if the user ' +
-      'declines, they are cancelled and you plan again).',
+      'declines, they are cancelled and you plan again). ' +
+      'busy means the workflow run is busy for a moment and nothing was recorded: call again shortly.',
     input: CreateTasksToolInput,
     result: CreateTasksToolResult,
     delivers: false,
@@ -97,14 +99,19 @@ export const toolSpecs: Record<McpToolName, ToolSpec> = {
     description:
       'Send a message to another AgentWorkflowGui session, Claude or Codex. Returns the delivery status, ' +
       'not a reply; a reply arrives later as a new message. To retry an earlier message, pass its ' +
-      'operationId as retryOf with the same content.',
+      'operationId as retryOf with the same content. Delivery pending or unknown means the GUI has your message and ' +
+      'is still confirming that it arrived: do not send it again. A resend (retryOf with its operationId) is answered ' +
+      'as duplicate and is never delivered twice. ' +
+      'busy means the workflow run is busy for a moment and nothing was recorded: call again shortly.',
     input: SendMessageToolInput,
     result: SendMessageToolResult,
     delivers: true,
   },
   report_to_root: {
     description:
-      'Report progress to the root session, or ask for the user\'s confirmation with needsUserConfirmation.',
+      'Report progress to the root session, or ask for the user\'s confirmation with needsUserConfirmation. ' +
+      'A result without a rejection means the GUI has your report and delivers it to root: do not report the same thing again. ' +
+      'busy means the workflow run is busy for a moment and nothing was recorded: call again shortly.',
     input: ReportToRootToolInput,
     result: ReportToRootToolResult,
     delivers: false,

@@ -5,6 +5,8 @@ export { SessionRuntimes, type SessionRuntimesOptions } from './runtimes';
 export {
   type CommandOf,
   ArchivedTreeError,
+  boundedSend,
+  gatedStep,
   SessionService,
   type SessionServiceOptions,
   type TransferCommand,
@@ -12,6 +14,7 @@ export {
   type WorkflowEntry,
   type WorkflowHooks,
   type SupervisorHooks,
+  type ToolDeadline,
   type WorkflowSession,
 } from './service';
 export { absolutePath, isAbsolutePath, WrittenPaths, type WrittenPathsOptions } from './written-paths';
