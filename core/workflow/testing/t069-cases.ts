@@ -168,29 +168,46 @@ export const t069Cases = (backend: string, make: Make) => {
     });
 
     it('two ordinary sessions send to each other while both run: both answer at the deadline, then each goes once', async () => {
-      const { w, review } = await running();
-      expect(await w.run({ type: 'session.create', requestId: rid(), sessionId: PLAIN, kind: 'ordinary', agentId: 'agent-planner' as never, model: { runtime: 'claude', model: 'haiku' }, cwd: CWD })).toMatchObject({ ok: true });
+      // No workflow run at all: two ordinary Claude sessions, each running a turn of its own.
+      const w = await make(template());
+      const PLAIN_2 = SessionId.parse('plain-claude-2');
+      for (const sessionId of [PLAIN, PLAIN_2]) {
+        expect(await w.run({ type: 'session.create', requestId: rid(), sessionId, kind: 'ordinary', agentId: 'agent-planner' as never, model: { runtime: 'claude', model: 'haiku' }, cwd: CWD })).toMatchObject({ ok: true });
+        await settle();
+        expect(await w.repositories.sessions.get(sessionId)).toMatchObject({ kind: 'ordinary' });
+        w.holding.add(sessionId);
+      }
+      // Each is idle: a message to it starts a turn there, which stays running.
+      expect(await send(w, PLAIN_2, PLAIN, 'wake one', 'op-wake-1')).toMatchObject({ status: 'accepted', delivery: 'sent' });
       await settle();
-      w.holding.add(PLAIN);
-      expect(await send(w, review, PLAIN, 'wake plain', 'op-wake')).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      expect(await send(w, PLAIN, PLAIN_2, 'wake two', 'op-wake-2')).toMatchObject({ status: 'accepted', delivery: 'sent' });
       await settle();
       const time = timeControl(w);
       const inserts = holdInserts(w.claude);
-      const toPlain = call(() => send(w, review, PLAIN, 'review to plain', 'op-rp'));
-      const toReviewCall = call(() => send(w, PLAIN, review, 'plain to review', 'op-pr'));
+      const oneToTwo = call(() => send(w, PLAIN, PLAIN_2, 'one to two', 'op-12'));
+      const twoToOne = call(() => send(w, PLAIN_2, PLAIN, 'two to one', 'op-21'));
       await settle();
+      // Both join the other's running turn, so each ack waits for the other's call.
       expect(inserts.held()).toHaveLength(2);
+      expect(oneToTwo.result).toBeUndefined();
+      expect(twoToOne.result).toBeUndefined();
       time.passAll();
       await settle();
-      expect(toPlain.result).toMatchObject({ status: 'accepted', delivery: 'unknown' });
-      expect(toReviewCall.result).toMatchObject({ status: 'accepted', delivery: 'unknown' });
-      inserts.ack('review to plain');
-      inserts.ack('plain to review');
+      expect(oneToTwo.result).toEqual({ status: 'accepted', peerMessageId: peerIdOf(op('op-12')), operationId: op('op-12'), delivery: 'unknown' });
+      expect(twoToOne.result).toEqual({ status: 'accepted', peerMessageId: peerIdOf(op('op-21')), operationId: op('op-21'), delivery: 'unknown' });
+      expect(inserts.held()).toHaveLength(2);
+      inserts.ack('one to two');
+      inserts.ack('two to one');
       await settle();
-      expect((await w.store.get(op('op-rp')))?.delivery.state).toBe('sent');
-      expect((await w.store.get(op('op-pr')))?.delivery.state).toBe('sent');
-      expect(dispatchedText(w, 'review to plain')).toHaveLength(1);
-      expect(dispatchedText(w, 'plain to review')).toHaveLength(1);
+      for (const id of ['op-12', 'op-21']) {
+        const record = await w.store.get(op(id));
+        expect(record?.delivery).toMatchObject({ state: 'sent', attempts: [{ state: 'sent' }] });
+        // Messages of no run.
+        expect(record?.kind === 'peer-message' ? record.peer?.instanceId : 'not a message').toBeUndefined();
+      }
+      expect(dispatchedText(w, 'one to two')).toHaveLength(1);
+      expect(dispatchedText(w, 'two to one')).toHaveLength(1);
+      expect(await openOf(w, 'delivery-unknown')).toEqual([]);
     });
 
     it("root's send_message to a node against that node's report_to_root: both answer at the deadline, then each goes once and the run ends", async () => {
