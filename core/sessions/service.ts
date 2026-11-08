@@ -2156,18 +2156,43 @@ export class SessionService {
   /**
    * A message of a run to another session of it than root (T068): accepted in the run's queue, as its end and its handoffs
    * run there, so the end's closing step lists every one accepted before it and none is accepted once the end is committed
-   * (the caller is told, as for a message to root). In the run's queue the target's part runs in the target's queue (its
-   * provision is made there, as ever), the order a handoff takes (run → session); the dispatch is waited for outside both,
-   * in the target's send lane (T067). A resend of one accepted before the end is answered as before.
+   * (the caller is told, as for a message to root). Nothing waits for a session's queue while the run's queue is held
+   * (T068 r1: a cleanup's `exclusive()` may hold that queue until an ack that waits for a tool call that waits for the run's
+   * queue). So in three parts: the target is provisioned first in its own queue, as ever, outside the run's queue; the run's
+   * step only accepts (binding the target as it is, never dispatching a provision) and enters the target's part into the
+   * target's queue there, without waiting for it, so messages to one target go in the order they were accepted (C-07); that
+   * part (the send lane, T067) is waited for outside both. A resend of one accepted before the end is answered as before.
    */
   private async deliverInRun(p: PendingConfirmation, instanceId: InstanceId, inRunQueue: NonNullable<WorkflowHooks['inRunQueue']>): Promise<SendMessageToolResult> {
-    const step = await inRunQueue(instanceId, async (): Promise<SendMessageToolResult | Sending<void>> => {
-      const instance = await this.repos.instances.get(instanceId);
-      const over = instance?.state === 'completed' || instance?.state === 'cancelled';
-      if (over && (await this.store.get(p.operationId)) === undefined) return { status: 'rejected', rejection: RUN_ENDED };
-      return this.peerStep(p);
+    const shuttingDown: SendMessageToolResult = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } };
+    // 1. Provisioned in the target's queue, not holding the run's: only for a new message to a target not bound yet, and
+    //    not for a run read as ended (the run's step refuses it; this read only spares an ended run's node a start).
+    if ((await this.store.get(p.operationId)) === undefined && (await this.binding(p.to)) === undefined && !runEnded((await this.repos.instances.get(instanceId)) ?? { state: 'running' })) {
+      await this.serial(sessionKey(p.to), async () => {
+        if (this.closing) return;
+        const target = await this.repos.sessions.get(p.to);
+        if (target !== undefined && (await this.closedRefusal(target)) === undefined) await this.ensureProvisioned(target);
+      });
+    }
+    // 2. Accepted in the run's queue; the target's part is entered into its queue in this same step and waited for after it.
+    const accepted = await inRunQueue(instanceId, async (): Promise<SendMessageToolResult | { next: Promise<SendMessageToolResult | Sending<void>> }> => {
+      if (this.closing) return shuttingDown;
+      if ((await this.store.get(p.operationId)) === undefined) {
+        const instance = await this.repos.instances.get(instanceId);
+        if (instance !== undefined && runEnded(instance)) return { status: 'rejected', rejection: RUN_ENDED };
+        const target = await this.repos.sessions.get(p.to);
+        if (target === undefined) return { status: 'rejected', rejection: { reason: 'unknown-target', detail: 'no such session' } };
+        const refused = await this.acceptPeer(p, target, 'bound-only');
+        if (refused !== undefined) return refused;
+      }
+      // `peerStep` enters the target's queue before its first wait, so in this step.
+      const next = this.peerStep(p);
+      next.catch(() => undefined);
+      return { next };
     });
-    return this.peerAnswer(p, step);
+    // 3. The target's part and its dispatch, outside the run's queue.
+    if (!('next' in accepted)) return accepted;
+    return this.peerAnswer(p, await accepted.next);
   }
 
   /** The target's part of a message, in its queue: an answer, or its dispatch entered into the target's send lane. */
@@ -2233,13 +2258,14 @@ export class SessionService {
    * Accepts the message (its target provisioned or its provision recorded first); undefined once it is stored. In the
    * target's queue (`deliverPeerNow`), or in the run's for a message of a run to its root (`acceptInRun`, T066).
    */
-  private async acceptPeer(p: PendingConfirmation, target: LogicalSession): Promise<SendMessageToolResult | undefined> {
+  private async acceptPeer(p: PendingConfirmation, target: LogicalSession, mode: 'provision' | 'bound-only' = 'provision'): Promise<SendMessageToolResult | undefined> {
     const shuttingDown: SendMessageToolResult = { status: 'rejected', rejection: { reason: 'shutting-down', detail: 'the GUI is closing' } };
     if (this.closing) return shuttingDown;
     // A closed target whose folder is gone is not resumed anywhere (R-06, T036): refused before it is accepted (C-30 `folder-missing`).
     const closed = await this.closedRefusal(target);
     if (closed !== undefined) return { status: 'rejected', rejection: { reason: 'folder-missing', detail: 'the target session is closed and its folder no longer exists' } };
-    const provisioned = await this.ensureProvisioned(target);
+    // `bound-only` (in the run's queue, T068 r1): the target as it is bound now, its provision never dispatched here.
+    const provisioned = mode === 'provision' ? await this.ensureProvisioned(target) : await this.boundNow(target);
     if (this.closing) return shuttingDown;
     const provision = await this.store.get(provisionOp(target.id));
     // Not started yet: the message waits for the target's provision (CR2 §3) instead of being refused.
@@ -2812,6 +2838,18 @@ export class SessionService {
       retryable: true,
       mayHaveSideEffects: false,
     };
+  }
+
+  /**
+   * The session's runtime session as it is bound now, without recording or dispatching its provision (T068 r1: for an
+   * acceptance in a run's queue, which waits for no runtime). Not bound: a payload then waits for the provision, if one is
+   * recorded (`acceptPeer`).
+   */
+  private async boundNow(session: LogicalSession): Promise<Provisioned> {
+    const ref = await this.binding(session.id);
+    if (ref === undefined) return { ok: false, code: 'runtime_unavailable', message: 'The session is not started yet', retryable: true, mayHaveSideEffects: false };
+    this.runtimes.bind(session.id, ref);
+    return { ok: true, nativeSessionRef: ref };
   }
 
   /** The session's provision, recorded once and not dispatched here (CR2 §3): its record, or why there is none. */

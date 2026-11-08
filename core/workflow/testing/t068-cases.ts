@@ -401,6 +401,146 @@ export const t068Cases = (backend: string, make: Make) => {
     });
   });
 
+  describe(`T068 r1 (${backend}): Astra r1`, () => {
+    /** Holds the first call of the named methods once its own result is read: what it read stays as it was then. */
+    const pauseAfterFirst = (target: object, methods: readonly string[]) => {
+      const t = target as Record<string, (...args: unknown[]) => Promise<unknown>>;
+      let release: () => void = () => undefined;
+      let paused = 0;
+      for (const method of methods) {
+        const original = t[method]!.bind(target);
+        t[method] = async (...args: unknown[]) => {
+          const result = await original(...args);
+          if (paused++ === 0) await new Promise<void>((resolve) => (release = resolve));
+          return result;
+        };
+      }
+      return { paused: () => paused, release: () => release() };
+    };
+
+    it('P1-1: a message claimed, then retried while the end lists what it closes, is listed still: it never goes once the run has ended', async () => {
+      const { w, impl, review } = await nodes();
+      const runtime = watch(w);
+      const claim = holdBeforeClaim(w);
+      void send(w, review, impl, 'note retried', 'op-retried');
+      await settle();
+      expect(claim.paused()).toBe(1);
+      // 1. The end has read the run's messages for its check of unknown ones: A is pending then.
+      const check = pauseAfterFirst(w.repositories.peerMessages, ['list']);
+      let answer: unknown;
+      void end(w).then((r) => (answer = r));
+      await settle();
+      expect(check.paused()).toBe(1);
+      // 2. A is claimed; its dispatch comes back unknown (written, no ack): the user is asked.
+      w.codex.get(impl)!.dispatchModes.push('lost');
+      claim.release();
+      await settle();
+      expect(await w.store.get(op('op-retried'))).toMatchObject({ delivery: { state: 'unknown' } });
+      const [question] = (await openOf(w, 'delivery-unknown')).filter((e) => e.id.startsWith('delivery:op-retried/'));
+      expect(question).toBeDefined();
+      // 3. The end lists what it closes: held once its first read is done, whichever way it reads.
+      const listing = pauseAfterFirst(w.store, ['listByState', 'listByTarget']);
+      check.release();
+      await settle();
+      expect(listing.paused()).toBe(1);
+      // 4. The user retries A: pending again, its new dispatch held right before its claim.
+      void w.run({ type: 'delivery.resolve', requestId: rid(), escalationId: question!.id, decision: 'retry', acceptDuplicateRisk: true });
+      await settle();
+      expect(claim.paused()).toBe(2);
+      expect(await w.store.get(op('op-retried'))).toMatchObject({ delivery: { state: 'pending' } });
+      // 5. The end goes on, then the retry's dispatch.
+      const after = holdAfterEnd(w);
+      listing.release();
+      await settle();
+      expect(answer).toMatchObject({ ok: true });
+      claim.release();
+      await settle();
+      after.release();
+      await settle();
+      // Only the first try reached the runtime, while the run ran; the retry was closed with the run before its claim.
+      expect(runtime.of('note retried')).toEqual(['running']);
+      expect(await w.store.get(op('op-retried'))).toMatchObject({ delivery: { state: 'pending' }, outcome: { kind: 'cancelled', detail: 'the run was completed' } });
+    });
+
+    it("P1-2: a cleanup's exclusive() holds Y's queue until an insert's ack: Z's next message to Y and Y's send_message(root) both return before that ack", async () => {
+      const { w, impl, review } = await nodes();
+      // Y (impl) in a turn of its own.
+      w.holding.add(impl);
+      expect(await handoff(w, ROOT, { ...toImpl, content: 'second' })).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      await settle();
+      // Every insert into Y waits for the test (it never times out by itself): its ack comes once Y's tool call returned.
+      const codex = w.codex.get(impl)!;
+      const original = codex.dispatchOnce.bind(codex);
+      const held: { request: DispatchRequest; end: (result: DispatchResult) => void }[] = [];
+      codex.dispatchOnce = (request) => (request.entry.kind === 'insert' ? new Promise<DispatchResult>((done) => held.push({ request, end: done })) : original(request));
+      const ack = (i: number) => {
+        const request = held[i]!.request;
+        codex.history.set(request.attempt.clientMessageId, { ref: request.nativeSessionRef, text: request.text });
+        held[i]!.end({ state: 'sent', nativeRef: { sessionRef: request.nativeSessionRef }, evidence: { kind: 'live-ack', at: '2026-10-29T00:00:00.000Z', detail: 'status frame' } });
+      };
+      // 1. Z (review) inserts into Y's running turn: its ack waits in Y's send lane.
+      let first: unknown;
+      void send(w, review, impl, 'first note', 'op-x1').then((r) => (first = r));
+      await settle();
+      expect(held).toHaveLength(1);
+      // 2. A cleanup's exclusive() takes Y's queue, then waits for Y's lane.
+      let cleaned = false;
+      void w.service.exclusive([impl], () => {
+        cleaned = true;
+        return Promise.resolve();
+      });
+      await settle();
+      expect(cleaned).toBe(false);
+      // 3. Z sends Y another: accepted in the run's queue, which it leaves; it waits for Y's queue outside it.
+      let second: unknown;
+      void send(w, review, impl, 'second note', 'op-x2').then((r) => (second = r));
+      await settle();
+      expect(await w.store.get(op('op-x2'))).toMatchObject({ delivery: { state: 'pending' } });
+      expect(second).toBeUndefined();
+      // 4. Y, in its turn, sends to root: the run's queue is free, so it goes and Y's tool call returns, before the ack.
+      let spoke: unknown;
+      void send(w, impl, ROOT, 'question from Y', 'op-x-root').then((r) => (spoke = r));
+      await settle();
+      expect(spoke).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      expect(first).toBeUndefined();
+      expect(cleaned).toBe(false);
+      // Y's runtime takes the first note in: the cleanup's step runs, then the second note goes into Y's lane, in order.
+      ack(0);
+      await settle();
+      expect(first).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      expect(cleaned).toBe(true);
+      expect(held).toHaveLength(2);
+      ack(1);
+      await settle();
+      expect(second).toMatchObject({ status: 'accepted', delivery: 'sent' });
+      expect(held.map((h) => (h.request.text.includes('first note') ? 'first' : h.request.text.includes('second note') ? 'second' : 'other'))).toEqual(['first', 'second']);
+    });
+
+    it('C-07: messages of the run to one target go in the order the run accepted them, whoever sends them', async () => {
+      const { w, impl, review } = await nodes();
+      // The run's queue is held (a handoff's dispatch waits): every message waits for it, in the order it was sent.
+      const held = gate();
+      const runtime = watch(w, (request) => (request.text.includes('hold the run') ? held.wait() : undefined));
+      void handoff(w, ROOT, { ...toImpl, content: 'hold the run' });
+      await settle();
+      expect(runtime.of('hold the run')).toEqual(['running']);
+      const results: unknown[] = [];
+      void send(w, review, impl, 'message one', 'op-fifo-1').then((r) => results.push(r));
+      void send(w, ROOT, impl, 'message two', 'op-fifo-2').then((r) => results.push(r));
+      void send(w, review, impl, 'message three', 'op-fifo-3').then((r) => results.push(r));
+      await settle();
+      expect(await w.store.get(op('op-fifo-1'))).toBeUndefined();
+      held.open();
+      await settle();
+      expect(results).toHaveLength(3);
+      const order = runtime.seen
+        .map((s) => s.text)
+        .filter((t) => t.includes('message '))
+        .map((t) => (t.includes('message one') ? 1 : t.includes('message two') ? 2 : 3));
+      expect(order).toEqual([1, 2, 3]);
+    });
+  });
+
   describe(`T068 (${backend}): a task stopped at a limit cancels only what is not claimed`, () => {
     /** impl is busy; review sends the task back (queued); impl's turn ends and that handoff waits right before its claim. */
     const pastTheGate = async () => {

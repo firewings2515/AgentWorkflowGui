@@ -32,7 +32,7 @@ import {
   type WorkflowTask,
   activeMergeStates,
 } from '../../contracts';
-import type { AppRepositories, CleanupResult, DeliveryStore, EndUnclaimedResult, GitPort, WorktreeRef } from '../ports';
+import type { AppRepositories, CleanupResult, DeliveryStore, EndUnclaimedResult, GitPort, StoredDelivery, WorktreeRef } from '../ports';
 import type { CommandOf, SessionService, WorkflowSession } from '../sessions';
 import { type AgentNode, nodeOf, rootNode } from '../workflow/graph';
 import { peerIdOf } from '../workflow/ids';
@@ -1439,10 +1439,19 @@ export class TaskPipeline {
     state: 'completed' | 'cancelled',
     mode: 'together' | 'each',
   ): Promise<{ result: EndUnclaimedResult; handoffs: Map<OperationId, Handoff>; toRoot: Set<OperationId> }> {
-    // Every message of the run not sent (pending, or claimed now: unknown with no outcome), whatever its target (T068).
-    const messages = [...(await this.store.listByState('pending')), ...(await this.store.listByState('unknown'))].filter(
-      (r) => r.kind === 'peer-message' && r.peer?.instanceId === instance.id && r.outcome === undefined,
-    );
+    // Every message of the run not sent (pending, or claimed now: unknown with no outcome), whatever its target (T068). Read
+    // by target (T068 r1): a message has one target session from its acceptance on, and each target's records are read in
+    // one step, so one moving between pending and unknown meanwhile (claimed, then retried) is listed still; a read by state
+    // and then another could miss it. Every target is a session of the run (its root, its nodes, a conflict's resolver;
+    // archived ones too: archiving only marks them), and the run's messages are accepted in its queue, where this runs.
+    const targets = new Set<SessionId>([instance.rootSessionId]);
+    for (const s of await this.repos.sessions.list()) if (s.kind === 'workflow' && s.workflow.instanceId === instance.id) targets.add(s.id);
+    const messages: StoredDelivery[] = [];
+    for (const sessionId of targets) {
+      for (const r of await this.store.listByTarget(sessionId)) {
+        if (r.kind === 'peer-message' && r.peer?.instanceId === instance.id && r.outcome === undefined && r.delivery.state !== 'sent') messages.push(r);
+      }
+    }
     const reports = messages.map((r) => r.operationId);
     const toRoot = new Set(messages.filter((r) => r.target.sessionId === instance.rootSessionId).map((r) => r.operationId));
     const handoffs = new Map<OperationId, Handoff>();
