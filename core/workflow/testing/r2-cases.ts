@@ -73,7 +73,8 @@ export const r2Cases = (backend: string, make: (workflow?: WorkflowTemplate) => 
       w.emitTurn(impl, 'busy-1', 'running');
       await settle();
       await handoff(w, review, { ...rework, content: 'queued' }, { operationId: 'op-queued' });
-      crashOnce(w.store, 'recordOutcome');
+      // The cancel's write (an `endUnclaimed` of the handoff since T068, only while it is not claimed).
+      crashOnce(w.store, 'endUnclaimed', (_ids, outcome) => (outcome as { detail?: string }).detail === 'the task stopped at a handoff limit');
       expect(await handoff(w, ROOT, toImpl)).toMatchObject({ status: 'escalated', reason: 'limit-exceeded' });
       expect((await w.repositories.handoffs.listByInstance(INSTANCE)).find((h) => h.operationId === 'op-queued')?.outcome).toBeUndefined();
       const before = received(w, impl).length;

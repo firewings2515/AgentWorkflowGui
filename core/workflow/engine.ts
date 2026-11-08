@@ -1077,7 +1077,8 @@ export class WorkflowEngine implements WorkflowHooks {
       if ((await this.repos.sessions.get(h.target.sessionId)) === undefined) held.push(h);
     }
     const cancel = async (handoff: Handoff, detail: string) => {
-      await this.store.recordOutcome(handoff.operationId, { kind: 'cancelled', detail, at: this.options.now() }).catch(() => undefined);
+      // Only while not claimed (T068), as every cancel of a handoff: a held one has no session to be sent to yet anyway.
+      await this.store.endUnclaimed([handoff.operationId], { kind: 'cancelled', detail, at: this.options.now() }).catch(() => undefined);
       await this.publishHandoff(handoff.id);
     };
     // First every decision and every count, each written before any session is made, so a crash between the two
@@ -1468,17 +1469,26 @@ export class WorkflowEngine implements WorkflowHooks {
       if (handoff.taskId !== taskId || handoff.delivery.state !== 'pending' || handoff.outcome !== undefined) continue;
       // A handoff to the merge node is never delivered: its task is in the merge queue, nothing waits to be sent (T032).
       if (nodeOf(instance.template, handoff.toNodeId)?.kind === 'merge') continue;
-      // Best effort: the delivery gate asks `mayDeliver` too, so one whose cancel failed is not sent either.
-      const written = await this.store
-        .recordOutcome(handoff.operationId, { kind: 'cancelled', detail: 'the task stopped at a handoff limit', at: this.options.now() })
-        .catch((error: unknown) => {
-          this.log(`cancelling handoff ${handoff.id} failed (${errorName(error)})`);
-          return 'failed' as const;
-        });
-      if (written === 'recorded') cancelled++;
+      // Best effort: the delivery gate asks `mayDeliver` too, so one whose cancel failed is not sent either. Only while not
+      // claimed (T068): the gate's check is a read, so one may be claimed since it was listed; that one is on its way, and its
+      // delivery tells how it went (sent, or unknown for the user, D-12), never cancelled on top of it.
+      if (await this.cancelUnclaimed(handoff, 'the task stopped at a handoff limit')) cancelled++;
       await this.publishHandoff(handoff.id);
     }
     return cancelled;
+  }
+
+  /**
+   * Cancels a handoff only while it is pending and not claimed (T068, the store's `endUnclaimed`, exclusive with the claim):
+   * true once this call cancelled it. One claimed meanwhile is left to its delivery (logged); a failed write is logged.
+   */
+  private async cancelUnclaimed(handoff: Handoff, detail: string): Promise<boolean> {
+    const closed = await this.store.endUnclaimed([handoff.operationId], { kind: 'cancelled', detail, at: this.options.now() }).catch((error: unknown) => {
+      this.log(`cancelling handoff ${handoff.id} failed (${errorName(error)})`);
+      return undefined;
+    });
+    if (closed?.status === 'in-flight') this.log(`handoff ${handoff.id} is on its way; it is not cancelled`);
+    return closed?.status === 'ended' && closed.ended.includes(handoff.operationId);
   }
 
   /** Whether another run's first message, still on record, is meant for this root session ID (r3-P1-2). */
@@ -1946,13 +1956,7 @@ export class WorkflowEngine implements WorkflowHooks {
         if (state === undefined) await this.openRoundEscalation(instance, round);
         if (state === 'declined' || state === 'resolved') {
           for (const handoff of held) {
-            const written = await this.store
-              .recordOutcome(handoff.operationId, { kind: 'cancelled', detail: 'the user declined its blocked round', at: this.options.now() })
-              .catch((error: unknown) => {
-                this.log(`cancelling handoff ${handoff.id} failed (${errorName(error)})`);
-                return 'failed' as const;
-              });
-            if (written === 'recorded') await this.publishHandoff(handoff.id);
+            if (await this.cancelUnclaimed(handoff, 'the user declined its blocked round')) await this.publishHandoff(handoff.id);
           }
         }
         if (state !== 'approved') continue;
