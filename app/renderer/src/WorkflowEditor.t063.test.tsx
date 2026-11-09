@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 // T063: adding, copying and deleting templates in the editor, the empty page, the starter button, a new template without
-// any Agent, read-only, and 「開始 Workflow」's way to a new template.
+// any Agent, read-only, and 「開始 Workflow」's way to a new template. T070: the starter button became the template
+// library's entry 「範本庫」; the starter template is added from there (WorkflowEditor.t070.test.tsx has the rest).
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -77,8 +78,8 @@ describe('T063 new template', () => {
     const save = vi.spyOn(repository, 'save');
     render(<Harness repository={repository} initialId="unavailable" />);
     expect(screen.getByRole('heading', { name: '還沒有 Workflow 範本' })).toBeTruthy();
-    // No starter button without a core (the demo).
-    expect(screen.queryByRole('button', { name: '加入起始範本' })).toBeNull();
+    // No template library without a core (the demo).
+    expect(screen.queryByRole('button', { name: '範本庫' })).toBeNull();
     click('新增範本');
     expect(screen.getByRole('heading', { name: '未命名 Workflow' })).toBeTruthy();
     expect(screen.getByText('新範本 · 尚未儲存')).toBeTruthy();
@@ -225,19 +226,24 @@ describe('T063 starter button', () => {
   };
   const starter = WorkflowTemplate.parse({ ...template, id: STARTER_WORKFLOW_ID, name: '規劃 → 實作 → 審查', revision: 0 });
 
-  it('on the empty page and beside the list while the starter template is missing; adding it opens it', async () => {
+  it('on the empty page, through the template library; adding it opens it, and the library then shows it added', async () => {
     const repository = withStarter([], starter);
     render(<Harness repository={repository} initialId="unavailable" />);
-    click('加入起始範本');
-    expect(await screen.findByRole('heading', { name: '規劃 → 實作 → 審查' })).toBeTruthy();
-    expect(screen.getByText('已加入起始範本「規劃 → 實作 → 審查」。')).toBeTruthy();
+    click('範本庫');
+    click('加入「規劃 → 實作 → 審查」');
+    expect(await screen.findByRole('heading', { name: '規劃 → 實作 → 審查', level: 2 })).toBeTruthy();
+    expect(screen.getByText('已加入範本「規劃 → 實作 → 審查」。')).toBeTruthy();
     expect(repository.addStarter).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole('button', { name: '加入起始範本' })).toBeNull();
+    expect(vi.mocked(repository.addStarter!).mock.calls[0]![0]).toMatchObject({ type: 'workflow.addStarter', template: 'starter' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    click('範本庫');
+    expect(screen.queryByRole('button', { name: '加入「規劃 → 實作 → 審查」' })).toBeNull();
+    expect(button('打開「規劃 → 實作 → 審查」')).toBeTruthy();
   });
 
   it('beside the list for an install in use', () => {
     render(<Harness repository={withStarter([template], starter)} />);
-    expect(toolbar().getByRole('button', { name: '加入起始範本' })).toBeTruthy();
+    expect(toolbar().getByRole('button', { name: '範本庫' })).toBeTruthy();
   });
 });
 
@@ -246,7 +252,9 @@ describe('T063 read-only', () => {
     const repository: WorkflowRepository = { ...createWorkflowRepository([template]), addStarter: vi.fn() };
     const remove = vi.spyOn(repository, 'delete');
     render(<Harness repository={repository} readOnly />);
-    for (const name of ['新增範本', '複製', '刪除範本', '加入起始範本']) expect(button(name).disabled).toBe(true);
+    for (const name of ['新增範本', '複製', '刪除範本']) expect(button(name).disabled).toBe(true);
+    // The library still opens (to read and to open what is there); adding from it is off.
+    expect(button('範本庫').disabled).toBe(false);
     act(() => { button('刪除範本').click(); });
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(remove).not.toHaveBeenCalled();
@@ -255,7 +263,8 @@ describe('T063 read-only', () => {
   it('the empty page too', () => {
     render(<Harness repository={{ ...createWorkflowRepository([]), addStarter: vi.fn() }} initialId="unavailable" readOnly />);
     expect(button('新增範本').disabled).toBe(true);
-    expect(button('加入起始範本').disabled).toBe(true);
+    click('範本庫');
+    expect(button('加入「規劃 → 實作 → 審查」').disabled).toBe(true);
   });
 });
 

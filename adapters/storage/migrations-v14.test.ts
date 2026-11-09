@@ -40,17 +40,15 @@ const v13 = (with_: { agent?: boolean; workflow?: boolean; instance?: boolean })
 const offered = async (db: DatabaseSync) => createRepositories(db).markers.has('starter-offered');
 
 describe('v14: data stored under contracts 0.10', () => {
-  it('reads every record as it was, the versioned ones at 0.11.0; the template pinned in a run too', async () => {
+  it('reads every record as it was, the versioned ones at the current version (0.11.0 by v14, moved on by later migrations); the template pinned in a run too', async () => {
     v13({ agent: true, workflow: true, instance: true });
     const db = openDatabase(path);
     try {
-      expect(db.prepare('SELECT max(version) AS v FROM schema_migration').get()?.v).toBe(14);
-      expect(latestVersion()).toBe(14);
-      expect(CONTRACTS_VERSION).toBe('0.11.0');
+      expect(db.prepare('SELECT max(version) AS v FROM schema_migration').get()?.v).toBe(latestVersion());
       const data = await createRepositories(db).readSnapshotData();
-      expect(data.agents.map((a) => a.schemaVersion)).toEqual(['0.11.0']);
-      expect(data.workflows.map((w) => w.schemaVersion)).toEqual(['0.11.0']);
-      expect(data.instances.map((i) => i.template.schemaVersion)).toEqual(['0.11.0']);
+      expect(data.agents.map((a) => a.schemaVersion)).toEqual([CONTRACTS_VERSION]);
+      expect(data.workflows.map((w) => w.schemaVersion)).toEqual([CONTRACTS_VERSION]);
+      expect(data.instances.map((i) => i.template.schemaVersion)).toEqual([CONTRACTS_VERSION]);
       expect(data.workflows[0]).toMatchObject({ id: workflow.id, name: workflow.name, revision: workflow.revision });
     } finally {
       db.close();

@@ -8,8 +8,8 @@ import { fixtureSnapshotInput } from './fixtures/snapshot';
 const ok = (schema: z.ZodType, input: unknown) => schema.safeParse(input).success;
 
 describe('contracts 0.11', () => {
-  it('is version 0.11.0', () => {
-    expect(CONTRACTS_VERSION).toBe('0.11.0');
+  it('is version 0.11.0 or later (0.12.0, T070)', () => {
+    expect(['0.11.0', '0.12.0']).toContain(CONTRACTS_VERSION);
   });
 
   it('0.10 data reads: the Snapshot and its records keep their shape', () => {
@@ -29,7 +29,7 @@ describe('contracts 0.11', () => {
     expect(ok(Command, { ...command, extra: true })).toBe(false);
   });
 
-  it('workflow.addStarter takes nothing', () => {
+  it('workflow.addStarter takes nothing else (the call of 0.11 still reads; 0.12 adds only the optional `template`)', () => {
     expect(ok(Command, { type: 'workflow.addStarter', requestId: 'r1' })).toBe(true);
     expect(ok(Command, { type: 'workflow.addStarter', requestId: 'r1', workflowId: 'wf-1' })).toBe(false);
   });

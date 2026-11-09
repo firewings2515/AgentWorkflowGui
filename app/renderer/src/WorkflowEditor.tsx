@@ -1,7 +1,7 @@
 import { readOnlyProps } from './read-only';
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { NodeId, STARTER_WORKFLOW_ID } from '../../../contracts';
-import type { AgentDefinition, ModelOption, RuntimeStatus, WorkflowInstance, WorkflowNode, WorkflowTemplate } from '../../../contracts';
+import { NodeId } from '../../../contracts';
+import type { AgentDefinition, BuiltinTemplateKey, ModelOption, RuntimeStatus, WorkflowInstance, WorkflowNode, WorkflowTemplate } from '../../../contracts';
 import type { WorkflowRepository } from './workflow-repository';
 import { addStarterCommand, workflowDeleteCommand, workflowSaveCommand } from './workflow-repository';
 import type { WorkflowDemoControls } from './workflow-demo';
@@ -11,6 +11,7 @@ import type { GraphSelection, WorkflowIssue } from './workflow-editor-state';
 import { workflowIssueLabel } from './workflow-validation';
 import { WorkflowInspector, WorkflowSettings, workflowFieldId } from './WorkflowInspector';
 import { NODE_DRAG_TYPE, WorkflowCanvas } from './workflow-canvas/WorkflowCanvas';
+import { TEMPLATE_LIBRARY, type LibraryEntry } from './template-library';
 import './workflow-editor.css';
 
 interface Draft {
@@ -89,6 +90,52 @@ function DeleteTemplateDialog({ workflow, dirty, running, onCancel, onConfirm }:
   </dialog>;
 }
 
+/**
+ * T070: the template library. The starter template and the eight built-in ones, each with what it suits, its node flow
+ * and whether it needs a git repository; one not in the list yet is added (its own Agents with it), one there already is
+ * opened. Read-only data: nothing is added, opening still works.
+ */
+function TemplateLibraryDialog({ workflows, readOnly, pending, errors, onAdd, onOpen, onClose }: {
+  workflows: readonly WorkflowTemplate[]; readOnly: boolean; pending: BuiltinTemplateKey | null; errors: Partial<Record<BuiltinTemplateKey, string>>;
+  onAdd: (entry: LibraryEntry) => void; onOpen: (entry: LibraryEntry) => void; onClose: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useLayoutEffect(() => {
+    const previous = document.activeElement;
+    const element = dialog.current;
+    if (element?.showModal) element.showModal(); else element?.setAttribute('open', '');
+    element?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+    return () => { element?.close?.(); if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
+  }, []);
+  const writeProps = readOnlyProps(readOnly);
+  return <dialog ref={dialog} className="workflow-library" aria-labelledby="workflow-library-title" onCancel={event => { event.preventDefault(); onClose(); }} onKeyDown={event => {
+    if (event.key !== 'Tab') return;
+    const buttons = Array.from(dialog.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? []);
+    if (event.shiftKey && document.activeElement === buttons[0]) { event.preventDefault(); buttons.at(-1)?.focus(); }
+    else if (!event.shiftKey && document.activeElement === buttons.at(-1)) { event.preventDefault(); buttons[0]?.focus(); }
+  }}>
+    <h2 id="workflow-library-title">範本庫</h2>
+    <p>內建範本不綁專案。加入後會放進範本清單，連同它用到的 Agent，之後可以自己修改。</p>
+    {readOnly && <p className="storage-banner" role="status">唯讀模式：無法加入範本。</p>}
+    <ul className="workflow-library-list">
+      {TEMPLATE_LIBRARY.map(entry => {
+        const added = workflows.some(item => item.id === entry.workflowId);
+        const error = errors[entry.key];
+        return <li key={entry.key} aria-labelledby={`workflow-library-${entry.key}`}>
+          <div className="workflow-library-head"><h3 id={`workflow-library-${entry.key}`}>{entry.name}</h3>{entry.needsGit && <span className="workflow-library-tag">需要 git repo</span>}</div>
+          <p className="muted">{entry.summary}</p>
+          <div className="workflow-actions">
+            {added ? <><span className="workflow-library-added">已加入</span><button type="button" aria-label={`打開「${entry.name}」`} onClick={() => onOpen(entry)}>打開</button></>
+              : <button type="button" {...writeProps} aria-label={`加入「${entry.name}」`} disabled={readOnly || pending !== null} onClick={() => onAdd(entry)}>{pending === entry.key ? '加入中…' : '加入'}</button>}
+          </div>
+          {error && <p className="field-error" role="alert">{error}</p>}
+        </li>;
+      })}
+    </ul>
+    <div className="workflow-actions"><button type="button" onClick={onClose}>關閉</button></div>
+  </dialog>;
+}
+
 export function WorkflowEditor({ repository, demo, agents, models, runtimes = [], selectedId, visible, onSelect, readOnly = false, instances = [], onOpenAgents, newTemplateRequest = 0 }: {
   readOnly?: boolean; repository: WorkflowRepository; demo?: WorkflowDemoControls | undefined; agents: readonly AgentDefinition[]; models: readonly ModelOption[]; runtimes?: readonly RuntimeStatus[];
   selectedId: string; visible: boolean; onSelect: (id: string) => void;
@@ -105,7 +152,7 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
   const [deleteTarget, setDeleteTarget] = useState<GraphSelection>(null);
   const [deleteTemplate, setDeleteTemplate] = useState(false);
   const [notice, setNotice] = useState('');
-  const [starter, setStarter] = useState({ pending: false, error: '' });
+  const [library, setLibrary] = useState<{ open: boolean; pending: BuiltinTemplateKey | null; errors: Partial<Record<BuiltinTemplateKey, string>> }>({ open: false, pending: null, errors: {} });
   const [renderedId, setRenderedId] = useState(selectedId);
   const [focusRequest, setFocusRequest] = useState<{ id: string; field: string; sequence: number } | null>(null);
   const consumedFocus = useRef(0);
@@ -199,22 +246,28 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
     } catch { if (mounted.current) patch(target, { pending: false, error: '刪除服務無法回應，範本仍保留。' }); }
     finally { locks.current.delete(target); }
   };
-  const starterMissing = !!repository.addStarter && !workflows.some(item => item.id === STARTER_WORKFLOW_ID);
-  const addStarter = async () => {
-    if (readOnly || !repository.addStarter || starter.pending) return;
-    setStarter({ pending: true, error: '' });
+  // T070: the template library (T063's starter button became its entry). Absent in the demo, which has no core to make them.
+  const libraryAvailable = !!repository.addStarter;
+  const addFromLibrary = async (entry: LibraryEntry) => {
+    if (readOnly || !repository.addStarter || library.pending !== null) return;
+    setLibrary(previous => ({ ...previous, pending: entry.key, errors: { ...previous.errors, [entry.key]: '' } }));
     try {
-      const result = await repository.addStarter(addStarterCommand());
+      const result = await repository.addStarter(addStarterCommand(entry.key));
       if (!mounted.current) return;
-      if (!result.ok) { setStarter({ pending: false, error: commandFeedback(result) }); return; }
-      setStarter({ pending: false, error: '' });
-      setNotice('已加入起始範本「規劃 → 實作 → 審查」。');
-      onSelect(STARTER_WORKFLOW_ID);
-    } catch { if (mounted.current) setStarter({ pending: false, error: '服務無法回應，起始範本沒有加入。' }); }
+      if (!result.ok) { setLibrary(previous => ({ ...previous, pending: null, errors: { ...previous.errors, [entry.key]: commandFeedback(result) } })); return; }
+      setLibrary({ open: false, pending: null, errors: {} });
+      setNotice(`已加入範本「${entry.name}」。`);
+      onSelect(entry.workflowId);
+    } catch { if (mounted.current) setLibrary(previous => ({ ...previous, pending: null, errors: { ...previous.errors, [entry.key]: '服務無法回應，範本沒有加入。' } })); }
+  };
+  const openFromLibrary = (entry: LibraryEntry) => {
+    setLibrary({ open: false, pending: null, errors: {} });
+    setNotice('');
+    onSelect(entry.workflowId);
   };
   const running = saved ? instances.filter(run => run.workflowId === saved.id && run.state !== 'completed' && run.state !== 'cancelled') : [];
   const writeProps = readOnlyProps(readOnly);
-  const starterButton = starterMissing && <button type="button" {...writeProps} disabled={readOnly || starter.pending} onClick={() => { void addStarter(); }}>{starter.pending ? '加入中…' : '加入起始範本'}</button>;
+  const libraryButton = libraryAvailable && <button type="button" aria-haspopup="dialog" onClick={() => setLibrary(previous => ({ ...previous, open: true }))}>範本庫</button>;
   const change = (value: WorkflowTemplate, manualEdge?: { source: string; target: string }) => {
     if (!pending && draft && workflow) {
       const destinationChoices = Object.fromEntries(value.nodes.flatMap(node => node.outputRules.flatMap(rule => {
@@ -303,20 +356,19 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
         {saved && <button type="button" {...writeProps} disabled={readOnly} onClick={() => startDraft(copyWorkflowDraft(saved))}>複製</button>}
         {saved && <button type="button" className="workflow-danger" {...writeProps} disabled={readOnly || pending || draft?.blocked} onClick={() => setDeleteTemplate(true)}>刪除範本</button>}
         {isNew && <button type="button" disabled={pending} onClick={discardNew}>捨棄新範本</button>}
-        {draft && starterButton}
+        {draft && libraryButton}
         {workflow && <button id={workflowFieldId('save')} className="primary" {...writeProps} disabled={readOnly || pending || draft?.blocked || repository.isBlocked?.(selectedId) || stale} onClick={() => { void save(); }}>{pending ? '儲存中…' : '儲存 Workflow'}</button>}
       </div>
     </header>
     {notice && <p className="workflow-notice" role="status">{notice}</p>}
-    {starter.error && <p className="field-error workflow-notice" role="alert">{starter.error}</p>}
     {!draft && <div className="workflow-empty">
       {!workflows.length && <h3>還沒有 Workflow 範本</h3>}
       <p className="muted">範本決定 Workflow 有哪些節點、各用哪個 Agent 和 Model，以及節點之間怎麼交接。</p>
       <div className="workflow-actions">
         <button type="button" className="primary" {...writeProps} disabled={readOnly} onClick={createNew}>新增範本</button>
-        {starterButton}
+        {libraryButton}
       </div>
-      {starterMissing && <p className="muted">起始範本「規劃 → 實作 → 審查」：規劃拆解 task（清單先給你確認），實作照 task 修改，審查檢查後回報規劃。</p>}
+      {libraryAvailable && <p className="muted">也可以從範本庫加入內建範本，例如「規劃 → 實作 → 審查」。</p>}
     </div>}
     {draft && workflow && <>
       <div className="workflow-feedback-area">
@@ -397,6 +449,8 @@ export function WorkflowEditor({ repository, demo, agents, models, runtimes = []
         </aside>
       </div>
     </>}
+    {visible && library.open && <TemplateLibraryDialog workflows={workflows} readOnly={readOnly} pending={library.pending} errors={library.errors}
+      onAdd={entry => { void addFromLibrary(entry); }} onOpen={openFromLibrary} onClose={() => { if (library.pending === null) setLibrary({ open: false, pending: null, errors: {} }); }} />}
     {visible && saved && draft && deleteTemplate && <DeleteTemplateDialog workflow={saved} dirty={draft.dirty} running={running} onCancel={() => setDeleteTemplate(false)} onConfirm={() => { void removeTemplate(); }} />}
     {visible && workflow && deleteTarget && <DeleteGraphDialog workflow={workflow} selection={deleteTarget} onCancel={() => setDeleteTarget(null)} onConfirm={() => {
       const after = removeGraphSelection(workflow, deleteTarget);

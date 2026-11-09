@@ -94,6 +94,7 @@ import { SessionRuntimes } from './runtimes';
 import { type Allocated, WorkFolders } from './work-folders';
 import { WrittenPaths, type WrittenPathsOptions } from './written-paths';
 import { gated, ServiceClosedError } from './write-gate';
+import { installBuiltin } from '../workflow/builtin-templates';
 import { installStarter, type StarterInstall } from '../workflow/starter';
 
 type Failure = Extract<CommandResult, { ok: false }>;
@@ -1924,9 +1925,19 @@ export class SessionService {
     return this.serial('starter', () => installStarter(this.repos, { models: this.options.modelOptions?.() ?? [], now: this.options.now(), mode: 'first-start' }));
   }
 
-  /** `workflow.addStarter` (T063): what of the starter set is missing, with the models listed now. */
+  /**
+   * `workflow.addStarter` (T063, T070): what of one library template is missing (the starter set without `template`), with
+   * the models listed now. What was written now is announced (`agent.updated`, `workflow.updated`), so every view shows it
+   * without reading the Snapshot again; nothing written, nothing announced.
+   */
   private async addStarter(command: CommandOf<'workflow.addStarter'>): Promise<CommandResult> {
-    const installed = await installStarter(this.repos, { models: this.options.modelOptions?.() ?? [], now: this.options.now(), mode: 'user' });
+    const installed = await installBuiltin(this.repos, { key: command.template ?? 'starter', models: this.options.modelOptions?.() ?? [], now: this.options.now() });
+    const added = new Set(installed.added);
+    for (const id of added) {
+      const agent = await this.repos.agents.get(id as AgentDefinition['id']);
+      if (agent !== undefined) this.options.publish({ type: 'agent.updated', agent });
+    }
+    if (installed.workflow !== undefined && added.has(installed.workflow.id)) this.options.publish({ type: 'workflow.updated', workflow: installed.workflow });
     return ok(command.requestId, installed.workflow === undefined ? {} : { revision: installed.workflow.revision });
   }
 

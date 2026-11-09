@@ -65,4 +65,13 @@
 .workflow-empty h3 { margin: 0; font-size: 18px; }
 .workflow-empty p { margin: 0; }
 .workflow-notice { margin: 8px 18px; }
+/* T070: the template library. */
+.workflow-library { width: min(640px, calc(100vw - 32px)); max-width: calc(100vw - 32px); }
+.workflow-library-list { list-style: none; margin: 16px 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.workflow-library-list > li { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.workflow-library-list p { margin: 0; }
+.workflow-library-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.workflow-library-head h3 { margin: 0; font-size: 15px; }
+.workflow-library-tag { padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; }
+.workflow-library-added { font-size: 13px; color: var(--muted); }
 .workflow-danger { color: var(--error); }
