@@ -1932,12 +1932,12 @@ export class SessionService {
    */
   private async addStarter(command: CommandOf<'workflow.addStarter'>): Promise<CommandResult> {
     const installed = await installBuiltin(this.repos, { key: command.template ?? 'starter', models: this.options.modelOptions?.() ?? [], now: this.options.now() });
-    const added = new Set(installed.added);
-    for (const id of added) {
-      const agent = await this.repos.agents.get(id as AgentDefinition['id']);
+    // Only what was written now, each by its own kind (r1 P2-1).
+    for (const id of installed.addedAgents) {
+      const agent = await this.repos.agents.get(id);
       if (agent !== undefined) this.options.publish({ type: 'agent.updated', agent });
     }
-    if (installed.workflow !== undefined && added.has(installed.workflow.id)) this.options.publish({ type: 'workflow.updated', workflow: installed.workflow });
+    if (installed.workflow !== undefined && installed.workflowAdded) this.options.publish({ type: 'workflow.updated', workflow: installed.workflow });
     return ok(command.requestId, installed.workflow === undefined ? {} : { revision: installed.workflow.revision });
   }
 

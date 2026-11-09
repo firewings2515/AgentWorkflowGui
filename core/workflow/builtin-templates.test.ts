@@ -125,6 +125,26 @@ describe('T070 the built-in templates', () => {
     expect(all('evaluator-optimizer')).toContain('package.json 的 scripts');
     expect(all('spec-parallel')).toContain('其他節點讀不到你的工作資料夾');
     expect(all('spec-parallel')).toContain('create_tasks');
+    // r1 P2-2: the reviewer reads only the builder's handoff, so the builder passes the task's spec on, every time.
+    const d = builtinSet('spec-parallel', [], now);
+    const toReview = d.workflow.nodes.find((n) => n.id === builtinNodeId('spec-parallel', 'builder'))!.outputRules[0]!;
+    expect(toReview.payload).toMatch(/^原樣轉交的 task 規格（驗收條件、介面、測試指令）/);
+    expect(d.workflow.nodes.find((n) => n.id === builtinNodeId('spec-parallel', 'reviewer'))!.inputRules[0]!.condition).toContain('規格');
+    expect(d.agents.find((a) => a.id === BUILTIN_AGENT_IDS['spec-parallel'].builder)!.instructions).toContain('原樣附上交接給你的這個 task 的規格（驗收條件、介面、測試指令）');
+    expect(d.agents.find((a) => a.id === BUILTIN_AGENT_IDS['spec-parallel'].reviewer)!.instructions).toContain('交接沒有附上規格時，退回實作要它補上');
+    // r1 P2-3: the reviewer stops files that do not belong (test outputs) before the merge: in the worktree and in the
+    // task's own commits, without assuming a branch name; the builder removes or ignores them; the library says so.
+    const reviewer = d.agents.find((a) => a.id === BUILTIN_AGENT_IDS['spec-parallel'].reviewer)!.instructions;
+    expect(reviewer).toContain('`git status`');
+    expect(reviewer).toMatch(/`git log --stat` 或 `git show --stat`/);
+    expect(reviewer).toContain('只看這個 task 的 commit');
+    expect(reviewer).toContain('不要假設 branch 名稱');
+    expect(reviewer).toContain('有不該進來的檔案時不能交給合併：退回實作');
+    expect(d.agents.find((a) => a.id === BUILTIN_AGENT_IDS['spec-parallel'].builder)!.instructions).toContain('刪掉或加進 ignore');
+    const rules = d.workflow.nodes.find((n) => n.id === builtinNodeId('spec-parallel', 'reviewer'))!.outputRules;
+    expect(rules.find((r) => r.id === 'reviewer-merge')!.condition).toContain('沒有不該進來的檔案');
+    expect(rules.find((r) => r.id === 'reviewer-rework')!.condition).toContain('不該進來的檔案');
+    expect(d.workflow.description).toContain('審查會擋下測試產物這類不該進來的檔案');
     expect(all('tdd')).toContain('git hash-object');
     expect(all('tdd')).toContain('不是 git 專案');
     expect(builtinSet('cross-review', [], now).workflow.nodes.filter((n) => n.kind === 'agent' && n.agentId === BUILTIN_AGENT_IDS['cross-review'].reviewer)).toHaveLength(2);
@@ -201,14 +221,21 @@ describe('T070 installBuiltin (memory)', () => {
     expect(await repos.markers.has(STARTER_MARKER)).toBe(true);
   });
 
-  it('a failed write leaves none of it; the next add writes all of it', async () => {
+  it('r1 P2-4: a write that fails after two of the Agents were stored leaves none of it; the next add writes all of it', async () => {
     const repos = new MemoryRepositories();
-    const seed = repos.seedDefinitions.bind(repos);
-    let calls = 0;
-    repos.seedDefinitions = (s) => (++calls === 1 ? Promise.reject(new Error('injected:write')) : seed(s));
-    await expect(add(repos)).rejects.toThrow('injected:write');
+    // The third Agent's write fails: the first two are already in the store when it does.
+    const records = repos.agents.records;
+    const set = records.set.bind(records);
+    let writes = 0;
+    records.set = (id, record) => {
+      if (++writes === 3) throw new Error('injected:third-agent');
+      return set(id, record);
+    };
+    await expect(add(repos)).rejects.toThrow('injected:third-agent');
+    expect(writes).toBe(3);
     expect(await repos.agents.list()).toEqual([]);
     expect(await repos.workflows.list()).toEqual([]);
+    records.set = set;
     expect((await add(repos)).added).toHaveLength(5);
   });
 

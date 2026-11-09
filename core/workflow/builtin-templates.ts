@@ -207,7 +207,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
   //    work in task worktrees, review, and the merge node that tests before the target branch moves.
   'spec-parallel': {
     name: '規格驅動＋平行實作',
-    description: '要拆成多個 task 的較大功能。規格（task 清單先給你確認）→ 實作（最多 2 個同時）⇄ 審查 → 合併 → 規格。需要 git repo，專案設定要有測試指令。',
+    description: '要拆成多個 task 的較大功能。規格（task 清單先給你確認）→ 實作（最多 2 個同時）⇄ 審查 → 合併 → 規格。需要 git repo，專案設定要有測試指令。審查會擋下測試產物這類不該進來的檔案。',
     reworkLimit: 2,
     isolation: 'worktree',
     agents: {
@@ -229,8 +229,8 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
         description: '在 task 的 worktree 照規格實作',
         lines: [
           '你是實作者，在這個 task 自己的 worktree 工作。照交接的規格修改程式和測試，只做這個 task 的範圍；發現範圍外的問題列在交接裡，不要順手修。',
-          `完成後${RUN_TESTS}交給審查：改了哪些檔案、實際執行的指令和輸出重點。`,
-          '收到審查退回時修正再交回。不要自己 commit，系統會代為 commit。',
+          `完成後${RUN_TESTS}審查只看得到你的交接，所以交給審查時，先原樣附上交接給你的這個 task 的規格（驗收條件、介面、測試指令），再寫改了哪些檔案、實際執行的指令和輸出重點。`,
+          '收到審查退回時修正再交回，一樣附上規格；審查指出不該進來的檔案（測試產物、暫存檔）時，刪掉或加進 ignore。不要自己 commit，系統會代為 commit。',
           NO_BYPASS,
         ],
       },
@@ -239,8 +239,11 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
         description: '對照規格審查，自己跑測試',
         lines: [
           '你是審查者。不修改任何檔案，但可以執行指令。',
-          `對照交接的規格和驗收條件檢查實作與測試，自己執行測試指令。${EVIDENCE}`,
-          '符合規格就交給合併；不符合就退回實作，列出具體問題和位置。不要硬找問題。',
+          `對照實作交接裡附上的 task 規格和驗收條件，檢查實作與測試；交接沒有附上規格時，退回實作要它補上。自己執行測試指令。${EVIDENCE}`,
+          // r1 P2-3: what a writing node or this one leaves in the worktree is committed by the GUI at the handoff and merged.
+          '跑完測試後，用 `git status` 看 worktree 有沒有新的、沒被 ignore 的檔案（例如測試產生的報告、暫存檔）；再用 `git log --stat` 或 `git show --stat` 看這個 task 已經 commit 的檔案。只看這個 task 的 commit：從交接內容知道 task 改了哪些檔案，或自己找出 task 的起點，不要假設 branch 名稱。',
+          '有不該進來的檔案時不能交給合併：退回實作，請它刪掉或加進 ignore。',
+          '符合規格、也沒有不該進來的檔案，才交給合併；不符合就退回實作，列出具體問題和位置。不要硬找問題。',
           NO_BYPASS,
         ],
       },
@@ -254,12 +257,12 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
         ] },
       { role: 'builder', label: '實作', agent: 'builder', runtime: 'codex', writePolicy: 'write', concurrency: 2, position: { x: 240, y: 120 },
         inputs: [{ id: 'in', condition: '規格負責人交來的 task 或審查的退回' }],
-        outputs: [{ id: 'builder-reviewer', condition: '實作完成、測試跑過時', payload: '改了哪些檔案、執行的指令與輸出重點', target: to('reviewer') }] },
+        outputs: [{ id: 'builder-reviewer', condition: '實作完成、測試跑過時', payload: '原樣轉交的 task 規格（驗收條件、介面、測試指令）、改了哪些檔案、執行的指令與輸出重點', target: to('reviewer') }] },
       { role: 'reviewer', label: '審查', agent: 'reviewer', runtime: 'claude', writePolicy: 'exec-only', position: { x: 480, y: 120 },
-        inputs: [{ id: 'in', condition: '實作交來的 task' }],
+        inputs: [{ id: 'in', condition: '實作交來的 task：原樣轉交的規格與實作結果' }],
         outputs: [
-          { id: 'reviewer-rework', condition: '不符合規格時', payload: '具體問題與位置、你執行的指令與輸出重點', target: to('builder') },
-          { id: 'reviewer-merge', condition: '符合規格時', payload: '審查結論、你執行的指令與輸出重點', target: to('merge') },
+          { id: 'reviewer-rework', condition: '不符合規格，或有不該進來的檔案時', payload: '具體問題與位置（包括不該進來的檔案）、你執行的指令與輸出重點', target: to('builder') },
+          { id: 'reviewer-merge', condition: '符合規格、也沒有不該進來的檔案時', payload: '審查結論、你執行的指令與輸出重點', target: to('merge') },
         ] },
       { role: 'merge', label: '合併', writePolicy: 'write', position: { x: 720, y: 120 },
         outputs: [{ id: 'merged', condition: '合併且測試通過後', payload: '合併結果', target: 'root' }] },
@@ -652,6 +655,14 @@ export const builtinSet = (
 
 type LibraryRepositories = Parameters<typeof installStarter>[0];
 
+/** What `installBuiltin` wrote, by kind (r1 P2-1): an ID stored now is either one of the set's Agents or its template. */
+export interface LibraryInstall extends StarterInstall {
+  /** The set's Agents stored now (not the ones already there). */
+  addedAgents: AgentDefinition['id'][];
+  /** Whether the template was stored now. */
+  workflowAdded: boolean;
+}
+
 /**
  * `workflow.addStarter` (T063, T070): adds what of one library template is missing, in one transaction
  * (`seedDefinitions`). `starter` is the starter set as before (and sets its mark); another key writes only that template
@@ -661,11 +672,18 @@ type LibraryRepositories = Parameters<typeof installStarter>[0];
 export const installBuiltin = async (
   repos: LibraryRepositories,
   options: { key: BuiltinTemplateKey; models: readonly ModelOption[]; now: Timestamp },
-): Promise<StarterInstall> => {
+): Promise<LibraryInstall> => {
   const { key, models, now } = options;
-  if (key === 'starter') return installStarter(repos, { models, now, mode: 'user' });
   const set = builtinSet(key, models, now);
-  const added = await repos.seedDefinitions({ agents: set.agents, workflows: [set.workflow] });
-  const workflow = await repos.workflows.get(set.workflow.id);
-  return { added, ...(workflow !== undefined && { workflow }) };
+  let installed: StarterInstall;
+  if (key === 'starter') installed = await installStarter(repos, { models, now, mode: 'user' });
+  else {
+    const added = await repos.seedDefinitions({ agents: set.agents, workflows: [set.workflow] });
+    const workflow = await repos.workflows.get(set.workflow.id);
+    installed = { added, ...(workflow !== undefined && { workflow }) };
+  }
+  // The IDs stored now come back mixed; they are told apart by the set's own IDs, which never collide with one another, so
+  // a record of the other kind under the same ID (an Agent named like the template) is never taken for one written now.
+  const added = new Set(installed.added);
+  return { ...installed, addedAgents: set.agents.filter((a) => added.has(a.id)).map((a) => a.id), workflowAdded: added.has(set.workflow.id) };
 };

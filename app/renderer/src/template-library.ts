@@ -21,7 +21,7 @@ export const TEMPLATE_LIBRARY: readonly LibraryEntry[] = [
   entry('starter', '規劃 → 實作 → 審查', '一般的修改工作。規劃拆解 task（清單先給你確認）→ 實作 → 審查，審查回報規劃。不需要 git repo。'),
   entry('evaluator-optimizer', '評估者－優化者', '需求明確、要反覆修到合格的修改。協調 → 修改者 ⇄ 評審（自己跑測試）→ 協調。不需要 git repo。'),
   entry('tdd', '測試驅動（TDD）', '先寫測試再實作的新功能或修 bug。協調 → 測試撰寫 → 實作 ⇄ 驗證（只執行指令）→ 協調。建議用 git repo，驗證才查得出測試有沒有被改。'),
-  entry('spec-parallel', '規格驅動＋平行實作', '要拆成多個 task 的較大功能。規格（task 清單先給你確認）→ 實作（最多 2 個同時）⇄ 審查 → 合併 → 規格。需要 git repo，專案設定要有測試指令。', true),
+  entry('spec-parallel', '規格驅動＋平行實作', '要拆成多個 task 的較大功能。規格（task 清單先給你確認）→ 實作（最多 2 個同時）⇄ 審查 → 合併 → 規格。需要 git repo，專案設定要有測試指令。審查會擋下測試產物這類不該進來的檔案。', true),
   entry('parallel-review', '平行審查＋彙整', '只想先看問題、不改檔。協調 → 正確性審查＋健壯性審查（同時）→ 彙整 → 協調。不需要 git repo。'),
   entry('routing', '路由分流', 'bug 和新功能混在一起的需求。分流 → 修 bug 或 新功能（只走一條）→ 審查 → 分流。不需要 git repo。'),
   entry('docs-review', '文件撰寫＋技術審稿', '照程式實際行為寫文件。協調 → 撰寫 ⇄ 審稿 → 協調。不需要 git repo。'),

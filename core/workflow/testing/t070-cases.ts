@@ -7,6 +7,7 @@
 // (app/main/workflow-t070.test.ts).
 import { describe, expect, it } from 'vitest';
 import {
+  AgentId,
   type AppEvent,
   BUILTIN_AGENT_IDS,
   BUILTIN_WORKFLOW_IDS,
@@ -102,6 +103,19 @@ export const t070LibraryCases = (backend: string, make: MakeWorld) =>
       expect(await w.run(addOf('tdd'))).toMatchObject({ ok: true, revision: 0 });
       expect(updates(w, again)).toEqual([]);
       expect((await w.repositories.workflows.list()).filter((x) => x.id === BUILTIN_WORKFLOW_IDS.tdd)).toHaveLength(1);
+    });
+
+    it('r1 P2-1: an Agent stored under the template\'s ID is not announced: only what was written now, by its kind', async () => {
+      const w = await make();
+      const own = (await w.repositories.agents.list())[0]!;
+      const twin = { ...own, id: AgentId.parse(BUILTIN_WORKFLOW_IDS.tdd), name: '名字和範本 ID 一樣的 Agent' };
+      expect((await w.repositories.agents.save(twin, null)).status).toBe('saved');
+      const from = w.events.length;
+      expect(await w.run(addOf('tdd'))).toMatchObject({ ok: true, revision: 0 });
+      const announced = updates(w, from);
+      expect(announced).not.toContain(`agent:${BUILTIN_WORKFLOW_IDS.tdd}`);
+      expect(announced.sort()).toEqual([...Object.values(BUILTIN_AGENT_IDS.tdd).map((id) => `agent:${id}`), `workflow:${BUILTIN_WORKFLOW_IDS.tdd}`].sort());
+      expect(await w.repositories.agents.get(twin.id)).toMatchObject({ name: '名字和範本 ID 一樣的 Agent', revision: 0 });
     });
 
     it('deleted, it is added again through the command; the Agent kept is not announced and not overwritten', async () => {
