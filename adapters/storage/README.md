@@ -93,3 +93,9 @@ migration v14 把 agent／workflow／project 與 instance 內 template 的 `sche
 自動放入起始範本；空的資料庫不寫，下一次啟動放入一次後才寫。備份是整個資料庫檔，標記跟著一起備份與還原。
 `workflow.delete` 用既有的 `DefinitionRepository.delete`（compare-and-set）；instance 的 body 本來就存整份範本，
 刪掉範本不影響已結束的執行。
+
+## v0.12（T070）
+
+migration v15 只把 agent／workflow／project 與 instance 內 template 的 `schemaVersion` 從 0.11.0 改為 0.12.0，
+不加表、不改欄位、不加索引、不動標記。範本庫的內建範本和它們的 Agent 是一般的定義（固定 ID），只在使用者從範本庫
+加入時用 `seedDefinitions` 寫入；第一次啟動仍然只放起始範本。

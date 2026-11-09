@@ -127,7 +127,8 @@ export function commandTarget(command: Command): string {
   if ('agentId' in command) return `agent:${command.agentId}`;
   if ('workflow' in command) return `workflow:${command.workflow.id}`;
   if (command.type === 'workflow.delete') return `workflow:${command.workflowId}`;
-  if (command.type === 'workflow.addStarter') return 'workflow:starter';
+  // T070: one add per library template at a time; the starter set keeps the target it had in 0.11.
+  if (command.type === 'workflow.addStarter') return command.template === undefined || command.template === 'starter' ? 'workflow:starter' : `workflow:builtin:${command.template}`;
   if ('instanceId' in command) return `instance:${command.instanceId}`;
   if ('transferId' in command) return `transfer:${command.transferId}`;
   if ('escalationId' in command) return `escalation:${command.escalationId}`;

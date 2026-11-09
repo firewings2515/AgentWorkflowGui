@@ -433,6 +433,16 @@ INSERT INTO app_marker (name, at)
   WHERE EXISTS (SELECT 1 FROM agent) OR EXISTS (SELECT 1 FROM workflow);
 `;
 
+// Contracts 0.12 (T070): only the version. `workflow.addStarter` takes an optional template key; the built-in templates of
+// the library and their Agents are ordinary definitions under fixed IDs, stored only when the user adds one. The marks
+// stay as they are: a first start still adds only the starter set.
+const contracts12V15 = `
+UPDATE agent SET body = json_set(body, '$.schemaVersion', '0.12.0') WHERE json_extract(body, '$.schemaVersion') = '0.11.0';
+UPDATE workflow SET body = json_set(body, '$.schemaVersion', '0.12.0') WHERE json_extract(body, '$.schemaVersion') = '0.11.0';
+UPDATE project SET body = json_set(body, '$.schemaVersion', '0.12.0') WHERE json_extract(body, '$.schemaVersion') = '0.11.0';
+UPDATE workflow_instance SET body = json_set(body, '$.template.schemaVersion', '0.12.0') WHERE json_extract(body, '$.template.schemaVersion') = '0.11.0';
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'delivery', sql: deliveryV1 },
   { version: 2, name: 'repositories', sql: repositoriesV2 },
@@ -448,6 +458,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 12, name: 'contracts-0.9', sql: contracts09V12 },
   { version: 13, name: 'contracts-0.10', sql: contracts10V13 },
   { version: 14, name: 'contracts-0.11', sql: contracts11V14 },
+  { version: 15, name: 'contracts-0.12', sql: contracts12V15 },
 ];
 
 export const latestVersion = (migrations: readonly Migration[] = MIGRATIONS): number => migrations.at(-1)?.version ?? 0;

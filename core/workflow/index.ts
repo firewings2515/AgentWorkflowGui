@@ -3,3 +3,4 @@ export { WorkflowEngine, type HandoffCallContext, type ReportCallContext, type W
 export * from './graph';
 export * from './ids';
 export * from './starter';
+export * from './builtin-templates';

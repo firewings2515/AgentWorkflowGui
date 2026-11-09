@@ -30,6 +30,7 @@ import { FileLock } from './locks';
 import { ProjectSettings } from './project';
 import { addRuleIssue, ruleIssue } from './rules';
 import { RuntimeStatus } from './runtimes';
+import { BuiltinTemplateKey } from './starter';
 import { BackupInfo, ReadOnlyReason, StorageInfo } from './storage';
 import { Artifact, Attachment, LogicalSession, Message, NativeTask, PeerMessage, SessionActivity, TokenUsage, Turn } from './session';
 import { TransferProposal, UiPreferences } from './transfer';
@@ -88,11 +89,14 @@ export const Command = z.discriminatedUnion('type', [
    */
   cmd('workflow.delete', { workflowId: WorkflowId, expectedRevision: Revision }),
   /**
-   * Adds the starter set (T063, 0.11): the three Agents of STARTER_AGENT_IDS and the template STARTER_WORKFLOW_ID
-   * 「規劃 → 實作 → 審查」. What already exists under those IDs is kept as it is (an edited Agent is not overwritten), so a
-   * repeat adds nothing. The result's `revision` is the template's.
+   * Adds a template of the template library with its own Agents (T063, 0.11; T070, 0.12). Without `template` (as in 0.11)
+   * or with `starter`: the starter set, the three Agents of STARTER_AGENT_IDS and the template STARTER_WORKFLOW_ID
+   * 「規劃 → 實作 → 審查」. With another key: that built-in template (BUILTIN_WORKFLOW_IDS) and its Agents
+   * (BUILTIN_AGENT_IDS), nothing of the others. What already exists under those IDs is kept as it is (an edited Agent or
+   * template is not overwritten), so a repeat adds nothing; a deleted template is added again with the Agents still there.
+   * What is added now is announced with `agent.updated` and `workflow.updated`. The result's `revision` is the template's.
    */
-  cmd('workflow.addStarter', {}),
+  cmd('workflow.addStarter', { template: BuiltinTemplateKey.optional() }),
   cmd('workflow.start', {
     instanceId: InstanceId,
     rootSessionId: SessionId,

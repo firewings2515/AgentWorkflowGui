@@ -203,8 +203,19 @@ export class MemoryRepositories implements AppRepositories {
     },
   };
 
-  /** All or nothing, as the SQLite one: every record is checked before anything is stored. */
+  /**
+   * All or nothing, as the SQLite one: every record is checked before anything is stored, and a write that fails half way
+   * (T070 r1 P2-4) puts the Agents, templates and marks back as they were before it.
+   */
   seedDefinitions(seed: DefinitionSeed): Promise<string[]> {
+    const before = { agents: new Map(this.agents.records), workflows: new Map(this.workflows.records), marks: new Map(this.markerRecords) };
+    // Through Map.prototype: a test may have replaced a map's own `set` to fail a write; the restore must not go through it.
+    const restore = () => {
+      for (const [records, saved] of [[this.agents.records, before.agents], [this.workflows.records, before.workflows], [this.markerRecords, before.marks]] as [Map<string, unknown>, Map<string, unknown>][]) {
+        Map.prototype.clear.call(records);
+        for (const [id, record] of saved) Map.prototype.set.call(records, id, record);
+      }
+    };
     try {
       const agents = seed.agents.map((a) => AgentSchema.parse(a));
       const workflows = seed.workflows.map((w) => WorkflowSchema.parse(w));
@@ -215,6 +226,7 @@ export class MemoryRepositories implements AppRepositories {
       if (mark !== undefined && !this.markerRecords.has(mark.name)) this.markerRecords.set(mark.name, mark.at);
       return Promise.resolve(added);
     } catch (error) {
+      restore();
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
   }

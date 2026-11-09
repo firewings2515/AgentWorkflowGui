@@ -1,5 +1,5 @@
 import { Command, RequestId, WorkflowTemplate } from '../../../contracts';
-import type { CommandResult } from '../../../contracts';
+import type { BuiltinTemplateKey, CommandResult } from '../../../contracts';
 import type { RendererStore } from './renderer-store';
 
 export type SaveWorkflowCommand = Extract<Command, { type: 'workflow.save' }>;
@@ -12,7 +12,7 @@ export interface WorkflowRepository {
   save: (command: SaveWorkflowCommand) => Promise<CommandResult>;
   /** T063: deletes a saved template (contracts 0.11). */
   delete: (command: DeleteWorkflowCommand) => Promise<CommandResult>;
-  /** T063: adds the starter set; absent in the demo (it has no core to make it). */
+  /** T063, T070: adds a template of the template library (the starter set without a key); absent in the demo (it has no core to make it). */
   addStarter?: (command: AddStarterCommand) => Promise<CommandResult>;
   isBlocked?: (id: string) => boolean;
   acknowledge?: (id: string) => void;
@@ -27,7 +27,10 @@ export function createIpcWorkflowRepository(store: RendererStore): WorkflowRepos
 export const workflowDeleteCommand = (workflow: WorkflowTemplate): DeleteWorkflowCommand => ({
   type: 'workflow.delete', requestId: RequestId.parse(crypto.randomUUID()), workflowId: workflow.id, expectedRevision: workflow.revision,
 });
-export const addStarterCommand = (): AddStarterCommand => ({ type: 'workflow.addStarter', requestId: RequestId.parse(crypto.randomUUID()) });
+/** The 0.11 call without a key (the starter set); with one, that library template (T070). */
+export const addStarterCommand = (template?: BuiltinTemplateKey): AddStarterCommand => ({
+  type: 'workflow.addStarter', requestId: RequestId.parse(crypto.randomUUID()), ...(template !== undefined && { template }),
+});
 export const workflowSaveCommand = (workflow: WorkflowTemplate, expectedRevision: number | null): SaveWorkflowCommand => ({
   type: 'workflow.save', requestId: RequestId.parse(crypto.randomUUID()), workflow, expectedRevision,
 });
