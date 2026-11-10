@@ -27,6 +27,11 @@ const RUN_TESTS = `執行交接給的測試指令；交接沒給就${FIND_TESTS}
 const EVIDENCE = '回報時附上實際執行的指令和輸出重點（例如通過與失敗的數量、失敗訊息），不能只寫「通過」。';
 const SCOPE = '只改這次範圍內的東西；發現範圍外的問題列在交接裡，不要順手修。';
 const NO_BYPASS = '指令被環境或權限擋下時，照實回報錯誤訊息，不要自己加旗標或改設定繞過。';
+/**
+ * For a writing node whose next node runs the tests itself (T071): when its own sandbox will not run them (on Windows
+ * Codex's writing sandbox cannot start child processes), it hands over with the error instead of waiting on the user.
+ */
+const BLOCKED_HANDOFF = '測試指令被環境擋下（例如沙箱不允許開子行程）時，不要停下來問使用者：把指令和錯誤訊息照實寫進交接，照常交給下一個節點，由它執行測試。';
 
 // ---- the shape of a template -----------------------------------------------------------------------------------------
 
@@ -104,6 +109,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
           `交給評審時說明改了哪些檔案、怎麼改。${EVIDENCE}`,
           '收到評審退回時逐條處理，說明每一條怎麼改，再交回評審。',
           NO_BYPASS,
+          BLOCKED_HANDOFF,
         ],
       },
       judge: {
@@ -123,7 +129,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
         outputs: [{ id: 'lead-writer', condition: '需求清楚、可以交給修改者時', payload: '要修改什麼、範圍、完成條件、測試指令', target: to('writer') }] },
       { role: 'writer', label: '修改者', agent: 'writer', runtime: 'codex', writePolicy: 'write', position: { x: 240, y: 120 },
         inputs: [{ id: 'in', condition: '協調者的修改說明或評審的退回意見' }],
-        outputs: [{ id: 'writer-judge', condition: '修改完成、測試跑過時', payload: '改了哪些檔案、做法、執行的指令與輸出重點', target: to('judge') }] },
+        outputs: [{ id: 'writer-judge', condition: '修改完成時（測試跑過，或被環境擋下並附上錯誤）', payload: '改了哪些檔案、做法、執行的指令與輸出重點', target: to('judge') }] },
       { role: 'judge', label: '評審', agent: 'judge', runtime: 'claude', writePolicy: 'exec-only', position: { x: 480, y: 120 },
         inputs: [{ id: 'in', condition: '修改者交來的修改' }],
         outputs: [
@@ -170,6 +176,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
           '完成後執行測試指令，交給驗證：改了哪些檔案、實際執行的指令和輸出重點，並原樣附上測試撰寫給的測試檔清單和雜湊值。',
           '收到驗證退回時修正，再交回驗證。',
           NO_BYPASS,
+          BLOCKED_HANDOFF,
         ],
       },
       verifier: {
@@ -192,7 +199,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
         outputs: [{ id: 'tester-builder', condition: '測試寫好且確認會失敗時', payload: '測試檔清單與各檔的雜湊值、預期行為、目前失敗的輸出重點', target: to('builder') }] },
       { role: 'builder', label: '實作', agent: 'builder', runtime: 'codex', writePolicy: 'write', position: { x: 440, y: 120 },
         inputs: [{ id: 'in', condition: '測試撰寫者的測試或驗證的退回' }],
-        outputs: [{ id: 'builder-verifier', condition: '實作完成、測試跑過時', payload: '改了哪些檔案、執行的指令與輸出重點、測試檔清單與雜湊值', target: to('verifier') }] },
+        outputs: [{ id: 'builder-verifier', condition: '實作完成時（測試跑過，或被環境擋下並附上錯誤）', payload: '改了哪些檔案、執行的指令與輸出重點、測試檔清單與雜湊值', target: to('verifier') }] },
       { role: 'verifier', label: '驗證', agent: 'verifier', runtime: 'claude', writePolicy: 'exec-only', position: { x: 660, y: 120 },
         inputs: [{ id: 'in', condition: '實作者交來的實作' }],
         outputs: [
@@ -232,6 +239,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
           `完成後${RUN_TESTS}審查只看得到你的交接，所以交給審查時，先原樣附上交接給你的這個 task 的規格（驗收條件、介面、測試指令），再寫改了哪些檔案、實際執行的指令和輸出重點。`,
           '收到審查退回時修正再交回，一樣附上規格；審查指出不該進來的檔案（測試產物、暫存檔）時，刪掉或加進 ignore。不要自己 commit，系統會代為 commit。',
           NO_BYPASS,
+          BLOCKED_HANDOFF,
         ],
       },
       reviewer: {
@@ -257,7 +265,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
         ] },
       { role: 'builder', label: '實作', agent: 'builder', runtime: 'codex', writePolicy: 'write', concurrency: 2, position: { x: 240, y: 120 },
         inputs: [{ id: 'in', condition: '規格負責人交來的 task 或審查的退回' }],
-        outputs: [{ id: 'builder-reviewer', condition: '實作完成、測試跑過時', payload: '原樣轉交的 task 規格（驗收條件、介面、測試指令）、改了哪些檔案、執行的指令與輸出重點', target: to('reviewer') }] },
+        outputs: [{ id: 'builder-reviewer', condition: '實作完成時（測試跑過，或被環境擋下並附上錯誤）', payload: '原樣轉交的 task 規格（驗收條件、介面、測試指令）、改了哪些檔案、執行的指令與輸出重點', target: to('reviewer') }] },
       { role: 'reviewer', label: '審查', agent: 'reviewer', runtime: 'claude', writePolicy: 'exec-only', position: { x: 480, y: 120 },
         inputs: [{ id: 'in', condition: '實作交來的 task：原樣轉交的規格與實作結果' }],
         outputs: [
@@ -359,6 +367,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
           '執行測試指令確認通過，交給審查：重現測試、修正內容、實際執行的指令和輸出重點。',
           '收到審查退回時修正再交回。',
           NO_BYPASS,
+          BLOCKED_HANDOFF,
         ],
       },
       feature: {
@@ -369,6 +378,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
           '執行測試指令確認通過，交給審查：新增內容、實際執行的指令和輸出重點。',
           '收到審查退回時修正再交回。',
           NO_BYPASS,
+          BLOCKED_HANDOFF,
         ],
       },
       reviewer: {
@@ -492,6 +502,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
           '可以先補保護行為的測試再重構。完成後執行測試指令，交給驗證：改動摘要、實際執行的指令和輸出重點。',
           '收到驗證退回時修正再交回。',
           NO_BYPASS,
+          BLOCKED_HANDOFF,
         ],
       },
       verifier: {
@@ -513,7 +524,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
         outputs: [{ id: 'analyst-refactorer', condition: '分析完成時', payload: '重構步驟、要保護的對外行為、不在範圍的 bug、測試指令', target: to('refactorer') }] },
       { role: 'refactorer', label: '重構', agent: 'refactorer', runtime: 'codex', writePolicy: 'write', position: { x: 440, y: 120 },
         inputs: [{ id: 'in', condition: '重構步驟或驗證退回' }],
-        outputs: [{ id: 'refactorer-verifier', condition: '重構完成、測試跑過時', payload: '改動摘要、執行的指令與輸出重點', target: to('verifier') }] },
+        outputs: [{ id: 'refactorer-verifier', condition: '重構完成時（測試跑過，或被環境擋下並附上錯誤）', payload: '改動摘要、執行的指令與輸出重點', target: to('verifier') }] },
       { role: 'verifier', label: '驗證', agent: 'verifier', runtime: 'claude', writePolicy: 'exec-only', position: { x: 660, y: 120 },
         inputs: [{ id: 'in', condition: '重構結果' }],
         outputs: [
@@ -559,6 +570,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
           '列出你決定不修的問題和理由。',
           '完成後執行測試指令，交給驗證：修了什麼、不修什麼與理由、實際執行的指令和輸出重點。收到驗證退回時修正再交回。',
           NO_BYPASS,
+          BLOCKED_HANDOFF,
         ],
       },
       verifier: {
@@ -586,7 +598,7 @@ export const BUILTIN_TEMPLATES: Readonly<Record<BuiltinKey, TemplateSpec>> = {
         outputs: [{ id: 'revB-fixer', condition: '審查完成時', payload: '問題清單：檔案、行號、重現方式', target: to('fixer') }] },
       { role: 'fixer', label: '彙整修正', agent: 'fixer', runtime: 'codex', writePolicy: 'write', position: { x: 440, y: 160 },
         inputs: [{ id: 'both', condition: '兩份審查報告（或驗證退回）', wait: true }],
-        outputs: [{ id: 'fixer-verifier', condition: '修正完成、測試跑過時', payload: '修了什麼、不修什麼與理由、執行的指令與輸出重點', target: to('verifier') }] },
+        outputs: [{ id: 'fixer-verifier', condition: '修正完成時（測試跑過，或被環境擋下並附上錯誤）', payload: '修了什麼、不修什麼與理由、執行的指令與輸出重點', target: to('verifier') }] },
       { role: 'verifier', label: '驗證', agent: 'verifier', runtime: 'claude', writePolicy: 'exec-only', position: { x: 660, y: 160 },
         inputs: [{ id: 'in', condition: '修正結果' }],
         outputs: [
