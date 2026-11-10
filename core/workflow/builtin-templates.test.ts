@@ -110,6 +110,19 @@ describe('T070 the built-in templates', () => {
         if (n.writePolicy === 'exec-only') expect(agent.instructions).toMatch(/輸出重點|不能只寫「通過」/);
       }
     });
+
+    it('T071: a writing node handing to a node that runs the tests hands over when its sandbox blocks them, not waits on the user', () => {
+      const byId = new Map(workflow.nodes.map((n) => [n.id, n]));
+      for (const n of agentNodes) {
+        if (n.writePolicy !== 'write') continue;
+        const next = n.outputRules.flatMap((r) => (r.target.kind === 'node' ? [byId.get(r.target.nodeId)] : []));
+        if (!next.some((m) => m?.writePolicy === 'exec-only')) continue;
+        const agent = agents.find((a) => a.id === n.agentId)!;
+        expect(agent.instructions).toContain('不要停下來問使用者');
+        // the rule to the tester must not require tests that the sandbox would not run
+        for (const r of n.outputRules) expect(r.condition).not.toMatch(/、測試跑過時$/);
+      }
+    });
   });
 
   it('nine library names, none twice, none the starter template\'s', () => {
